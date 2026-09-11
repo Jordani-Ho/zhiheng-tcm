@@ -15,14 +15,27 @@ export default function App() {
   const [roleData, setRoleData] = useState<RoleData | null>(null)
   const [localRecord, setLocalRecord] = useState('')
   
-  // 积分状态与时辰模拟状态
+  // 积分与时差模拟
   const [points, setPoints] = useState(0)
   const [simulateYoushi, setSimulateYoushi] = useState(false)
 
-  // 读取本地积分（模拟数据主权）
+  // 智能体草案与签字状态
+  const [agentDraft, setAgentDraft] = useState('')
+  const [isDraftApproved, setIsDraftApproved] = useState(false)
+
+  // 初始化：从本地读取状态
   useEffect(() => {
     const savedPoints = localStorage.getItem('tcm_patient_points')
     if (savedPoints) setPoints(Number(savedPoints))
+    
+    const savedRecord = localStorage.getItem('tcm_patient_record')
+    if (savedRecord) setLocalRecord(savedRecord)
+
+    const savedDraft = localStorage.getItem('tcm_agent_draft')
+    if (savedDraft) setAgentDraft(savedDraft)
+
+    const savedApproved = localStorage.getItem('tcm_draft_approved')
+    if (savedApproved === 'true') setIsDraftApproved(true)
   }, [])
 
   // 获取黄历数据
@@ -33,7 +46,7 @@ export default function App() {
       .catch(() => setData(null))
   }, [])
 
-  // 切换角色时，获取对应角色的数据
+  // 切换角色时，获取对应角色的基础数据
   useEffect(() => {
     fetch(`/api/role/${currentRole}`)
       .then(r => r.json())
@@ -41,22 +54,14 @@ export default function App() {
       .catch(() => setRoleData(null))
   }, [currentRole])
 
-  // 读取本地病历
-  useEffect(() => {
-    const saved = localStorage.getItem('tcm_patient_record')
-    if (saved) setLocalRecord(saved)
-  }, [])
-
   const saveRecordToLocal = () => {
     localStorage.setItem('tcm_patient_record', localRecord)
     alert('✅ 病历已保存在您的设备本地（数据主权归您所有）')
   }
 
-  // 判断当前时辰逻辑
   const currentHour = new Date().getHours()
   const isYoushi = (currentHour >= 17 && currentHour < 19) || simulateYoushi
 
-  // 打卡动作
   const handleCheckIn = () => {
     if (!isYoushi) {
       alert('❌ 当前非酉时（17:00-19:00），子午流注未至，暂不可打卡。')
@@ -68,9 +73,31 @@ export default function App() {
     alert('✅ 酉时打卡成功！\n肾经当令，太渊穴按摩已记录。\n积分 +10')
   }
 
-  // 老师审核签字
+  // 患者智能体采集数据
+  const handleAgentCollect = () => {
+    alert('✅ 张三智能体已采集今日打卡与病历数据，已加密上报给李老师智能体。')
+  }
+
+  // 老师智能体生成草案
+  const handleGenerateDraft = () => {
+    const draft = `根据张三白露节气打卡记录，建议：继续按揉太渊穴，并增加百合粥食疗。`;
+    setAgentDraft(draft);
+    localStorage.setItem('tcm_agent_draft', draft);
+    alert('✅ 李老师智能体已根据数据生成回复草案，等待老师审核签字。')
+  }
+
+  // 老师审核签字生效
   const handleTeacherSign = () => {
-    alert('✅ 已审核签字并发送给张三。\n系统已自动执行阅后即焚：该记录已从老师端内存中彻底擦除。')
+    setIsDraftApproved(true);
+    localStorage.setItem('tcm_draft_approved', 'true');
+    alert('✅ 已审核签字并发送给张三。\n系统后台已自动执行阅后即焚：该记录已从老师端内存中彻底擦除。')
+  }
+
+  // 清空数据（用于反复测试）
+  const resetAll = () => {
+    localStorage.clear()
+    setPoints(0); setLocalRecord(''); setAgentDraft(''); setIsDraftApproved(false);
+    alert('已重置所有本地数据');
   }
 
   const boxStyle = {
@@ -131,93 +158,99 @@ export default function App() {
 
         <div style={boxStyle}>
           <div style={{ textAlign: 'center', marginBottom: '15px', color: '#8b4513', fontWeight: 'bold' }}>
-            🧑‍⚕️ 角色切换
+            🧑‍⚕️ 角色切换（演示用）
           </div>
           <div style={{ display: 'flex', flexWrap: 'wrap', justifyContent: 'center' }}>
             {roles.map((role) => (
-              <button 
-                key={role.key} 
-                style={roleBtnStyle(role.key)} 
-                onClick={() => setCurrentRole(role.key)}
-              >
+              <button key={role.key} style={roleBtnStyle(role.key)} onClick={() => setCurrentRole(role.key)}>
                 {role.name}
               </button>
             ))}
           </div>
           <div style={{ textAlign: 'center', marginTop: '15px', fontSize: '12px', color: '#999' }}>
-            <label style={{ cursor: 'pointer' }}>
+            <label style={{ cursor: 'pointer', marginRight: '15px' }}>
               <input type="checkbox" checked={simulateYoushi} onChange={(e) => setSimulateYoushi(e.target.checked)} style={{ marginRight: '5px' }} />
-              开启时光模拟（强行进入酉时，用于测试打卡）
+              时光模拟(强行酉时)
             </label>
+            <button onClick={resetAll} style={{ background: 'none', border: 'none', color: '#b22222', cursor: 'pointer', textDecoration: 'underline' }}>重置演示数据</button>
           </div>
         </div>
 
-        {roleData && (
-          <div style={{ ...boxStyle, background: roleData.role_type.includes('teacher') ? '#e8f0e8' : '#fdfcf0' }}>
-            <div style={{ textAlign: 'center', fontSize: '18px', color: '#8b4513', marginBottom: '10px' }}>
-              {roleData.view_title}
-            </div>
-            <div style={{ textAlign: 'center', color: '#555', lineHeight: '1.8' }}>
-              {roleData.view_content}
-            </div>
-            {roleData.can_check_in && (
+        {/* --- 患者端专属 --- */}
+        {currentRole === 'patient_zhangsan' && (
+          <>
+            <div style={{ ...boxStyle, background: '#fdfcf0' }}>
+              <div style={{ textAlign: 'center', fontSize: '18px', color: '#8b4513', marginBottom: '10px' }}>📝 我的作业</div>
+              <div style={{ textAlign: 'center', color: '#555', lineHeight: '1.8' }}>今日作业：按揉太渊穴5分钟。请记得在酉时完成。</div>
               <div style={{ textAlign: 'center', marginTop: '20px' }}>
-                <button 
-                  onClick={handleCheckIn}
-                  style={{ 
-                    padding: '10px 24px', 
-                    borderRadius: '30px', 
-                    border: 'none', 
-                    background: isYoushi ? '#8b4513' : '#ccc', 
-                    color: '#fff', 
-                    fontSize: '16px', 
-                    cursor: isYoushi ? 'pointer' : 'not-allowed', 
-                    fontFamily: 'serif',
-                    transition: 'all 0.2s'
-                  }}
-                >
+                <button onClick={handleCheckIn} style={{ padding: '10px 24px', borderRadius: '30px', border: 'none', background: isYoushi ? '#8b4513' : '#ccc', color: '#fff', fontSize: '16px', cursor: isYoushi ? 'pointer' : 'not-allowed', fontFamily: 'serif' }}>
                   {isYoushi ? '立即打卡（酉时）' : '未至酉时（17-19点）'}
                 </button>
-                <div style={{ fontSize: '12px', color: '#999', marginTop: '8px' }}>
-                  {isYoushi ? '🌿 肾经当令，适宜按揉太渊穴' : '⏳ 请在对应时辰内操作'}
-                </div>
+              </div>
+            </div>
+            <div style={boxStyle}>
+              <div style={{ textAlign: 'center', marginBottom: '15px', color: '#8b4513', fontWeight: 'bold' }}>📁 我的病历本</div>
+              <textarea value={localRecord} onChange={(e) => setLocalRecord(e.target.value)} placeholder="请记录您今天的身体感受..." style={{ width: '100%', height: '80px', padding: '10px', borderRadius: '8px', border: '1px solid #d4c8a8', fontFamily: 'serif', fontSize: '14px', boxSizing: 'border-box' }} />
+              <div style={{ textAlign: 'center', marginTop: '15px' }}>
+                <button onClick={saveRecordToLocal} style={{ padding: '8px 20px', borderRadius: '30px', border: 'none', background: '#5a7d5a', color: '#fff', fontSize: '14px', cursor: 'pointer', fontFamily: 'serif' }}>🔒 保存在本地</button>
+              </div>
+            </div>
+            {isDraftApproved && (
+              <div style={{ ...boxStyle, background: '#e8f4ea', border: '1px solid #5a7d5a' }}>
+                <div style={{ textAlign: 'center', color: '#5a7d5a', fontWeight: 'bold' }}>📩 收到李老师的新医嘱</div>
+                <div style={{ textAlign: 'center', marginTop: '10px' }}>{agentDraft}</div>
+              </div>
+            )}
+          </>
+        )}
+
+        {/* --- 张三智能体 --- */}
+        {currentRole === 'patient_agent' && (
+          <div style={boxStyle}>
+            <div style={{ textAlign: 'center', fontSize: '18px', color: '#8b4513', marginBottom: '10px' }}>🤖 智能体采集</div>
+            <div style={{ textAlign: 'center', color: '#555', lineHeight: '1.8' }}>仅采集上报，不做独立分析。</div>
+            <div style={{ textAlign: 'center', marginTop: '20px' }}>
+              <button onClick={handleAgentCollect} style={{ padding: '10px 24px', borderRadius: '30px', border: 'none', background: '#8b4513', color: '#fff', fontSize: '16px', cursor: 'pointer', fontFamily: 'serif' }}>📤 采集并上报数据</button>
+            </div>
+          </div>
+        )}
+
+        {/* --- 李老师智能体 --- */}
+        {currentRole === 'teacher_agent' && (
+          <div style={{ ...boxStyle, background: '#e8f0e8' }}>
+            <div style={{ textAlign: 'center', fontSize: '18px', color: '#8b4513', marginBottom: '10px' }}>🤖 智能体草案</div>
+            <div style={{ textAlign: 'center', color: '#555', lineHeight: '1.8' }}>已根据张三的打卡生成回复草案。</div>
+            {!agentDraft ? (
+              <div style={{ textAlign: 'center', marginTop: '20px' }}>
+                <button onClick={handleGenerateDraft} style={{ padding: '10px 24px', borderRadius: '30px', border: 'none', background: '#8b4513', color: '#fff', fontSize: '16px', cursor: 'pointer', fontFamily: 'serif' }}>⚙️ 生成草案</button>
+              </div>
+            ) : (
+              <div style={{ marginTop: '20px', padding: '15px', background: '#fff', borderRadius: '8px', border: '1px dashed #8b4513' }}>
+                <strong>草案内容：</strong>{agentDraft}
               </div>
             )}
           </div>
         )}
 
-        {currentRole === 'patient_zhangsan' && (
-          <div style={boxStyle}>
-            <div style={{ textAlign: 'center', marginBottom: '15px', color: '#8b4513', fontWeight: 'bold' }}>
-              📁 我的病历本（只存在我的设备上）
-            </div>
-            <textarea 
-              value={localRecord}
-              onChange={(e) => setLocalRecord(e.target.value)}
-              placeholder="请记录您今天的身体感受、症状或老师给的调理建议..."
-              style={{ width: '100%', height: '100px', padding: '10px', borderRadius: '8px', border: '1px solid #d4c8a8', fontFamily: 'serif', fontSize: '14px', boxSizing: 'border-box' }}
-            />
-            <div style={{ textAlign: 'center', marginTop: '15px' }}>
-              <button onClick={saveRecordToLocal} style={{ padding: '10px 24px', borderRadius: '30px', border: 'none', background: '#5a7d5a', color: '#fff', fontSize: '16px', cursor: 'pointer', fontFamily: 'serif' }}>
-                🔒 保存在本地
-              </button>
-            </div>
-          </div>
-        )}
-
+        {/* --- 李老师 --- */}
         {currentRole === 'teacher_li' && (
-          <div style={boxStyle}>
-            <div style={{ textAlign: 'center', marginBottom: '15px', color: '#8b4513', fontWeight: 'bold' }}>
-              📋 患者记录审核
+          <div style={{ ...boxStyle, background: '#e8f0e8' }}>
+            <div style={{ textAlign: 'center', fontSize: '18px', color: '#8b4513', marginBottom: '10px' }}>📋 患者记录审核</div>
+            <div style={{ textAlign: 'center', color: '#666', padding: '15px', background: '#fce4e4', borderRadius: '8px', fontSize: '14px', marginBottom: '15px' }}>
+              {localRecord ? `患者记录：${localRecord}` : '暂无患者临时记录。'}
             </div>
-            <div style={{ textAlign: 'center', color: '#666', padding: '15px', background: '#fce4e4', borderRadius: '8px', fontSize: '14px' }}>
-              {localRecord ? `患者局部记录：${localRecord}` : '暂无患者临时记录（患者端未提供）。'}
-            </div>
-            <div style={{ textAlign: 'center', marginTop: '15px' }}>
-              <button onClick={handleTeacherSign} style={{ padding: '10px 24px', borderRadius: '30px', border: 'none', background: '#8b4513', color: '#fff', fontSize: '16px', cursor: 'pointer', fontFamily: 'serif' }}>
-                ✍️ 审核签字，发送给张三
-              </button>
-            </div>
+            {agentDraft && !isDraftApproved && (
+              <div style={{ padding: '15px', background: '#fff', borderRadius: '8px', border: '1px dashed #8b4513', marginBottom: '15px' }}>
+                <strong>智能体草案：</strong>{agentDraft}
+              </div>
+            )}
+            {isDraftApproved ? (
+              <div style={{ textAlign: 'center', color: '#5a7d5a', fontWeight: 'bold' }}>✅ 已签字生效，阅后即焚。</div>
+            ) : (
+              <div style={{ textAlign: 'center' }}>
+                <button onClick={handleTeacherSign} style={{ padding: '10px 24px', borderRadius: '30px', border: 'none', background: '#8b4513', color: '#fff', fontSize: '16px', cursor: 'pointer', fontFamily: 'serif' }}>✍️ 审核签字，发送给张三</button>
+              </div>
+            )}
           </div>
         )}
 
