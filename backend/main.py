@@ -11,40 +11,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 四大核心角色的数据模型（模拟数据）
-ROLE_DATA = {
-    "patient_zhangsan": {
-        "role_name": "患者张三",
-        "role_type": "patient",
-        "view_title": "📝 我的作业",
-        "view_content": "今日作业：按揉太渊穴5分钟。请记得在酉时完成。",
-        "can_check_in": True,
-        "privacy_notice": "🔒 数据主权归你所有 · 阅后即焚"
-    },
-    "patient_agent": {
-        "role_name": "张三智能体",
-        "role_type": "patient_agent",
-        "view_title": "🤖 智能体采集",
-        "view_content": "已采集张三今日的打卡数据，等待老师审核。",
-        "can_check_in": False,
-        "privacy_notice": "🔒 数据仅由智能体采集上报，不存储"
-    },
-    "teacher_li": {
-        "role_name": "李老师",
-        "role_type": "teacher",
-        "view_title": "📋 患者作业审核",
-        "view_content": "张三：已完成白露节气穴位按摩，等待老师签字确认。",
-        "can_check_in": False,
-        "privacy_notice": "🔒 老师端阅后即焚，不存病历"
-    },
-    "teacher_agent": {
-        "role_name": "李老师智能体",
-        "role_type": "teacher_agent",
-        "view_title": "🤖 智能体草案",
-        "view_content": "已根据张三的打卡生成回复草案，等待老师审核签字。",
-        "can_check_in": False,
-        "privacy_notice": "🔒 草案由智能体生成，老师签字才生效"
-    }
+# 全局状态（实际生产环境会存患者端本地，这里为了演示先放内存）
+patient_state = {
+    "raw_data": "",
+    "ai_draft": "",
+    "is_approved": False,
+    "status": "待患者打卡"
 }
 
 @app.get("/api/health")
@@ -58,10 +30,36 @@ def get_huangli():
         "lunar": "农历八月初一",
         "solar_term": "白露",
         "health_trend": "宜养肺润燥，早卧早起",
-        "homework": "今日酉时（17-19点）按揉太渊穴5分钟"
+        "homework": "今日酉时（17-19点）按揉太渊穴5分钟",
+        "current_shi": "酉时"
     }
 
-@app.get("/api/role/{role_key}")
-def get_role_data(role_key: str):
-    # 根据角色返回对应数据，如果角色不存在则返回默认值
-    return ROLE_DATA.get(role_key, ROLE_DATA["patient_zhangsan"])
+# 1. 患者智能体：采集上报
+@app.post("/api/agent/patient/report")
+def patient_report():
+    patient_state["raw_data"] = "患者张三：今日酉时完成按揉太渊穴5分钟，感受微酸。"
+    patient_state["status"] = "已上报，待老师智能体处理"
+    return patient_state
+
+# 2. 老师智能体：生成草案
+@app.post("/api/agent/teacher/generate_draft")
+def teacher_generate_draft():
+    if "已上报" not in patient_state["status"]:
+        return {"error": "患者尚未上报数据"}
+    patient_state["ai_draft"] = "根据张三今日打卡反馈，建议明日减量至3分钟，并注意保暖。"
+    patient_state["status"] = "待老师审核签字"
+    return patient_state
+
+# 3. 老师（真人）：审核签字
+@app.post("/api/agent/teacher/approve")
+def teacher_approve():
+    if "待老师审核签字" not in patient_state["status"]:
+        return {"error": "当前没有待审核的草案"}
+    patient_state["is_approved"] = True
+    patient_state["status"] = "已签字生效，阅后即焚"
+    return patient_state
+
+# 4. 获取当前状态（前端轮询用）
+@app.get("/api/agent/state")
+def get_agent_state():
+    return patient_state
