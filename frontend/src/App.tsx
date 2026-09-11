@@ -23,6 +23,9 @@ export default function App() {
   const [agentDraft, setAgentDraft] = useState('')
   const [isDraftApproved, setIsDraftApproved] = useState(false)
 
+  // 核心新增：今日打卡状态
+  const [hasCheckedIn, setHasCheckedIn] = useState(false)
+
   // 初始化：从本地读取状态
   useEffect(() => {
     const savedPoints = localStorage.getItem('tcm_patient_points')
@@ -36,9 +39,11 @@ export default function App() {
 
     const savedApproved = localStorage.getItem('tcm_draft_approved')
     if (savedApproved === 'true') setIsDraftApproved(true)
+
+    const savedCheckIn = localStorage.getItem('tcm_has_checked_in')
+    if (savedCheckIn === 'true') setHasCheckedIn(true)
   }, [])
 
-  // 获取黄历数据
   useEffect(() => {
     fetch('/api/huangli')
       .then(r => r.json())
@@ -46,7 +51,6 @@ export default function App() {
       .catch(() => setData(null))
   }, [])
 
-  // 切换角色时，获取对应角色的基础数据
   useEffect(() => {
     fetch(`/api/role/${currentRole}`)
       .then(r => r.json())
@@ -69,16 +73,16 @@ export default function App() {
     }
     const newPoints = points + 10
     setPoints(newPoints)
+    setHasCheckedIn(true)
     localStorage.setItem('tcm_patient_points', newPoints.toString())
+    localStorage.setItem('tcm_has_checked_in', 'true')
     alert('✅ 酉时打卡成功！\n肾经当令，太渊穴按摩已记录。\n积分 +10')
   }
 
-  // 患者智能体采集数据
   const handleAgentCollect = () => {
     alert('✅ 张三智能体已采集今日打卡与病历数据，已加密上报给李老师智能体。')
   }
 
-  // 老师智能体生成草案
   const handleGenerateDraft = () => {
     const draft = `根据张三白露节气打卡记录，建议：继续按揉太渊穴，并增加百合粥食疗。`;
     setAgentDraft(draft);
@@ -86,18 +90,16 @@ export default function App() {
     alert('✅ 李老师智能体已根据数据生成回复草案，等待老师审核签字。')
   }
 
-  // 老师审核签字生效
   const handleTeacherSign = () => {
     setIsDraftApproved(true);
     localStorage.setItem('tcm_draft_approved', 'true');
     alert('✅ 已审核签字并发送给张三。\n系统后台已自动执行阅后即焚：该记录已从老师端内存中彻底擦除。')
   }
 
-  // 清空数据（用于反复测试）
   const resetAll = () => {
     localStorage.clear()
-    setPoints(0); setLocalRecord(''); setAgentDraft(''); setIsDraftApproved(false);
-    alert('已重置所有本地数据');
+    setPoints(0); setLocalRecord(''); setAgentDraft(''); setIsDraftApproved(false); setHasCheckedIn(false);
+    alert('已重置所有本地数据')
   }
 
   const boxStyle = {
@@ -150,8 +152,9 @@ export default function App() {
             <div style={{ textAlign: 'center', color: '#5a7d5a', fontSize: '16px', marginBottom: '10px' }}>
               🌿 {data.solar_term}：{data.health_trend}
             </div>
-            <div style={{ textAlign: 'center', background: '#fff8e7', padding: '15px', borderRadius: '8px', color: '#8b4513' }}>
-              📝 今日作业：{data.homework}
+            {/* 核心优化：动态显示今日作业状态 */}
+            <div style={{ textAlign: 'center', background: hasCheckedIn ? '#e8f4ea' : '#fff8e7', padding: '15px', borderRadius: '8px', color: hasCheckedIn ? '#5a7d5a' : '#8b4513', transition: 'all 0.3s' }}>
+              {hasCheckedIn ? '✅ 今日作业已完成（酉时打卡成功）' : `📝 今日作业：${data.homework}`}
             </div>
           </div>
         )}
@@ -176,15 +179,14 @@ export default function App() {
           </div>
         </div>
 
-        {/* --- 患者端专属 --- */}
         {currentRole === 'patient_zhangsan' && (
           <>
             <div style={{ ...boxStyle, background: '#fdfcf0' }}>
               <div style={{ textAlign: 'center', fontSize: '18px', color: '#8b4513', marginBottom: '10px' }}>📝 我的作业</div>
               <div style={{ textAlign: 'center', color: '#555', lineHeight: '1.8' }}>今日作业：按揉太渊穴5分钟。请记得在酉时完成。</div>
               <div style={{ textAlign: 'center', marginTop: '20px' }}>
-                <button onClick={handleCheckIn} style={{ padding: '10px 24px', borderRadius: '30px', border: 'none', background: isYoushi ? '#8b4513' : '#ccc', color: '#fff', fontSize: '16px', cursor: isYoushi ? 'pointer' : 'not-allowed', fontFamily: 'serif' }}>
-                  {isYoushi ? '立即打卡（酉时）' : '未至酉时（17-19点）'}
+                <button onClick={handleCheckIn} disabled={hasCheckedIn} style={{ padding: '10px 24px', borderRadius: '30px', border: 'none', background: hasCheckedIn ? '#ccc' : (isYoushi ? '#8b4513' : '#ccc'), color: '#fff', fontSize: '16px', cursor: hasCheckedIn ? 'not-allowed' : (isYoushi ? 'pointer' : 'not-allowed'), fontFamily: 'serif' }}>
+                  {hasCheckedIn ? '已打卡' : (isYoushi ? '立即打卡（酉时）' : '未至酉时（17-19点）')}
                 </button>
               </div>
             </div>
@@ -204,7 +206,6 @@ export default function App() {
           </>
         )}
 
-        {/* --- 张三智能体 --- */}
         {currentRole === 'patient_agent' && (
           <div style={boxStyle}>
             <div style={{ textAlign: 'center', fontSize: '18px', color: '#8b4513', marginBottom: '10px' }}>🤖 智能体采集</div>
@@ -215,7 +216,6 @@ export default function App() {
           </div>
         )}
 
-        {/* --- 李老师智能体 --- */}
         {currentRole === 'teacher_agent' && (
           <div style={{ ...boxStyle, background: '#e8f0e8' }}>
             <div style={{ textAlign: 'center', fontSize: '18px', color: '#8b4513', marginBottom: '10px' }}>🤖 智能体草案</div>
@@ -232,7 +232,6 @@ export default function App() {
           </div>
         )}
 
-        {/* --- 李老师 --- */}
         {currentRole === 'teacher_li' && (
           <div style={{ ...boxStyle, background: '#e8f0e8' }}>
             <div style={{ textAlign: 'center', fontSize: '18px', color: '#8b4513', marginBottom: '10px' }}>📋 患者记录审核</div>
