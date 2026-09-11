@@ -14,7 +14,18 @@ export default function App() {
   const [currentRole, setCurrentRole] = useState('patient_zhangsan')
   const [roleData, setRoleData] = useState<RoleData | null>(null)
   const [localRecord, setLocalRecord] = useState('')
+  
+  // 积分状态与时辰模拟状态
+  const [points, setPoints] = useState(0)
+  const [simulateYoushi, setSimulateYoushi] = useState(false)
 
+  // 读取本地积分（模拟数据主权）
+  useEffect(() => {
+    const savedPoints = localStorage.getItem('tcm_patient_points')
+    if (savedPoints) setPoints(Number(savedPoints))
+  }, [])
+
+  // 获取黄历数据
   useEffect(() => {
     fetch('/api/huangli')
       .then(r => r.json())
@@ -22,6 +33,7 @@ export default function App() {
       .catch(() => setData(null))
   }, [])
 
+  // 切换角色时，获取对应角色的数据
   useEffect(() => {
     fetch(`/api/role/${currentRole}`)
       .then(r => r.json())
@@ -29,6 +41,7 @@ export default function App() {
       .catch(() => setRoleData(null))
   }, [currentRole])
 
+  // 读取本地病历
   useEffect(() => {
     const saved = localStorage.getItem('tcm_patient_record')
     if (saved) setLocalRecord(saved)
@@ -39,10 +52,25 @@ export default function App() {
     alert('✅ 病历已保存在您的设备本地（数据主权归您所有）')
   }
 
-  // 老师审核签字并发送
+  // 判断当前时辰逻辑
+  const currentHour = new Date().getHours()
+  const isYoushi = (currentHour >= 17 && currentHour < 19) || simulateYoushi
+
+  // 打卡动作
+  const handleCheckIn = () => {
+    if (!isYoushi) {
+      alert('❌ 当前非酉时（17:00-19:00），子午流注未至，暂不可打卡。')
+      return
+    }
+    const newPoints = points + 10
+    setPoints(newPoints)
+    localStorage.setItem('tcm_patient_points', newPoints.toString())
+    alert('✅ 酉时打卡成功！\n肾经当令，太渊穴按摩已记录。\n积分 +10')
+  }
+
+  // 老师审核签字
   const handleTeacherSign = () => {
     alert('✅ 已审核签字并发送给张三。\n系统已自动执行阅后即焚：该记录已从老师端内存中彻底擦除。')
-    // 真实场景下，这里会触发后台发送逻辑。老师端不会存储病历。
   }
 
   const boxStyle = {
@@ -78,9 +106,14 @@ export default function App() {
     <div style={{ minHeight: '100vh', background: '#f5f1e6', padding: '40px 20px', fontFamily: 'serif' }}>
       <div style={{ maxWidth: '600px', margin: '0 auto' }}>
         
-        <h1 style={{ textAlign: 'center', color: '#8b4513', borderBottom: '2px solid #d4c8a8', paddingBottom: '15px', marginBottom: '30px', fontSize: '28px', letterSpacing: '2px' }}>
-          知衡 · 中医治未病社区
-        </h1>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', borderBottom: '2px solid #d4c8a8', paddingBottom: '15px', marginBottom: '30px' }}>
+          <h1 style={{ color: '#8b4513', fontSize: '24px', letterSpacing: '2px', margin: 0 }}>
+            知衡 · 中医治未病社区
+          </h1>
+          <div style={{ background: '#fff8e7', border: '1px solid #8b4513', borderRadius: '20px', padding: '6px 14px', color: '#8b4513', fontWeight: 'bold', fontSize: '14px' }}>
+            🏆 积分：{points}
+          </div>
+        </div>
         
         {data && (
           <div style={boxStyle}>
@@ -111,6 +144,12 @@ export default function App() {
               </button>
             ))}
           </div>
+          <div style={{ textAlign: 'center', marginTop: '15px', fontSize: '12px', color: '#999' }}>
+            <label style={{ cursor: 'pointer' }}>
+              <input type="checkbox" checked={simulateYoushi} onChange={(e) => setSimulateYoushi(e.target.checked)} style={{ marginRight: '5px' }} />
+              开启时光模拟（强行进入酉时，用于测试打卡）
+            </label>
+          </div>
         </div>
 
         {roleData && (
@@ -123,9 +162,25 @@ export default function App() {
             </div>
             {roleData.can_check_in && (
               <div style={{ textAlign: 'center', marginTop: '20px' }}>
-                <button style={{ padding: '10px 24px', borderRadius: '30px', border: 'none', background: '#8b4513', color: '#fff', fontSize: '16px', cursor: 'pointer', fontFamily: 'serif' }}>
-                  立即打卡
+                <button 
+                  onClick={handleCheckIn}
+                  style={{ 
+                    padding: '10px 24px', 
+                    borderRadius: '30px', 
+                    border: 'none', 
+                    background: isYoushi ? '#8b4513' : '#ccc', 
+                    color: '#fff', 
+                    fontSize: '16px', 
+                    cursor: isYoushi ? 'pointer' : 'not-allowed', 
+                    fontFamily: 'serif',
+                    transition: 'all 0.2s'
+                  }}
+                >
+                  {isYoushi ? '立即打卡（酉时）' : '未至酉时（17-19点）'}
                 </button>
+                <div style={{ fontSize: '12px', color: '#999', marginTop: '8px' }}>
+                  {isYoushi ? '🌿 肾经当令，适宜按揉太渊穴' : '⏳ 请在对应时辰内操作'}
+                </div>
               </div>
             )}
           </div>
