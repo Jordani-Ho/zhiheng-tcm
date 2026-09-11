@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useState, useRef } from 'react'
 
 interface RoleData {
   role_name: string
@@ -15,18 +15,15 @@ export default function App() {
   const [roleData, setRoleData] = useState<RoleData | null>(null)
   const [localRecord, setLocalRecord] = useState('')
   
-  // 积分与时差模拟
   const [points, setPoints] = useState(0)
   const [simulateYoushi, setSimulateYoushi] = useState(false)
-
-  // 智能体草案与签字状态
   const [agentDraft, setAgentDraft] = useState('')
   const [isDraftApproved, setIsDraftApproved] = useState(false)
-
-  // 核心新增：今日打卡状态
   const [hasCheckedIn, setHasCheckedIn] = useState(false)
 
-  // 初始化：从本地读取状态
+  // 引入用于文件导入的 Ref
+  const fileInputRef = useRef<HTMLInputElement>(null)
+
   useEffect(() => {
     const savedPoints = localStorage.getItem('tcm_patient_points')
     if (savedPoints) setPoints(Number(savedPoints))
@@ -61,6 +58,52 @@ export default function App() {
   const saveRecordToLocal = () => {
     localStorage.setItem('tcm_patient_record', localRecord)
     alert('✅ 病历已保存在您的设备本地（数据主权归您所有）')
+  }
+
+  // 核心新增：导出病历到本地文件
+  const handleExport = () => {
+    const exportData = {
+      record: localRecord,
+      points: points,
+      checkInStatus: hasCheckedIn,
+      timestamp: new Date().toISOString()
+    }
+    const dataStr = JSON.stringify(exportData, null, 2)
+    const blob = new Blob([dataStr], { type: 'application/json' })
+    const url = URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    link.href = url
+    link.download = `zhiheng_record_${new Date().toISOString().slice(0, 10)}.json`
+    document.body.appendChild(link)
+    link.click()
+    document.body.removeChild(link)
+    URL.revokeObjectURL(url)
+  }
+
+  // 核心新增：从本地文件导入病历
+  const handleImport = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0]
+    if (!file) return
+    const reader = new FileReader()
+    reader.onload = (e) => {
+      try {
+        const content = e.target?.result as string
+        const parsed = JSON.parse(content)
+        if (parsed.record !== undefined) setLocalRecord(parsed.record)
+        if (parsed.points !== undefined) setPoints(parsed.points)
+        if (parsed.checkInStatus !== undefined) setHasCheckedIn(parsed.checkInStatus)
+        
+        localStorage.setItem('tcm_patient_record', parsed.record || '')
+        localStorage.setItem('tcm_patient_points', (parsed.points || 0).toString())
+        localStorage.setItem('tcm_has_checked_in', parsed.checkInStatus ? 'true' : 'false')
+        
+        alert('✅ 病历与积分数据已成功导入本地设备！数据主权已转移。')
+      } catch (err) {
+        alert('❌ 导入失败：文件格式不正确。')
+      }
+    }
+    reader.readAsText(file)
+    event.target.value = '' // 允许重复选择同一文件
   }
 
   const currentHour = new Date().getHours()
@@ -152,7 +195,6 @@ export default function App() {
             <div style={{ textAlign: 'center', color: '#5a7d5a', fontSize: '16px', marginBottom: '10px' }}>
               🌿 {data.solar_term}：{data.health_trend}
             </div>
-            {/* 核心优化：动态显示今日作业状态 */}
             <div style={{ textAlign: 'center', background: hasCheckedIn ? '#e8f4ea' : '#fff8e7', padding: '15px', borderRadius: '8px', color: hasCheckedIn ? '#5a7d5a' : '#8b4513', transition: 'all 0.3s' }}>
               {hasCheckedIn ? '✅ 今日作业已完成（酉时打卡成功）' : `📝 今日作业：${data.homework}`}
             </div>
@@ -190,13 +232,21 @@ export default function App() {
                 </button>
               </div>
             </div>
+            
+            {/* 病历本与导入导出区 */}
             <div style={boxStyle}>
               <div style={{ textAlign: 'center', marginBottom: '15px', color: '#8b4513', fontWeight: 'bold' }}>📁 我的病历本</div>
               <textarea value={localRecord} onChange={(e) => setLocalRecord(e.target.value)} placeholder="请记录您今天的身体感受..." style={{ width: '100%', height: '80px', padding: '10px', borderRadius: '8px', border: '1px solid #d4c8a8', fontFamily: 'serif', fontSize: '14px', boxSizing: 'border-box' }} />
-              <div style={{ textAlign: 'center', marginTop: '15px' }}>
-                <button onClick={saveRecordToLocal} style={{ padding: '8px 20px', borderRadius: '30px', border: 'none', background: '#5a7d5a', color: '#fff', fontSize: '14px', cursor: 'pointer', fontFamily: 'serif' }}>🔒 保存在本地</button>
+              
+              <div style={{ display: 'flex', justifyContent: 'center', gap: '10px', marginTop: '15px', flexWrap: 'wrap' }}>
+                <button onClick={saveRecordToLocal} style={{ padding: '8px 16px', borderRadius: '30px', border: 'none', background: '#5a7d5a', color: '#fff', fontSize: '14px', cursor: 'pointer', fontFamily: 'serif' }}>🔒 保存在本地</button>
+                <button onClick={handleExport} style={{ padding: '8px 16px', borderRadius: '30px', border: '1px solid #8b4513', background: '#fff', color: '#8b4513', fontSize: '14px', cursor: 'pointer', fontFamily: 'serif' }}>📤 导出病历</button>
+                <button onClick={() => fileInputRef.current?.click()} style={{ padding: '8px 16px', borderRadius: '30px', border: '1px solid #8b4513', background: '#fff', color: '#8b4513', fontSize: '14px', cursor: 'pointer', fontFamily: 'serif' }}>📥 导入病历</button>
+                {/* 隐藏的文件输入框 */}
+                <input type="file" accept=".json" ref={fileInputRef} style={{ display: 'none' }} onChange={handleImport} />
               </div>
             </div>
+
             {isDraftApproved && (
               <div style={{ ...boxStyle, background: '#e8f4ea', border: '1px solid #5a7d5a' }}>
                 <div style={{ textAlign: 'center', color: '#5a7d5a', fontWeight: 'bold' }}>📩 收到李老师的新医嘱</div>
