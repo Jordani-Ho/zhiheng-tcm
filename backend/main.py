@@ -11,7 +11,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 黄历数据
+# 模拟数据库（这里存打卡记录）
+checkins = [
+    {"id": 1, "patient_name": "张三", "time": "16:30", "status": "已提交", "content": "太渊穴按揉完成"}
+]
+
 @app.get("/api/huangli")
 def get_huangli():
     return {
@@ -22,7 +26,6 @@ def get_huangli():
         "homework": "今日酉时（17-19点）按揉太渊穴5分钟"
     }
 
-# 四大角色数据
 @app.get("/api/roles")
 def get_roles():
     return [
@@ -32,7 +35,6 @@ def get_roles():
         {"id": "agent_zhang", "name": "张三智能体", "type": "顾问"}
     ]
 
-# 根据角色ID获取不同数据
 @app.get("/api/role/{role_id}")
 def get_role_data(role_id: str):
     if role_id == "teacher_li":
@@ -43,3 +45,21 @@ def get_role_data(role_id: str):
         return {"title": "李老师的智能助理", "content": "今日患者打卡率 85%，有1位患者未按时打卡。", "color": "#f0f0f0"}
     else:
         return {"title": "张三的智能顾问", "content": "正在采集您的身体数据，建议今日多喝水，注意保暖。", "color": "#f0f0f0"}
+
+# 新增：患者提交打卡
+@app.post("/api/checkin")
+def do_checkin():
+    # 模拟新增一条打卡记录（实际开发中会写入患者本地数据库）
+    checkins.append({
+        "id": len(checkins) + 1,
+        "patient_name": "张三",
+        "time": "刚刚",
+        "status": "已提交",
+        "content": "今日作业：按揉太渊穴5分钟"
+    })
+    return {"status": "ok", "message": "打卡成功"}
+
+# 新增：老师获取所有打卡记录
+@app.get("/api/checkins")
+def get_checkins():
+    return checkins
