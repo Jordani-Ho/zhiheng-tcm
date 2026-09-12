@@ -8,16 +8,49 @@ interface HuangliData {
   homework: string
 }
 
-export default function App() {
-  const [data, setData] = useState<HuangliData | null>(null)
-  const [currentRole, setCurrentRole] = useState('患者张三')
+interface RoleData {
+  role_type: string
+  name: string
+  task: string
+  detail: string
+}
 
+export default function App() {
+  const [huangli, setHuangli] = useState<HuangliData | null>(null)
+  const [currentRole, setCurrentRole] = useState('患者张三')
+  const [roleData, setRoleData] = useState<RoleData | null>(null)
+
+  // 获取黄历
   useEffect(() => {
     fetch('/api/huangli')
       .then(r => r.json())
-      .then(d => setData(d))
-      .catch(() => setData(null))
+      .then(d => setHuangli(d))
+      .catch(() => setHuangli(null))
   }, [])
+
+  // 获取角色数据（角色切换时重新获取）
+  const fetchRoleData = () => {
+    fetch(`/api/role-data?role=${currentRole}`)
+      .then(r => r.json())
+      .then(d => setRoleData(d))
+      .catch(() => setRoleData(null))
+  }
+
+  useEffect(() => {
+    fetchRoleData()
+  }, [currentRole])
+
+  // 患者打卡动作
+  const handleCheckIn = () => {
+    fetch('/api/check-in', { method: 'POST' })
+      .then(() => fetchRoleData()) // 打卡后刷新数据
+  }
+
+  // 老师审核动作
+  const handleApprove = () => {
+    fetch('/api/approve', { method: 'POST' })
+      .then(() => fetchRoleData()) // 审核后刷新数据
+  }
 
   const boxStyle = {
     background: '#fdfcf0',
@@ -49,18 +82,18 @@ export default function App() {
           知衡 · 中医治未病社区
         </h1>
         
-        {!data ? (
+        {!huangli ? (
           <div style={{ textAlign: 'center', padding: '50px', color: '#8b4513' }}>正在推算黄历数据...</div>
         ) : (
           <div style={boxStyle}>
             <div style={{ textAlign: 'center', fontSize: '18px', color: '#333', marginBottom: '15px' }}>
-              <span style={{ fontWeight: 'bold' }}>{data.date}</span> · {data.lunar}
+              <span style={{ fontWeight: 'bold' }}>{huangli.date}</span> · {huangli.lunar}
             </div>
             <div style={{ textAlign: 'center', color: '#5a7d5a', fontSize: '16px', marginBottom: '10px' }}>
-              🌿 {data.solar_term}：{data.health_trend}
+              🌿 {huangli.solar_term}：{huangli.health_trend}
             </div>
             <div style={{ textAlign: 'center', background: '#fff8e7', padding: '15px', borderRadius: '8px', color: '#8b4513' }}>
-              📝 今日作业：{data.homework}
+              📝 今日作业：{huangli.homework}
             </div>
           </div>
         )}
@@ -84,17 +117,30 @@ export default function App() {
 
         <div style={{ ...boxStyle, background: currentRole.includes('老师') ? '#e8f0e8' : '#fdfcf0' }}>
           <div style={{ textAlign: 'center', fontSize: '18px', color: '#8b4513', marginBottom: '10px' }}>
-            {currentRole.includes('老师') ? '📋 患者作业审核' : '📝 我的作业'}
+            {roleData ? `📋 ${roleData.name} 的任务` : '加载中...'}
           </div>
           <div style={{ textAlign: 'center', color: '#555', lineHeight: '1.8' }}>
-            {currentRole.includes('老师') 
-              ? '张三：已完成白露节气穴位按摩，等待老师签字确认。' 
-              : '今日作业：按揉太渊穴5分钟。请记得在酉时完成。'}
+            {roleData ? roleData.detail : '正在获取数据...'}
           </div>
-          {!currentRole.includes('老师') && (
+          
+          {/* 患者打卡按钮 */}
+          {currentRole === '患者张三' && roleData?.detail.includes('请记得') && (
             <div style={{ textAlign: 'center', marginTop: '20px' }}>
-              <button style={{ padding: '10px 24px', borderRadius: '30px', border: 'none', background: '#8b4513', color: '#fff', fontSize: '16px', cursor: 'pointer', fontFamily: 'serif' }}>
+              <button 
+                onClick={handleCheckIn}
+                style={{ padding: '10px 24px', borderRadius: '30px', border: 'none', background: '#8b4513', color: '#fff', fontSize: '16px', cursor: 'pointer', fontFamily: 'serif' }}>
                 立即打卡
+              </button>
+            </div>
+          )}
+
+          {/* 老师签字按钮 */}
+          {currentRole === '李老师' && roleData?.task === '待审核' && roleData?.detail.includes('已打卡') && (
+            <div style={{ textAlign: 'center', marginTop: '20px' }}>
+              <button 
+                onClick={handleApprove}
+                style={{ padding: '10px 24px', borderRadius: '30px', border: 'none', background: '#5a7d5a', color: '#fff', fontSize: '16px', cursor: 'pointer', fontFamily: 'serif' }}>
+                签字确认
               </button>
             </div>
           )}
