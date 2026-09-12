@@ -56,14 +56,21 @@ def get_huangli():
     prev_term = None
     next_term = None
     
+    # 【修复点】兼容 cnlunar 返回元组 (月, 日) 或字符串的情况
     for name, date_val in term_list:
-        date_str_val = str(date_val)[:10] 
+        if isinstance(date_val, tuple):
+            # 如果是元组，拼装成 YYYY-MM-DD 格式
+            date_str_val = f"{now.year}-{date_val[0]:02d}-{date_val[1]:02d}"
+        else:
+            # 如果是字符串，截取前10位
+            date_str_val = str(date_val)[:10]
+            
         if date_str_val <= today_str:
             prev_term = (name, date_str_val)
         elif date_str_val > today_str and next_term is None:
             next_term = (name, date_str_val)
 
-    # 【修改点1】组装提示语时，过滤掉“无”和空白
+    # 组装提示语
     term_tip = ""
     today_term = lunar_obj.todaySolarTerms
     if today_term and today_term != '无':
