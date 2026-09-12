@@ -20,24 +20,17 @@ homework_db = {
     "status": "pending"
 }
 
-# 转述记录（模拟患者智能体的转述本）
 transcriptions_db = []
+drafts_db = [] # 老师智能体生成的草案
 
-# 定义接收数据的格式
 class TranscriptionInput(BaseModel):
     patient_name: str
     content: str
-    data_type: str  # text, image, audio
+    data_type: str
 
 @app.get("/api/huangli")
 def get_huangli():
-    return {
-        "date": "2026年09月11日",
-        "lunar": "农历八月初一",
-        "solar_term": "白露",
-        "health_trend": "宜养肺润燥，早卧早起",
-        "homework": "今日酉时（17-19点）按揉太渊穴5分钟"
-    }
+    return {"date": "2026年09月11日", "lunar": "农历八月初一", "solar_term": "白露", "health_trend": "宜养肺润燥，早卧早起", "homework": "今日酉时（17-19点）按揉太渊穴5分钟"}
 
 @app.get("/api/role-data")
 def get_role_data(role: str):
@@ -48,7 +41,6 @@ def get_role_data(role: str):
             return {"role_type": "teacher", "name": "李老师", "task": "待审核", "detail": f"{homework_db['patient_name']}：{homework_db['task']}（已打卡，待签字确认）"}
         else:
             return {"role_type": "teacher", "name": "李老师", "task": "已审核", "detail": f"{homework_db['patient_name']}的作业已签字确认。"}
-    
     elif role == "患者张三":
         if homework_db["status"] == "pending":
             return {"role_type": "patient", "name": "张三", "task": homework_db["task"], "detail": homework_db["detail"]}
@@ -56,7 +48,6 @@ def get_role_data(role: str):
             return {"role_type": "patient", "name": "张三", "task": homework_db["task"], "detail": "已打卡，等待老师签字确认。"}
         else:
             return {"role_type": "patient", "name": "张三", "task": homework_db["task"], "detail": "老师已签字确认，完成！"}
-    
     return {"role_type": "unknown", "name": role, "task": "暂无任务", "detail": "数据加载中..."}
 
 @app.post("/api/check-in")
@@ -69,20 +60,38 @@ def approve():
     homework_db["status"] = "approved"
     return {"message": "审核通过"}
 
-# 患者智能体转述接口
 @app.post("/api/transcribe")
 def transcribe(input_data: TranscriptionInput):
-    # 【铁律】：这里只做记录和转述，不做任何推理、诊断、修改。
-    # 只是把患者的输入原样保存下来，准备转交给老师。
-    transcriptions_db.append({
-        "id": len(transcriptions_db) + 1,
-        "patient_name": input_data.patient_name,
-        "content": input_data.content,
-        "data_type": input_data.data_type
-    })
+    transcriptions_db.append({"id": len(transcriptions_db) + 1, "patient_name": input_data.patient_name, "content": input_data.content, "data_type": input_data.data_type})
     return {"message": "转述成功", "total": len(transcriptions_db)}
 
-# 老师获取转述列表接口
 @app.get("/api/transcriptions")
 def get_transcriptions():
     return transcriptions_db
+
+# 【第6天新增】老师智能体生成草案接口
+@app.post("/api/generate-draft")
+def generate_draft(transcript_id: int):
+    transcript = next((t for t in transcriptions_db if t["id"] == transcript_id), None)
+    if not transcript:
+        return {"error": "找不到该转述"}
+
+    # 【铁律】：只做格式转换，绝不推理。把患者原话填入老师预设的模板结构。
+    template = f"""【中医病历草案】
+患者姓名：{transcript['patient_name']}
+主诉内容：{transcript['content']}
+（以上内容由患者智能体原样转述，等待老师补充辨证与诊断。）"""
+    
+    draft = {
+        "id": len(drafts_db) + 1,
+        "transcript_id": transcript_id,
+        "patient_name": transcript['patient_name'],
+        "content": template.strip()
+    }
+    drafts_db.append(draft)
+    return {"message": "草案生成成功", "draft": draft}
+
+# 获取所有草案接口
+@app.get("/api/drafts")
+def get_drafts():
+    return drafts_db
