@@ -1,5 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
 app = FastAPI(title="zhiheng-tcm-backend")
 
@@ -11,14 +12,22 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 模拟数据库：记录作业状态
-# status: pending(待打卡) -> checked_in(已打卡待审核) -> approved(已审核)
+# 模拟数据库
 homework_db = {
     "patient_name": "张三",
     "task": "今日作业：按揉太渊穴5分钟",
     "detail": "请记得在酉时完成。",
     "status": "pending"
 }
+
+# 转述记录（模拟患者智能体的转述本）
+transcriptions_db = []
+
+# 定义接收数据的格式
+class TranscriptionInput(BaseModel):
+    patient_name: str
+    content: str
+    data_type: str  # text, image, audio
 
 @app.get("/api/huangli")
 def get_huangli():
@@ -32,7 +41,6 @@ def get_huangli():
 
 @app.get("/api/role-data")
 def get_role_data(role: str):
-    # 老师看到的是患者的作业状态
     if role == "李老师":
         if homework_db["status"] == "pending":
             return {"role_type": "teacher", "name": "李老师", "task": "待审核", "detail": "患者尚未打卡。"}
@@ -41,7 +49,6 @@ def get_role_data(role: str):
         else:
             return {"role_type": "teacher", "name": "李老师", "task": "已审核", "detail": f"{homework_db['patient_name']}的作业已签字确认。"}
     
-    # 患者看到自己的作业状态
     elif role == "患者张三":
         if homework_db["status"] == "pending":
             return {"role_type": "patient", "name": "张三", "task": homework_db["task"], "detail": homework_db["detail"]}
@@ -50,15 +57,32 @@ def get_role_data(role: str):
         else:
             return {"role_type": "patient", "name": "张三", "task": homework_db["task"], "detail": "老师已签字确认，完成！"}
     
-    # 智能体先不处理，暂时返回空
     return {"role_type": "unknown", "name": role, "task": "暂无任务", "detail": "数据加载中..."}
 
 @app.post("/api/check-in")
 def check_in():
     homework_db["status"] = "checked_in"
-    return {"message": "打卡成功", "status": "checked_in"}
+    return {"message": "打卡成功"}
 
 @app.post("/api/approve")
 def approve():
     homework_db["status"] = "approved"
-    return {"message": "审核通过", "status": "approved"}
+    return {"message": "审核通过"}
+
+# 患者智能体转述接口
+@app.post("/api/transcribe")
+def transcribe(input_data: TranscriptionInput):
+    # 【铁律】：这里只做记录和转述，不做任何推理、诊断、修改。
+    # 只是把患者的输入原样保存下来，准备转交给老师。
+    transcriptions_db.append({
+        "id": len(transcriptions_db) + 1,
+        "patient_name": input_data.patient_name,
+        "content": input_data.content,
+        "data_type": input_data.data_type
+    })
+    return {"message": "转述成功", "total": len(transcriptions_db)}
+
+# 老师获取转述列表接口
+@app.get("/api/transcriptions")
+def get_transcriptions():
+    return transcriptions_db
