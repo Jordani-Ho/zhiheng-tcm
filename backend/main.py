@@ -29,10 +29,14 @@ class DraftUpdate(BaseModel):
 class SignInput(BaseModel):
     final_plan: str
 
+class HomeworkInput(BaseModel):
+    patient_name: str
+    task: str
+    detail: str
+
 @app.get("/api/huangli")
 def get_huangli():
     now = datetime.now()
-    
     date_str = now.strftime("%Y年%m月%d日")
     lunar_date = lunardate.LunarDate.fromSolarDate(now.year, now.month, now.day)
     lunar_month = f"闰{lunar_date.month}月" if lunar_date.isLeapMonth else f"{lunar_date.month}月"
@@ -52,13 +56,11 @@ def get_huangli():
     
     prev_term = None
     next_term = None
-    
     for name, date_val in term_list:
         if isinstance(date_val, tuple):
             date_str_val = f"{now.year}-{date_val[0]:02d}-{date_val[1]:02d}"
         else:
             date_str_val = str(date_val)[:10]
-            
         if date_str_val <= today_str:
             prev_term = (name, date_str_val)
         elif date_str_val > today_str and next_term is None:
@@ -92,37 +94,51 @@ def get_huangli():
         "current_shi": current_shi
     }
 
-@app.get("/api/role-data")
-def get_role_data(role: str):
-    hw = database.get_homework()
-    if not hw:
-        return {"role_type": "unknown", "name": role, "task": "暂无任务", "detail": "数据加载中..."}
+# 【第13天新增】获取患者列表接口
+@app.get("/api/patients")
+def get_patients():
+    return database.get_patients()
 
+# 【第13天修改】支持根据患者动态获取数据
+@app.get("/api/role-data")
+def get_role_data(role: str, patient_name: str = "张三"):
+    hw = database.get_homework(patient_name)
+    
     if role == "李老师":
+        if not hw:
+            return {"role_type": "teacher", "name": "李老师", "task": "待审核", "detail": f"{patient_name}尚未打卡。"}
         if hw["status"] == "pending":
-            return {"role_type": "teacher", "name": "李老师", "task": "待审核", "detail": "患者尚未打卡。"}
+            return {"role_type": "teacher", "name": "李老师", "task": "待审核", "detail": f"{patient_name}尚未打卡。"}
         elif hw["status"] == "checked_in":
-            return {"role_type": "teacher", "name": "李老师", "task": "待审核", "detail": f"{hw['patient_name']}：{hw['task']}（已打卡，待签字确认）"}
+            return {"role_type": "teacher", "name": "李老师", "task": "待审核", "detail": f"{patient_name}：{hw['task']}（已打卡，待签字确认）"}
         else:
-            return {"role_type": "teacher", "name": "李老师", "task": "已审核", "detail": f"{hw['patient_name']}的作业已签字确认。"}
-    elif role == "患者张三":
+            return {"role_type": "teacher", "name": "李老师", "task": "已审核", "detail": f"{patient_name}的作业已签字确认。"}
+    elif role == "患者" or role == "患者智能体":
+        if not hw:
+            return {"role_type": "patient", "name": patient_name, "task": "暂无作业", "detail": "等待老师布置作业。"}
         if hw["status"] == "pending":
-            return {"role_type": "patient", "name": "张三", "task": hw["task"], "detail": hw["detail"]}
+            return {"role_type": "patient", "name": patient_name, "task": hw["task"], "detail": hw["detail"]}
         elif hw["status"] == "checked_in":
-            return {"role_type": "patient", "name": "张三", "task": hw["task"], "detail": "已打卡，等待老师签字确认。"}
+            return {"role_type": "patient", "name": patient_name, "task": hw["task"], "detail": "已打卡，等待老师签字确认。"}
         else:
-            return {"role_type": "patient", "name": "张三", "task": hw["task"], "detail": "老师已签字确认，完成！"}
+            return {"role_type": "patient", "name": patient_name, "task": hw["task"], "detail": "老师已签字确认，完成！"}
     return {"role_type": "unknown", "name": role, "task": "暂无任务", "detail": "数据加载中..."}
 
+# 【第13天新增】老师布置作业接口
+@app.post("/api/homework")
+def create_homework(input_data: HomeworkInput):
+    database.create_homework(input_data.patient_name, input_data.task, input_data.detail)
+    return {"message": "作业已布置"}
+
 @app.post("/api/check-in")
-def check_in():
-    database.update_homework_status("checked_in")
-    database.add_points("张三", 10) # 【第12天新增】患者打卡 +10 积分
+def check_in(patient_name: str = "张三"):
+    database.update_homework_status(patient_name, "checked_in")
+    database.add_points(patient_name, 10)
     return {"message": "打卡成功"}
 
 @app.post("/api/approve")
-def approve():
-    database.update_homework_status("approved")
+def approve(patient_name: str = "张三"):
+    database.update_homework_status(patient_name, "approved")
     return {"message": "审核通过"}
 
 @app.post("/api/transcribe")
@@ -131,8 +147,8 @@ def transcribe(input_data: TranscriptionInput):
     return {"message": "转述成功"}
 
 @app.get("/api/transcriptions")
-def get_transcriptions():
-    return database.get_transcriptions()
+def get_transcriptions(patient_name: str = None):
+    return database.get_transcriptions(patient_name)
 
 @app.post("/api/generate-draft")
 def generate_draft(transcript_id: int):
@@ -167,21 +183,19 @@ def update_draft(draft_id: int, update_data: DraftUpdate):
 
 @app.post("/api/drafts/{draft_id}/sign")
 def sign_draft_endpoint(draft_id: int, input_data: SignInput):
-    result = database.sign_draft(draft_id, input_data.final_plan)
-    if not result:
+    patient_name = database.sign_draft(draft_id, input_data.final_plan)
+    if not patient_name:
         return {"error": "找不到该病历"}
-    # 【第12天新增】签字后，患者支付 50 积分学费给老师
-    database.transfer_points("张三", "李老师", 50)
+    database.transfer_points(patient_name, "李老师", 50)
     return {"message": "签字确认成功，已归档至患者健康档案，学费已支付"}
 
 @app.get("/api/patient-records")
-def get_patient_records():
-    return database.get_patient_records()
+def get_patient_records(patient_name: str = None):
+    return database.get_patient_records(patient_name)
 
-# 【第12天新增】获取积分接口
 @app.get("/api/points")
-def get_points():
+def get_points(patient_name: str = "张三"):
     return {
-        "patient_points": database.get_points("张三"),
+        "patient_points": database.get_points(patient_name),
         "teacher_points": database.get_points("李老师")
     }
