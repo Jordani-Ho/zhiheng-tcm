@@ -22,6 +22,7 @@ homework_db = {
 
 transcriptions_db = []
 drafts_db = []
+patient_records_db = [] # 【第8天新增】患者健康档案（已签字病历）
 
 class TranscriptionInput(BaseModel):
     patient_name: str
@@ -88,7 +89,7 @@ def generate_draft(transcript_id: int):
         "transcript_id": transcript_id,
         "patient_name": transcript['patient_name'],
         "content": template.strip(),
-        "signed": False # 新增：签字状态
+        "signed": False
     }
     drafts_db.append(draft)
     return {"message": "草案生成成功", "draft": draft}
@@ -97,7 +98,6 @@ def generate_draft(transcript_id: int):
 def get_drafts():
     return drafts_db
 
-# 【第7天新增】老师修改草案接口
 @app.put("/api/drafts/{draft_id}")
 def update_draft(draft_id: int, update_data: DraftUpdate):
     draft = next((d for d in drafts_db if d["id"] == draft_id), None)
@@ -106,11 +106,25 @@ def update_draft(draft_id: int, update_data: DraftUpdate):
     draft["content"] = update_data.content
     return {"message": "草案已更新", "draft": draft}
 
-# 【第7天新增】老师签字确认接口
+# 【第8天修改】老师签字 -> 归档给患者，老师端销毁（阅后即焚）
 @app.post("/api/drafts/{draft_id}/sign")
 def sign_draft(draft_id: int):
     draft = next((d for d in drafts_db if d["id"] == draft_id), None)
     if not draft:
         return {"error": "找不到该草案"}
+    
+    # 1. 标记为已签字
     draft["signed"] = True
-    return {"message": "签字确认成功", "draft": draft}
+    
+    # 2. 归档到患者健康档案
+    patient_records_db.append(draft)
+    
+    # 3. 从老师待办列表中移除（模拟老师端“阅后即焚”）
+    drafts_db.remove(draft)
+    
+    return {"message": "签字确认成功，已归档至患者健康档案", "destroyed": True}
+
+# 【第8天新增】患者获取自己的健康档案接口
+@app.get("/api/patient-records")
+def get_patient_records():
+    return patient_records_db

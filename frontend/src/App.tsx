@@ -12,6 +12,7 @@ export default function App() {
   const [inputText, setInputText] = useState('')
   const [transcriptions, setTranscriptions] = useState<Transcription[]>([])
   const [drafts, setDrafts] = useState<Draft[]>([])
+  const [patientRecords, setPatientRecords] = useState<Draft[]>([]) // 【第8天新增】患者健康档案
 
   useEffect(() => {
     fetch('/api/huangli').then(r => r.json()).then(d => setHuangli(d)).catch(() => setHuangli(null))
@@ -29,10 +30,15 @@ export default function App() {
     fetch('/api/drafts').then(r => r.json()).then(d => setDrafts(d)).catch(() => setDrafts([]))
   }
 
+  const fetchPatientRecords = () => {
+    fetch('/api/patient-records').then(r => r.json()).then(d => setPatientRecords(d)).catch(() => setPatientRecords([]))
+  }
+
   useEffect(() => {
     fetchRoleData()
     fetchTranscriptions()
     fetchDrafts()
+    fetchPatientRecords() // 加载患者档案
   }, [currentRole])
 
   const handleCheckIn = () => { fetch('/api/check-in', { method: 'POST' }).then(() => fetchRoleData()) }
@@ -52,7 +58,6 @@ export default function App() {
       .then(() => fetchDrafts())
   }
 
-  // 【第7天新增】老师编辑草案内容
   const handleEditDraft = (draftId: number, newContent: string) => {
     fetch(`/api/drafts/${draftId}`, {
       method: 'PUT',
@@ -61,10 +66,13 @@ export default function App() {
     }).then(() => fetchDrafts())
   }
 
-  // 【第7天新增】老师签字确认
+  // 【第8天修改】签字后，不仅刷新草稿，还要刷新患者档案
   const handleSignDraft = (draftId: number) => {
     fetch(`/api/drafts/${draftId}/sign`, { method: 'POST' })
-      .then(() => fetchDrafts())
+      .then(() => {
+        fetchDrafts();          // 刷新老师端（已阅后即焚，草案会消失）
+        fetchPatientRecords();  // 刷新患者端（新档案会出现）
+      })
   }
 
   const boxStyle = { background: '#fdfcf0', border: '1px solid #d4c8a8', borderRadius: '12px', padding: '24px', marginBottom: '20px', boxShadow: '0 4px 12px rgba(0,0,0,0.06)' }
@@ -129,36 +137,45 @@ export default function App() {
           </div>
         )}
 
-        {/* 【第7天新增】老师智能体生成的病历草案（可编辑+签字） */}
+        {/* 【第8天修改】老师端草案（如果草案被签字了，它会从列表中消失，模拟阅后即焚） */}
         {(currentRole === '李老师' || currentRole === '李老师智能体') && (
           <div style={{ ...boxStyle, background: '#fcfdfa' }}>
-            <div style={{ textAlign: 'center', fontSize: '18px', color: '#8b4513', marginBottom: '15px' }}>📄 病历草案（供老师审核修改）</div>
+            <div style={{ textAlign: 'center', fontSize: '18px', color: '#8b4513', marginBottom: '15px' }}>📄 待处理病历草案（老师端阅后即焚）</div>
             {drafts.length === 0 ? (
-              <div style={{ textAlign: 'center', color: '#999' }}>暂无草案，请先点击上方“生成草案”</div>
+              <div style={{ textAlign: 'center', color: '#999' }}>暂无待处理草案（已签字草案将销毁，不再显示）</div>
             ) : (
               drafts.map(d => (
                 <div key={d.id} style={{ padding: '15px', border: '1px solid #e0e0e0', borderRadius: '8px', marginBottom: '10px', background: '#fff' }}>
-                  <div style={{ color: '#8b4513', fontWeight: 'bold', marginBottom: '5px' }}>患者：{d.patient_name} {d.signed && <span style={{ color: '#5a7d5a', fontSize: '12px' }}>（✅ 已签字）</span>}</div>
-                  
-                  {/* 如果未签字，显示可编辑文本框 */}
-                  {!d.signed ? (
-                    <>
-                      <textarea 
-                        value={d.content} 
-                        onChange={(e) => {
-                          const newDrafts = drafts.map(item => item.id === d.id ? { ...item, content: e.target.value } : item);
-                          setDrafts(newDrafts);
-                        }}
-                        style={{ width: '100%', height: '120px', padding: '10px', borderRadius: '8px', border: '1px solid #d4c8a8', fontFamily: 'serif', fontSize: '14px', marginBottom: '10px', boxSizing: 'border-box', whiteSpace: 'pre-wrap' }} 
-                      />
-                      <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '10px' }}>
-                        <button onClick={() => handleEditDraft(d.id, d.content)} style={{ padding: '6px 16px', borderRadius: '20px', border: '1px solid #8b4513', background: 'transparent', color: '#8b4513', cursor: 'pointer' }}>保存修改</button>
-                        <button onClick={() => handleSignDraft(d.id)} style={{ padding: '6px 16px', borderRadius: '20px', border: 'none', background: '#5a7d5a', color: '#fff', cursor: 'pointer' }}>签字确认</button>
-                      </div>
-                    </>
-                  ) : (
-                    <div style={{ whiteSpace: 'pre-wrap', fontSize: '14px', color: '#555', lineHeight: '1.6' }}>{d.content}</div>
-                  )}
+                  <div style={{ color: '#8b4513', fontWeight: 'bold', marginBottom: '5px' }}>患者：{d.patient_name}</div>
+                  <textarea 
+                    value={d.content} 
+                    onChange={(e) => {
+                      const newDrafts = drafts.map(item => item.id === d.id ? { ...item, content: e.target.value } : item);
+                      setDrafts(newDrafts);
+                    }}
+                    style={{ width: '100%', height: '100px', padding: '10px', borderRadius: '8px', border: '1px solid #d4c8a8', fontFamily: 'serif', fontSize: '14px', marginBottom: '10px', boxSizing: 'border-box', whiteSpace: 'pre-wrap' }} 
+                  />
+                  <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '10px' }}>
+                    <button onClick={() => handleEditDraft(d.id, d.content)} style={{ padding: '6px 16px', borderRadius: '20px', border: '1px solid #8b4513', background: 'transparent', color: '#8b4513', cursor: 'pointer' }}>保存修改</button>
+                    <button onClick={() => handleSignDraft(d.id)} style={{ padding: '6px 16px', borderRadius: '20px', border: 'none', background: '#5a7d5a', color: '#fff', cursor: 'pointer' }}>签字归档（阅后即焚）</button>
+                  </div>
+                </div>
+              ))
+            )}
+          </div>
+        )}
+
+        {/* 【第8天新增】患者健康档案（患者端可见） */}
+        {(currentRole === '患者张三' || currentRole === '张三智能体') && (
+          <div style={{ ...boxStyle, background: '#f7fcf9' }}>
+            <div style={{ textAlign: 'center', fontSize: '18px', color: '#5a7d5a', marginBottom: '15px' }}>📂 我的健康档案（数据主权归你所有）</div>
+            {patientRecords.length === 0 ? (
+              <div style={{ textAlign: 'center', color: '#999' }}>暂无历史病历，等待老师签字归档。</div>
+            ) : (
+              patientRecords.map(r => (
+                <div key={r.id} style={{ padding: '15px', border: '1px solid #b8d8c0', borderRadius: '8px', marginBottom: '10px', background: '#fff' }}>
+                  <div style={{ color: '#5a7d5a', fontWeight: 'bold', marginBottom: '5px' }}>✅ 已签字病历</div>
+                  <div style={{ whiteSpace: 'pre-wrap', fontSize: '14px', color: '#333' }}>{r.content}</div>
                 </div>
               ))
             )}
