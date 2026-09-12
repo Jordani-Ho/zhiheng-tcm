@@ -3,7 +3,7 @@ import { useEffect, useState } from 'react'
 interface HuangliData { date: string; lunar: string; solar_term: string; health_trend: string; homework: string; }
 interface RoleData { role_type: string; name: string; task: string; detail: string; }
 interface Transcription { id: number; patient_name: string; content: string; data_type: string; }
-interface Draft { id: number; transcript_id: number; patient_name: string; content: string; signed: boolean; }
+interface Draft { id: number; transcript_id: number; patient_name: string; content: string; signed: boolean; doctor?: string; }
 
 export default function App() {
   const [huangli, setHuangli] = useState<HuangliData | null>(null)
@@ -12,7 +12,9 @@ export default function App() {
   const [inputText, setInputText] = useState('')
   const [transcriptions, setTranscriptions] = useState<Transcription[]>([])
   const [drafts, setDrafts] = useState<Draft[]>([])
-  const [patientRecords, setPatientRecords] = useState<Draft[]>([]) // 【第8天新增】患者健康档案
+  const [patientRecords, setPatientRecords] = useState<Draft[]>([])
+  // 【新增】用于存储每个草案对应的“最终给患者的方案”
+  const [finalPlans, setFinalPlans] = useState<{ [key: number]: string }>({})
 
   useEffect(() => {
     fetch('/api/huangli').then(r => r.json()).then(d => setHuangli(d)).catch(() => setHuangli(null))
@@ -38,7 +40,7 @@ export default function App() {
     fetchRoleData()
     fetchTranscriptions()
     fetchDrafts()
-    fetchPatientRecords() // 加载患者档案
+    fetchPatientRecords()
   }, [currentRole])
 
   const handleCheckIn = () => { fetch('/api/check-in', { method: 'POST' }).then(() => fetchRoleData()) }
@@ -66,13 +68,24 @@ export default function App() {
     }).then(() => fetchDrafts())
   }
 
-  // 【第8天修改】签字后，不仅刷新草稿，还要刷新患者档案
+  // 【修改】签字时带上最终方案
   const handleSignDraft = (draftId: number) => {
-    fetch(`/api/drafts/${draftId}/sign`, { method: 'POST' })
-      .then(() => {
-        fetchDrafts();          // 刷新老师端（已阅后即焚，草案会消失）
-        fetchPatientRecords();  // 刷新患者端（新档案会出现）
-      })
+    const plan = finalPlans[draftId]?.trim()
+    if (!plan) {
+      alert("请先填写给患者的最终辨证施治方案！")
+      return
+    }
+
+    fetch(`/api/drafts/${draftId}/sign`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ final_plan: plan })
+    }).then(() => {
+      fetchDrafts();
+      fetchPatientRecords();
+      // 清空对应的输入框
+      setFinalPlans(prev => ({ ...prev, [draftId]: '' }));
+    })
   }
 
   const boxStyle = { background: '#fdfcf0', border: '1px solid #d4c8a8', borderRadius: '12px', padding: '24px', marginBottom: '20px', boxShadow: '0 4px 12px rgba(0,0,0,0.06)' }
@@ -121,15 +134,15 @@ export default function App() {
 
         {currentRole === '李老师' && (
           <div style={boxStyle}>
-            <div style={{ textAlign: 'center', fontSize: '18px', color: '#5a7d5a', marginBottom: '15px' }}>📋 接收到的患者转述</div>
+            <div style={{ textAlign: 'center', fontSize: '18px', color: '#5a7d5a', marginBottom: '15px' }}>📋 接收到张三的陈述</div>
             {transcriptions.length === 0 ? (
-              <div style={{ textAlign: 'center', color: '#999' }}>暂无转述记录</div>
+              <div style={{ textAlign: 'center', color: '#999' }}>暂无陈述记录</div>
             ) : (
               <ul style={{ paddingLeft: '20px', color: '#333' }}>
                 {transcriptions.map(t => (
                   <li key={t.id} style={{ marginBottom: '10px' }}>
                     <span style={{ color: '#8b4513', fontWeight: 'bold' }}>[{t.data_type}]</span> {t.content}
-                    <button onClick={() => handleGenerateDraft(t.id)} style={{ marginLeft: '10px', padding: '2px 8px', fontSize: '12px', borderRadius: '10px', border: '1px solid #5a7d5a', background: 'transparent', color: '#5a7d5a', cursor: 'pointer' }}>生成草案</button>
+                    <button onClick={() => handleGenerateDraft(t.id)} style={{ marginLeft: '10px', padding: '2px 8px', fontSize: '12px', borderRadius: '10px', border: '1px solid #5a7d5a', background: 'transparent', color: '#5a7d5a', cursor: 'pointer' }}>生成病历草案</button>
                   </li>
                 ))}
               </ul>
@@ -137,27 +150,40 @@ export default function App() {
           </div>
         )}
 
-        {/* 【第8天修改】老师端草案（如果草案被签字了，它会从列表中消失，模拟阅后即焚） */}
+        {/* 老师端：病历草案处理（含最终方案输入） */}
         {(currentRole === '李老师' || currentRole === '李老师智能体') && (
           <div style={{ ...boxStyle, background: '#fcfdfa' }}>
-            <div style={{ textAlign: 'center', fontSize: '18px', color: '#8b4513', marginBottom: '15px' }}>📄 待处理病历草案（老师端阅后即焚）</div>
+            <div style={{ textAlign: 'center', fontSize: '18px', color: '#8b4513', marginBottom: '15px' }}>📄 张三病历草案（待处理）</div>
             {drafts.length === 0 ? (
-              <div style={{ textAlign: 'center', color: '#999' }}>暂无待处理草案（已签字草案将销毁，不再显示）</div>
+              <div style={{ textAlign: 'center', color: '#999' }}>暂无待处理病历（已签字病历将销毁，不再显示）</div>
             ) : (
               drafts.map(d => (
-                <div key={d.id} style={{ padding: '15px', border: '1px solid #e0e0e0', borderRadius: '8px', marginBottom: '10px', background: '#fff' }}>
-                  <div style={{ color: '#8b4513', fontWeight: 'bold', marginBottom: '5px' }}>患者：{d.patient_name}</div>
+                <div key={d.id} style={{ padding: '15px', border: '1px solid #e0e0e0', borderRadius: '8px', marginBottom: '15px', background: '#fff' }}>
+                  <div style={{ color: '#8b4513', fontWeight: 'bold', marginBottom: '5px' }}>病历详情（含过往参考）</div>
                   <textarea 
                     value={d.content} 
                     onChange={(e) => {
                       const newDrafts = drafts.map(item => item.id === d.id ? { ...item, content: e.target.value } : item);
                       setDrafts(newDrafts);
                     }}
-                    style={{ width: '100%', height: '100px', padding: '10px', borderRadius: '8px', border: '1px solid #d4c8a8', fontFamily: 'serif', fontSize: '14px', marginBottom: '10px', boxSizing: 'border-box', whiteSpace: 'pre-wrap' }} 
+                    style={{ width: '100%', height: '120px', padding: '10px', borderRadius: '8px', border: '1px solid #d4c8a8', fontFamily: 'serif', fontSize: '14px', marginBottom: '10px', boxSizing: 'border-box', whiteSpace: 'pre-wrap' }} 
                   />
-                  <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '10px' }}>
-                    <button onClick={() => handleEditDraft(d.id, d.content)} style={{ padding: '6px 16px', borderRadius: '20px', border: '1px solid #8b4513', background: 'transparent', color: '#8b4513', cursor: 'pointer' }}>保存修改</button>
-                    <button onClick={() => handleSignDraft(d.id)} style={{ padding: '6px 16px', borderRadius: '20px', border: 'none', background: '#5a7d5a', color: '#fff', cursor: 'pointer' }}>签字归档（阅后即焚）</button>
+                  <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: '15px' }}>
+                    <button onClick={() => handleEditDraft(d.id, d.content)} style={{ padding: '6px 16px', borderRadius: '20px', border: '1px solid #8b4513', background: 'transparent', color: '#8b4513', cursor: 'pointer' }}>保存病历修改</button>
+                  </div>
+
+                  {/* 【新增】给患者的最终方案输入框 */}
+                  <div style={{ borderTop: '1px dashed #d4c8a8', paddingTop: '15px' }}>
+                    <div style={{ color: '#5a7d5a', fontWeight: 'bold', marginBottom: '8px' }}>📝 给患者的最终辨证施治方案（患者只能看到这里的内容）</div>
+                    <textarea
+                      value={finalPlans[d.id] || ''}
+                      onChange={(e) => setFinalPlans({ ...finalPlans, [d.id]: e.target.value })}
+                      placeholder="请在此写下最终结论、医嘱或调理方案..."
+                      style={{ width: '100%', height: '80px', padding: '10px', borderRadius: '8px', border: '1px solid #b8d8c0', background: '#f7fcf9', fontFamily: 'serif', fontSize: '14px', marginBottom: '10px', boxSizing: 'border-box' }}
+                    />
+                    <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
+                      <button onClick={() => handleSignDraft(d.id)} style={{ padding: '8px 20px', borderRadius: '20px', border: 'none', background: '#5a7d5a', color: '#fff', cursor: 'pointer', fontWeight: 'bold' }}>签字归档（阅后即焚）</button>
+                    </div>
                   </div>
                 </div>
               ))
@@ -165,7 +191,7 @@ export default function App() {
           </div>
         )}
 
-        {/* 【第8天新增】患者健康档案（患者端可见） */}
+        {/* 患者健康档案 */}
         {(currentRole === '患者张三' || currentRole === '张三智能体') && (
           <div style={{ ...boxStyle, background: '#f7fcf9' }}>
             <div style={{ textAlign: 'center', fontSize: '18px', color: '#5a7d5a', marginBottom: '15px' }}>📂 我的健康档案（数据主权归你所有）</div>
@@ -174,8 +200,8 @@ export default function App() {
             ) : (
               patientRecords.map(r => (
                 <div key={r.id} style={{ padding: '15px', border: '1px solid #b8d8c0', borderRadius: '8px', marginBottom: '10px', background: '#fff' }}>
-                  <div style={{ color: '#5a7d5a', fontWeight: 'bold', marginBottom: '5px' }}>✅ 已签字病历</div>
-                  <div style={{ whiteSpace: 'pre-wrap', fontSize: '14px', color: '#333' }}>{r.content}</div>
+                  <div style={{ color: '#5a7d5a', fontWeight: 'bold', marginBottom: '5px' }}>✅ {r.doctor || '李老师'}已签字病历</div>
+                  <div style={{ whiteSpace: 'pre-wrap', fontSize: '14px', color: '#333', lineHeight: '1.6' }}>{r.content}</div>
                 </div>
               ))
             )}

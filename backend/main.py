@@ -12,17 +12,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 模拟数据库
-homework_db = {
-    "patient_name": "张三",
-    "task": "今日作业：按揉太渊穴5分钟",
-    "detail": "请记得在酉时完成。",
-    "status": "pending"
-}
-
+homework_db = {"patient_name": "张三", "task": "今日作业：按揉太渊穴5分钟", "detail": "请记得在酉时完成。", "status": "pending"}
 transcriptions_db = []
 drafts_db = []
-patient_records_db = [] # 【第8天新增】患者健康档案（已签字病历）
+patient_records_db = [] # 患者健康档案
 
 class TranscriptionInput(BaseModel):
     patient_name: str
@@ -31,6 +24,10 @@ class TranscriptionInput(BaseModel):
 
 class DraftUpdate(BaseModel):
     content: str
+
+# 【新增】签字时接收最终方案
+class SignInput(BaseModel):
+    final_plan: str
 
 @app.get("/api/huangli")
 def get_huangli():
@@ -67,7 +64,7 @@ def approve():
 @app.post("/api/transcribe")
 def transcribe(input_data: TranscriptionInput):
     transcriptions_db.append({"id": len(transcriptions_db) + 1, "patient_name": input_data.patient_name, "content": input_data.content, "data_type": input_data.data_type})
-    return {"message": "转述成功", "total": len(transcriptions_db)}
+    return {"message": "转述成功"}
 
 @app.get("/api/transcriptions")
 def get_transcriptions():
@@ -79,20 +76,29 @@ def generate_draft(transcript_id: int):
     if not transcript:
         return {"error": "找不到该转述"}
 
-    template = f"""【中医病历草案】
-患者姓名：{transcript['patient_name']}
-主诉内容：{transcript['content']}
-（以上内容由患者智能体原样转述，等待老师补充辨证与诊断。）"""
-    
+    patient_name = transcript['patient_name']
+    # 1. 获取该患者过往已签字病历
+    past_records = [r for r in patient_records_db if r["patient_name"] == patient_name]
+    past_content = "\n".join([f"- {r['content']}" for r in past_records]) if past_records else "暂无过往病历"
+
+    # 2. 拼接最新陈述和过往病历（仅供老师参考）
+    template = f"""【{patient_name}过往病历】
+{past_content}
+
+【{patient_name}最新陈述】
+{transcript['content']}
+
+（以上内容仅供老师辨证参考）"""
+
     draft = {
         "id": len(drafts_db) + 1,
         "transcript_id": transcript_id,
-        "patient_name": transcript['patient_name'],
+        "patient_name": patient_name,
         "content": template.strip(),
         "signed": False
     }
     drafts_db.append(draft)
-    return {"message": "草案生成成功", "draft": draft}
+    return {"message": "病历草案生成成功", "draft": draft}
 
 @app.get("/api/drafts")
 def get_drafts():
@@ -102,29 +108,31 @@ def get_drafts():
 def update_draft(draft_id: int, update_data: DraftUpdate):
     draft = next((d for d in drafts_db if d["id"] == draft_id), None)
     if not draft:
-        return {"error": "找不到该草案"}
+        return {"error": "找不到该病历"}
     draft["content"] = update_data.content
-    return {"message": "草案已更新", "draft": draft}
+    return {"message": "病历已更新", "draft": draft}
 
-# 【第8天修改】老师签字 -> 归档给患者，老师端销毁（阅后即焚）
+# 【修改】老师签字时，只归档最终方案给患者
 @app.post("/api/drafts/{draft_id}/sign")
-def sign_draft(draft_id: int):
+def sign_draft(draft_id: int, input_data: SignInput):
     draft = next((d for d in drafts_db if d["id"] == draft_id), None)
     if not draft:
-        return {"error": "找不到该草案"}
+        return {"error": "找不到该病历"}
     
-    # 1. 标记为已签字
-    draft["signed"] = True
+    # 1. 归档到患者健康档案（只存最终方案，不含过往病历和陈述）
+    patient_record = {
+        "id": len(patient_records_db) + 1,
+        "patient_name": draft["patient_name"],
+        "content": input_data.final_plan, # 只存老师给的方案
+        "doctor": "李老师"
+    }
+    patient_records_db.append(patient_record)
     
-    # 2. 归档到患者健康档案
-    patient_records_db.append(draft)
-    
-    # 3. 从老师待办列表中移除（模拟老师端“阅后即焚”）
+    # 2. 从老师待办列表中移除（阅后即焚）
     drafts_db.remove(draft)
     
-    return {"message": "签字确认成功，已归档至患者健康档案", "destroyed": True}
+    return {"message": "签字确认成功，最终方案已归档至患者健康档案", "destroyed": True}
 
-# 【第8天新增】患者获取自己的健康档案接口
 @app.get("/api/patient-records")
 def get_patient_records():
     return patient_records_db
