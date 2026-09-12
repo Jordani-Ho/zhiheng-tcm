@@ -11,28 +11,38 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 全局用户状态（真实业务会存患者端本地，这里模拟）
-user_state = {
-    "points": 120,  # 初始积分
-    "today_checked": False,  # 今日是否已打卡
-    "checkin_time": ""
+# 模拟病历数据（真实场景存在患者端本地，这里为了演示放内存）
+patient_record = {
+    "content": "",
+    "is_burned": False,
+    "message": ""
 }
 
 @app.get("/api/health")
 def health():
     return {"status": "ok", "service": "zhiheng-tcm-backend"}
 
-@app.get("/api/user/status")
-def get_user_status():
-    return user_state
+# 1. 患者提交病历
+@app.post("/api/record/save")
+def save_record(payload: dict):
+    patient_record["content"] = payload.get("content", "")
+    patient_record["is_burned"] = False
+    patient_record["message"] = "病历已安全发送至老师端"
+    return patient_record
 
-# 打卡接口
-@app.post("/api/user/checkin")
-def checkin():
-    if user_state["today_checked"]:
-        return {"message": "今日已打卡，不可重复操作"}
-    
-    user_state["today_checked"] = True
-    user_state["points"] += 10  # 完成一次奖励10积分
-    user_state["checkin_time"] = "酉时" # 模拟当前时辰
-    return {"message": "打卡成功！积分+10", "points": user_state["points"]}
+# 2. 老师端查看病历（每次查看都确保是未焚毁状态）
+@app.get("/api/record/view")
+def view_record():
+    if patient_record["is_burned"]:
+        return {"content": "", "is_burned": True, "message": "该病历已阅后即焚，老师端无法再查看"}
+    return patient_record
+
+# 3. 老师点击“阅后即焚”
+@app.post("/api/record/burn")
+def burn_record():
+    if not patient_record["content"]:
+        return {"message": "没有可焚毁的病历"}
+    patient_record["content"] = ""
+    patient_record["is_burned"] = True
+    patient_record["message"] = "病历已阅后即焚，老师端数据已清空"
+    return patient_record
