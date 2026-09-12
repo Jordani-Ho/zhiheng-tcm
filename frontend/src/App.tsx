@@ -3,7 +3,7 @@ import { useEffect, useState } from 'react'
 interface HuangliData { date: string; lunar: string; solar_term: string; health_trend: string; homework: string; }
 interface RoleData { role_type: string; name: string; task: string; detail: string; }
 interface Transcription { id: number; patient_name: string; content: string; data_type: string; }
-interface Draft { id: number; transcript_id: number; patient_name: string; content: string; }
+interface Draft { id: number; transcript_id: number; patient_name: string; content: string; signed: boolean; }
 
 export default function App() {
   const [huangli, setHuangli] = useState<HuangliData | null>(null)
@@ -47,9 +47,23 @@ export default function App() {
     }).then(() => { setInputText(''); fetchTranscriptions() })
   }
 
-  // 【第6天新增】触发智能体生成草案
   const handleGenerateDraft = (transcriptId: number) => {
     fetch(`/api/generate-draft?transcript_id=${transcriptId}`, { method: 'POST' })
+      .then(() => fetchDrafts())
+  }
+
+  // 【第7天新增】老师编辑草案内容
+  const handleEditDraft = (draftId: number, newContent: string) => {
+    fetch(`/api/drafts/${draftId}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content: newContent })
+    }).then(() => fetchDrafts())
+  }
+
+  // 【第7天新增】老师签字确认
+  const handleSignDraft = (draftId: number) => {
+    fetch(`/api/drafts/${draftId}/sign`, { method: 'POST' })
       .then(() => fetchDrafts())
   }
 
@@ -97,7 +111,6 @@ export default function App() {
           </div>
         )}
 
-        {/* 【第6天新增】老师端：接收转述并生成草案 */}
         {currentRole === '李老师' && (
           <div style={boxStyle}>
             <div style={{ textAlign: 'center', fontSize: '18px', color: '#5a7d5a', marginBottom: '15px' }}>📋 接收到的患者转述</div>
@@ -116,17 +129,36 @@ export default function App() {
           </div>
         )}
 
-        {/* 【第6天新增】老师智能体生成的病历草案展示 */}
+        {/* 【第7天新增】老师智能体生成的病历草案（可编辑+签字） */}
         {(currentRole === '李老师' || currentRole === '李老师智能体') && (
           <div style={{ ...boxStyle, background: '#fcfdfa' }}>
-            <div style={{ textAlign: 'center', fontSize: '18px', color: '#8b4513', marginBottom: '15px' }}>📄 病历草案（供老师审核）</div>
+            <div style={{ textAlign: 'center', fontSize: '18px', color: '#8b4513', marginBottom: '15px' }}>📄 病历草案（供老师审核修改）</div>
             {drafts.length === 0 ? (
               <div style={{ textAlign: 'center', color: '#999' }}>暂无草案，请先点击上方“生成草案”</div>
             ) : (
               drafts.map(d => (
-                <div key={d.id} style={{ padding: '15px', border: '1px solid #e0e0e0', borderRadius: '8px', marginBottom: '10px', background: '#fff', whiteSpace: 'pre-wrap', fontSize: '14px' }}>
-                  <div style={{ color: '#8b4513', fontWeight: 'bold', marginBottom: '5px' }}>患者：{d.patient_name}</div>
-                  {d.content}
+                <div key={d.id} style={{ padding: '15px', border: '1px solid #e0e0e0', borderRadius: '8px', marginBottom: '10px', background: '#fff' }}>
+                  <div style={{ color: '#8b4513', fontWeight: 'bold', marginBottom: '5px' }}>患者：{d.patient_name} {d.signed && <span style={{ color: '#5a7d5a', fontSize: '12px' }}>（✅ 已签字）</span>}</div>
+                  
+                  {/* 如果未签字，显示可编辑文本框 */}
+                  {!d.signed ? (
+                    <>
+                      <textarea 
+                        value={d.content} 
+                        onChange={(e) => {
+                          const newDrafts = drafts.map(item => item.id === d.id ? { ...item, content: e.target.value } : item);
+                          setDrafts(newDrafts);
+                        }}
+                        style={{ width: '100%', height: '120px', padding: '10px', borderRadius: '8px', border: '1px solid #d4c8a8', fontFamily: 'serif', fontSize: '14px', marginBottom: '10px', boxSizing: 'border-box', whiteSpace: 'pre-wrap' }} 
+                      />
+                      <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '10px' }}>
+                        <button onClick={() => handleEditDraft(d.id, d.content)} style={{ padding: '6px 16px', borderRadius: '20px', border: '1px solid #8b4513', background: 'transparent', color: '#8b4513', cursor: 'pointer' }}>保存修改</button>
+                        <button onClick={() => handleSignDraft(d.id)} style={{ padding: '6px 16px', borderRadius: '20px', border: 'none', background: '#5a7d5a', color: '#fff', cursor: 'pointer' }}>签字确认</button>
+                      </div>
+                    </>
+                  ) : (
+                    <div style={{ whiteSpace: 'pre-wrap', fontSize: '14px', color: '#555', lineHeight: '1.6' }}>{d.content}</div>
+                  )}
                 </div>
               ))
             )}

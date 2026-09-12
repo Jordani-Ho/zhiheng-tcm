@@ -21,12 +21,15 @@ homework_db = {
 }
 
 transcriptions_db = []
-drafts_db = [] # 老师智能体生成的草案
+drafts_db = []
 
 class TranscriptionInput(BaseModel):
     patient_name: str
     content: str
     data_type: str
+
+class DraftUpdate(BaseModel):
+    content: str
 
 @app.get("/api/huangli")
 def get_huangli():
@@ -69,14 +72,12 @@ def transcribe(input_data: TranscriptionInput):
 def get_transcriptions():
     return transcriptions_db
 
-# 【第6天新增】老师智能体生成草案接口
 @app.post("/api/generate-draft")
 def generate_draft(transcript_id: int):
     transcript = next((t for t in transcriptions_db if t["id"] == transcript_id), None)
     if not transcript:
         return {"error": "找不到该转述"}
 
-    # 【铁律】：只做格式转换，绝不推理。把患者原话填入老师预设的模板结构。
     template = f"""【中医病历草案】
 患者姓名：{transcript['patient_name']}
 主诉内容：{transcript['content']}
@@ -86,12 +87,30 @@ def generate_draft(transcript_id: int):
         "id": len(drafts_db) + 1,
         "transcript_id": transcript_id,
         "patient_name": transcript['patient_name'],
-        "content": template.strip()
+        "content": template.strip(),
+        "signed": False # 新增：签字状态
     }
     drafts_db.append(draft)
     return {"message": "草案生成成功", "draft": draft}
 
-# 获取所有草案接口
 @app.get("/api/drafts")
 def get_drafts():
     return drafts_db
+
+# 【第7天新增】老师修改草案接口
+@app.put("/api/drafts/{draft_id}")
+def update_draft(draft_id: int, update_data: DraftUpdate):
+    draft = next((d for d in drafts_db if d["id"] == draft_id), None)
+    if not draft:
+        return {"error": "找不到该草案"}
+    draft["content"] = update_data.content
+    return {"message": "草案已更新", "draft": draft}
+
+# 【第7天新增】老师签字确认接口
+@app.post("/api/drafts/{draft_id}/sign")
+def sign_draft(draft_id: int):
+    draft = next((d for d in drafts_db if d["id"] == draft_id), None)
+    if not draft:
+        return {"error": "找不到该草案"}
+    draft["signed"] = True
+    return {"message": "签字确认成功", "draft": draft}
