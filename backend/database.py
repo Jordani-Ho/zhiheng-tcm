@@ -1,7 +1,6 @@
 import sqlite3
 import os
 
-# 数据库文件会保存在 backend 目录下
 DB_PATH = os.path.join(os.path.dirname(__file__), "zhiheng.db")
 
 def get_connection():
@@ -10,7 +9,6 @@ def get_connection():
     return conn
 
 def init_db():
-    """初始化数据库表结构"""
     conn = get_connection()
     cursor = conn.cursor()
 
@@ -55,14 +53,31 @@ def init_db():
     )
     """)
 
+    # 5. 【第12天新增】积分账户表
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS accounts (
+        role_name TEXT PRIMARY KEY,
+        points INTEGER DEFAULT 0
+    )
+    """)
+
     conn.commit()
 
-    # 检查并插入默认数据（如果没有数据的话）
+    # 初始化默认数据
     cursor.execute("SELECT COUNT(*) as count FROM homework")
     if cursor.fetchone()["count"] == 0:
         cursor.execute("INSERT INTO homework (patient_name, task, detail, status) VALUES (?, ?, ?, ?)",
                        ("张三", "今日作业：按揉太渊穴5分钟", "请记得在酉时完成。", "pending"))
         conn.commit()
+
+    # 给患者和老师初始积分
+    cursor.execute("SELECT COUNT(*) as count FROM accounts WHERE role_name = '张三'")
+    if cursor.fetchone()["count"] == 0:
+        cursor.execute("INSERT INTO accounts (role_name, points) VALUES (?, ?)", ("张三", 100)) # 患者初始100分
+    cursor.execute("SELECT COUNT(*) as count FROM accounts WHERE role_name = '李老师'")
+    if cursor.fetchone()["count"] == 0:
+        cursor.execute("INSERT INTO accounts (role_name, points) VALUES (?, ?)", ("李老师", 500)) # 老师初始500分
+    conn.commit()
 
     conn.close()
 
@@ -117,17 +132,16 @@ def update_draft_content(draft_id, content):
 
 def sign_draft(draft_id, final_plan):
     conn = get_connection()
-    # 1. 获取原草案信息
     draft = conn.execute("SELECT * FROM drafts WHERE id = ?", (draft_id,)).fetchone()
     if not draft:
         conn.close()
         return None
 
-    # 2. 归档到患者健康档案
+    # 1. 归档到患者健康档案
     conn.execute("INSERT INTO patient_records (patient_name, content, doctor) VALUES (?, ?, ?)",
                  (draft["patient_name"], final_plan, "李老师"))
 
-    # 3. 删除草案（阅后即焚）
+    # 2. 阅后即焚
     conn.execute("DELETE FROM drafts WHERE id = ?", (draft_id,))
     
     conn.commit()
@@ -143,3 +157,26 @@ def get_patient_records(patient_name=None):
         rows = conn.execute("SELECT * FROM patient_records ORDER BY id DESC").fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
+# ---------- 【第12天新增】积分相关操作 ----------
+def get_points(role_name):
+    conn = get_connection()
+    row = conn.execute("SELECT points FROM accounts WHERE role_name = ?", (role_name,)).fetchone()
+    conn.close()
+    return row["points"] if row else 0
+
+def add_points(role_name, amount):
+    conn = get_connection()
+    conn.execute("UPDATE accounts SET points = points + ? WHERE role_name = ?", (amount, role_name))
+    conn.commit()
+    conn.close()
+
+def transfer_points(from_role, to_role, amount):
+    """模拟患者支付学费给老师"""
+    conn = get_connection()
+    # 扣患者
+    conn.execute("UPDATE accounts SET points = points - ? WHERE role_name = ?", (amount, from_role))
+    # 加老师
+    conn.execute("UPDATE accounts SET points = points + ? WHERE role_name = ?", (amount, to_role))
+    conn.commit()
+    conn.close()

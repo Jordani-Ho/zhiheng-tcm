@@ -14,6 +14,8 @@ export default function App() {
   const [drafts, setDrafts] = useState<Draft[]>([])
   const [patientRecords, setPatientRecords] = useState<Draft[]>([])
   const [finalPlans, setFinalPlans] = useState<{ [key: number]: string }>({})
+  // 【第12天新增】积分状态
+  const [points, setPoints] = useState<{ patient_points: number; teacher_points: number } | null>(null)
 
   useEffect(() => {
     fetch('/api/huangli').then(r => r.json()).then(d => setHuangli(d)).catch(() => setHuangli(null))
@@ -35,14 +37,26 @@ export default function App() {
     fetch('/api/patient-records').then(r => r.json()).then(d => setPatientRecords(d)).catch(() => setPatientRecords([]))
   }
 
+  // 【第12天新增】获取积分
+  const fetchPoints = () => {
+    fetch('/api/points').then(r => r.json()).then(d => setPoints(d)).catch(() => setPoints(null))
+  }
+
   useEffect(() => {
     fetchRoleData()
     fetchTranscriptions()
     fetchDrafts()
     fetchPatientRecords()
+    fetchPoints()
   }, [currentRole])
 
-  const handleCheckIn = () => { fetch('/api/check-in', { method: 'POST' }).then(() => fetchRoleData()) }
+  const handleCheckIn = () => { 
+    fetch('/api/check-in', { method: 'POST' }).then(() => {
+      fetchRoleData()
+      fetchPoints() // 打卡后刷新积分
+    })
+  }
+  
   const handleApprove = () => { fetch('/api/approve', { method: 'POST' }).then(() => fetchRoleData()) }
   
   const handleTranscribe = () => {
@@ -81,6 +95,7 @@ export default function App() {
     }).then(() => {
       fetchDrafts();
       fetchPatientRecords();
+      fetchPoints(); // 【第12天新增】签字后刷新积分
       setFinalPlans(prev => ({ ...prev, [draftId]: '' }));
     })
   }
@@ -121,11 +136,25 @@ export default function App() {
           </div>
         </div>
 
+        {/* 【第12天新增】积分展示卡片 */}
+        {points && (
+          <div style={{ ...boxStyle, display: 'flex', justifyContent: 'space-around', textAlign: 'center', background: '#fffdf5' }}>
+            <div>
+              <div style={{ fontSize: '12px', color: '#999' }}>当前患者积分</div>
+              <div style={{ fontSize: '24px', fontWeight: 'bold', color: '#8b4513' }}>{points.patient_points}</div>
+            </div>
+            <div>
+              <div style={{ fontSize: '12px', color: '#999' }}>当前老师积分</div>
+              <div style={{ fontSize: '24px', fontWeight: 'bold', color: '#5a7d5a' }}>{points.teacher_points}</div>
+            </div>
+          </div>
+        )}
+
         <div style={{ ...boxStyle, background: currentRole.includes('老师') ? '#e8f0e8' : '#fdfcf0' }}>
           <div style={{ textAlign: 'center', fontSize: '18px', color: '#8b4513', marginBottom: '10px' }}>{roleData ? `📋 ${roleData.name} 的任务` : '加载中...'}</div>
           <div style={{ textAlign: 'center', color: '#555', lineHeight: '1.8' }}>{roleData ? roleData.detail : '正在获取数据...'}</div>
           {currentRole === '患者张三' && roleData?.detail.includes('请记得') && (
-            <div style={{ textAlign: 'center', marginTop: '20px' }}><button onClick={handleCheckIn} style={{ padding: '10px 24px', borderRadius: '30px', border: 'none', background: '#8b4513', color: '#fff', fontSize: '16px', cursor: 'pointer' }}>立即打卡</button></div>
+            <div style={{ textAlign: 'center', marginTop: '20px' }}><button onClick={handleCheckIn} style={{ padding: '10px 24px', borderRadius: '30px', border: 'none', background: '#8b4513', color: '#fff', fontSize: '16px', cursor: 'pointer' }}>立即打卡（+10积分）</button></div>
           )}
           {currentRole === '李老师' && roleData?.task === '待审核' && roleData?.detail.includes('已打卡') && (
             <div style={{ textAlign: 'center', marginTop: '20px' }}><button onClick={handleApprove} style={{ padding: '10px 24px', borderRadius: '30px', border: 'none', background: '#5a7d5a', color: '#fff', fontSize: '16px', cursor: 'pointer' }}>签字确认</button></div>
@@ -188,7 +217,7 @@ export default function App() {
                       style={{ width: '100%', height: '80px', padding: '10px', borderRadius: '8px', border: '1px solid #b8d8c0', background: '#f7fcf9', fontFamily: 'serif', fontSize: '14px', marginBottom: '10px', boxSizing: 'border-box' }}
                     />
                     <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
-                      <button onClick={() => handleSignDraft(d.id)} style={{ padding: '8px 20px', borderRadius: '20px', border: 'none', background: '#5a7d5a', color: '#fff', cursor: 'pointer', fontWeight: 'bold' }}>签字归档（阅后即焚）</button>
+                      <button onClick={() => handleSignDraft(d.id)} style={{ padding: '8px 20px', borderRadius: '20px', border: 'none', background: '#5a7d5a', color: '#fff', cursor: 'pointer', fontWeight: 'bold' }}>签字归档（阅后即焚，支付50积分）</button>
                     </div>
                   </div>
                 </div>

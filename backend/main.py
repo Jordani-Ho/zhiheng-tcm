@@ -16,7 +16,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 初始化数据库
 database.init_db()
 
 class TranscriptionInput(BaseModel):
@@ -47,7 +46,6 @@ def get_huangli():
     shichen_names = ["子", "丑", "寅", "卯", "辰", "巳", "午", "未", "申", "酉", "戌", "亥"]
     current_shi = shichen_names[shichen_index] + "时"
 
-    # 计算节气
     lunar_obj = cnlunar.Lunar(now, godType='8char')
     term_list = sorted(lunar_obj.thisYearSolarTermsDic.items(), key=lambda x: str(x[1]))
     today_str = now.strftime('%Y-%m-%d')
@@ -119,6 +117,7 @@ def get_role_data(role: str):
 @app.post("/api/check-in")
 def check_in():
     database.update_homework_status("checked_in")
+    database.add_points("张三", 10) # 【第12天新增】患者打卡 +10 积分
     return {"message": "打卡成功"}
 
 @app.post("/api/approve")
@@ -143,7 +142,6 @@ def generate_draft(transcript_id: int):
         return {"error": "找不到该转述"}
 
     patient_name = transcript['patient_name']
-    # 获取过往病历
     past_records = database.get_patient_records(patient_name)
     past_content = "\n".join([f"- {r['content']}" for r in past_records]) if past_records else "暂无过往病历"
 
@@ -172,8 +170,18 @@ def sign_draft_endpoint(draft_id: int, input_data: SignInput):
     result = database.sign_draft(draft_id, input_data.final_plan)
     if not result:
         return {"error": "找不到该病历"}
-    return {"message": "签字确认成功，最终方案已归档至患者健康档案"}
+    # 【第12天新增】签字后，患者支付 50 积分学费给老师
+    database.transfer_points("张三", "李老师", 50)
+    return {"message": "签字确认成功，已归档至患者健康档案，学费已支付"}
 
 @app.get("/api/patient-records")
 def get_patient_records():
     return database.get_patient_records()
+
+# 【第12天新增】获取积分接口
+@app.get("/api/points")
+def get_points():
+    return {
+        "patient_points": database.get_points("张三"),
+        "teacher_points": database.get_points("李老师")
+    }
