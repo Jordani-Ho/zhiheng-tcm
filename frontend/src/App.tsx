@@ -6,12 +6,13 @@ export default function App() {
   const [inviteCode, setInviteCode] = useState('')
   const [loginMsg, setLoginMsg] = useState('')
   
-  // 核心数据：病历
+  // 核心状态
   const [patientData, setPatientData] = useState('')
+  const [thinkProcess, setThinkProcess] = useState<string[]>([])
   const [aiDraft, setAiDraft] = useState('')
   const [actionMsg, setActionMsg] = useState('')
 
-  // 登录状态初始化
+  // 登录初始化
   useEffect(() => {
     const savedRole = localStorage.getItem('zhiheng_role')
     const savedName = localStorage.getItem('zhiheng_name')
@@ -21,7 +22,6 @@ export default function App() {
     }
   }, [])
 
-  // 登录
   const handleLogin = () => {
     if (!inviteCode.trim()) return setLoginMsg('请输入邀请码')
     fetch('/api/auth/login', {
@@ -41,44 +41,48 @@ export default function App() {
       })
   }
 
-  // 退出
-    // 退出
   const handleLogout = () => {
-    // 只清除身份信息，保留本地病历数据，方便演示角色切换
     localStorage.removeItem('zhiheng_role')
     localStorage.removeItem('zhiheng_name')
-    // 注意：这里绝对不要写 localStorage.clear()，不然数据全没了
-
-    setRole(null); setName(null); setInviteCode(''); setActionMsg('')
-    
-    // 重新加载页面，保证状态干净切换
     window.location.reload()
   }
 
-  // 患者提交病历（存入本地 localStorage）
-  const handlePatientSubmit = () => {
+  // 患者触发智能体思考
+  const handleThink = () => {
     if (!patientData.trim()) return setActionMsg('请输入病历内容')
-    localStorage.setItem('zhiheng_record', patientData) // 真实数据存在患者本地！
-    setActionMsg('病历已安全存入本地，并发送给老师智能体')
-    // 模拟通知老师智能体
-    fetch('/api/agent/teacher/draft', {
+    localStorage.setItem('zhiheng_record', patientData)
+    setActionMsg('数据已存入本地，正在请求智能体分析...')
+    setThinkProcess(['📡 正在连接老师智能体...', '🔍 正在进行症状提取...', '🧠 正在辨证推理...'])
+    setAiDraft('')
+
+    fetch('/api/agent/think', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ raw_data: patientData })
-    }).then(r => r.json()).then(d => {
-      if (d.draft) {
-        localStorage.setItem('zhiheng_draft', d.draft)
-        setAiDraft(d.draft)
-      }
     })
+      .then(r => r.json())
+      .then(d => {
+        if (d.draft) {
+          setAiDraft(d.draft)
+          setThinkProcess([
+            `✅ 症状提取完成：${d.symptoms.join('、')}`,
+            `🧠 辨证结果：${d.syndrome}`,
+            `📝 草案生成完毕`
+          ])
+          localStorage.setItem('zhiheng_draft', d.draft)
+          setActionMsg('智能体分析完成！')
+        } else {
+          setActionMsg(d.error || '分析失败')
+        }
+      })
   }
 
-  // 老师阅后即焚（清空本地存储）
   const handleBurn = () => {
     localStorage.removeItem('zhiheng_record')
     localStorage.removeItem('zhiheng_draft')
     setPatientData('')
     setAiDraft('')
+    setThinkProcess([])
     setActionMsg('🔥 病历已阅后即焚，本地数据已物理清除')
   }
 
@@ -86,18 +90,17 @@ export default function App() {
     background: '#fdfcf0',
     border: '1px solid #d4c8a8',
     borderRadius: '12px',
-    padding: '24px',
-    marginBottom: '20px',
+    padding: '20px',
+    marginBottom: '15px',
     boxShadow: '0 4px 12px rgba(0,0,0,0.06)'
   }
 
-  // -------------- 登录门禁 ----------------
+  // -------------- 登录页 ----------------
   if (!role) {
     return (
       <div style={{ minHeight: '100vh', background: '#f5f1e6', display: 'flex', alignItems: 'center', justifyContent: 'center', fontFamily: 'serif', padding: '20px' }}>
         <div style={{ ...boxStyle, maxWidth: '400px', width: '100%', textAlign: 'center' }}>
           <h1 style={{ color: '#8b4513', fontSize: '24px' }}>知衡 · 治未病社区</h1>
-          <p style={{ color: '#666', fontSize: '14px', marginBottom: '20px' }}>封闭式邀请制 · 请凭邀请码进入</p>
           <input 
             type="text" placeholder="邀请码（老师: TEACHER888 / 患者: PATIENT666）"
             value={inviteCode} onChange={(e) => setInviteCode(e.target.value)}
@@ -128,20 +131,30 @@ export default function App() {
               placeholder="例如：今日舌苔偏白，脉细，畏寒..."
               style={{ width: '100%', height: '80px', padding: '10px', boxSizing: 'border-box', borderRadius: '8px', border: '1px solid #d4c8a8', marginBottom: '10px', fontFamily: 'serif' }}
             />
-            <button onClick={handlePatientSubmit} style={{ padding: '8px 16px', borderRadius: '20px', border: 'none', background: '#8b4513', color: '#fff', cursor: 'pointer' }}>提交给老师智能体</button>
+            <button onClick={handleThink} style={{ padding: '8px 16px', borderRadius: '20px', border: 'none', background: '#8b4513', color: '#fff', cursor: 'pointer' }}>提交并交由智能体分析</button>
           </div>
         ) : (
           <div style={boxStyle}>
             <div style={{ color: '#8b4513', fontWeight: 'bold', marginBottom: '10px' }}>👨‍⚕️ 老师端（阅后即焚）</div>
             <div style={{ color: '#333', padding: '10px', background: '#fff', borderRadius: '8px', minHeight: '40px', marginBottom: '10px' }}>
-              患者病历（临时显示，阅后即焚）：{localStorage.getItem('zhiheng_record') || '暂无'}
+              患者病历（临时显示）：{localStorage.getItem('zhiheng_record') || '暂无'}
             </div>
             {localStorage.getItem('zhiheng_draft') && (
-              <div style={{ color: '#5a7d5a', padding: '10px', background: '#e8f0e8', borderRadius: '8px', marginBottom: '10px' }}>
+              <div style={{ color: '#5a7d5a', padding: '10px', background: '#e8f0e8', borderRadius: '8px', marginBottom: '10px', whiteSpace: 'pre-wrap' }}>
                 🤖 智能体草案：{localStorage.getItem('zhiheng_draft')}
               </div>
             )}
             <button onClick={handleBurn} disabled={!localStorage.getItem('zhiheng_record')} style={{ padding: '8px 16px', borderRadius: '20px', border: '1px solid #8b4513', background: '#fdfcf0', color: '#8b4513', cursor: 'pointer' }}>🔥 一键阅后即焚</button>
+          </div>
+        )}
+
+        {/* 思考过程可视化 */}
+        {thinkProcess.length > 0 && (
+          <div style={{ ...boxStyle, background: '#fff8e7', border: '1px dashed #8b4513' }}>
+            <div style={{ color: '#8b4513', fontWeight: 'bold', marginBottom: '10px' }}>🧠 智能体思考过程</div>
+            <ul style={{ margin: 0, paddingLeft: '20px', color: '#666', fontSize: '14px', lineHeight: '1.8' }}>
+              {thinkProcess.map((step, idx) => <li key={idx}>{step}</li>)}
+            </ul>
           </div>
         )}
 
