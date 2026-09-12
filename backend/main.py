@@ -1,6 +1,9 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from datetime import datetime
+import lunardate
+import cnlunar
 
 app = FastAPI(title="zhiheng-tcm-backend")
 
@@ -15,7 +18,7 @@ app.add_middleware(
 homework_db = {"patient_name": "张三", "task": "今日作业：按揉太渊穴5分钟", "detail": "请记得在酉时完成。", "status": "pending"}
 transcriptions_db = []
 drafts_db = []
-patient_records_db = [] # 患者健康档案
+patient_records_db = []
 
 class TranscriptionInput(BaseModel):
     patient_name: str
@@ -25,13 +28,69 @@ class TranscriptionInput(BaseModel):
 class DraftUpdate(BaseModel):
     content: str
 
-# 【新增】签字时接收最终方案
 class SignInput(BaseModel):
     final_plan: str
 
 @app.get("/api/huangli")
 def get_huangli():
-    return {"date": "2026年09月11日", "lunar": "农历八月初一", "solar_term": "白露", "health_trend": "宜养肺润燥，早卧早起", "homework": "今日酉时（17-19点）按揉太渊穴5分钟"}
+    now = datetime.now()
+    
+    date_str = now.strftime("%Y年%m月%d日")
+    lunar_date = lunardate.LunarDate.fromSolarDate(now.year, now.month, now.day)
+    lunar_month = f"闰{lunar_date.month}月" if lunar_date.isLeapMonth else f"{lunar_date.month}月"
+    lunar_day_str = f"初{lunar_date.day}" if lunar_date.day < 10 else f"{lunar_date.day}"
+    if lunar_date.day == 1: lunar_day_str = "初一"
+    if lunar_date.day == 15: lunar_day_str = "十五"
+    lunar_str = f"农历{lunar_month}{lunar_day_str}"
+
+    hour = now.hour
+    shichen_index = (hour + 1) // 2 % 12
+    shichen_names = ["子", "丑", "寅", "卯", "辰", "巳", "午", "未", "申", "酉", "戌", "亥"]
+    current_shi = shichen_names[shichen_index] + "时"
+
+    # 计算节气
+    lunar_obj = cnlunar.Lunar(now, godType='8char')
+    term_list = sorted(lunar_obj.thisYearSolarTermsDic.items(), key=lambda x: str(x[1]))
+    today_str = now.strftime('%Y-%m-%d')
+    
+    prev_term = None
+    next_term = None
+    
+    for name, date_val in term_list:
+        date_str_val = str(date_val)[:10] 
+        if date_str_val <= today_str:
+            prev_term = (name, date_str_val)
+        elif date_str_val > today_str and next_term is None:
+            next_term = (name, date_str_val)
+
+    # 【修改点1】组装提示语时，过滤掉“无”和空白
+    term_tip = ""
+    today_term = lunar_obj.todaySolarTerms
+    if today_term and today_term != '无':
+        term_tip = f"今日{today_term}"
+    else:
+        parts = []
+        if prev_term:
+            prev_date = datetime.strptime(prev_term[1], '%Y-%m-%d')
+            days_from_prev = (now - prev_date).days
+            parts.append(f"{prev_term[0]}后第{days_from_prev}天")
+        if next_term:
+            next_date = datetime.strptime(next_term[1], '%Y-%m-%d')
+            days_to_next = (next_date - now).days
+            parts.append(f"离{next_term[0]}还有{days_to_next}天")
+        term_tip = "，".join(parts)
+
+    current_solar_term_name = today_term if (today_term and today_term != '无') else (prev_term[0] if prev_term else "")
+
+    return {
+        "date": date_str,
+        "lunar": lunar_str,
+        "solar_term": current_solar_term_name,
+        "solar_term_tip": term_tip,
+        "health_trend": "宜养肺润燥，早卧早起",
+        "homework": f"今日{current_shi}（{hour}-{(hour+2)%24}点）按揉太渊穴5分钟",
+        "current_shi": current_shi
+    }
 
 @app.get("/api/role-data")
 def get_role_data(role: str):
@@ -77,11 +136,9 @@ def generate_draft(transcript_id: int):
         return {"error": "找不到该转述"}
 
     patient_name = transcript['patient_name']
-    # 1. 获取该患者过往已签字病历
     past_records = [r for r in patient_records_db if r["patient_name"] == patient_name]
     past_content = "\n".join([f"- {r['content']}" for r in past_records]) if past_records else "暂无过往病历"
 
-    # 2. 拼接最新陈述和过往病历（仅供老师参考）
     template = f"""【{patient_name}过往病历】
 {past_content}
 
@@ -112,26 +169,22 @@ def update_draft(draft_id: int, update_data: DraftUpdate):
     draft["content"] = update_data.content
     return {"message": "病历已更新", "draft": draft}
 
-# 【修改】老师签字时，只归档最终方案给患者
 @app.post("/api/drafts/{draft_id}/sign")
 def sign_draft(draft_id: int, input_data: SignInput):
     draft = next((d for d in drafts_db if d["id"] == draft_id), None)
     if not draft:
         return {"error": "找不到该病历"}
     
-    # 1. 归档到患者健康档案（只存最终方案，不含过往病历和陈述）
     patient_record = {
         "id": len(patient_records_db) + 1,
         "patient_name": draft["patient_name"],
-        "content": input_data.final_plan, # 只存老师给的方案
+        "content": input_data.final_plan,
         "doctor": "李老师"
     }
     patient_records_db.append(patient_record)
-    
-    # 2. 从老师待办列表中移除（阅后即焚）
     drafts_db.remove(draft)
     
-    return {"message": "签字确认成功，最终方案已归档至患者健康档案", "destroyed": True}
+    return {"message": "签字确认成功，最终方案已归档至患者健康档案"}
 
 @app.get("/api/patient-records")
 def get_patient_records():
