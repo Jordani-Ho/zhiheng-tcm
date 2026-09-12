@@ -4,6 +4,7 @@ from pydantic import BaseModel
 from datetime import datetime
 import lunardate
 import cnlunar
+import database
 
 app = FastAPI(title="zhiheng-tcm-backend")
 
@@ -15,10 +16,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-homework_db = {"patient_name": "张三", "task": "今日作业：按揉太渊穴5分钟", "detail": "请记得在酉时完成。", "status": "pending"}
-transcriptions_db = []
-drafts_db = []
-patient_records_db = []
+# 初始化数据库
+database.init_db()
 
 class TranscriptionInput(BaseModel):
     patient_name: str
@@ -56,13 +55,10 @@ def get_huangli():
     prev_term = None
     next_term = None
     
-    # 【修复点】兼容 cnlunar 返回元组 (月, 日) 或字符串的情况
     for name, date_val in term_list:
         if isinstance(date_val, tuple):
-            # 如果是元组，拼装成 YYYY-MM-DD 格式
             date_str_val = f"{now.year}-{date_val[0]:02d}-{date_val[1]:02d}"
         else:
-            # 如果是字符串，截取前10位
             date_str_val = str(date_val)[:10]
             
         if date_str_val <= today_str:
@@ -70,7 +66,6 @@ def get_huangli():
         elif date_str_val > today_str and next_term is None:
             next_term = (name, date_str_val)
 
-    # 组装提示语
     term_tip = ""
     today_term = lunar_obj.todaySolarTerms
     if today_term and today_term != '无':
@@ -101,49 +96,55 @@ def get_huangli():
 
 @app.get("/api/role-data")
 def get_role_data(role: str):
+    hw = database.get_homework()
+    if not hw:
+        return {"role_type": "unknown", "name": role, "task": "暂无任务", "detail": "数据加载中..."}
+
     if role == "李老师":
-        if homework_db["status"] == "pending":
+        if hw["status"] == "pending":
             return {"role_type": "teacher", "name": "李老师", "task": "待审核", "detail": "患者尚未打卡。"}
-        elif homework_db["status"] == "checked_in":
-            return {"role_type": "teacher", "name": "李老师", "task": "待审核", "detail": f"{homework_db['patient_name']}：{homework_db['task']}（已打卡，待签字确认）"}
+        elif hw["status"] == "checked_in":
+            return {"role_type": "teacher", "name": "李老师", "task": "待审核", "detail": f"{hw['patient_name']}：{hw['task']}（已打卡，待签字确认）"}
         else:
-            return {"role_type": "teacher", "name": "李老师", "task": "已审核", "detail": f"{homework_db['patient_name']}的作业已签字确认。"}
+            return {"role_type": "teacher", "name": "李老师", "task": "已审核", "detail": f"{hw['patient_name']}的作业已签字确认。"}
     elif role == "患者张三":
-        if homework_db["status"] == "pending":
-            return {"role_type": "patient", "name": "张三", "task": homework_db["task"], "detail": homework_db["detail"]}
-        elif homework_db["status"] == "checked_in":
-            return {"role_type": "patient", "name": "张三", "task": homework_db["task"], "detail": "已打卡，等待老师签字确认。"}
+        if hw["status"] == "pending":
+            return {"role_type": "patient", "name": "张三", "task": hw["task"], "detail": hw["detail"]}
+        elif hw["status"] == "checked_in":
+            return {"role_type": "patient", "name": "张三", "task": hw["task"], "detail": "已打卡，等待老师签字确认。"}
         else:
-            return {"role_type": "patient", "name": "张三", "task": homework_db["task"], "detail": "老师已签字确认，完成！"}
+            return {"role_type": "patient", "name": "张三", "task": hw["task"], "detail": "老师已签字确认，完成！"}
     return {"role_type": "unknown", "name": role, "task": "暂无任务", "detail": "数据加载中..."}
 
 @app.post("/api/check-in")
 def check_in():
-    homework_db["status"] = "checked_in"
+    database.update_homework_status("checked_in")
     return {"message": "打卡成功"}
 
 @app.post("/api/approve")
 def approve():
-    homework_db["status"] = "approved"
+    database.update_homework_status("approved")
     return {"message": "审核通过"}
 
 @app.post("/api/transcribe")
 def transcribe(input_data: TranscriptionInput):
-    transcriptions_db.append({"id": len(transcriptions_db) + 1, "patient_name": input_data.patient_name, "content": input_data.content, "data_type": input_data.data_type})
+    database.insert_transcription(input_data.patient_name, input_data.content, input_data.data_type)
     return {"message": "转述成功"}
 
 @app.get("/api/transcriptions")
 def get_transcriptions():
-    return transcriptions_db
+    return database.get_transcriptions()
 
 @app.post("/api/generate-draft")
 def generate_draft(transcript_id: int):
-    transcript = next((t for t in transcriptions_db if t["id"] == transcript_id), None)
+    transcripts = database.get_transcriptions()
+    transcript = next((t for t in transcripts if t["id"] == transcript_id), None)
     if not transcript:
         return {"error": "找不到该转述"}
 
     patient_name = transcript['patient_name']
-    past_records = [r for r in patient_records_db if r["patient_name"] == patient_name]
+    # 获取过往病历
+    past_records = database.get_patient_records(patient_name)
     past_content = "\n".join([f"- {r['content']}" for r in past_records]) if past_records else "暂无过往病历"
 
     template = f"""【{patient_name}过往病历】
@@ -154,45 +155,25 @@ def generate_draft(transcript_id: int):
 
 （以上内容仅供老师辨证参考）"""
 
-    draft = {
-        "id": len(drafts_db) + 1,
-        "transcript_id": transcript_id,
-        "patient_name": patient_name,
-        "content": template.strip(),
-        "signed": False
-    }
-    drafts_db.append(draft)
-    return {"message": "病历草案生成成功", "draft": draft}
+    draft_id = database.insert_draft(transcript_id, patient_name, template.strip())
+    return {"message": "病历草案生成成功", "draft_id": draft_id}
 
 @app.get("/api/drafts")
 def get_drafts():
-    return drafts_db
+    return database.get_drafts()
 
 @app.put("/api/drafts/{draft_id}")
 def update_draft(draft_id: int, update_data: DraftUpdate):
-    draft = next((d for d in drafts_db if d["id"] == draft_id), None)
-    if not draft:
-        return {"error": "找不到该病历"}
-    draft["content"] = update_data.content
-    return {"message": "病历已更新", "draft": draft}
+    database.update_draft_content(draft_id, update_data.content)
+    return {"message": "病历已更新"}
 
 @app.post("/api/drafts/{draft_id}/sign")
-def sign_draft(draft_id: int, input_data: SignInput):
-    draft = next((d for d in drafts_db if d["id"] == draft_id), None)
-    if not draft:
+def sign_draft_endpoint(draft_id: int, input_data: SignInput):
+    result = database.sign_draft(draft_id, input_data.final_plan)
+    if not result:
         return {"error": "找不到该病历"}
-    
-    patient_record = {
-        "id": len(patient_records_db) + 1,
-        "patient_name": draft["patient_name"],
-        "content": input_data.final_plan,
-        "doctor": "李老师"
-    }
-    patient_records_db.append(patient_record)
-    drafts_db.remove(draft)
-    
     return {"message": "签字确认成功，最终方案已归档至患者健康档案"}
 
 @app.get("/api/patient-records")
 def get_patient_records():
-    return patient_records_db
+    return database.get_patient_records()
