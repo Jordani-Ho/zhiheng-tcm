@@ -5,8 +5,21 @@ export default function App() {
   const [name, setName] = useState<string | null>(null)
   const [inviteCode, setInviteCode] = useState('')
   const [loginMsg, setLoginMsg] = useState('')
+  
+  // 患者数据状态
+  const [patient, setPatient] = useState<any>(null)
 
-  // 页面加载时，检查本地是否已有登录状态
+  // 动作提示
+  const [actionMsg, setActionMsg] = useState('')
+
+  // 获取患者实时数据
+  const fetchPatient = () => {
+    fetch('/api/patient/status')
+      .then(r => r.json())
+      .then(d => setPatient(d))
+  }
+
+  // 页面加载时，检查本地登录状态并拉取数据
   useEffect(() => {
     const savedRole = localStorage.getItem('zhiheng_role')
     const savedName = localStorage.getItem('zhiheng_name')
@@ -14,6 +27,9 @@ export default function App() {
       setRole(savedRole)
       setName(savedName)
     }
+    fetchPatient()
+    const interval = setInterval(fetchPatient, 3000) // 每3秒刷新
+    return () => clearInterval(interval)
   }, [])
 
   // 登录逻辑
@@ -44,7 +60,27 @@ export default function App() {
     setRole(null)
     setName(null)
     setInviteCode('')
-    setLoginMsg('')
+    setActionMsg('')
+  }
+
+  // 患者打卡动作
+  const handlePatientCheckin = () => {
+    fetch('/api/patient/checkin', { method: 'POST' })
+      .then(r => r.json())
+      .then(d => {
+        setActionMsg(d.message)
+        fetchPatient()
+      })
+  }
+
+  // 老师审核动作
+  const handleTeacherApprove = () => {
+    fetch('/api/teacher/approve', { method: 'POST' })
+      .then(r => r.json())
+      .then(d => {
+        setActionMsg(d.message)
+        fetchPatient()
+      })
   }
 
   const boxStyle = {
@@ -66,7 +102,7 @@ export default function App() {
           
           <input 
             type="text" 
-            placeholder="请输入邀请码（老师: TEACHER888 / 患者: PATIENT666）"
+            placeholder="邀请码（老师: TEACHER888 / 患者: PATIENT666）"
             value={inviteCode}
             onChange={(e) => setInviteCode(e.target.value)}
             style={{ width: '100%', padding: '12px', boxSizing: 'border-box', borderRadius: '8px', border: '1px solid #d4c8a8', marginBottom: '15px', fontFamily: 'serif', textAlign: 'center' }}
@@ -102,22 +138,50 @@ export default function App() {
 
         {/* 演示：根据角色显示不同的卡片 */}
         {role === 'patient' ? (
+          // 患者视图
           <div style={boxStyle}>
-            <div style={{ color: '#8b4513', fontWeight: 'bold', marginBottom: '10px' }}>📝 今日作业</div>
+            <div style={{ color: '#8b4513', fontWeight: 'bold', marginBottom: '10px' }}>📝 我的今日作业</div>
             <div style={{ textAlign: 'center', background: '#fff8e7', padding: '15px', borderRadius: '8px', color: '#8b4513', marginBottom: '15px' }}>
               今日酉时（17-19点）按揉太渊穴5分钟
             </div>
+            
+            <div style={{ textAlign: 'center', marginBottom: '15px' }}>
+              <span style={{ fontSize: '16px', color: '#5a7d5a', fontWeight: 'bold' }}>当前积分：{patient?.points ?? '...'} 分</span>
+            </div>
+
             <div style={{ textAlign: 'center' }}>
-              <button style={{ padding: '10px 24px', borderRadius: '30px', border: 'none', background: '#8b4513', color: '#fff', cursor: 'pointer' }}>立即打卡</button>
+              <button 
+                onClick={handlePatientCheckin}
+                disabled={patient?.today_checked}
+                style={{ padding: '10px 24px', borderRadius: '30px', border: 'none', background: patient?.today_checked ? '#ccc' : '#8b4513', color: '#fff', cursor: patient?.today_checked ? 'not-allowed' : 'pointer', fontFamily: 'serif' }}
+              >
+                {patient?.today_checked ? '✅ 已打卡，待老师审核' : '立即打卡'}
+              </button>
             </div>
           </div>
         ) : (
+          // 老师视图
           <div style={boxStyle}>
-            <div style={{ color: '#8b4513', fontWeight: 'bold', marginBottom: '10px' }}>📋 患者作业审核</div>
-            <div style={{ color: '#555', marginBottom: '15px' }}>张三：已完成白露节气穴位按摩，等待老师签字确认。</div>
-            <button style={{ padding: '8px 16px', borderRadius: '20px', border: 'none', background: '#8b4513', color: '#fff', cursor: 'pointer' }}>审核并签字</button>
+            <div style={{ color: '#8b4513', fontWeight: 'bold', marginBottom: '10px' }}>📋 待审核打卡</div>
+            {patient?.pending_approval ? (
+              <>
+                <div style={{ color: '#555', marginBottom: '15px' }}>
+                  {patient?.name} 在 {patient?.checkin_time} 完成了今日作业，等待您的审核。
+                </div>
+                <button 
+                  onClick={handleTeacherApprove}
+                  style={{ padding: '8px 16px', borderRadius: '20px', border: 'none', background: '#8b4513', color: '#fff', cursor: 'pointer', fontFamily: 'serif' }}
+                >
+                  审核并奖励积分
+                </button>
+              </>
+            ) : (
+              <div style={{ color: '#999', fontStyle: 'italic' }}>暂无待审核的打卡记录。</div>
+            )}
           </div>
         )}
+
+        {actionMsg && <div style={{ textAlign: 'center', color: '#5a7d5a', marginTop: '15px', fontWeight: 'bold' }}>{actionMsg}</div>}
 
         <div style={{ textAlign: 'center', marginTop: '20px', padding: '10px', borderTop: '1px dashed #d4c8a8', color: '#8b4513', fontSize: '13px', fontWeight: 'bold' }}>
           🔒 数据主权归患者 · 老师端阅后即焚
