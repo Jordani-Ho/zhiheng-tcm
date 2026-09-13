@@ -5,7 +5,7 @@ interface RoleData { role_type: string; name: string; task: string; detail: stri
 interface Transcription { id: number; patient_name: string; content: string; data_type: string; }
 interface Draft { id: number; transcript_id: number; patient_name: string; content: string; signed: boolean; doctor?: string; }
 interface Patient { name: string; teacher_name: string; }
-interface PatientRecord { id: number; patient_name: string; content: string; doctor: string; }
+interface PatientRecord { id: number; patient_name: string; ai_draft: string; final_plan: string; doctor: string; }
 
 export default function App() {
   const [huangli, setHuangli] = useState<HuangliData | null>(null)
@@ -23,7 +23,6 @@ export default function App() {
   const [newDetail, setNewDetail] = useState('')
   const [uploading, setUploading] = useState(false)
   const fileInputRef = useRef<HTMLInputElement>(null)
-  // 【第15天新增】老师端查看历史病历的展开状态
   const [showHistory, setShowHistory] = useState(false)
 
   useEffect(() => {
@@ -57,7 +56,7 @@ export default function App() {
     fetchDrafts()
     fetchPatientRecords()
     fetchPoints()
-    setShowHistory(false) // 切换患者时折叠历史
+    setShowHistory(false)
   }, [currentRole, selectedPatient])
 
   const handleCheckIn = () => { 
@@ -81,15 +80,10 @@ export default function App() {
   const handleImageUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0]
     if (!file) return
-
     setUploading(true)
     const formData = new FormData()
     formData.append('file', file)
-
-    fetch(`/api/upload?patient_name=${selectedPatient}`, {
-      method: 'POST',
-      body: formData
-    })
+    fetch(`/api/upload?patient_name=${selectedPatient}`, { method: 'POST', body: formData })
       .then(r => r.json())
       .then(() => {
         setUploading(false)
@@ -121,7 +115,6 @@ export default function App() {
       alert("请先填写给患者的最终辨证施治方案！")
       return
     }
-
     fetch(`/api/drafts/${draftId}/sign`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -221,7 +214,7 @@ export default function App() {
           )}
         </div>
 
-        {/* 【第15天新增】老师端查看历史病历 */}
+        {/* 【第16天修改】老师端查看历史病历（展示学习轨迹） */}
         {(currentRole === '李老师' || currentRole === '李老师智能体') && (
           <div style={{ ...boxStyle, background: '#fff9f0' }}>
             <div 
@@ -236,9 +229,12 @@ export default function App() {
                   <div style={{ textAlign: 'center', color: '#999' }}>暂无历史病历记录</div>
                 ) : (
                   patientRecords.map(r => (
-                    <div key={r.id} style={{ padding: '12px', border: '1px dashed #d4c8a8', borderRadius: '8px', marginBottom: '10px', background: '#fdfcf0' }}>
-                      <div style={{ color: '#5a7d5a', fontSize: '12px', marginBottom: '5px' }}>✅ 由 {r.doctor} 签字确认</div>
-                      <div style={{ whiteSpace: 'pre-wrap', fontSize: '14px', color: '#333' }}>{r.content}</div>
+                    <div key={r.id} style={{ padding: '12px', border: '1px dashed #d4c8a8', borderRadius: '8px', marginBottom: '15px', background: '#fdfcf0' }}>
+                      <div style={{ color: '#5a7d5a', fontSize: '12px', marginBottom: '8px', fontWeight: 'bold' }}>✅ 由 {r.doctor} 签字确认</div>
+                      <div style={{ fontSize: '13px', color: '#999', marginBottom: '3px' }}>【智能体原始草案】</div>
+                      <div style={{ whiteSpace: 'pre-wrap', fontSize: '13px', color: '#666', background: '#f5f5f5', padding: '8px', borderRadius: '6px', marginBottom: '8px' }}>{r.ai_draft}</div>
+                      <div style={{ fontSize: '13px', color: '#8b4513', marginBottom: '3px' }}>【老师最终决策】</div>
+                      <div style={{ whiteSpace: 'pre-wrap', fontSize: '14px', color: '#333', background: '#fff8e7', padding: '8px', borderRadius: '6px' }}>{r.final_plan}</div>
                     </div>
                   ))
                 )}
@@ -328,7 +324,7 @@ export default function App() {
               patientRecords.map(r => (
                 <div key={r.id} style={{ padding: '15px', border: '1px solid #b8d8c0', borderRadius: '8px', marginBottom: '10px', background: '#fff' }}>
                   <div style={{ color: '#5a7d5a', fontWeight: 'bold', marginBottom: '5px' }}>✅ {r.doctor || '李老师'}已签字病历</div>
-                  <div style={{ whiteSpace: 'pre-wrap', fontSize: '14px', color: '#333', lineHeight: '1.6' }}>{r.content}</div>
+                  <div style={{ whiteSpace: 'pre-wrap', fontSize: '14px', color: '#333', lineHeight: '1.6' }}>{r.final_plan}</div>
                 </div>
               ))
             )}

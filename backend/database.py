@@ -20,7 +20,7 @@ def init_db():
     )
     """)
 
-    # 2. 作业表（绑定到具体患者）
+    # 2. 作业表
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS homework (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -53,12 +53,13 @@ def init_db():
     )
     """)
 
-    # 5. 患者健康档案表
+    # 5. 患者健康档案表（【第16天修改】加入 AI 原始草案与最终方案字段）
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS patient_records (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         patient_name TEXT,
-        content TEXT,
+        ai_draft TEXT,
+        final_plan TEXT,
         doctor TEXT
     )
     """)
@@ -118,7 +119,6 @@ def create_homework(patient_name, task, detail):
 
 def update_homework_status(patient_name, status):
     conn = get_connection()
-    # 更新该患者最新的那条作业
     conn.execute("UPDATE homework SET status = ? WHERE id = (SELECT MAX(id) FROM homework WHERE patient_name = ?)", (status, patient_name))
     conn.commit()
     conn.close()
@@ -162,6 +162,7 @@ def update_draft_content(draft_id, content):
     conn.commit()
     conn.close()
 
+# 【第16天修改】签字时，同时保存 AI 原始草案与老师最终方案
 def sign_draft(draft_id, final_plan):
     conn = get_connection()
     draft = conn.execute("SELECT * FROM drafts WHERE id = ?", (draft_id,)).fetchone()
@@ -169,8 +170,11 @@ def sign_draft(draft_id, final_plan):
         conn.close()
         return None
 
-    conn.execute("INSERT INTO patient_records (patient_name, content, doctor) VALUES (?, ?, ?)",
-                 (draft["patient_name"], final_plan, "李老师"))
+    # 将 AI 生成的原始草案 和 老师最终修改的方案 一起归档
+    conn.execute("INSERT INTO patient_records (patient_name, ai_draft, final_plan, doctor) VALUES (?, ?, ?, ?)",
+                 (draft["patient_name"], draft["content"], final_plan, "李老师"))
+
+    # 删除草案（阅后即焚）
     conn.execute("DELETE FROM drafts WHERE id = ?", (draft_id,))
     
     conn.commit()

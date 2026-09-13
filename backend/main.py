@@ -20,10 +20,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 创建上传目录
 UPLOAD_DIR = os.path.join(os.path.dirname(__file__), "uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
-# 挂载静态文件服务，让前端可以通过 /uploads/xxx.jpg 访问图片
 app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 
 database.init_db()
@@ -153,24 +151,17 @@ def transcribe(input_data: TranscriptionInput):
     database.insert_transcription(input_data.patient_name, input_data.content, input_data.data_type)
     return {"message": "转述成功"}
 
-# 【第14天新增】图片上传接口
 @app.post("/api/upload")
 async def upload_image(patient_name: str = "张三", file: UploadFile = File(...)):
-    # 1. 生成唯一文件名，防止重名覆盖
     ext = os.path.splitext(file.filename)[1] if file.filename else ".jpg"
     unique_name = f"{uuid.uuid4().hex}{ext}"
     file_path = os.path.join(UPLOAD_DIR, unique_name)
     
-    # 2. 保存文件
     with open(file_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
     
-    # 3. 生成访问 URL（相对路径，前端会自动通过代理访问）
     file_url = f"/uploads/{unique_name}"
-    
-    # 4. 原样记录到转述表（智能体只负责转述，不推理）
     database.insert_transcription(patient_name, file_url, "image")
-    
     return {"message": "图片转述成功", "url": file_url}
 
 @app.get("/api/transcriptions")
@@ -186,9 +177,8 @@ def generate_draft(transcript_id: int):
 
     patient_name = transcript['patient_name']
     past_records = database.get_patient_records(patient_name)
-    past_content = "\n".join([f"- {r['content']}" for r in past_records]) if past_records else "暂无过往病历"
+    past_content = "\n".join([f"- {r['final_plan']}" for r in past_records]) if past_records else "暂无过往病历"
 
-    # 如果是图片，转述内容显示为图片链接
     if transcript['data_type'] == 'image':
         content_desc = f"[患者上传了图片：{transcript['content']}]"
     else:
