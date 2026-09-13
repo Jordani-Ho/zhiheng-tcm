@@ -42,13 +42,17 @@ class HomeworkInput(BaseModel):
     task: str
     detail: str
 
-# 【第17天新增】患者档案输入模型
 class ProfileInput(BaseModel):
     patient_name: str
     gender: str
     birth_date: str
     birth_time: str
     location: str
+
+# 【第18天新增】添加家庭成员模型
+class AddPatientInput(BaseModel):
+    name: str
+    guardian_name: str
 
 @app.get("/api/huangli")
 def get_huangli():
@@ -110,16 +114,21 @@ def get_huangli():
         "current_shi": current_shi
     }
 
+# 【第18天修改】获取当前监护人下的所有患者
 @app.get("/api/patients")
-def get_patients():
-    return database.get_patients()
+def get_patients(guardian_name: str = None):
+    return database.get_patients(guardian_name)
 
-# 【第17天新增】获取患者档案
+# 【第18天新增】添加家属档案
+@app.post("/api/patients/add")
+def add_patient(input_data: AddPatientInput):
+    database.add_patient(input_data.name, input_data.guardian_name)
+    return {"message": "家属档案添加成功"}
+
 @app.get("/api/patient-profile")
 def get_patient_profile(patient_name: str):
     return database.get_patient_profile(patient_name)
 
-# 【第17天新增】保存患者档案
 @app.post("/api/patient-profile")
 def save_patient_profile(input_data: ProfileInput):
     database.save_patient_profile(

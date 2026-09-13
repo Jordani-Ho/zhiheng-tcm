@@ -4,9 +4,8 @@ interface HuangliData { date: string; lunar: string; solar_term: string; solar_t
 interface RoleData { role_type: string; name: string; task: string; detail: string; }
 interface Transcription { id: number; patient_name: string; content: string; data_type: string; }
 interface Draft { id: number; transcript_id: number; patient_name: string; content: string; signed: boolean; doctor?: string; }
-interface Patient { name: string; teacher_name: string; }
+interface Patient { name: string; teacher_name: string; guardian_name: string; }
 interface PatientRecord { id: number; patient_name: string; ai_draft: string; final_plan: string; doctor: string; }
-// 【第17天新增】档案接口
 interface PatientProfile { patient_name: string; gender: string; birth_date: string; birth_time: string; location: string; }
 
 export default function App() {
@@ -26,14 +25,21 @@ export default function App() {
   const [uploading, setUploading] = useState(false)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const [showHistory, setShowHistory] = useState(false)
-  // 【第17天新增】档案状态
   const [profile, setProfile] = useState<PatientProfile | null>(null)
   const [editingProfile, setEditingProfile] = useState(false)
+  // 【第18天新增】添加家属档案状态
+  const [showAddFamily, setShowAddFamily] = useState(false)
+  const [newFamilyName, setNewFamilyName] = useState('')
 
   useEffect(() => {
     fetch('/api/huangli').then(r => r.json()).then(d => setHuangli(d)).catch(() => setHuangli(null))
-    fetch('/api/patients').then(r => r.json()).then(d => setPatients(d)).catch(() => setPatients([]))
+    // 默认获取“张三”监护下的所有患者（包括自己）
+    fetchPatients('张三')
   }, [])
+
+  const fetchPatients = (guardian: string) => {
+    fetch(`/api/patients?guardian_name=${guardian}`).then(r => r.json()).then(d => setPatients(d)).catch(() => setPatients([]))
+  }
 
   const fetchRoleData = () => {
     fetch(`/api/role-data?role=${currentRole}&patient_name=${selectedPatient}`).then(r => r.json()).then(d => setRoleData(d)).catch(() => setRoleData(null))
@@ -55,7 +61,6 @@ export default function App() {
     fetch(`/api/points?patient_name=${selectedPatient}`).then(r => r.json()).then(d => setPoints(d)).catch(() => setPoints(null))
   }
 
-  // 【第17天新增】获取档案
   const fetchProfile = () => {
     fetch(`/api/patient-profile?patient_name=${selectedPatient}`).then(r => r.json()).then(d => setProfile(d)).catch(() => setProfile(null))
   }
@@ -155,7 +160,6 @@ export default function App() {
     })
   }
 
-  // 【第17天新增】保存档案
   const handleSaveProfile = () => {
     if (!profile) return
     fetch('/api/patient-profile', {
@@ -165,6 +169,24 @@ export default function App() {
     }).then(() => {
       setEditingProfile(false)
       alert("档案已保存！")
+    })
+  }
+
+  // 【第18天新增】添加家属档案
+  const handleAddFamily = () => {
+    if (!newFamilyName.trim()) {
+      alert("请输入家属姓名！")
+      return
+    }
+    fetch('/api/patients/add', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: newFamilyName, guardian_name: '张三' }) // 目前模拟张三作为监护人
+    }).then(() => {
+      setNewFamilyName('')
+      setShowAddFamily(false)
+      fetchPatients('张三') // 刷新家属列表
+      alert("家属档案添加成功！")
     })
   }
 
@@ -197,16 +219,44 @@ export default function App() {
           </div>
         )}
 
+        {/* 【第18天修改】患者选择器（带添加家属按钮） */}
         <div style={{ ...boxStyle, background: '#f7fcf9' }}>
-          <div style={{ textAlign: 'center', marginBottom: '10px', color: '#5a7d5a', fontWeight: 'bold' }}>👥 当前患者</div>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '10px' }}>
+            <div style={{ color: '#5a7d5a', fontWeight: 'bold' }}>👥 当前就诊人</div>
+            <button 
+              onClick={() => setShowAddFamily(!showAddFamily)} 
+              style={{ padding: '4px 12px', borderRadius: '15px', border: '1px solid #5a7d5a', background: 'transparent', color: '#5a7d5a', cursor: 'pointer', fontSize: '12px' }}
+            >
+              {showAddFamily ? '取消' : '+ 添加家属'}
+            </button>
+          </div>
+          
+          {/* 家属列表 */}
           <div style={{ display: 'flex', flexWrap: 'wrap', justifyContent: 'center' }}>
             {patients.map(p => (
-              <button key={p.name} style={patientBtnStyle(p.name)} onClick={() => setSelectedPatient(p.name)}>{p.name}</button>
+              <button key={p.name} style={patientBtnStyle(p.name)} onClick={() => setSelectedPatient(p.name)}>
+                {p.guardian_name === 'self' ? p.name : `${p.name} (家属)`}
+              </button>
             ))}
           </div>
+
+          {/* 添加家属输入框 */}
+          {showAddFamily && (
+            <div style={{ marginTop: '10px', borderTop: '1px dashed #b8d8c0', paddingTop: '10px' }}>
+              <input 
+                value={newFamilyName} 
+                onChange={(e) => setNewFamilyName(e.target.value)} 
+                placeholder="请输入家属姓名（例如：张三父亲、张三儿子）" 
+                style={inputStyle} 
+              />
+              <div style={{ textAlign: 'right' }}>
+                <button onClick={handleAddFamily} style={{ padding: '6px 16px', borderRadius: '20px', border: 'none', background: '#5a7d5a', color: '#fff', cursor: 'pointer' }}>确认添加</button>
+              </div>
+            </div>
+          )}
         </div>
 
-        {/* 【第17天新增】患者基础档案卡片（患者和患者智能体可见） */}
+        {/* 患者基础档案卡片 */}
         {(currentRole === '患者' || currentRole === '患者智能体') && profile && (
           <div style={{ ...boxStyle, background: '#fffaf0' }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '15px' }}>
@@ -281,7 +331,6 @@ export default function App() {
           )}
         </div>
 
-        {/* 老师端查看历史病历（展示学习轨迹） */}
         {(currentRole === '李老师' || currentRole === '李老师智能体') && (
           <div style={{ ...boxStyle, background: '#fff9f0' }}>
             <div 

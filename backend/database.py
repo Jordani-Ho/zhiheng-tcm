@@ -12,15 +12,16 @@ def init_db():
     conn = get_connection()
     cursor = conn.cursor()
 
-    # 1. 患者表
+    # 1. 患者表（【第18天修改】新增 guardian_name 字段）
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS patients (
         name TEXT PRIMARY KEY,
-        teacher_name TEXT DEFAULT '李老师'
+        teacher_name TEXT DEFAULT '李老师',
+        guardian_name TEXT DEFAULT 'self'
     )
     """)
 
-    # 2. 【第17天新增】患者基础档案表
+    # 2. 患者基础档案表
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS patient_profiles (
         patient_name TEXT PRIMARY KEY,
@@ -88,8 +89,9 @@ def init_db():
     # 初始化默认数据
     cursor.execute("SELECT COUNT(*) as count FROM patients")
     if cursor.fetchone()["count"] == 0:
-        cursor.execute("INSERT INTO patients (name, teacher_name) VALUES (?, ?)", ("张三", "李老师"))
-        cursor.execute("INSERT INTO patients (name, teacher_name) VALUES (?, ?)", ("李四", "李老师"))
+        # 默认把张三、李四都当作自己管理自己
+        cursor.execute("INSERT INTO patients (name, teacher_name, guardian_name) VALUES (?, ?, ?)", ("张三", "李老师", "self"))
+        cursor.execute("INSERT INTO patients (name, teacher_name, guardian_name) VALUES (?, ?, ?)", ("李四", "李老师", "self"))
         conn.commit()
 
     cursor.execute("SELECT COUNT(*) as count FROM homework")
@@ -108,13 +110,23 @@ def init_db():
     conn.close()
 
 # ---------- 患者相关操作 ----------
-def get_patients():
+def get_patients(guardian_name=None):
     conn = get_connection()
-    rows = conn.execute("SELECT * FROM patients").fetchall()
+    if guardian_name:
+        # 获取“自己”以及“自己监护的所有家属”
+        rows = conn.execute("SELECT * FROM patients WHERE name = ? OR guardian_name = ?", (guardian_name, guardian_name)).fetchall()
+    else:
+        rows = conn.execute("SELECT * FROM patients").fetchall()
     conn.close()
     return [dict(r) for r in rows]
 
-# 【第17天新增】患者基础档案操作
+def add_patient(name, guardian_name):
+    conn = get_connection()
+    conn.execute("INSERT OR IGNORE INTO patients (name, teacher_name, guardian_name) VALUES (?, ?, ?)", (name, "李老师", guardian_name))
+    conn.commit()
+    conn.close()
+
+# 患者基础档案操作
 def get_patient_profile(patient_name):
     conn = get_connection()
     row = conn.execute("SELECT * FROM patient_profiles WHERE patient_name = ?", (patient_name,)).fetchone()
