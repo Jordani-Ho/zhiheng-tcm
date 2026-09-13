@@ -5,6 +5,7 @@ interface RoleData { role_type: string; name: string; task: string; detail: stri
 interface Transcription { id: number; patient_name: string; content: string; data_type: string; }
 interface Draft { id: number; transcript_id: number; patient_name: string; content: string; signed: boolean; doctor?: string; }
 interface Patient { name: string; teacher_name: string; }
+interface PatientRecord { id: number; patient_name: string; content: string; doctor: string; }
 
 export default function App() {
   const [huangli, setHuangli] = useState<HuangliData | null>(null)
@@ -13,16 +14,17 @@ export default function App() {
   const [inputText, setInputText] = useState('')
   const [transcriptions, setTranscriptions] = useState<Transcription[]>([])
   const [drafts, setDrafts] = useState<Draft[]>([])
-  const [patientRecords, setPatientRecords] = useState<Draft[]>([])
+  const [patientRecords, setPatientRecords] = useState<PatientRecord[]>([])
   const [finalPlans, setFinalPlans] = useState<{ [key: number]: string }>({})
   const [points, setPoints] = useState<{ patient_points: number; teacher_points: number } | null>(null)
   const [patients, setPatients] = useState<Patient[]>([])
   const [selectedPatient, setSelectedPatient] = useState('张三')
   const [newTask, setNewTask] = useState('')
   const [newDetail, setNewDetail] = useState('')
-  // 【第14天新增】图片上传状态
   const [uploading, setUploading] = useState(false)
   const fileInputRef = useRef<HTMLInputElement>(null)
+  // 【第15天新增】老师端查看历史病历的展开状态
+  const [showHistory, setShowHistory] = useState(false)
 
   useEffect(() => {
     fetch('/api/huangli').then(r => r.json()).then(d => setHuangli(d)).catch(() => setHuangli(null))
@@ -55,6 +57,7 @@ export default function App() {
     fetchDrafts()
     fetchPatientRecords()
     fetchPoints()
+    setShowHistory(false) // 切换患者时折叠历史
   }, [currentRole, selectedPatient])
 
   const handleCheckIn = () => { 
@@ -75,7 +78,6 @@ export default function App() {
     }).then(() => { setInputText(''); fetchTranscriptions() })
   }
 
-  // 【第14天新增】图片上传处理
   const handleImageUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0]
     if (!file) return
@@ -91,8 +93,8 @@ export default function App() {
       .then(r => r.json())
       .then(() => {
         setUploading(false)
-        fetchTranscriptions() // 刷新转述列表
-        if (fileInputRef.current) fileInputRef.current.value = '' // 清空文件选择
+        fetchTranscriptions()
+        if (fileInputRef.current) fileInputRef.current.value = ''
       })
       .catch(() => {
         setUploading(false)
@@ -219,6 +221,32 @@ export default function App() {
           )}
         </div>
 
+        {/* 【第15天新增】老师端查看历史病历 */}
+        {(currentRole === '李老师' || currentRole === '李老师智能体') && (
+          <div style={{ ...boxStyle, background: '#fff9f0' }}>
+            <div 
+              style={{ textAlign: 'center', fontSize: '18px', color: '#8b4513', fontWeight: 'bold', cursor: 'pointer', display: 'flex', justifyContent: 'center', alignItems: 'center', gap: '5px' }}
+              onClick={() => setShowHistory(!showHistory)}
+            >
+              📂 {selectedPatient} 的历史病历 {showHistory ? '▲' : '▼'}
+            </div>
+            {showHistory && (
+              <div style={{ marginTop: '15px' }}>
+                {patientRecords.length === 0 ? (
+                  <div style={{ textAlign: 'center', color: '#999' }}>暂无历史病历记录</div>
+                ) : (
+                  patientRecords.map(r => (
+                    <div key={r.id} style={{ padding: '12px', border: '1px dashed #d4c8a8', borderRadius: '8px', marginBottom: '10px', background: '#fdfcf0' }}>
+                      <div style={{ color: '#5a7d5a', fontSize: '12px', marginBottom: '5px' }}>✅ 由 {r.doctor} 签字确认</div>
+                      <div style={{ whiteSpace: 'pre-wrap', fontSize: '14px', color: '#333' }}>{r.content}</div>
+                    </div>
+                  ))
+                )}
+              </div>
+            )}
+          </div>
+        )}
+
         {currentRole === '李老师' && (
           <div style={{ ...boxStyle, background: '#f0f7f0' }}>
             <div style={{ textAlign: 'center', fontSize: '18px', color: '#5a7d5a', marginBottom: '15px' }}>📝 给 {selectedPatient} 布置作业</div>
@@ -234,7 +262,6 @@ export default function App() {
             <textarea value={inputText} onChange={(e) => setInputText(e.target.value)} placeholder="在此输入您的感受、症状或语音识别后的文字..." style={{ width: '100%', height: '80px', padding: '10px', borderRadius: '8px', border: '1px solid #d4c8a8', fontFamily: 'serif', marginBottom: '15px', boxSizing: 'border-box' }} />
             <div style={{ display: 'flex', justifyContent: 'center', gap: '10px' }}>
               <button onClick={handleTranscribe} style={{ padding: '10px 24px', borderRadius: '30px', border: 'none', background: '#8b4513', color: '#fff', fontSize: '16px', cursor: 'pointer' }}>发送文字转述</button>
-              {/* 【第14天新增】图片上传按钮 */}
               <button onClick={() => fileInputRef.current?.click()} style={{ padding: '10px 24px', borderRadius: '30px', border: '1px solid #8b4513', background: '#fdfcf0', color: '#8b4513', fontSize: '16px', cursor: 'pointer' }} disabled={uploading}>
                 {uploading ? '上传中...' : '📷 上传图片'}
               </button>
@@ -253,7 +280,6 @@ export default function App() {
                 {transcriptions.map(t => (
                   <li key={t.id} style={{ marginBottom: '10px' }}>
                     <span style={{ color: '#8b4513', fontWeight: 'bold' }}>[{t.data_type}]</span>
-                    {/* 【第14天修改】图片类型显示缩略图 */}
                     {t.data_type === 'image' ? (
                       <img src={t.content} alt="患者上传图片" style={{ maxWidth: '150px', borderRadius: '8px', marginLeft: '5px', display: 'block', marginTop: '5px' }} />
                     ) : (
