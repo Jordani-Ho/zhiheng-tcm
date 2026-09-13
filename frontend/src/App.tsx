@@ -6,15 +6,7 @@ interface Transcription { id: number; patient_name: string; content: string; dat
 interface Draft { id: number; transcript_id: number; patient_name: string; content: string; signed: boolean; doctor?: string; }
 interface Patient { name: string; teacher_name: string; guardian_name: string; relation: string; }
 interface PatientRecord { id: number; patient_name: string; ai_draft: string; final_plan: string; doctor: string; }
-interface PatientProfile { 
-  patient_name: string; 
-  gender: string; 
-  birth_date: string; 
-  birth_time: string; 
-  location: string; 
-  bazi?: string;
-  wuxing?: string;
-}
+interface PatientProfile { patient_name: string; gender: string; birth_date: string; birth_time: string; location: string; bazi?: string; wuxing?: string; }
 
 export default function App() {
   const [huangli, setHuangli] = useState<HuangliData | null>(null)
@@ -36,21 +28,38 @@ export default function App() {
   const [profile, setProfile] = useState<PatientProfile | null>(null)
   const [editingProfile, setEditingProfile] = useState(false)
   
-  // 添加亲友的完整表单状态
   const [showAddFamily, setShowAddFamily] = useState(false)
   const [newFamilyName, setNewFamilyName] = useState('')
   const [newRelation, setNewRelation] = useState('')
   const [newGender, setNewGender] = useState('')
-  const [newBirthDate, setNewBirthDate] = useState('')
+  // 【第23天修改1】出生日期拆为三个字段
+  const [newBirthYear, setNewBirthYear] = useState('')
+  const [newBirthMonth, setNewBirthMonth] = useState('')
+  const [newBirthDay, setNewBirthDay] = useState('')
   const [newBirthTime, setNewBirthTime] = useState('')
   const [newLocation, setNewLocation] = useState('')
+  // 【第23天修改2】监护人居住地
+  const [guardianLocation, setGuardianLocation] = useState('')
 
-  // 【第21天修改1】获取今天的日期字符串，用于限制不能选未来的出生日期
-  const todayStr = new Date().toISOString().split('T')[0]
+  // 生成年份、月份、日期数组
+  const currentYear = new Date().getFullYear()
+  const yearOptions = Array.from({ length: currentYear - 1920 + 1 }, (_, i) => currentYear - i)
+  const monthOptions = Array.from({ length: 12 }, (_, i) => i + 1)
+  const getDayOptions = () => {
+    const y = parseInt(newBirthYear) || currentYear
+    const m = parseInt(newBirthMonth) || 1
+    const days = new Date(y, m, 0).getDate()
+    return Array.from({ length: days }, (_, i) => i + 1)
+  }
 
   useEffect(() => {
     fetch('/api/huangli').then(r => r.json()).then(d => setHuangli(d)).catch(() => setHuangli(null))
     fetchPatients('张三')
+    // 获取监护人（张三）的居住地作为默认值
+    fetch('/api/patient-profile?patient_name=张三')
+      .then(r => r.json())
+      .then(d => setGuardianLocation(d.location || ''))
+      .catch(() => {})
   }, [])
 
   const fetchPatients = (guardian: string) => {
@@ -200,11 +209,26 @@ export default function App() {
     }
   }
 
+  // 【第23天修改3】打开添加亲友时，默认填入监护人居住地
+  const handleToggleAddFamily = () => {
+    if (!showAddFamily) {
+      // 打开时预填居住地
+      setNewLocation(guardianLocation)
+    }
+    setShowAddFamily(!showAddFamily)
+  }
+
   const handleAddFamily = () => {
-    if (!newFamilyName.trim() || !newRelation.trim() || !newGender || !newBirthDate) {
-      alert("请至少填写姓名、关系、性别和出生日期！")
+    // 校验：姓名、关系、性别、年月日都必须有
+    if (!newFamilyName.trim() || !newRelation.trim() || !newGender || !newBirthYear || !newBirthMonth || !newBirthDay) {
+      alert("请至少填写姓名、关系、性别和完整的出生年月日！")
       return
     }
+    // 组合为 YYYY-MM-DD
+    const mm = String(newBirthMonth).padStart(2, '0')
+    const dd = String(newBirthDay).padStart(2, '0')
+    const birthDate = `${newBirthYear}-${mm}-${dd}`
+    
     fetch('/api/patients/add', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -213,7 +237,7 @@ export default function App() {
         guardian_name: '张三',
         relation: newRelation,
         gender: newGender,
-        birth_date: newBirthDate,
+        birth_date: birthDate,
         birth_time: newBirthTime,
         location: newLocation
       })
@@ -221,7 +245,9 @@ export default function App() {
       setNewFamilyName('')
       setNewRelation('')
       setNewGender('')
-      setNewBirthDate('')
+      setNewBirthYear('')
+      setNewBirthMonth('')
+      setNewBirthDay('')
       setNewBirthTime('')
       setNewLocation('')
       setShowAddFamily(false)
@@ -232,8 +258,10 @@ export default function App() {
 
   const boxStyle = { background: '#fdfcf0', border: '1px solid #d4c8a8', borderRadius: '12px', padding: '24px', marginBottom: '20px', boxShadow: '0 4px 12px rgba(0,0,0,0.06)' }
   const roleBtnStyle = (role: string) => ({ padding: '8px 16px', margin: '5px', borderRadius: '20px', border: '1px solid #8b4513', cursor: 'pointer', fontFamily: 'serif', fontSize: '14px', backgroundColor: currentRole === role ? '#8b4513' : '#fdfcf0', color: currentRole === role ? '#fff' : '#8b4513', transition: 'all 0.2s' })
-  const patientBtnStyle = (name: string) => ({ padding: '4px 12px', margin: '3px', borderRadius: '15px', border: '1px solid #5a7d5a', cursor: 'pointer', fontFamily: 'serif', fontSize: '12px', backgroundColor: selectedPatient === name ? '#5a7d5a' : '#f7fcf9', color: selectedPatient === name ? '#fff' : '#5a7d5a', transition: 'all 0.2s' })
+  const patientBtnStyle = (name: string) => ({ padding: '6px 14px', margin: '4px', borderRadius: '15px', border: '1px solid #5a7d5a', cursor: 'pointer', fontFamily: 'serif', fontSize: '13px', backgroundColor: selectedPatient === name ? '#5a7d5a' : '#f7fcf9', color: selectedPatient === name ? '#fff' : '#5a7d5a', transition: 'all 0.2s' })
   const inputStyle = { width: '100%', padding: '8px', borderRadius: '6px', border: '1px solid #d4c8a8', fontFamily: 'serif', marginBottom: '8px', boxSizing: 'border-box' as const }
+  // 日期三下拉框样式
+  const dateSelectStyle = { padding: '8px', borderRadius: '6px', border: '1px solid #d4c8a8', fontFamily: 'serif', marginRight: '6px', marginBottom: '8px' }
 
   return (
     <div style={{ minHeight: '100vh', background: '#f5f1e6', padding: '40px 20px', fontFamily: 'serif' }}>
@@ -259,69 +287,81 @@ export default function App() {
           </div>
         )}
 
-        <div style={{ ...boxStyle, background: '#f7fcf9' }}>
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '10px' }}>
-            {/* 【第21天修改2】去掉代述提示 */}
-            <div style={{ color: '#5a7d5a', fontWeight: 'bold' }}>👥 当前就诊人</div>
-            
-            {/* 【第21天修改3】医生端不显示"添加亲友"按钮 */}
-            {currentRole === '患者' && (
+        {(currentRole === '患者' || currentRole === '患者智能体') && (
+          <div style={{ ...boxStyle, background: '#f0f7f5' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
+              <div style={{ fontSize: '18px', color: '#5a7d5a', fontWeight: 'bold' }}>🏠 我的家庭（{patients.length}人）</div>
               <button 
-                onClick={() => setShowAddFamily(!showAddFamily)} 
+                onClick={handleToggleAddFamily} 
                 style={{ padding: '4px 12px', borderRadius: '15px', border: '1px solid #5a7d5a', background: 'transparent', color: '#5a7d5a', cursor: 'pointer', fontSize: '12px' }}
               >
                 {showAddFamily ? '取消' : '+ 添加亲友'}
               </button>
+            </div>
+            
+            <div style={{ display: 'flex', flexWrap: 'wrap', justifyContent: 'center' }}>
+              {patients.map(p => (
+                <button key={p.name} style={patientBtnStyle(p.name)} onClick={() => setSelectedPatient(p.name)}>
+                  {p.relation === '本人' ? `👤 ${p.name}` : `👨‍👩‍👧 ${p.name}（${p.relation}）`}
+                </button>
+              ))}
+            </div>
+            <div style={{ textAlign: 'center', fontSize: '12px', color: '#999', marginTop: '10px' }}>
+              点击头像，帮家人打卡、看健康档案、代述问诊
+            </div>
+
+            {showAddFamily && (
+              <div style={{ marginTop: '15px', borderTop: '1px dashed #b8d8c0', paddingTop: '15px' }}>
+                <div style={{ fontSize: '14px', color: '#5a7d5a', fontWeight: 'bold', marginBottom: '10px' }}>📝 亲友基础信息</div>
+                <input value={newFamilyName} onChange={(e) => setNewFamilyName(e.target.value)} placeholder="姓名（必填）" style={inputStyle} />
+                
+                <select value={newRelation} onChange={(e) => handleRelationChange(e.target.value)} style={inputStyle}>
+                  <option value="">与您的关系（必填）</option>
+                  <option value="父亲">父亲</option>
+                  <option value="母亲">母亲</option>
+                  <option value="儿子">儿子</option>
+                  <option value="女儿">女儿</option>
+                  <option value="配偶">配偶</option>
+                  <option value="其他">其他</option>
+                </select>
+                
+                <select value={newGender} onChange={(e) => setNewGender(e.target.value)} style={inputStyle}>
+                  <option value="">性别（必填，选关系后自动联动）</option>
+                  <option value="男">男</option>
+                  <option value="女">女</option>
+                </select>
+                
+                {/* 【第23天修改4】年月日顺序的三个下拉框 */}
+                <label style={{ fontSize: '12px', color: '#888' }}>出生日期（按 年-月-日 顺序选择）</label>
+                <div style={{ display: 'flex', flexWrap: 'wrap', marginBottom: '8px' }}>
+                  <select value={newBirthYear} onChange={(e) => setNewBirthYear(e.target.value)} style={dateSelectStyle}>
+                    <option value="">年</option>
+                    {yearOptions.map(y => <option key={y} value={y}>{y}</option>)}
+                  </select>
+                  <select value={newBirthMonth} onChange={(e) => setNewBirthMonth(e.target.value)} style={dateSelectStyle}>
+                    <option value="">月</option>
+                    {monthOptions.map(m => <option key={m} value={m}>{m}</option>)}
+                  </select>
+                  <select value={newBirthDay} onChange={(e) => setNewBirthDay(e.target.value)} style={dateSelectStyle}>
+                    <option value="">日</option>
+                    {getDayOptions().map(d => <option key={d} value={d}>{d}</option>)}
+                  </select>
+                </div>
+                
+                <label style={{ fontSize: '12px', color: '#888' }}>出生时间（选填，精确到小时即可）</label>
+                <input type="time" step="3600" value={newBirthTime} onChange={(e) => setNewBirthTime(e.target.value)} style={inputStyle} />
+                
+                <label style={{ fontSize: '12px', color: '#888' }}>现居住地（默认继承您的居住地，可修改）</label>
+                <input value={newLocation} onChange={(e) => setNewLocation(e.target.value)} placeholder="例如：广东省广州市" style={inputStyle} />
+                
+                <div style={{ textAlign: 'right', marginTop: '10px' }}>
+                  <button onClick={handleAddFamily} style={{ padding: '6px 20px', borderRadius: '20px', border: 'none', background: '#5a7d5a', color: '#fff', cursor: 'pointer' }}>确认添加亲友</button>
+                </div>
+              </div>
             )}
           </div>
-          
-          <div style={{ display: 'flex', flexWrap: 'wrap', justifyContent: 'center' }}>
-            {patients.map(p => (
-              <button key={p.name} style={patientBtnStyle(p.name)} onClick={() => setSelectedPatient(p.name)}>
-                {p.relation === '本人' ? p.name : `${p.name} (${p.relation})`}
-              </button>
-            ))}
-          </div>
+        )}
 
-          {/* 添加亲友表单只在患者端显示 */}
-          {showAddFamily && currentRole === '患者' && (
-            <div style={{ marginTop: '10px', borderTop: '1px dashed #b8d8c0', paddingTop: '15px' }}>
-              <div style={{ fontSize: '14px', color: '#5a7d5a', fontWeight: 'bold', marginBottom: '10px' }}>📝 亲友基础信息</div>
-              <input value={newFamilyName} onChange={(e) => setNewFamilyName(e.target.value)} placeholder="姓名（必填）" style={inputStyle} />
-              
-              <select value={newRelation} onChange={(e) => handleRelationChange(e.target.value)} style={inputStyle}>
-                <option value="">与您的关系（必填）</option>
-                <option value="父亲">父亲</option>
-                <option value="母亲">母亲</option>
-                <option value="儿子">儿子</option>
-                <option value="女儿">女儿</option>
-                <option value="配偶">配偶</option>
-                <option value="其他">其他</option>
-              </select>
-              
-              <select value={newGender} onChange={(e) => setNewGender(e.target.value)} style={inputStyle}>
-                <option value="">性别（必填，选关系后自动联动）</option>
-                <option value="男">男</option>
-                <option value="女">女</option>
-              </select>
-              
-              <label style={{ fontSize: '12px', color: '#888' }}>出生日期（必填，不能选未来日期）</label>
-              {/* 【第21天修改4】限定最大日期为今天 */}
-              <input type="date" max={todayStr} value={newBirthDate} onChange={(e) => setNewBirthDate(e.target.value)} style={inputStyle} />
-              
-              <label style={{ fontSize: '12px', color: '#888' }}>出生时间（选填，精确到小时即可）</label>
-              {/* 【第21天修改5】时间限定为小时 */}
-              <input type="time" step="3600" value={newBirthTime} onChange={(e) => setNewBirthTime(e.target.value)} style={inputStyle} />
-              
-              <input value={newLocation} onChange={(e) => setNewLocation(e.target.value)} placeholder="现居住地（例如：广东省深圳市南山区）" style={inputStyle} />
-              <div style={{ textAlign: 'right', marginTop: '10px' }}>
-                <button onClick={handleAddFamily} style={{ padding: '6px 20px', borderRadius: '20px', border: 'none', background: '#5a7d5a', color: '#fff', cursor: 'pointer' }}>确认添加亲友</button>
-              </div>
-            </div>
-          )}
-        </div>
-
-        {/* 基础档案卡片 */}
         {(currentRole === '患者' || currentRole === '患者智能体') && profile && (
           <div style={{ ...boxStyle, background: '#fffaf0' }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '15px' }}>
@@ -343,13 +383,11 @@ export default function App() {
                   <option value="女">女</option>
                 </select>
                 <label style={{ fontSize: '13px', color: '#666' }}>出生日期（不能选未来）</label>
-                {/* 【第21天修改6】编辑档案时也限制日期 */}
                 <input type="date" max={todayStr} value={profile.birth_date} onChange={e => setProfile({...profile, birth_date: e.target.value})} style={inputStyle} />
                 <label style={{ fontSize: '13px', color: '#666' }}>出生时间（选填，精确到小时即可）</label>
-                {/* 【第21天修改7】编辑档案时也限定小时 */}
                 <input type="time" step="3600" value={profile.birth_time} onChange={e => setProfile({...profile, birth_time: e.target.value})} style={inputStyle} />
                 <label style={{ fontSize: '13px', color: '#666' }}>现居住地</label>
-                <input type="text" value={profile.location} onChange={e => setProfile({...profile, location: e.target.value})} placeholder="例如：广东省深圳市南山区" style={inputStyle} />
+                <input type="text" value={profile.location} onChange={e => setProfile({...profile, location: e.target.value})} placeholder="例如：广东省广州市" style={inputStyle} />
                 <div style={{ textAlign: 'right' }}>
                   <button onClick={handleSaveProfile} style={{ padding: '6px 20px', borderRadius: '20px', border: 'none', background: '#8b4513', color: '#fff', cursor: 'pointer' }}>保存档案</button>
                 </div>
@@ -360,7 +398,6 @@ export default function App() {
                 <div>出生日期：{profile.birth_date || '未填写'}</div>
                 <div>出生时间：{profile.birth_time || '未填写（后续可由老师或智能体推断）'}</div>
                 <div>现居住地：{profile.location || '未填写'}</div>
-                {/* 【第21天修改8】去掉患者端的八字五行展示，只保留信息录入 */}
               </div>
             )}
           </div>
@@ -427,7 +464,6 @@ export default function App() {
           </div>
         )}
 
-        {/* 【第21天修改9】在医生端展示患者的基础档案（含八字五行） */}
         {(currentRole === '李老师' || currentRole === '李老师智能体') && profile && (
           <div style={{ ...boxStyle, background: '#fffaf0' }}>
             <div style={{ fontSize: '18px', color: '#8b4513', fontWeight: 'bold', marginBottom: '15px' }}>📋 {selectedPatient} 的基础档案（供辨证参考）</div>
@@ -473,7 +509,6 @@ export default function App() {
 
         {currentRole === '李老师' && (
           <div style={boxStyle}>
-            {/* 【第21天修改10】去掉代述标签，直接显示陈述 */}
             <div style={{ textAlign: 'center', fontSize: '18px', color: '#5a7d5a', marginBottom: '15px' }}>📋 接收到 {selectedPatient} 的陈述</div>
             {transcriptions.length === 0 ? (
               <div style={{ textAlign: 'center', color: '#999' }}>暂无陈述记录</div>

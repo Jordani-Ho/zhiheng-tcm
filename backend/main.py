@@ -135,27 +135,39 @@ def add_patient(input_data: AddPatientInput):
     )
     return {"message": "亲友档案添加成功"}
 
-# 【第20天修改】获取患者档案，同时返回八字与五行推算
 @app.get("/api/patient-profile")
 def get_patient_profile(patient_name: str):
     profile = database.get_patient_profile(patient_name)
     
-    # 计算八字
     if profile and profile["birth_date"]:
         try:
-            # 如果出生时间未知，默认按当天 00:00（子时）推算，并提醒用户
             time_str = profile["birth_time"] if profile["birth_time"] else "00:00"
             birth_dt = datetime.strptime(f"{profile['birth_date']} {time_str}", "%Y-%m-%d %H:%M")
             
             lunar_obj = cnlunar.Lunar(birth_dt, godType='8char')
             profile["bazi"] = f"{lunar_obj.year8Char} {lunar_obj.month8Char} {lunar_obj.day8Char} {lunar_obj.twohour8Char}"
             
-            # 简单推算五行属性（cnlunar 提供了五行）
-            if hasattr(lunar_obj, 'baziFiveElements'):
-                profile["wuxing"] = lunar_obj.baziFiveElements
+            wuxing_str = "五行推算暂不可用"
+            if hasattr(lunar_obj, 'baziFiveElements') and lunar_obj.baziFiveElements:
+                elems = lunar_obj.baziFiveElements
+                if isinstance(elems, dict):
+                    wuxing_str = " ".join([f"{k}:{v}" for k, v in elems.items()])
+                else:
+                    wuxing_str = str(elems)
             else:
-                profile["wuxing"] = "五行推算暂不可用"
-        except Exception as e:
+                try:
+                    bazi_chars = [lunar_obj.year8Char[0], lunar_obj.month8Char[0], lunar_obj.day8Char[0], lunar_obj.twohour8Char[0]]
+                    wuxing_map = {'甲':'木','乙':'木','丙':'火','丁':'火','戊':'土','己':'土','庚':'金','辛':'金','壬':'水','癸':'水'}
+                    counts = {"木":0, "火":0, "土":0, "金":0, "水":0}
+                    for c in bazi_chars:
+                        if c in wuxing_map:
+                            counts[wuxing_map[c]] += 1
+                    wuxing_str = " ".join([f"{k}:{v}" for k, v in counts.items()])
+                except Exception:
+                    wuxing_str = "五行推算暂不可用"
+            
+            profile["wuxing"] = wuxing_str
+        except Exception:
             profile["bazi"] = "八字推算失败"
             profile["wuxing"] = "五行推算失败"
     else:
