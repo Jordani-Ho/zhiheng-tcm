@@ -1,10 +1,14 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from datetime import datetime
 import lunardate
 import cnlunar
 import database
+import os
+import shutil
+import uuid
 
 app = FastAPI(title="zhiheng-tcm-backend")
 
@@ -15,6 +19,12 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# 创建上传目录
+UPLOAD_DIR = os.path.join(os.path.dirname(__file__), "uploads")
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+# 挂载静态文件服务，让前端可以通过 /uploads/xxx.jpg 访问图片
+app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 
 database.init_db()
 
@@ -94,12 +104,10 @@ def get_huangli():
         "current_shi": current_shi
     }
 
-# 【第13天新增】获取患者列表接口
 @app.get("/api/patients")
 def get_patients():
     return database.get_patients()
 
-# 【第13天修改】支持根据患者动态获取数据
 @app.get("/api/role-data")
 def get_role_data(role: str, patient_name: str = "张三"):
     hw = database.get_homework(patient_name)
@@ -124,7 +132,6 @@ def get_role_data(role: str, patient_name: str = "张三"):
             return {"role_type": "patient", "name": patient_name, "task": hw["task"], "detail": "老师已签字确认，完成！"}
     return {"role_type": "unknown", "name": role, "task": "暂无任务", "detail": "数据加载中..."}
 
-# 【第13天新增】老师布置作业接口
 @app.post("/api/homework")
 def create_homework(input_data: HomeworkInput):
     database.create_homework(input_data.patient_name, input_data.task, input_data.detail)
@@ -146,6 +153,26 @@ def transcribe(input_data: TranscriptionInput):
     database.insert_transcription(input_data.patient_name, input_data.content, input_data.data_type)
     return {"message": "转述成功"}
 
+# 【第14天新增】图片上传接口
+@app.post("/api/upload")
+async def upload_image(patient_name: str = "张三", file: UploadFile = File(...)):
+    # 1. 生成唯一文件名，防止重名覆盖
+    ext = os.path.splitext(file.filename)[1] if file.filename else ".jpg"
+    unique_name = f"{uuid.uuid4().hex}{ext}"
+    file_path = os.path.join(UPLOAD_DIR, unique_name)
+    
+    # 2. 保存文件
+    with open(file_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+    
+    # 3. 生成访问 URL（相对路径，前端会自动通过代理访问）
+    file_url = f"/uploads/{unique_name}"
+    
+    # 4. 原样记录到转述表（智能体只负责转述，不推理）
+    database.insert_transcription(patient_name, file_url, "image")
+    
+    return {"message": "图片转述成功", "url": file_url}
+
 @app.get("/api/transcriptions")
 def get_transcriptions(patient_name: str = None):
     return database.get_transcriptions(patient_name)
@@ -161,11 +188,17 @@ def generate_draft(transcript_id: int):
     past_records = database.get_patient_records(patient_name)
     past_content = "\n".join([f"- {r['content']}" for r in past_records]) if past_records else "暂无过往病历"
 
+    # 如果是图片，转述内容显示为图片链接
+    if transcript['data_type'] == 'image':
+        content_desc = f"[患者上传了图片：{transcript['content']}]"
+    else:
+        content_desc = transcript['content']
+
     template = f"""【{patient_name}过往病历】
 {past_content}
 
 【{patient_name}最新陈述】
-{transcript['content']}
+{content_desc}
 
 （以上内容仅供老师辨证参考）"""
 

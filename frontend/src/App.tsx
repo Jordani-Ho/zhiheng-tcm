@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useState, useRef } from 'react'
 
 interface HuangliData { date: string; lunar: string; solar_term: string; solar_term_tip: string; health_trend: string; homework: string; }
 interface RoleData { role_type: string; name: string; task: string; detail: string; }
@@ -16,11 +16,13 @@ export default function App() {
   const [patientRecords, setPatientRecords] = useState<Draft[]>([])
   const [finalPlans, setFinalPlans] = useState<{ [key: number]: string }>({})
   const [points, setPoints] = useState<{ patient_points: number; teacher_points: number } | null>(null)
-  // 【第13天新增】患者列表与当前选中患者
   const [patients, setPatients] = useState<Patient[]>([])
   const [selectedPatient, setSelectedPatient] = useState('张三')
   const [newTask, setNewTask] = useState('')
   const [newDetail, setNewDetail] = useState('')
+  // 【第14天新增】图片上传状态
+  const [uploading, setUploading] = useState(false)
+  const fileInputRef = useRef<HTMLInputElement>(null)
 
   useEffect(() => {
     fetch('/api/huangli').then(r => r.json()).then(d => setHuangli(d)).catch(() => setHuangli(null))
@@ -73,6 +75,31 @@ export default function App() {
     }).then(() => { setInputText(''); fetchTranscriptions() })
   }
 
+  // 【第14天新增】图片上传处理
+  const handleImageUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]
+    if (!file) return
+
+    setUploading(true)
+    const formData = new FormData()
+    formData.append('file', file)
+
+    fetch(`/api/upload?patient_name=${selectedPatient}`, {
+      method: 'POST',
+      body: formData
+    })
+      .then(r => r.json())
+      .then(() => {
+        setUploading(false)
+        fetchTranscriptions() // 刷新转述列表
+        if (fileInputRef.current) fileInputRef.current.value = '' // 清空文件选择
+      })
+      .catch(() => {
+        setUploading(false)
+        alert("图片上传失败，请重试")
+      })
+  }
+
   const handleGenerateDraft = (transcriptId: number) => {
     fetch(`/api/generate-draft?transcript_id=${transcriptId}`, { method: 'POST' })
       .then(() => fetchDrafts())
@@ -105,7 +132,6 @@ export default function App() {
     })
   }
 
-  // 【第13天新增】老师布置作业
   const handleCreateHomework = () => {
     if (!newTask.trim()) {
       alert("请填写作业内容！")
@@ -151,7 +177,6 @@ export default function App() {
           </div>
         )}
 
-        {/* 【第13天新增】患者选择器 */}
         <div style={{ ...boxStyle, background: '#f7fcf9' }}>
           <div style={{ textAlign: 'center', marginBottom: '10px', color: '#5a7d5a', fontWeight: 'bold' }}>👥 当前患者</div>
           <div style={{ display: 'flex', flexWrap: 'wrap', justifyContent: 'center' }}>
@@ -194,25 +219,12 @@ export default function App() {
           )}
         </div>
 
-        {/* 【第13天新增】老师布置作业区 */}
         {currentRole === '李老师' && (
           <div style={{ ...boxStyle, background: '#f0f7f0' }}>
             <div style={{ textAlign: 'center', fontSize: '18px', color: '#5a7d5a', marginBottom: '15px' }}>📝 给 {selectedPatient} 布置作业</div>
-            <input 
-              value={newTask} 
-              onChange={(e) => setNewTask(e.target.value)} 
-              placeholder="作业标题（例如：按揉太渊穴5分钟）" 
-              style={{ width: '100%', padding: '10px', borderRadius: '8px', border: '1px solid #b8d8c0', fontFamily: 'serif', marginBottom: '10px', boxSizing: 'border-box' }}
-            />
-            <input 
-              value={newDetail} 
-              onChange={(e) => setNewDetail(e.target.value)} 
-              placeholder="作业详情（例如：请记得在酉时完成）" 
-              style={{ width: '100%', padding: '10px', borderRadius: '8px', border: '1px solid #b8d8c0', fontFamily: 'serif', marginBottom: '10px', boxSizing: 'border-box' }}
-            />
-            <div style={{ textAlign: 'center' }}>
-              <button onClick={handleCreateHomework} style={{ padding: '8px 20px', borderRadius: '20px', border: 'none', background: '#5a7d5a', color: '#fff', cursor: 'pointer' }}>布置作业</button>
-            </div>
+            <input value={newTask} onChange={(e) => setNewTask(e.target.value)} placeholder="作业标题（例如：按揉太渊穴5分钟）" style={{ width: '100%', padding: '10px', borderRadius: '8px', border: '1px solid #b8d8c0', fontFamily: 'serif', marginBottom: '10px', boxSizing: 'border-box' }} />
+            <input value={newDetail} onChange={(e) => setNewDetail(e.target.value)} placeholder="作业详情（例如：请记得在酉时完成）" style={{ width: '100%', padding: '10px', borderRadius: '8px', border: '1px solid #b8d8c0', fontFamily: 'serif', marginBottom: '10px', boxSizing: 'border-box' }} />
+            <div style={{ textAlign: 'center' }}><button onClick={handleCreateHomework} style={{ padding: '8px 20px', borderRadius: '20px', border: 'none', background: '#5a7d5a', color: '#fff', cursor: 'pointer' }}>布置作业</button></div>
           </div>
         )}
 
@@ -220,7 +232,14 @@ export default function App() {
           <div style={boxStyle}>
             <div style={{ textAlign: 'center', fontSize: '18px', color: '#8b4513', marginBottom: '15px' }}>🗣️ 患者智能体（仅转述，不推理）</div>
             <textarea value={inputText} onChange={(e) => setInputText(e.target.value)} placeholder="在此输入您的感受、症状或语音识别后的文字..." style={{ width: '100%', height: '80px', padding: '10px', borderRadius: '8px', border: '1px solid #d4c8a8', fontFamily: 'serif', marginBottom: '15px', boxSizing: 'border-box' }} />
-            <div style={{ textAlign: 'center' }}><button onClick={handleTranscribe} style={{ padding: '10px 24px', borderRadius: '30px', border: 'none', background: '#8b4513', color: '#fff', fontSize: '16px', cursor: 'pointer' }}>发送给智能体转述</button></div>
+            <div style={{ display: 'flex', justifyContent: 'center', gap: '10px' }}>
+              <button onClick={handleTranscribe} style={{ padding: '10px 24px', borderRadius: '30px', border: 'none', background: '#8b4513', color: '#fff', fontSize: '16px', cursor: 'pointer' }}>发送文字转述</button>
+              {/* 【第14天新增】图片上传按钮 */}
+              <button onClick={() => fileInputRef.current?.click()} style={{ padding: '10px 24px', borderRadius: '30px', border: '1px solid #8b4513', background: '#fdfcf0', color: '#8b4513', fontSize: '16px', cursor: 'pointer' }} disabled={uploading}>
+                {uploading ? '上传中...' : '📷 上传图片'}
+              </button>
+              <input type="file" ref={fileInputRef} onChange={handleImageUpload} accept="image/*" style={{ display: 'none' }} />
+            </div>
           </div>
         )}
 
@@ -233,7 +252,13 @@ export default function App() {
               <ul style={{ paddingLeft: '20px', color: '#333' }}>
                 {transcriptions.map(t => (
                   <li key={t.id} style={{ marginBottom: '10px' }}>
-                    <span style={{ color: '#8b4513', fontWeight: 'bold' }}>[{t.data_type}]</span> {t.content}
+                    <span style={{ color: '#8b4513', fontWeight: 'bold' }}>[{t.data_type}]</span>
+                    {/* 【第14天修改】图片类型显示缩略图 */}
+                    {t.data_type === 'image' ? (
+                      <img src={t.content} alt="患者上传图片" style={{ maxWidth: '150px', borderRadius: '8px', marginLeft: '5px', display: 'block', marginTop: '5px' }} />
+                    ) : (
+                      <span style={{ marginLeft: '5px' }}>{t.content}</span>
+                    )}
                     <button onClick={() => handleGenerateDraft(t.id)} style={{ marginLeft: '10px', padding: '2px 8px', fontSize: '12px', borderRadius: '10px', border: '1px solid #5a7d5a', background: 'transparent', color: '#5a7d5a', cursor: 'pointer' }}>生成病历草案</button>
                   </li>
                 ))}
@@ -251,26 +276,13 @@ export default function App() {
               drafts.map(d => (
                 <div key={d.id} style={{ padding: '15px', border: '1px solid #e0e0e0', borderRadius: '8px', marginBottom: '15px', background: '#fff' }}>
                   <div style={{ color: '#8b4513', fontWeight: 'bold', marginBottom: '5px' }}>患者：{d.patient_name} 的病历</div>
-                  <textarea 
-                    value={d.content} 
-                    onChange={(e) => {
-                      const newDrafts = drafts.map(item => item.id === d.id ? { ...item, content: e.target.value } : item);
-                      setDrafts(newDrafts);
-                    }}
-                    style={{ width: '100%', height: '120px', padding: '10px', borderRadius: '8px', border: '1px solid #d4c8a8', fontFamily: 'serif', fontSize: '14px', marginBottom: '10px', boxSizing: 'border-box', whiteSpace: 'pre-wrap' }} 
-                  />
+                  <textarea value={d.content} onChange={(e) => { const newDrafts = drafts.map(item => item.id === d.id ? { ...item, content: e.target.value } : item); setDrafts(newDrafts); }} style={{ width: '100%', height: '120px', padding: '10px', borderRadius: '8px', border: '1px solid #d4c8a8', fontFamily: 'serif', fontSize: '14px', marginBottom: '10px', boxSizing: 'border-box', whiteSpace: 'pre-wrap' }} />
                   <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: '15px' }}>
                     <button onClick={() => handleEditDraft(d.id, d.content)} style={{ padding: '6px 16px', borderRadius: '20px', border: '1px solid #8b4513', background: 'transparent', color: '#8b4513', cursor: 'pointer' }}>保存病历修改</button>
                   </div>
-
                   <div style={{ borderTop: '1px dashed #d4c8a8', paddingTop: '15px' }}>
                     <div style={{ color: '#5a7d5a', fontWeight: 'bold', marginBottom: '8px' }}>📝 给 {d.patient_name} 的最终辨证施治方案（患者只能看到这里的内容）</div>
-                    <textarea
-                      value={finalPlans[d.id] || ''}
-                      onChange={(e) => setFinalPlans({ ...finalPlans, [d.id]: e.target.value })}
-                      placeholder="请在此写下最终结论、医嘱或调理方案..."
-                      style={{ width: '100%', height: '80px', padding: '10px', borderRadius: '8px', border: '1px solid #b8d8c0', background: '#f7fcf9', fontFamily: 'serif', fontSize: '14px', marginBottom: '10px', boxSizing: 'border-box' }}
-                    />
+                    <textarea value={finalPlans[d.id] || ''} onChange={(e) => setFinalPlans({ ...finalPlans, [d.id]: e.target.value })} placeholder="请在此写下最终结论、医嘱或调理方案..." style={{ width: '100%', height: '80px', padding: '10px', borderRadius: '8px', border: '1px solid #b8d8c0', background: '#f7fcf9', fontFamily: 'serif', fontSize: '14px', marginBottom: '10px', boxSizing: 'border-box' }} />
                     <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
                       <button onClick={() => handleSignDraft(d.id)} style={{ padding: '8px 20px', borderRadius: '20px', border: 'none', background: '#5a7d5a', color: '#fff', cursor: 'pointer', fontWeight: 'bold' }}>签字归档（阅后即焚，支付50积分）</button>
                     </div>
