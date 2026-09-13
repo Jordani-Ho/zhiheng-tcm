@@ -49,10 +49,14 @@ class ProfileInput(BaseModel):
     birth_time: str
     location: str
 
-# 【第18天新增】添加家庭成员模型
 class AddPatientInput(BaseModel):
     name: str
     guardian_name: str
+    relation: str
+    gender: str
+    birth_date: str
+    birth_time: str
+    location: str
 
 @app.get("/api/huangli")
 def get_huangli():
@@ -114,20 +118,51 @@ def get_huangli():
         "current_shi": current_shi
     }
 
-# 【第18天修改】获取当前监护人下的所有患者
 @app.get("/api/patients")
 def get_patients(guardian_name: str = None):
     return database.get_patients(guardian_name)
 
-# 【第18天新增】添加家属档案
 @app.post("/api/patients/add")
 def add_patient(input_data: AddPatientInput):
-    database.add_patient(input_data.name, input_data.guardian_name)
-    return {"message": "家属档案添加成功"}
+    database.add_patient(
+        input_data.name,
+        input_data.guardian_name,
+        input_data.relation,
+        input_data.gender,
+        input_data.birth_date,
+        input_data.birth_time,
+        input_data.location
+    )
+    return {"message": "亲友档案添加成功"}
 
+# 【第20天修改】获取患者档案，同时返回八字与五行推算
 @app.get("/api/patient-profile")
 def get_patient_profile(patient_name: str):
-    return database.get_patient_profile(patient_name)
+    profile = database.get_patient_profile(patient_name)
+    
+    # 计算八字
+    if profile and profile["birth_date"]:
+        try:
+            # 如果出生时间未知，默认按当天 00:00（子时）推算，并提醒用户
+            time_str = profile["birth_time"] if profile["birth_time"] else "00:00"
+            birth_dt = datetime.strptime(f"{profile['birth_date']} {time_str}", "%Y-%m-%d %H:%M")
+            
+            lunar_obj = cnlunar.Lunar(birth_dt, godType='8char')
+            profile["bazi"] = f"{lunar_obj.year8Char} {lunar_obj.month8Char} {lunar_obj.day8Char} {lunar_obj.twohour8Char}"
+            
+            # 简单推算五行属性（cnlunar 提供了五行）
+            if hasattr(lunar_obj, 'baziFiveElements'):
+                profile["wuxing"] = lunar_obj.baziFiveElements
+            else:
+                profile["wuxing"] = "五行推算暂不可用"
+        except Exception as e:
+            profile["bazi"] = "八字推算失败"
+            profile["wuxing"] = "五行推算失败"
+    else:
+        profile["bazi"] = "缺少出生日期，无法推算八字"
+        profile["wuxing"] = "缺少出生日期，无法推算五行"
+        
+    return profile
 
 @app.post("/api/patient-profile")
 def save_patient_profile(input_data: ProfileInput):

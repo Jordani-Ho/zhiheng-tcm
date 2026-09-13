@@ -12,12 +12,13 @@ def init_db():
     conn = get_connection()
     cursor = conn.cursor()
 
-    # 1. 患者表（【第18天修改】新增 guardian_name 字段）
+    # 1. 患者表（新增 relation 关系字段）
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS patients (
         name TEXT PRIMARY KEY,
         teacher_name TEXT DEFAULT '李老师',
-        guardian_name TEXT DEFAULT 'self'
+        guardian_name TEXT DEFAULT 'self',
+        relation TEXT DEFAULT '本人'
     )
     """)
 
@@ -89,9 +90,8 @@ def init_db():
     # 初始化默认数据
     cursor.execute("SELECT COUNT(*) as count FROM patients")
     if cursor.fetchone()["count"] == 0:
-        # 默认把张三、李四都当作自己管理自己
-        cursor.execute("INSERT INTO patients (name, teacher_name, guardian_name) VALUES (?, ?, ?)", ("张三", "李老师", "self"))
-        cursor.execute("INSERT INTO patients (name, teacher_name, guardian_name) VALUES (?, ?, ?)", ("李四", "李老师", "self"))
+        cursor.execute("INSERT INTO patients (name, teacher_name, guardian_name, relation) VALUES (?, ?, ?, ?)", ("张三", "李老师", "self", "本人"))
+        cursor.execute("INSERT INTO patients (name, teacher_name, guardian_name, relation) VALUES (?, ?, ?, ?)", ("李四", "李老师", "self", "本人"))
         conn.commit()
 
     cursor.execute("SELECT COUNT(*) as count FROM homework")
@@ -113,16 +113,30 @@ def init_db():
 def get_patients(guardian_name=None):
     conn = get_connection()
     if guardian_name:
-        # 获取“自己”以及“自己监护的所有家属”
         rows = conn.execute("SELECT * FROM patients WHERE name = ? OR guardian_name = ?", (guardian_name, guardian_name)).fetchall()
     else:
         rows = conn.execute("SELECT * FROM patients").fetchall()
     conn.close()
     return [dict(r) for r in rows]
 
-def add_patient(name, guardian_name):
+# 【第19天修改】添加亲友及其基础信息档案
+def add_patient(name, guardian_name, relation, gender, birth_date, birth_time, location):
     conn = get_connection()
-    conn.execute("INSERT OR IGNORE INTO patients (name, teacher_name, guardian_name) VALUES (?, ?, ?)", (name, "李老师", guardian_name))
+    # 1. 写入患者表
+    conn.execute("INSERT OR IGNORE INTO patients (name, teacher_name, guardian_name, relation) VALUES (?, ?, ?, ?)", 
+                 (name, "李老师", guardian_name, relation))
+    
+    # 2. 同时写入基础档案表
+    conn.execute("""
+    INSERT INTO patient_profiles (patient_name, gender, birth_date, birth_time, location)
+    VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT(patient_name) DO UPDATE SET
+        gender=excluded.gender,
+        birth_date=excluded.birth_date,
+        birth_time=excluded.birth_time,
+        location=excluded.location
+    """, (name, gender, birth_date, birth_time, location))
+    
     conn.commit()
     conn.close()
 
