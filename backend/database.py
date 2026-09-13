@@ -20,7 +20,18 @@ def init_db():
     )
     """)
 
-    # 2. 作业表
+    # 2. 【第17天新增】患者基础档案表
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS patient_profiles (
+        patient_name TEXT PRIMARY KEY,
+        gender TEXT,
+        birth_date TEXT,
+        birth_time TEXT,
+        location TEXT
+    )
+    """)
+
+    # 3. 作业表
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS homework (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -32,7 +43,7 @@ def init_db():
     )
     """)
 
-    # 3. 转述表
+    # 4. 转述表
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS transcriptions (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -42,7 +53,7 @@ def init_db():
     )
     """)
 
-    # 4. 病历草案表
+    # 5. 病历草案表
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS drafts (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -53,7 +64,7 @@ def init_db():
     )
     """)
 
-    # 5. 患者健康档案表（【第16天修改】加入 AI 原始草案与最终方案字段）
+    # 6. 患者健康档案表
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS patient_records (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -64,7 +75,7 @@ def init_db():
     )
     """)
 
-    # 6. 积分账户表
+    # 7. 积分账户表
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS accounts (
         role_name TEXT PRIMARY KEY,
@@ -102,6 +113,29 @@ def get_patients():
     rows = conn.execute("SELECT * FROM patients").fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
+# 【第17天新增】患者基础档案操作
+def get_patient_profile(patient_name):
+    conn = get_connection()
+    row = conn.execute("SELECT * FROM patient_profiles WHERE patient_name = ?", (patient_name,)).fetchone()
+    conn.close()
+    if row:
+        return dict(row)
+    return {"patient_name": patient_name, "gender": "", "birth_date": "", "birth_time": "", "location": ""}
+
+def save_patient_profile(patient_name, gender, birth_date, birth_time, location):
+    conn = get_connection()
+    conn.execute("""
+    INSERT INTO patient_profiles (patient_name, gender, birth_date, birth_time, location)
+    VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT(patient_name) DO UPDATE SET
+        gender=excluded.gender,
+        birth_date=excluded.birth_date,
+        birth_time=excluded.birth_time,
+        location=excluded.location
+    """, (patient_name, gender, birth_date, birth_time, location))
+    conn.commit()
+    conn.close()
 
 # ---------- 作业相关操作 ----------
 def get_homework(patient_name):
@@ -162,7 +196,6 @@ def update_draft_content(draft_id, content):
     conn.commit()
     conn.close()
 
-# 【第16天修改】签字时，同时保存 AI 原始草案与老师最终方案
 def sign_draft(draft_id, final_plan):
     conn = get_connection()
     draft = conn.execute("SELECT * FROM drafts WHERE id = ?", (draft_id,)).fetchone()
@@ -170,11 +203,8 @@ def sign_draft(draft_id, final_plan):
         conn.close()
         return None
 
-    # 将 AI 生成的原始草案 和 老师最终修改的方案 一起归档
     conn.execute("INSERT INTO patient_records (patient_name, ai_draft, final_plan, doctor) VALUES (?, ?, ?, ?)",
                  (draft["patient_name"], draft["content"], final_plan, "李老师"))
-
-    # 删除草案（阅后即焚）
     conn.execute("DELETE FROM drafts WHERE id = ?", (draft_id,))
     
     conn.commit()

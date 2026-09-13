@@ -6,6 +6,8 @@ interface Transcription { id: number; patient_name: string; content: string; dat
 interface Draft { id: number; transcript_id: number; patient_name: string; content: string; signed: boolean; doctor?: string; }
 interface Patient { name: string; teacher_name: string; }
 interface PatientRecord { id: number; patient_name: string; ai_draft: string; final_plan: string; doctor: string; }
+// 【第17天新增】档案接口
+interface PatientProfile { patient_name: string; gender: string; birth_date: string; birth_time: string; location: string; }
 
 export default function App() {
   const [huangli, setHuangli] = useState<HuangliData | null>(null)
@@ -24,6 +26,9 @@ export default function App() {
   const [uploading, setUploading] = useState(false)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const [showHistory, setShowHistory] = useState(false)
+  // 【第17天新增】档案状态
+  const [profile, setProfile] = useState<PatientProfile | null>(null)
+  const [editingProfile, setEditingProfile] = useState(false)
 
   useEffect(() => {
     fetch('/api/huangli').then(r => r.json()).then(d => setHuangli(d)).catch(() => setHuangli(null))
@@ -50,12 +55,18 @@ export default function App() {
     fetch(`/api/points?patient_name=${selectedPatient}`).then(r => r.json()).then(d => setPoints(d)).catch(() => setPoints(null))
   }
 
+  // 【第17天新增】获取档案
+  const fetchProfile = () => {
+    fetch(`/api/patient-profile?patient_name=${selectedPatient}`).then(r => r.json()).then(d => setProfile(d)).catch(() => setProfile(null))
+  }
+
   useEffect(() => {
     fetchRoleData()
     fetchTranscriptions()
     fetchDrafts()
     fetchPatientRecords()
     fetchPoints()
+    fetchProfile()
     setShowHistory(false)
   }, [currentRole, selectedPatient])
 
@@ -144,9 +155,23 @@ export default function App() {
     })
   }
 
+  // 【第17天新增】保存档案
+  const handleSaveProfile = () => {
+    if (!profile) return
+    fetch('/api/patient-profile', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(profile)
+    }).then(() => {
+      setEditingProfile(false)
+      alert("档案已保存！")
+    })
+  }
+
   const boxStyle = { background: '#fdfcf0', border: '1px solid #d4c8a8', borderRadius: '12px', padding: '24px', marginBottom: '20px', boxShadow: '0 4px 12px rgba(0,0,0,0.06)' }
   const roleBtnStyle = (role: string) => ({ padding: '8px 16px', margin: '5px', borderRadius: '20px', border: '1px solid #8b4513', cursor: 'pointer', fontFamily: 'serif', fontSize: '14px', backgroundColor: currentRole === role ? '#8b4513' : '#fdfcf0', color: currentRole === role ? '#fff' : '#8b4513', transition: 'all 0.2s' })
   const patientBtnStyle = (name: string) => ({ padding: '4px 12px', margin: '3px', borderRadius: '15px', border: '1px solid #5a7d5a', cursor: 'pointer', fontFamily: 'serif', fontSize: '12px', backgroundColor: selectedPatient === name ? '#5a7d5a' : '#f7fcf9', color: selectedPatient === name ? '#fff' : '#5a7d5a', transition: 'all 0.2s' })
+  const inputStyle = { width: '100%', padding: '8px', borderRadius: '6px', border: '1px solid #d4c8a8', fontFamily: 'serif', marginBottom: '8px', boxSizing: 'border-box' as const }
 
   return (
     <div style={{ minHeight: '100vh', background: '#f5f1e6', padding: '40px 20px', fontFamily: 'serif' }}>
@@ -181,6 +206,48 @@ export default function App() {
           </div>
         </div>
 
+        {/* 【第17天新增】患者基础档案卡片（患者和患者智能体可见） */}
+        {(currentRole === '患者' || currentRole === '患者智能体') && profile && (
+          <div style={{ ...boxStyle, background: '#fffaf0' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '15px' }}>
+              <div style={{ fontSize: '18px', color: '#8b4513', fontWeight: 'bold' }}>📋 {selectedPatient} 的基础档案</div>
+              <button 
+                onClick={() => setEditingProfile(!editingProfile)}
+                style={{ padding: '4px 12px', borderRadius: '15px', border: '1px solid #8b4513', background: 'transparent', color: '#8b4513', cursor: 'pointer', fontSize: '12px' }}
+              >
+                {editingProfile ? '取消' : '编辑/补充'}
+              </button>
+            </div>
+            
+            {editingProfile ? (
+              <div>
+                <label style={{ fontSize: '13px', color: '#666' }}>性别</label>
+                <select value={profile.gender} onChange={e => setProfile({...profile, gender: e.target.value})} style={inputStyle}>
+                  <option value="">请选择</option>
+                  <option value="男">男</option>
+                  <option value="女">女</option>
+                </select>
+                <label style={{ fontSize: '13px', color: '#666' }}>出生日期</label>
+                <input type="date" value={profile.birth_date} onChange={e => setProfile({...profile, birth_date: e.target.value})} style={inputStyle} />
+                <label style={{ fontSize: '13px', color: '#666' }}>出生时间（选填，不知可留空）</label>
+                <input type="time" value={profile.birth_time} onChange={e => setProfile({...profile, birth_time: e.target.value})} style={inputStyle} />
+                <label style={{ fontSize: '13px', color: '#666' }}>现居住地</label>
+                <input type="text" value={profile.location} onChange={e => setProfile({...profile, location: e.target.value})} placeholder="例如：广东省深圳市南山区" style={inputStyle} />
+                <div style={{ textAlign: 'right' }}>
+                  <button onClick={handleSaveProfile} style={{ padding: '6px 20px', borderRadius: '20px', border: 'none', background: '#8b4513', color: '#fff', cursor: 'pointer' }}>保存档案</button>
+                </div>
+              </div>
+            ) : (
+              <div style={{ fontSize: '14px', color: '#333', lineHeight: '2' }}>
+                <div>性别：{profile.gender || '未填写'}</div>
+                <div>出生日期：{profile.birth_date || '未填写'}</div>
+                <div>出生时间：{profile.birth_time || '未填写（后续可由老师或智能体推断）'}</div>
+                <div>现居住地：{profile.location || '未填写'}</div>
+              </div>
+            )}
+          </div>
+        )}
+
         <div style={boxStyle}>
           <div style={{ textAlign: 'center', marginBottom: '15px', color: '#8b4513', fontWeight: 'bold' }}>🧑‍⚕️ 角色切换</div>
           <div style={{ display: 'flex', flexWrap: 'wrap', justifyContent: 'center' }}>
@@ -214,7 +281,7 @@ export default function App() {
           )}
         </div>
 
-        {/* 【第16天修改】老师端查看历史病历（展示学习轨迹） */}
+        {/* 老师端查看历史病历（展示学习轨迹） */}
         {(currentRole === '李老师' || currentRole === '李老师智能体') && (
           <div style={{ ...boxStyle, background: '#fff9f0' }}>
             <div 

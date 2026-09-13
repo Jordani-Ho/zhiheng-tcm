@@ -42,6 +42,14 @@ class HomeworkInput(BaseModel):
     task: str
     detail: str
 
+# 【第17天新增】患者档案输入模型
+class ProfileInput(BaseModel):
+    patient_name: str
+    gender: str
+    birth_date: str
+    birth_time: str
+    location: str
+
 @app.get("/api/huangli")
 def get_huangli():
     now = datetime.now()
@@ -105,6 +113,23 @@ def get_huangli():
 @app.get("/api/patients")
 def get_patients():
     return database.get_patients()
+
+# 【第17天新增】获取患者档案
+@app.get("/api/patient-profile")
+def get_patient_profile(patient_name: str):
+    return database.get_patient_profile(patient_name)
+
+# 【第17天新增】保存患者档案
+@app.post("/api/patient-profile")
+def save_patient_profile(input_data: ProfileInput):
+    database.save_patient_profile(
+        input_data.patient_name,
+        input_data.gender,
+        input_data.birth_date,
+        input_data.birth_time,
+        input_data.location
+    )
+    return {"message": "档案保存成功"}
 
 @app.get("/api/role-data")
 def get_role_data(role: str, patient_name: str = "张三"):
