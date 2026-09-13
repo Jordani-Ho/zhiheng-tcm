@@ -12,7 +12,7 @@ def init_db():
     conn = get_connection()
     cursor = conn.cursor()
 
-    # 1. 患者表（新增 relation 关系字段）
+    # 1. 患者表
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS patients (
         name TEXT PRIMARY KEY,
@@ -45,13 +45,14 @@ def init_db():
     )
     """)
 
-    # 4. 转述表
+    # 4. 转述表（【第26天修改】增加 processed 字段，用于标记是否已生成草案）
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS transcriptions (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         patient_name TEXT,
         content TEXT,
-        data_type TEXT
+        data_type TEXT,
+        processed INTEGER DEFAULT 0
     )
     """)
 
@@ -119,14 +120,10 @@ def get_patients(guardian_name=None):
     conn.close()
     return [dict(r) for r in rows]
 
-# 【第19天修改】添加亲友及其基础信息档案
 def add_patient(name, guardian_name, relation, gender, birth_date, birth_time, location):
     conn = get_connection()
-    # 1. 写入患者表
     conn.execute("INSERT OR IGNORE INTO patients (name, teacher_name, guardian_name, relation) VALUES (?, ?, ?, ?)", 
                  (name, "李老师", guardian_name, relation))
-    
-    # 2. 同时写入基础档案表
     conn.execute("""
     INSERT INTO patient_profiles (patient_name, gender, birth_date, birth_time, location)
     VALUES (?, ?, ?, ?, ?)
@@ -136,11 +133,9 @@ def add_patient(name, guardian_name, relation, gender, birth_date, birth_time, l
         birth_time=excluded.birth_time,
         location=excluded.location
     """, (name, gender, birth_date, birth_time, location))
-    
     conn.commit()
     conn.close()
 
-# 患者基础档案操作
 def get_patient_profile(patient_name):
     conn = get_connection()
     row = conn.execute("SELECT * FROM patient_profiles WHERE patient_name = ?", (patient_name,)).fetchone()
@@ -186,25 +181,28 @@ def update_homework_status(patient_name, status):
 # ---------- 转述相关操作 ----------
 def insert_transcription(patient_name, content, data_type):
     conn = get_connection()
-    conn.execute("INSERT INTO transcriptions (patient_name, content, data_type) VALUES (?, ?, ?)",
+    conn.execute("INSERT INTO transcriptions (patient_name, content, data_type, processed) VALUES (?, ?, ?, 0)",
                  (patient_name, content, data_type))
     conn.commit()
     conn.close()
 
+# 【第26天修改】只获取未处理的转述
 def get_transcriptions(patient_name=None):
     conn = get_connection()
     if patient_name:
-        rows = conn.execute("SELECT * FROM transcriptions WHERE patient_name = ? ORDER BY id DESC", (patient_name,)).fetchall()
+        rows = conn.execute("SELECT * FROM transcriptions WHERE patient_name = ? AND processed = 0 ORDER BY id DESC", (patient_name,)).fetchall()
     else:
-        rows = conn.execute("SELECT * FROM transcriptions ORDER BY id DESC").fetchall()
+        rows = conn.execute("SELECT * FROM transcriptions WHERE processed = 0 ORDER BY id DESC").fetchall()
     conn.close()
     return [dict(r) for r in rows]
 
 # ---------- 病历草案相关操作 ----------
+# 【第26天修改】生成草案时，把对应的陈述标记为已处理
 def insert_draft(transcript_id, patient_name, content):
     conn = get_connection()
     cursor = conn.execute("INSERT INTO drafts (transcript_id, patient_name, content, signed) VALUES (?, ?, ?, ?)",
                           (transcript_id, patient_name, content, 0))
+    conn.execute("UPDATE transcriptions SET processed = 1 WHERE id = ?", (transcript_id,))
     conn.commit()
     draft_id = cursor.lastrowid
     conn.close()
@@ -222,6 +220,7 @@ def update_draft_content(draft_id, content):
     conn.commit()
     conn.close()
 
+# 【第26天修改】签字归档时，同时生成作业，并从转述表中彻底删除该陈述
 def sign_draft(draft_id, final_plan):
     conn = get_connection()
     draft = conn.execute("SELECT * FROM drafts WHERE id = ?", (draft_id,)).fetchone()
@@ -229,8 +228,18 @@ def sign_draft(draft_id, final_plan):
         conn.close()
         return None
 
+    # 1. 归档到患者健康档案
     conn.execute("INSERT INTO patient_records (patient_name, ai_draft, final_plan, doctor) VALUES (?, ?, ?, ?)",
                  (draft["patient_name"], draft["content"], final_plan, "李老师"))
+    
+    # 2. 自动生成作业（把最终方案作为任务）
+    conn.execute("INSERT INTO homework (patient_name, task, detail, status, created_at) VALUES (?, ?, ?, ?, ?)",
+                 (draft["patient_name"], f"今日医嘱：{final_plan}", "请严格遵医嘱执行", "pending", "2026-09-11"))
+    
+    # 3. 彻底删除这条转述（阅后即焚）
+    conn.execute("DELETE FROM transcriptions WHERE id = ?", (draft["transcript_id"],))
+    
+    # 4. 删除草案
     conn.execute("DELETE FROM drafts WHERE id = ?", (draft_id,))
     
     conn.commit()
@@ -246,6 +255,25 @@ def get_patient_records(patient_name=None):
         rows = conn.execute("SELECT * FROM patient_records ORDER BY id DESC").fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
+# 【第25天新增】病历修改相关操作
+def is_latest_record(record_id, patient_name):
+    conn = get_connection()
+    latest = conn.execute(
+        "SELECT id FROM patient_records WHERE patient_name = ? ORDER BY id DESC LIMIT 1",
+        (patient_name,)
+    ).fetchone()
+    conn.close()
+    return latest and latest["id"] == record_id
+
+def update_patient_record(record_id, patient_name, new_content):
+    if not is_latest_record(record_id, patient_name):
+        return False
+    conn = get_connection()
+    conn.execute("UPDATE patient_records SET final_plan = ? WHERE id = ?", (new_content, record_id))
+    conn.commit()
+    conn.close()
+    return True
 
 # ---------- 积分相关操作 ----------
 def get_points(role_name):

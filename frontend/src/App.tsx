@@ -20,8 +20,6 @@ export default function App() {
   const [points, setPoints] = useState<{ patient_points: number; teacher_points: number } | null>(null)
   const [patients, setPatients] = useState<Patient[]>([])
   const [selectedPatient, setSelectedPatient] = useState('张三')
-  const [newTask, setNewTask] = useState('')
-  const [newDetail, setNewDetail] = useState('')
   const [uploading, setUploading] = useState(false)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const [showHistory, setShowHistory] = useState(false)
@@ -38,7 +36,10 @@ export default function App() {
   const [newBirthTime, setNewBirthTime] = useState('')
   const [newLocation, setNewLocation] = useState('')
   const [guardianLocation, setGuardianLocation] = useState('')
-  const [guardianGender, setGuardianGender] = useState('') // 监护人性别
+  const [guardianGender, setGuardianGender] = useState('')
+
+  const [editingRecordId, setEditingRecordId] = useState<number | null>(null)
+  const [editingRecordContent, setEditingRecordContent] = useState('')
 
   const currentYear = new Date().getFullYear()
   const yearOptions = Array.from({ length: currentYear - 1920 + 1 }, (_, i) => currentYear - i)
@@ -139,7 +140,10 @@ export default function App() {
 
   const handleGenerateDraft = (transcriptId: number) => {
     fetch(`/api/generate-draft?transcript_id=${transcriptId}`, { method: 'POST' })
-      .then(() => fetchDrafts())
+      .then(() => {
+        fetchDrafts()
+        fetchTranscriptions() // 刷新陈述列表，已处理的会自动消失
+      })
   }
 
   const handleEditDraft = (draftId: number, newContent: string) => {
@@ -165,23 +169,6 @@ export default function App() {
       fetchPatientRecords();
       fetchPoints();
       setFinalPlans(prev => ({ ...prev, [draftId]: '' }));
-    })
-  }
-
-  const handleCreateHomework = () => {
-    if (!newTask.trim()) {
-      alert("请填写作业内容！")
-      return
-    }
-    fetch('/api/homework', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ patient_name: selectedPatient, task: newTask, detail: newDetail })
-    }).then(() => {
-      setNewTask('')
-      setNewDetail('')
-      fetchRoleData()
-      alert("作业布置成功！")
     })
   }
 
@@ -258,6 +245,27 @@ export default function App() {
       fetchPatients('张三')
       alert("亲友档案添加成功！")
     })
+  }
+
+  const handleSaveRecord = (recordId: number) => {
+    if (!editingRecordContent.trim()) {
+      alert("病历内容不能为空！")
+      return
+    }
+    fetch(`/api/patient-records/${recordId}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ patient_name: selectedPatient, content: editingRecordContent })
+    })
+      .then(r => r.json())
+      .then(d => {
+        if (d.error) {
+          alert(d.error)
+        } else {
+          setEditingRecordId(null)
+          fetchPatientRecords()
+        }
+      })
   }
 
   const boxStyle = { background: '#fdfcf0', border: '1px solid #d4c8a8', borderRadius: '12px', padding: '24px', marginBottom: '20px', boxShadow: '0 4px 12px rgba(0,0,0,0.06)' }
@@ -486,15 +494,6 @@ export default function App() {
           </div>
         )}
 
-        {currentRole === '李老师' && (
-          <div style={{ ...boxStyle, background: '#f0f7f0' }}>
-            <div style={{ textAlign: 'center', fontSize: '18px', color: '#5a7d5a', marginBottom: '15px' }}>📝 给 {selectedPatient} 布置作业</div>
-            <input value={newTask} onChange={(e) => setNewTask(e.target.value)} placeholder="作业标题（例如：按揉太渊穴5分钟）" style={{ width: '100%', padding: '10px', borderRadius: '8px', border: '1px solid #b8d8c0', fontFamily: 'serif', marginBottom: '10px', boxSizing: 'border-box' }} />
-            <input value={newDetail} onChange={(e) => setNewDetail(e.target.value)} placeholder="作业详情（例如：请记得在酉时完成）" style={{ width: '100%', padding: '10px', borderRadius: '8px', border: '1px solid #b8d8c0', fontFamily: 'serif', marginBottom: '10px', boxSizing: 'border-box' }} />
-            <div style={{ textAlign: 'center' }}><button onClick={handleCreateHomework} style={{ padding: '8px 20px', borderRadius: '20px', border: 'none', background: '#5a7d5a', color: '#fff', cursor: 'pointer' }}>布置作业</button></div>
-          </div>
-        )}
-
         {(currentRole === '患者' || currentRole === '患者智能体') && (
           <div style={boxStyle}>
             <div style={{ textAlign: 'center', fontSize: '18px', color: '#8b4513', marginBottom: '15px' }}>🗣️ 患者智能体（仅转述，不推理）</div>
@@ -511,9 +510,9 @@ export default function App() {
 
         {currentRole === '李老师' && (
           <div style={boxStyle}>
-            <div style={{ textAlign: 'center', fontSize: '18px', color: '#5a7d5a', marginBottom: '15px' }}>📋 接收到 {selectedPatient} 的陈述</div>
+            <div style={{ textAlign: 'center', fontSize: '18px', color: '#5a7d5a', marginBottom: '15px' }}>📋 待处理陈述（{selectedPatient}）</div>
             {transcriptions.length === 0 ? (
-              <div style={{ textAlign: 'center', color: '#999' }}>暂无陈述记录</div>
+              <div style={{ textAlign: 'center', color: '#999' }}>暂无待处理陈述，请等待患者发送</div>
             ) : (
               <ul style={{ paddingLeft: '20px', color: '#333' }}>
                 {transcriptions.map(t => (
@@ -536,7 +535,7 @@ export default function App() {
           <div style={{ ...boxStyle, background: '#fcfdfa' }}>
             <div style={{ textAlign: 'center', fontSize: '18px', color: '#8b4513', marginBottom: '15px' }}>📄 病历草案（待处理）</div>
             {drafts.length === 0 ? (
-              <div style={{ textAlign: 'center', color: '#999' }}>暂无待处理病历（已签字病历将销毁，不再显示）</div>
+              <div style={{ textAlign: 'center', color: '#999' }}>暂无待处理病历</div>
             ) : (
               drafts.map(d => (
                 <div key={d.id} style={{ padding: '15px', border: '1px solid #e0e0e0', borderRadius: '8px', marginBottom: '15px', background: '#fff' }}>
@@ -546,10 +545,10 @@ export default function App() {
                     <button onClick={() => handleEditDraft(d.id, d.content)} style={{ padding: '6px 16px', borderRadius: '20px', border: '1px solid #8b4513', background: 'transparent', color: '#8b4513', cursor: 'pointer' }}>保存病历修改</button>
                   </div>
                   <div style={{ borderTop: '1px dashed #d4c8a8', paddingTop: '15px' }}>
-                    <div style={{ color: '#5a7d5a', fontWeight: 'bold', marginBottom: '8px' }}>📝 给 {d.patient_name} 的最终辨证施治方案（患者只能看到这里的内容）</div>
-                    <textarea value={finalPlans[d.id] || ''} onChange={(e) => setFinalPlans({ ...finalPlans, [d.id]: e.target.value })} placeholder="请在此写下最终结论、医嘱或调理方案..." style={{ width: '100%', height: '80px', padding: '10px', borderRadius: '8px', border: '1px solid #b8d8c0', background: '#f7fcf9', fontFamily: 'serif', fontSize: '14px', marginBottom: '10px', boxSizing: 'border-box' }} />
+                    <div style={{ color: '#5a7d5a', fontWeight: 'bold', marginBottom: '8px' }}>📝 给 {d.patient_name} 的最终辨证施治方案（同时自动作为患者作业）</div>
+                    <textarea value={finalPlans[d.id] || ''} onChange={(e) => setFinalPlans({ ...finalPlans, [d.id]: e.target.value })} placeholder="请在此写下最终结论、医嘱或调理方案（如：抓药xxx，三碗水煲成一碗，饭后服）..." style={{ width: '100%', height: '80px', padding: '10px', borderRadius: '8px', border: '1px solid #b8d8c0', background: '#f7fcf9', fontFamily: 'serif', fontSize: '14px', marginBottom: '10px', boxSizing: 'border-box' }} />
                     <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
-                      <button onClick={() => handleSignDraft(d.id)} style={{ padding: '8px 20px', borderRadius: '20px', border: 'none', background: '#5a7d5a', color: '#fff', cursor: 'pointer', fontWeight: 'bold' }}>签字归档（阅后即焚，支付50积分）</button>
+                      <button onClick={() => handleSignDraft(d.id)} style={{ padding: '8px 20px', borderRadius: '20px', border: 'none', background: '#5a7d5a', color: '#fff', cursor: 'pointer', fontWeight: 'bold' }}>签字归档（自动布置作业，支付50积分）</button>
                     </div>
                   </div>
                 </div>
@@ -560,16 +559,47 @@ export default function App() {
 
         {(currentRole === '患者' || currentRole === '患者智能体') && (
           <div style={{ ...boxStyle, background: '#f7fcf9' }}>
-            <div style={{ textAlign: 'center', fontSize: '18px', color: '#5a7d5a', marginBottom: '15px' }}>📂 {selectedPatient}的健康档案（数据主权归患者所有）</div>
+            <div style={{ textAlign: 'center', fontSize: '18px', color: '#5a7d5a', marginBottom: '10px' }}>📂 {selectedPatient}的健康档案（数据主权归患者所有）</div>
+            <div style={{ textAlign: 'center', fontSize: '12px', color: '#999', marginBottom: '15px', fontStyle: 'italic' }}>
+              最新病历在下一次就诊前可修改，之后将永久锁定。
+            </div>
             {patientRecords.length === 0 ? (
               <div style={{ textAlign: 'center', color: '#999' }}>暂无历史病历，等待老师签字归档。</div>
             ) : (
-              patientRecords.map(r => (
-                <div key={r.id} style={{ padding: '15px', border: '1px solid #b8d8c0', borderRadius: '8px', marginBottom: '10px', background: '#fff' }}>
-                  <div style={{ color: '#5a7d5a', fontWeight: 'bold', marginBottom: '5px' }}>✅ {r.doctor || '李老师'}已签字病历</div>
-                  <div style={{ whiteSpace: 'pre-wrap', fontSize: '14px', color: '#333', lineHeight: '1.6' }}>{r.final_plan}</div>
-                </div>
-              ))
+              patientRecords.map((r, index) => {
+                const isLatest = index === 0;
+                const isEditing = editingRecordId === r.id;
+                return (
+                  <div key={r.id} style={{ padding: '15px', border: '1px solid #b8d8c0', borderRadius: '8px', marginBottom: '10px', background: '#fff' }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '5px' }}>
+                      <div style={{ color: '#5a7d5a', fontWeight: 'bold' }}>✅ {r.doctor || '李老师'}已签字病历</div>
+                      {isLatest && !isEditing && (
+                        <button 
+                          onClick={() => { setEditingRecordId(r.id); setEditingRecordContent(r.final_plan); }}
+                          style={{ padding: '2px 10px', borderRadius: '12px', border: '1px solid #8b4513', background: 'transparent', color: '#8b4513', cursor: 'pointer', fontSize: '12px' }}
+                        >
+                          修改
+                        </button>
+                      )}
+                    </div>
+                    {isEditing ? (
+                      <div>
+                        <textarea 
+                          value={editingRecordContent} 
+                          onChange={(e) => setEditingRecordContent(e.target.value)} 
+                          style={{ width: '100%', height: '80px', padding: '8px', borderRadius: '6px', border: '1px solid #d4c8a8', fontFamily: 'serif', fontSize: '14px', marginBottom: '8px', boxSizing: 'border-box' }} 
+                        />
+                        <div style={{ textAlign: 'right' }}>
+                          <button onClick={() => setEditingRecordId(null)} style={{ padding: '4px 12px', borderRadius: '15px', border: '1px solid #999', background: 'transparent', color: '#666', cursor: 'pointer', fontSize: '12px', marginRight: '8px' }}>取消</button>
+                          <button onClick={() => handleSaveRecord(r.id)} style={{ padding: '4px 16px', borderRadius: '15px', border: 'none', background: '#5a7d5a', color: '#fff', cursor: 'pointer', fontSize: '12px' }}>保存</button>
+                        </div>
+                      </div>
+                    ) : (
+                      <div style={{ whiteSpace: 'pre-wrap', fontSize: '14px', color: '#333', lineHeight: '1.6' }}>{r.final_plan}</div>
+                    )}
+                  </div>
+                );
+              })
             )}
           </div>
         )}

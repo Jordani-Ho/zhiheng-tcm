@@ -291,11 +291,22 @@ def sign_draft_endpoint(draft_id: int, input_data: SignInput):
     if not patient_name:
         return {"error": "找不到该病历"}
     database.transfer_points(patient_name, "李老师", 50)
-    return {"message": "签字确认成功，已归档至患者健康档案，学费已支付"}
+    return {"message": "签字确认成功，已归档至患者健康档案，医嘱已自动转为患者作业，学费已支付"}
 
 @app.get("/api/patient-records")
 def get_patient_records(patient_name: str = None):
     return database.get_patient_records(patient_name)
+# 【第25天新增】修改病历（仅允许改最新一条）
+class RecordUpdate(BaseModel):
+    patient_name: str
+    content: str
+
+@app.put("/api/patient-records/{record_id}")
+def update_patient_record_endpoint(record_id: int, input_data: RecordUpdate):
+    success = database.update_patient_record(record_id, input_data.patient_name, input_data.content)
+    if not success:
+        return {"error": "该病历已成为历史记录，不可修改"}
+    return {"message": "病历已更新"}
 
 @app.get("/api/points")
 def get_points(patient_name: str = "张三"):
