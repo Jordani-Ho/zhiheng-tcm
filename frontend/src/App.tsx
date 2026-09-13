@@ -32,16 +32,14 @@ export default function App() {
   const [newFamilyName, setNewFamilyName] = useState('')
   const [newRelation, setNewRelation] = useState('')
   const [newGender, setNewGender] = useState('')
-  // 【第23天修改1】出生日期拆为三个字段
   const [newBirthYear, setNewBirthYear] = useState('')
   const [newBirthMonth, setNewBirthMonth] = useState('')
   const [newBirthDay, setNewBirthDay] = useState('')
   const [newBirthTime, setNewBirthTime] = useState('')
   const [newLocation, setNewLocation] = useState('')
-  // 【第23天修改2】监护人居住地
   const [guardianLocation, setGuardianLocation] = useState('')
+  const [guardianGender, setGuardianGender] = useState('') // 监护人性别
 
-  // 生成年份、月份、日期数组
   const currentYear = new Date().getFullYear()
   const yearOptions = Array.from({ length: currentYear - 1920 + 1 }, (_, i) => currentYear - i)
   const monthOptions = Array.from({ length: 12 }, (_, i) => i + 1)
@@ -55,10 +53,12 @@ export default function App() {
   useEffect(() => {
     fetch('/api/huangli').then(r => r.json()).then(d => setHuangli(d)).catch(() => setHuangli(null))
     fetchPatients('张三')
-    // 获取监护人（张三）的居住地作为默认值
     fetch('/api/patient-profile?patient_name=张三')
       .then(r => r.json())
-      .then(d => setGuardianLocation(d.location || ''))
+      .then(d => {
+        setGuardianLocation(d.location || '')
+        setGuardianGender(d.gender || '')
+      })
       .catch(() => {})
   }, [])
 
@@ -204,27 +204,31 @@ export default function App() {
       setNewGender('男')
     } else if (['母亲', '女儿'].includes(value)) {
       setNewGender('女')
+    } else if (value === '配偶') {
+      if (guardianGender === '男') {
+        setNewGender('女')
+      } else if (guardianGender === '女') {
+        setNewGender('男')
+      } else {
+        setNewGender('')
+      }
     } else {
       setNewGender('')
     }
   }
 
-  // 【第23天修改3】打开添加亲友时，默认填入监护人居住地
   const handleToggleAddFamily = () => {
     if (!showAddFamily) {
-      // 打开时预填居住地
       setNewLocation(guardianLocation)
     }
     setShowAddFamily(!showAddFamily)
   }
 
   const handleAddFamily = () => {
-    // 校验：姓名、关系、性别、年月日都必须有
     if (!newFamilyName.trim() || !newRelation.trim() || !newGender || !newBirthYear || !newBirthMonth || !newBirthDay) {
       alert("请至少填写姓名、关系、性别和完整的出生年月日！")
       return
     }
-    // 组合为 YYYY-MM-DD
     const mm = String(newBirthMonth).padStart(2, '0')
     const dd = String(newBirthDay).padStart(2, '0')
     const birthDate = `${newBirthYear}-${mm}-${dd}`
@@ -260,7 +264,6 @@ export default function App() {
   const roleBtnStyle = (role: string) => ({ padding: '8px 16px', margin: '5px', borderRadius: '20px', border: '1px solid #8b4513', cursor: 'pointer', fontFamily: 'serif', fontSize: '14px', backgroundColor: currentRole === role ? '#8b4513' : '#fdfcf0', color: currentRole === role ? '#fff' : '#8b4513', transition: 'all 0.2s' })
   const patientBtnStyle = (name: string) => ({ padding: '6px 14px', margin: '4px', borderRadius: '15px', border: '1px solid #5a7d5a', cursor: 'pointer', fontFamily: 'serif', fontSize: '13px', backgroundColor: selectedPatient === name ? '#5a7d5a' : '#f7fcf9', color: selectedPatient === name ? '#fff' : '#5a7d5a', transition: 'all 0.2s' })
   const inputStyle = { width: '100%', padding: '8px', borderRadius: '6px', border: '1px solid #d4c8a8', fontFamily: 'serif', marginBottom: '8px', boxSizing: 'border-box' as const }
-  // 日期三下拉框样式
   const dateSelectStyle = { padding: '8px', borderRadius: '6px', border: '1px solid #d4c8a8', fontFamily: 'serif', marginRight: '6px', marginBottom: '8px' }
 
   return (
@@ -331,7 +334,6 @@ export default function App() {
                   <option value="女">女</option>
                 </select>
                 
-                {/* 【第23天修改4】年月日顺序的三个下拉框 */}
                 <label style={{ fontSize: '12px', color: '#888' }}>出生日期（按 年-月-日 顺序选择）</label>
                 <div style={{ display: 'flex', flexWrap: 'wrap', marginBottom: '8px' }}>
                   <select value={newBirthYear} onChange={(e) => setNewBirthYear(e.target.value)} style={dateSelectStyle}>
