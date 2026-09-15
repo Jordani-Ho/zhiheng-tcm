@@ -21,7 +21,7 @@ def init_db():
     )
     """)
 
-    # 【第29天修改】新增出生地字段
+    # 【第28天修改】patient_profiles 增加 birth_place（出生地）
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS patient_profiles (
         patient_name TEXT PRIMARY KEY,
@@ -104,6 +104,7 @@ def init_db():
 
     conn.close()
 
+# ---------- 患者相关操作 ----------
 def get_patients(guardian_name=None):
     conn = get_connection()
     if guardian_name:
@@ -113,7 +114,6 @@ def get_patients(guardian_name=None):
     conn.close()
     return [dict(r) for r in rows]
 
-# 【第29天修改】添加出生地
 def add_patient(name, guardian_name, relation, gender, birth_date, birth_time, birth_place, location):
     conn = get_connection()
     conn.execute("INSERT OR IGNORE INTO patients (name, teacher_name, guardian_name, relation) VALUES (?, ?, ?, ?)", 
@@ -131,6 +131,19 @@ def add_patient(name, guardian_name, relation, gender, birth_date, birth_time, b
     conn.commit()
     conn.close()
 
+# 【第28天新增】删除亲友
+def delete_patient(name):
+    conn = get_connection()
+    conn.execute("DELETE FROM patients WHERE name = ?", (name,))
+    conn.execute("DELETE FROM patient_profiles WHERE patient_name = ?", (name,))
+    conn.execute("DELETE FROM homework WHERE patient_name = ?", (name,))
+    conn.execute("DELETE FROM transcriptions WHERE patient_name = ?", (name,))
+    conn.execute("DELETE FROM drafts WHERE patient_name = ?", (name,))
+    conn.execute("DELETE FROM patient_records WHERE patient_name = ?", (name,))
+    conn.execute("DELETE FROM accounts WHERE role_name = ?", (name,))
+    conn.commit()
+    conn.close()
+
 def get_patient_profile(patient_name):
     conn = get_connection()
     row = conn.execute("SELECT * FROM patient_profiles WHERE patient_name = ?", (patient_name,)).fetchone()
@@ -139,22 +152,30 @@ def get_patient_profile(patient_name):
         return dict(row)
     return {"patient_name": patient_name, "gender": "", "birth_date": "", "birth_time": "", "birth_place": "", "location": ""}
 
-# 【第29天修改】保存出生地
+# 【第28天修改】未填的可补充，已填的永久锁定
 def save_patient_profile(patient_name, gender, birth_date, birth_time, birth_place, location):
     conn = get_connection()
-    conn.execute("""
-    INSERT INTO patient_profiles (patient_name, gender, birth_date, birth_time, birth_place, location)
-    VALUES (?, ?, ?, ?, ?, ?)
-    ON CONFLICT(patient_name) DO UPDATE SET
-        gender=excluded.gender,
-        birth_date=excluded.birth_date,
-        birth_time=excluded.birth_time,
-        birth_place=excluded.birth_place,
-        location=excluded.location
-    """, (patient_name, gender, birth_date, birth_time, birth_place, location))
+    existing = conn.execute("SELECT * FROM patient_profiles WHERE patient_name = ?", (patient_name,)).fetchone()
+    if existing:
+        # 只更新为空的字段 + 允许改 location 和 birth_place
+        new_gender = existing["gender"] if existing["gender"] else gender
+        new_birth_date = existing["birth_date"] if existing["birth_date"] else birth_date
+        new_birth_time = existing["birth_time"] if existing["birth_time"] else birth_time
+        # 出生地和现居住地可以自由修改
+        new_birth_place = birth_place if birth_place else existing["birth_place"]
+        new_location = location
+        conn.execute("""
+        UPDATE patient_profiles SET gender = ?, birth_date = ?, birth_time = ?, birth_place = ?, location = ? WHERE patient_name = ?
+        """, (new_gender, new_birth_date, new_birth_time, new_birth_place, new_location, patient_name))
+    else:
+        conn.execute("""
+        INSERT INTO patient_profiles (patient_name, gender, birth_date, birth_time, birth_place, location)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """, (patient_name, gender, birth_date, birth_time, birth_place, location))
     conn.commit()
     conn.close()
 
+# ---------- 作业相关操作 ----------
 def get_homework(patient_name):
     conn = get_connection()
     row = conn.execute("SELECT * FROM homework WHERE patient_name = ? ORDER BY id DESC LIMIT 1", (patient_name,)).fetchone()
@@ -174,6 +195,7 @@ def update_homework_status(patient_name, status):
     conn.commit()
     conn.close()
 
+# ---------- 转述相关操作 ----------
 def insert_transcription(patient_name, content, data_type):
     conn = get_connection()
     conn.execute("INSERT INTO transcriptions (patient_name, content, data_type, processed) VALUES (?, ?, ?, 0)",
@@ -190,6 +212,7 @@ def get_transcriptions(patient_name=None):
     conn.close()
     return [dict(r) for r in rows]
 
+# ---------- 病历草案相关操作 ----------
 def insert_draft(transcript_id, patient_name, content):
     conn = get_connection()
     cursor = conn.execute("INSERT INTO drafts (transcript_id, patient_name, content, signed) VALUES (?, ?, ?, ?)",
@@ -221,10 +244,8 @@ def sign_draft(draft_id, final_plan):
 
     conn.execute("INSERT INTO patient_records (patient_name, ai_draft, final_plan, doctor) VALUES (?, ?, ?, ?)",
                  (draft["patient_name"], draft["content"], final_plan, "李老师"))
-    
     conn.execute("INSERT INTO homework (patient_name, task, detail, status, created_at) VALUES (?, ?, ?, ?, ?)",
                  (draft["patient_name"], f"今日医嘱：{final_plan}", "请严格遵医嘱执行", "pending", "2026-09-11"))
-    
     conn.execute("DELETE FROM transcriptions WHERE id = ?", (draft["transcript_id"],))
     conn.execute("DELETE FROM drafts WHERE id = ?", (draft_id,))
     
@@ -232,6 +253,7 @@ def sign_draft(draft_id, final_plan):
     conn.close()
     return draft["patient_name"]
 
+# ---------- 患者健康档案相关操作 ----------
 def get_patient_records(patient_name=None):
     conn = get_connection()
     if patient_name:
@@ -241,24 +263,7 @@ def get_patient_records(patient_name=None):
     conn.close()
     return [dict(r) for r in rows]
 
-def is_latest_record(record_id, patient_name):
-    conn = get_connection()
-    latest = conn.execute(
-        "SELECT id FROM patient_records WHERE patient_name = ? ORDER BY id DESC LIMIT 1",
-        (patient_name,)
-    ).fetchone()
-    conn.close()
-    return latest and latest["id"] == record_id
-
-def update_patient_record(record_id, patient_name, new_content):
-    if not is_latest_record(record_id, patient_name):
-        return False
-    conn = get_connection()
-    conn.execute("UPDATE patient_records SET final_plan = ? WHERE id = ?", (new_content, record_id))
-    conn.commit()
-    conn.close()
-    return True
-
+# ---------- 积分相关操作 ----------
 def get_points(role_name):
     conn = get_connection()
     row = conn.execute("SELECT points FROM accounts WHERE role_name = ?", (role_name,)).fetchone()

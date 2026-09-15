@@ -6,7 +6,7 @@ interface Transcription { id: number; patient_name: string; content: string; dat
 interface Draft { id: number; transcript_id: number; patient_name: string; content: string; signed: boolean; doctor?: string; }
 interface Patient { name: string; teacher_name: string; guardian_name: string; relation: string; }
 interface PatientRecord { id: number; patient_name: string; ai_draft: string; final_plan: string; doctor: string; }
-interface PatientProfile { patient_name: string; gender: string; birth_date: string; birth_time: string; birth_place?: string; location: string; bazi?: string; wuxing?: string; }
+interface PatientProfile { patient_name: string; gender: string; birth_date: string; birth_time: string; birth_place: string; location: string; bazi?: string; wuxing?: string; }
 
 export default function App() {
   const [huangli, setHuangli] = useState<HuangliData | null>(null)
@@ -34,28 +34,50 @@ export default function App() {
   const [newBirthMonth, setNewBirthMonth] = useState('')
   const [newBirthDay, setNewBirthDay] = useState('')
   const [newBirthTime, setNewBirthTime] = useState('')
-  const [newBirthPlace, setNewBirthPlace] = useState('') // 【第29天新增】
+  const [newBirthPlace, setNewBirthPlace] = useState('')
   const [newLocation, setNewLocation] = useState('')
   const [guardianLocation, setGuardianLocation] = useState('')
   const [guardianGender, setGuardianGender] = useState('')
 
   const [draftProfile, setDraftProfile] = useState<PatientProfile | null>(null)
-  const [editingRecordId, setEditingRecordId] = useState<number | null>(null)
-  const [editingRecordContent, setEditingRecordContent] = useState('')
-  const todayStr = new Date().toISOString().split('T')[0]
+  
+  const now = new Date()
+  const currentYear = now.getFullYear()
+  const currentMonth = now.getMonth() + 1
+  const currentDay = now.getDate()
+  const todayStr = now.toISOString().split('T')[0]
 
-  // 【第29天新增】面诊模式：医生快速录入
-  const [diagnosisInput, setDiagnosisInput] = useState('')
-
-  const currentYear = new Date().getFullYear()
   const yearOptions = Array.from({ length: currentYear - 1920 + 1 }, (_, i) => currentYear - i)
-  const monthOptions = Array.from({ length: 12 }, (_, i) => i + 1)
+  const monthOptions = Array.from({ length: 12 }, (_, i) => i + 1).filter(m => {
+    if (parseInt(newBirthYear) === currentYear) return m <= currentMonth
+    return true
+  })
   const getDayOptions = () => {
     const y = parseInt(newBirthYear) || currentYear
     const m = parseInt(newBirthMonth) || 1
+    if (y === currentYear && m === currentMonth) {
+      return Array.from({ length: currentDay }, (_, i) => i + 1)
+    }
     const days = new Date(y, m, 0).getDate()
     return Array.from({ length: days }, (_, i) => i + 1)
   }
+
+  // 【第28天修复】十二时辰选项
+  const timeOptions = [
+    { value: "", label: "时辰未知（选填）" },
+    { value: "23:00", label: "子时 (23:00-01:00)" },
+    { value: "01:00", label: "丑时 (01:00-03:00)" },
+    { value: "03:00", label: "寅时 (03:00-05:00)" },
+    { value: "05:00", label: "卯时 (05:00-07:00)" },
+    { value: "07:00", label: "辰时 (07:00-09:00)" },
+    { value: "09:00", label: "巳时 (09:00-11:00)" },
+    { value: "11:00", label: "午时 (11:00-13:00)" },
+    { value: "13:00", label: "未时 (13:00-15:00)" },
+    { value: "15:00", label: "申时 (15:00-17:00)" },
+    { value: "17:00", label: "酉时 (17:00-19:00)" },
+    { value: "19:00", label: "戌时 (19:00-21:00)" },
+    { value: "21:00", label: "亥时 (21:00-23:00)" }
+  ]
 
   useEffect(() => {
     fetch('/api/huangli').then(r => r.json()).then(d => setHuangli(d)).catch(() => setHuangli(null))
@@ -147,34 +169,6 @@ export default function App() {
       })
   }
 
-  // 【第29天修改】医生直接写面诊记录，生成草案
-  const handleGenerateDraftFromDiagnosis = () => {
-    if (!diagnosisInput.trim()) {
-      alert("请输入面诊记录！")
-      return
-    }
-    fetch('/api/transcribe', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ patient_name: selectedPatient, content: `[面诊记录] ${diagnosisInput}`, data_type: 'text' })
-    }).then(r => r.json()).then(() => {
-      // 这里需要拿到最新插入的ID，简单做法是重新获取列表，然后找第一条没有processed的
-      // 为了简化，我们直接调用生成草稿接口，用最新那条的ID
-      fetch(`/api/transcriptions?patient_name=${selectedPatient}`).then(r => r.json()).then(list => {
-        const latest = list.find((t: any) => t.content.includes(diagnosisInput));
-        if (latest) {
-          fetch(`/api/generate-draft?transcript_id=${latest.id}`, { method: 'POST' }).then(() => {
-            setDiagnosisInput('')
-            fetchDrafts()
-            fetchTranscriptions()
-          })
-        } else {
-          alert("生成失败，请重试")
-        }
-      })
-    })
-  }
-
   const handleGenerateDraft = (transcriptId: number) => {
     fetch(`/api/generate-draft?transcript_id=${transcriptId}`, { method: 'POST' })
       .then(() => {
@@ -222,6 +216,7 @@ export default function App() {
     })
   }
 
+  // 【第28天修复】选配偶时的性别自动推导和提示
   const handleRelationChange = (value: string) => {
     setNewRelation(value)
     if (['父亲', '儿子'].includes(value)) {
@@ -235,6 +230,7 @@ export default function App() {
         setNewGender('男')
       } else {
         setNewGender('')
+        alert("提示：请先点击上方“张三”的基础档案，填写您的性别，系统将自动推导配偶性别。")
       }
     } else {
       setNewGender('')
@@ -244,6 +240,7 @@ export default function App() {
   const handleToggleAddFamily = () => {
     if (!showAddFamily) {
       setNewLocation(guardianLocation)
+      setNewBirthPlace(guardianLocation) // 出生地默认继承
     }
     setShowAddFamily(!showAddFamily)
   }
@@ -286,24 +283,17 @@ export default function App() {
     })
   }
 
-  const handleSaveRecord = (recordId: number) => {
-    if (!editingRecordContent.trim()) {
-      alert("病历内容不能为空！")
+  const handleDeleteFamily = (name: string) => {
+    if (name === '张三') {
+      alert("本人档案不可删除！")
       return
     }
-    fetch(`/api/patient-records/${recordId}`, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ patient_name: selectedPatient, content: editingRecordContent })
-    })
-      .then(r => r.json())
-      .then(d => {
-        if (d.error) {
-          alert(d.error)
-        } else {
-          setEditingRecordId(null)
-          fetchPatientRecords()
-        }
+    if (!confirm(`确定要删除亲友【${name}】吗？删除后将无法恢复。`)) return
+    fetch(`/api/patients/${name}`, { method: 'DELETE' })
+      .then(() => {
+        if (selectedPatient === name) setSelectedPatient('张三')
+        fetchPatients('张三')
+        alert("亲友已删除")
       })
   }
 
@@ -313,7 +303,9 @@ export default function App() {
   const inputStyle = { width: '100%', padding: '8px', borderRadius: '6px', border: '1px solid #d4c8a8', fontFamily: 'serif', marginBottom: '8px', boxSizing: 'border-box' as const }
   const dateSelectStyle = { padding: '8px', borderRadius: '6px', border: '1px solid #d4c8a8', fontFamily: 'serif', marginRight: '6px', marginBottom: '8px' }
 
-  const latestRecordId = patientRecords.length > 0 ? patientRecords[0].id : null;
+  const needGender = !profile?.gender
+  const needBirthDate = !profile?.birth_date
+  const needBirthTime = !profile?.birth_time
 
   return (
     <div style={{ minHeight: '100vh', background: '#f5f1e6', padding: '40px 20px', fontFamily: 'serif' }}>
@@ -353,9 +345,20 @@ export default function App() {
             
             <div style={{ display: 'flex', flexWrap: 'wrap', justifyContent: 'center' }}>
               {patients.map(p => (
-                <button key={p.name} style={patientBtnStyle(p.name)} onClick={() => setSelectedPatient(p.name)}>
-                  {p.relation === '本人' ? `👤 ${p.name}` : `👨‍👩‍👧 ${p.name}（${p.relation}）`}
-                </button>
+                <div key={p.name} style={{ display: 'flex', alignItems: 'center', margin: '4px' }}>
+                  <button style={patientBtnStyle(p.name)} onClick={() => setSelectedPatient(p.name)}>
+                    {p.relation === '本人' ? `👤 ${p.name}` : `👨‍👩‍👧 ${p.name}（${p.relation}）`}
+                  </button>
+                  {p.relation !== '本人' && (
+                    <button 
+                      onClick={() => handleDeleteFamily(p.name)} 
+                      style={{ marginLeft: '4px', padding: '2px 8px', borderRadius: '12px', border: '1px solid #c0392b', background: 'transparent', color: '#c0392b', cursor: 'pointer', fontSize: '11px' }}
+                      title="删除"
+                    >
+                      ✕
+                    </button>
+                  )}
+                </div>
               ))}
             </div>
             <div style={{ textAlign: 'center', fontSize: '12px', color: '#999', marginTop: '10px' }}>
@@ -399,10 +402,11 @@ export default function App() {
                   </select>
                 </div>
                 
-                <label style={{ fontSize: '12px', color: '#888' }}>出生时间（选填，精确到小时即可）</label>
-                <input type="time" step="3600" value={newBirthTime} onChange={(e) => setNewBirthTime(e.target.value)} style={inputStyle} />
-
-                {/* 【第29天新增】出生地 */}
+                <label style={{ fontSize: '12px', color: '#888' }}>出生时间（选填，精确到时辰即可）</label>
+                <select value={newBirthTime} onChange={(e) => setNewBirthTime(e.target.value)} style={inputStyle}>
+                  {timeOptions.map(t => <option key={t.value} value={t.value}>{t.label}</option>)}
+                </select>
+                
                 <label style={{ fontSize: '12px', color: '#888' }}>出生地（选填，用于推算地域五行）</label>
                 <input value={newBirthPlace} onChange={(e) => setNewBirthPlace(e.target.value)} placeholder="例如：广东省广州市" style={inputStyle} />
                 
@@ -451,13 +455,66 @@ export default function App() {
             
             {editingProfile && draftProfile ? (
               <div>
-                <div style={{ fontSize: '14px', color: '#333', marginBottom: '10px' }}>
-                  <div>性别：{profile.gender || '未填写'}（不可修改）</div>
-                  <div>出生日期：{profile.birth_date || '未填写'}（不可修改）</div>
-                  <div>出生时间：{profile.birth_time || '未填写'}（不可修改）</div>
-                </div>
+                <label style={{ fontSize: '13px', color: '#666' }}>性别</label>
+                {needGender ? (
+                  <select value={draftProfile.gender} onChange={e => setDraftProfile({...draftProfile, gender: e.target.value})} style={inputStyle}>
+                    <option value="">请选择</option>
+                    <option value="男">男</option>
+                    <option value="女">女</option>
+                  </select>
+                ) : (
+                  <div style={{ fontSize: '14px', color: '#333', marginBottom: '8px' }}>{profile.gender}</div>
+                )}
+
+                <label style={{ fontSize: '13px', color: '#666' }}>出生日期</label>
+                {needBirthDate ? (
+                  <div style={{ display: 'flex', flexWrap: 'wrap', marginBottom: '8px' }}>
+                    <select value={draftProfile.birth_date ? draftProfile.birth_date.split('-')[0] : ''} onChange={e => {
+                      const y = e.target.value
+                      const m = draftProfile.birth_date ? draftProfile.birth_date.split('-')[1] : '01'
+                      const d = draftProfile.birth_date ? draftProfile.birth_date.split('-')[2] : '01'
+                      setDraftProfile({...draftProfile, birth_date: `${y}-${m}-${d}`})
+                    }} style={dateSelectStyle}>
+                      <option value="">年</option>
+                      {yearOptions.map(y => <option key={y} value={y}>{y}</option>)}
+                    </select>
+                    <select value={draftProfile.birth_date ? draftProfile.birth_date.split('-')[1] : ''} onChange={e => {
+                      const y = draftProfile.birth_date ? draftProfile.birth_date.split('-')[0] : currentYear
+                      const m = e.target.value
+                      const d = draftProfile.birth_date ? draftProfile.birth_date.split('-')[2] : '01'
+                      setDraftProfile({...draftProfile, birth_date: `${y}-${m}-${d}`})
+                    }} style={dateSelectStyle}>
+                      <option value="">月</option>
+                      {monthOptions.map(m => <option key={m} value={m}>{m}</option>)}
+                    </select>
+                    <select value={draftProfile.birth_date ? draftProfile.birth_date.split('-')[2] : ''} onChange={e => {
+                      const y = draftProfile.birth_date ? draftProfile.birth_date.split('-')[0] : currentYear
+                      const m = draftProfile.birth_date ? draftProfile.birth_date.split('-')[1] : '01'
+                      const d = e.target.value
+                      setDraftProfile({...draftProfile, birth_date: `${y}-${m}-${d}`})
+                    }} style={dateSelectStyle}>
+                      <option value="">日</option>
+                      {getDayOptions().map(d => <option key={d} value={d}>{d}</option>)}
+                    </select>
+                  </div>
+                ) : (
+                  <div style={{ fontSize: '14px', color: '#333', marginBottom: '8px' }}>{profile.birth_date}</div>
+                )}
+
+                <label style={{ fontSize: '13px', color: '#666' }}>出生时间</label>
+                {needBirthTime ? (
+                  <select value={draftProfile.birth_time} onChange={e => setDraftProfile({...draftProfile, birth_time: e.target.value})} style={inputStyle}>
+                    {timeOptions.map(t => <option key={t.value} value={t.value}>{t.label}</option>)}
+                  </select>
+                ) : (
+                  <div style={{ fontSize: '14px', color: '#333', marginBottom: '8px' }}>
+                    {timeOptions.find(t => t.value === profile.birth_time)?.label || profile.birth_time}
+                  </div>
+                )}
+
                 <label style={{ fontSize: '13px', color: '#666' }}>出生地（可修改）</label>
-                <input type="text" value={draftProfile.birth_place || ''} onChange={e => setDraftProfile({...draftProfile, birth_place: e.target.value})} placeholder="例如：广东省广州市" style={inputStyle} />
+                <input type="text" value={draftProfile.birth_place} onChange={e => setDraftProfile({...draftProfile, birth_place: e.target.value})} placeholder="例如：广东省广州市" style={inputStyle} />
+
                 <label style={{ fontSize: '13px', color: '#666' }}>现居住地（可修改）</label>
                 <input type="text" value={draftProfile.location} onChange={e => setDraftProfile({...draftProfile, location: e.target.value})} placeholder="例如：广东省广州市" style={inputStyle} />
               </div>
@@ -465,7 +522,7 @@ export default function App() {
               <div style={{ fontSize: '14px', color: '#333', lineHeight: '2' }}>
                 <div>性别：{profile.gender || '未填写'}</div>
                 <div>出生日期：{profile.birth_date || '未填写'}</div>
-                <div>出生时间：{profile.birth_time || '未填写（后续可由老师或智能体推断）'}</div>
+                <div>出生时间：{profile.birth_time ? (timeOptions.find(t => t.value === profile.birth_time)?.label || profile.birth_time) : '未填写'}</div>
                 <div>出生地：{profile.birth_place || '未填写'}</div>
                 <div>现居住地：{profile.location || '未填写'}</div>
               </div>
@@ -540,7 +597,7 @@ export default function App() {
             <div style={{ fontSize: '14px', color: '#333', lineHeight: '2' }}>
               <div>性别：{profile.gender || '未填写'}</div>
               <div>出生日期：{profile.birth_date || '未填写'}</div>
-              <div>出生时间：{profile.birth_time || '未填写（时辰未知，按子时推算）'}</div>
+              <div>出生时间：{profile.birth_time ? (timeOptions.find(t => t.value === profile.birth_time)?.label || profile.birth_time) : '未填写（时辰未知，按子时推算）'}</div>
               <div>出生地：{profile.birth_place || '未填写'}</div>
               <div>现居住地：{profile.location || '未填写'}</div>
               <div style={{ marginTop: '8px', paddingTop: '8px', borderTop: '1px dashed #d4c8a8', color: '#8b4513', fontWeight: 'bold' }}>
@@ -569,23 +626,6 @@ export default function App() {
           </div>
         )}
 
-        {/* 【第29天重塑】医生面诊区 */}
-        {currentRole === '李老师' && (
-          <div style={{ ...boxStyle, background: '#f0f7f0' }}>
-            <div style={{ textAlign: 'center', fontSize: '18px', color: '#5a7d5a', marginBottom: '15px' }}>🩺 面诊记录（{selectedPatient}）</div>
-            <textarea 
-              value={diagnosisInput} 
-              onChange={(e) => setDiagnosisInput(e.target.value)} 
-              placeholder="在此输入面诊记录，例如：脉象弦滑，舌苔黄腻，大便不成形..." 
-              style={{ width: '100%', height: '80px', padding: '10px', borderRadius: '8px', border: '1px solid #b8d8c0', fontFamily: 'serif', fontSize: '14px', marginBottom: '10px', boxSizing: 'border-box' }} 
-            />
-            <div style={{ textAlign: 'center' }}>
-              <button onClick={handleGenerateDraftFromDiagnosis} style={{ padding: '8px 20px', borderRadius: '20px', border: 'none', background: '#5a7d5a', color: '#fff', cursor: 'pointer' }}>生成病历草案</button>
-            </div>
-          </div>
-        )}
-
-        {/* 待处理陈述区（患者发过来的） */}
         {currentRole === '李老师' && (
           <div style={boxStyle}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '15px' }}>
@@ -643,19 +683,20 @@ export default function App() {
           </div>
         )}
 
-        {/* 【第29天修改】患者端健康档案：改为“健康趋势与作业”，隐藏病历原文 */}
         {(currentRole === '患者' || currentRole === '患者智能体') && (
           <div style={{ ...boxStyle, background: '#f7fcf9' }}>
-            <div style={{ textAlign: 'center', fontSize: '18px', color: '#5a7d5a', marginBottom: '15px' }}>📂 健康趋势与作业</div>
-            {patientRecords.length === 0 ? (
-              <div style={{ textAlign: 'center', color: '#999' }}>暂无历史病历，等待老师诊断归档。</div>
+            <div style={{ textAlign: 'center', fontSize: '18px', color: '#5a7d5a', marginBottom: '15px' }}>📂 {selectedPatient}的健康档案</div>
+            <div style={{ textAlign: 'center', fontSize: '13px', color: '#999', fontStyle: 'italic', lineHeight: '1.8', marginBottom: '15px' }}>
+              您的病历数据归您所有，由老师签字确认。<br/>
+              如有需要，请在下一次问诊时向老师咨询。
+            </div>
+            {patientRecords.length > 0 ? (
+              <div style={{ padding: '15px', border: '1px solid #b8d8c0', borderRadius: '8px', background: '#fff' }}>
+                <div style={{ color: '#5a7d5a', fontWeight: 'bold', marginBottom: '8px' }}>📌 最近一次就诊记录</div>
+                <div style={{ whiteSpace: 'pre-wrap', fontSize: '14px', color: '#333', lineHeight: '1.6' }}>{patientRecords[0].final_plan}</div>
+              </div>
             ) : (
-              patientRecords.map(r => (
-                <div key={r.id} style={{ padding: '15px', border: '1px solid #b8d8c0', borderRadius: '8px', marginBottom: '10px', background: '#fff' }}>
-                  <div style={{ color: '#5a7d5a', fontWeight: 'bold', marginBottom: '5px' }}>✅ {r.doctor || '李老师'}已签字病历</div>
-                  <div style={{ whiteSpace: 'pre-wrap', fontSize: '14px', color: '#333', lineHeight: '1.6' }}>{r.final_plan}</div>
-                </div>
-              ))
+              <div style={{ textAlign: 'center', color: '#999', padding: '20px' }}>暂无历史病历，等待老师签字归档。</div>
             )}
           </div>
         )}

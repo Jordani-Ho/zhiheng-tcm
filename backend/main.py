@@ -47,7 +47,7 @@ class ProfileInput(BaseModel):
     gender: str
     birth_date: str
     birth_time: str
-    birth_place: str # 【第29天新增】
+    birth_place: str
     location: str
 
 class AddPatientInput(BaseModel):
@@ -57,7 +57,7 @@ class AddPatientInput(BaseModel):
     gender: str
     birth_date: str
     birth_time: str
-    birth_place: str # 【第29天新增】
+    birth_place: str
     location: str
 
 @app.get("/api/huangli")
@@ -138,6 +138,12 @@ def add_patient(input_data: AddPatientInput):
     )
     return {"message": "亲友档案添加成功"}
 
+# 【第28天新增】删除亲友
+@app.delete("/api/patients/{name}")
+def delete_patient(name: str):
+    database.delete_patient(name)
+    return {"message": "亲友已删除"}
+
 @app.get("/api/patient-profile")
 def get_patient_profile(patient_name: str):
     profile = database.get_patient_profile(patient_name)
@@ -170,7 +176,7 @@ def get_patient_profile(patient_name: str):
                     wuxing_str = "五行推算暂不可用"
             
             profile["wuxing"] = wuxing_str
-        except Exception:
+        except Exception as e:
             profile["bazi"] = "八字推算失败"
             profile["wuxing"] = "五行推算失败"
     else:
@@ -189,7 +195,7 @@ def save_patient_profile(input_data: ProfileInput):
         input_data.birth_place,
         input_data.location
     )
-    return {"message": "档案保存成功"}
+    return {"message": "档案保存成功"} 
 
 @app.get("/api/role-data")
 def get_role_data(role: str, patient_name: str = "张三"):
