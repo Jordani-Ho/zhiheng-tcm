@@ -47,6 +47,7 @@ class ProfileInput(BaseModel):
     gender: str
     birth_date: str
     birth_time: str
+    birth_place: str # 【第29天新增】
     location: str
 
 class AddPatientInput(BaseModel):
@@ -56,6 +57,7 @@ class AddPatientInput(BaseModel):
     gender: str
     birth_date: str
     birth_time: str
+    birth_place: str # 【第29天新增】
     location: str
 
 @app.get("/api/huangli")
@@ -131,6 +133,7 @@ def add_patient(input_data: AddPatientInput):
         input_data.gender,
         input_data.birth_date,
         input_data.birth_time,
+        input_data.birth_place,
         input_data.location
     )
     return {"message": "亲友档案添加成功"}
@@ -183,6 +186,7 @@ def save_patient_profile(input_data: ProfileInput):
         input_data.gender,
         input_data.birth_date,
         input_data.birth_time,
+        input_data.birth_place,
         input_data.location
     )
     return {"message": "档案保存成功"}
@@ -296,7 +300,8 @@ def sign_draft_endpoint(draft_id: int, input_data: SignInput):
 @app.get("/api/patient-records")
 def get_patient_records(patient_name: str = None):
     return database.get_patient_records(patient_name)
-# 【第25天新增】修改病历（仅允许改最新一条）
+
+# 【第25天新增】修改病历
 class RecordUpdate(BaseModel):
     patient_name: str
     content: str
