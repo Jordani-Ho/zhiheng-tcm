@@ -62,7 +62,6 @@ export default function App() {
     return Array.from({ length: days }, (_, i) => i + 1)
   }
 
-  // 【第28天修复】十二时辰选项
   const timeOptions = [
     { value: "", label: "时辰未知（选填）" },
     { value: "23:00", label: "子时 (23:00-01:00)" },
@@ -216,7 +215,6 @@ export default function App() {
     })
   }
 
-  // 【第28天修复】选配偶时的性别自动推导和提示
   const handleRelationChange = (value: string) => {
     setNewRelation(value)
     if (['父亲', '儿子'].includes(value)) {
@@ -240,16 +238,30 @@ export default function App() {
   const handleToggleAddFamily = () => {
     if (!showAddFamily) {
       setNewLocation(guardianLocation)
-      setNewBirthPlace(guardianLocation) // 出生地默认继承
+      setNewBirthPlace(guardianLocation)
     }
     setShowAddFamily(!showAddFamily)
   }
 
   const handleAddFamily = () => {
+    // 1. 限制家属人数上限
+    if (patients.length >= 5) {
+      alert("最多只能添加 5 位家庭成员（含本人），请先删除不再需要的家属档案。")
+      return
+    }
+    
+    // 2. 基础校验
     if (!newFamilyName.trim() || !newRelation.trim() || !newGender || !newBirthYear || !newBirthMonth || !newBirthDay) {
       alert("请至少填写姓名、关系、性别和完整的出生年月日！")
       return
     }
+
+    // 3. 避免重复添加同名家属
+    if (patients.some(p => p.name === newFamilyName.trim())) {
+      alert(`家属【${newFamilyName.trim()}】已存在，请勿重复添加。`)
+      return
+    }
+
     const mm = String(newBirthMonth).padStart(2, '0')
     const dd = String(newBirthDay).padStart(2, '0')
     const birthDate = `${newBirthYear}-${mm}-${dd}`
@@ -512,8 +524,8 @@ export default function App() {
                   </div>
                 )}
 
-                <label style={{ fontSize: '13px', color: '#666' }}>出生地（可修改）</label>
-                <input type="text" value={draftProfile.birth_place} onChange={e => setDraftProfile({...draftProfile, birth_place: e.target.value})} placeholder="例如：广东省广州市" style={inputStyle} />
+                <label style={{ fontSize: '13px', color: '#666' }}>出生地（不可修改）</label>
+                <input type="text" value={draftProfile.birth_place} readOnly disabled style={{ ...inputStyle, backgroundColor: '#f0f0f0', color: '#888' }} />
 
                 <label style={{ fontSize: '13px', color: '#666' }}>现居住地（可修改）</label>
                 <input type="text" value={draftProfile.location} onChange={e => setDraftProfile({...draftProfile, location: e.target.value})} placeholder="例如：广东省广州市" style={inputStyle} />
