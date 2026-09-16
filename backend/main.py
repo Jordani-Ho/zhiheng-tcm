@@ -28,6 +28,7 @@ database.init_db()
 
 class TranscriptionInput(BaseModel):
     patient_name: str
+    teacher_name: str
     content: str
     data_type: str
 
@@ -39,6 +40,7 @@ class SignInput(BaseModel):
 
 class HomeworkInput(BaseModel):
     patient_name: str
+    teacher_name: str
     task: str
     detail: str
 
@@ -59,6 +61,10 @@ class AddPatientInput(BaseModel):
     birth_time: str
     birth_place: str
     location: str
+
+class TeacherStudentInput(BaseModel):
+    teacher_name: str
+    student_name: str
 
 @app.get("/api/huangli")
 def get_huangli():
@@ -120,25 +126,44 @@ def get_huangli():
         "current_shi": current_shi
     }
 
+# ---------- 老师 ----------
+@app.get("/api/teachers")
+def get_teachers():
+    return database.get_teachers()
+
+# ---------- 师生关系 ----------
+@app.get("/api/teacher-students")
+def get_teacher_students(teacher_name: str):
+    return database.get_teacher_students(teacher_name)
+
+@app.get("/api/student-teachers")
+def get_student_teachers(student_name: str):
+    return database.get_student_teachers(student_name)
+
+@app.post("/api/teacher-students")
+def add_teacher_student(input_data: TeacherStudentInput):
+    return database.add_teacher_student(input_data.teacher_name, input_data.student_name)
+
+@app.delete("/api/teacher-students")
+def remove_teacher_student(teacher_name: str, student_name: str):
+    return database.remove_teacher_student(teacher_name, student_name)
+
+@app.delete("/api/student-teachers")
+def leave_teacher(student_name: str, teacher_name: str):
+    return database.leave_teacher(student_name, teacher_name)
+
+# ---------- 患者 ----------
 @app.get("/api/patients")
 def get_patients(guardian_name: str = None):
     return database.get_patients(guardian_name)
 
 @app.post("/api/patients/add")
 def add_patient(input_data: AddPatientInput):
-    database.add_patient(
-        input_data.name,
-        input_data.guardian_name,
-        input_data.relation,
-        input_data.gender,
-        input_data.birth_date,
-        input_data.birth_time,
-        input_data.birth_place,
-        input_data.location
-    )
+    database.add_patient(input_data.name, input_data.guardian_name, input_data.relation,
+                         input_data.gender, input_data.birth_date, input_data.birth_time,
+                         input_data.birth_place, input_data.location)
     return {"message": "亲友档案添加成功"}
 
-# 【第28天新增】删除亲友
 @app.delete("/api/patients/{name}")
 def delete_patient(name: str):
     database.delete_patient(name)
@@ -147,15 +172,12 @@ def delete_patient(name: str):
 @app.get("/api/patient-profile")
 def get_patient_profile(patient_name: str):
     profile = database.get_patient_profile(patient_name)
-    
     if profile and profile["birth_date"]:
         try:
             time_str = profile["birth_time"] if profile["birth_time"] else "00:00"
             birth_dt = datetime.strptime(f"{profile['birth_date']} {time_str}", "%Y-%m-%d %H:%M")
-            
             lunar_obj = cnlunar.Lunar(birth_dt, godType='8char')
             profile["bazi"] = f"{lunar_obj.year8Char} {lunar_obj.month8Char} {lunar_obj.day8Char} {lunar_obj.twohour8Char}"
-            
             wuxing_str = "五行推算暂不可用"
             if hasattr(lunar_obj, 'baziFiveElements') and lunar_obj.baziFiveElements:
                 elems = lunar_obj.baziFiveElements
@@ -174,42 +196,35 @@ def get_patient_profile(patient_name: str):
                     wuxing_str = " ".join([f"{k}:{v}" for k, v in counts.items()])
                 except Exception:
                     wuxing_str = "五行推算暂不可用"
-            
             profile["wuxing"] = wuxing_str
-        except Exception as e:
+        except Exception:
             profile["bazi"] = "八字推算失败"
             profile["wuxing"] = "五行推算失败"
     else:
         profile["bazi"] = "缺少出生日期，无法推算八字"
         profile["wuxing"] = "缺少出生日期，无法推算五行"
-        
     return profile
 
 @app.post("/api/patient-profile")
 def save_patient_profile(input_data: ProfileInput):
-    database.save_patient_profile(
-        input_data.patient_name,
-        input_data.gender,
-        input_data.birth_date,
-        input_data.birth_time,
-        input_data.birth_place,
-        input_data.location
-    )
-    return {"message": "档案保存成功"} 
+    database.save_patient_profile(input_data.patient_name, input_data.gender, input_data.birth_date,
+                                  input_data.birth_time, input_data.birth_place, input_data.location)
+    return {"message": "档案保存成功"}
 
+# ---------- 角色数据 ----------
 @app.get("/api/role-data")
-def get_role_data(role: str, patient_name: str = "张三"):
-    hw = database.get_homework(patient_name)
+def get_role_data(role: str, patient_name: str = "张三", teacher_name: str = "李老师"):
+    hw = database.get_homework(patient_name, teacher_name)
     
     if role == "李老师":
         if not hw:
-            return {"role_type": "teacher", "name": "李老师", "task": "待审核", "detail": f"{patient_name}尚未打卡。"}
+            return {"role_type": "teacher", "name": teacher_name, "task": "待审核", "detail": f"{patient_name}尚未打卡。"}
         if hw["status"] == "pending":
-            return {"role_type": "teacher", "name": "李老师", "task": "待审核", "detail": f"{patient_name}尚未打卡。"}
+            return {"role_type": "teacher", "name": teacher_name, "task": "待审核", "detail": f"{patient_name}尚未打卡。"}
         elif hw["status"] == "checked_in":
-            return {"role_type": "teacher", "name": "李老师", "task": "待审核", "detail": f"{patient_name}：{hw['task']}（已打卡，待签字确认）"}
+            return {"role_type": "teacher", "name": teacher_name, "task": "待审核", "detail": f"{patient_name}：{hw['task']}（已打卡，待签字确认）"}
         else:
-            return {"role_type": "teacher", "name": "李老师", "task": "已审核", "detail": f"{patient_name}的作业已签字确认。"}
+            return {"role_type": "teacher", "name": teacher_name, "task": "已审核", "detail": f"{patient_name}的作业已签字确认。"}
     elif role == "患者" or role == "患者智能体":
         if not hw:
             return {"role_type": "patient", "name": patient_name, "task": "暂无作业", "detail": "等待老师布置作业。"}
@@ -223,41 +238,39 @@ def get_role_data(role: str, patient_name: str = "张三"):
 
 @app.post("/api/homework")
 def create_homework(input_data: HomeworkInput):
-    database.create_homework(input_data.patient_name, input_data.task, input_data.detail)
+    database.create_homework(input_data.patient_name, input_data.teacher_name, input_data.task, input_data.detail)
     return {"message": "作业已布置"}
 
 @app.post("/api/check-in")
-def check_in(patient_name: str = "张三"):
-    database.update_homework_status(patient_name, "checked_in")
+def check_in(patient_name: str = "张三", teacher_name: str = "李老师"):
+    database.update_homework_status(patient_name, teacher_name, "checked_in")
     database.add_points(patient_name, 10)
     return {"message": "打卡成功"}
 
 @app.post("/api/approve")
-def approve(patient_name: str = "张三"):
-    database.update_homework_status(patient_name, "approved")
+def approve(patient_name: str = "张三", teacher_name: str = "李老师"):
+    database.update_homework_status(patient_name, teacher_name, "approved")
     return {"message": "审核通过"}
 
 @app.post("/api/transcribe")
 def transcribe(input_data: TranscriptionInput):
-    database.insert_transcription(input_data.patient_name, input_data.content, input_data.data_type)
+    database.insert_transcription(input_data.patient_name, input_data.teacher_name, input_data.content, input_data.data_type)
     return {"message": "转述成功"}
 
 @app.post("/api/upload")
-async def upload_image(patient_name: str = "张三", file: UploadFile = File(...)):
+async def upload_image(patient_name: str = "张三", teacher_name: str = "李老师", file: UploadFile = File(...)):
     ext = os.path.splitext(file.filename)[1] if file.filename else ".jpg"
     unique_name = f"{uuid.uuid4().hex}{ext}"
     file_path = os.path.join(UPLOAD_DIR, unique_name)
-    
     with open(file_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
-    
     file_url = f"/uploads/{unique_name}"
-    database.insert_transcription(patient_name, file_url, "image")
+    database.insert_transcription(patient_name, teacher_name, file_url, "image")
     return {"message": "图片转述成功", "url": file_url}
 
 @app.get("/api/transcriptions")
-def get_transcriptions(patient_name: str = None):
-    return database.get_transcriptions(patient_name)
+def get_transcriptions(patient_name: str = None, teacher_name: str = None):
+    return database.get_transcriptions(patient_name, teacher_name)
 
 @app.post("/api/generate-draft")
 def generate_draft(transcript_id: int):
@@ -265,16 +278,14 @@ def generate_draft(transcript_id: int):
     transcript = next((t for t in transcripts if t["id"] == transcript_id), None)
     if not transcript:
         return {"error": "找不到该转述"}
-
     patient_name = transcript['patient_name']
-    past_records = database.get_patient_records(patient_name)
+    teacher_name = transcript['teacher_name']
+    past_records = database.get_patient_records(patient_name, teacher_name)
     past_content = "\n".join([f"- {r['final_plan']}" for r in past_records]) if past_records else "暂无过往病历"
-
     if transcript['data_type'] == 'image':
         content_desc = f"[患者上传了图片：{transcript['content']}]"
     else:
         content_desc = transcript['content']
-
     template = f"""【{patient_name}过往病历】
 {past_content}
 
@@ -282,13 +293,12 @@ def generate_draft(transcript_id: int):
 {content_desc}
 
 （以上内容仅供老师辨证参考）"""
-
-    draft_id = database.insert_draft(transcript_id, patient_name, template.strip())
+    draft_id = database.insert_draft(transcript_id, patient_name, teacher_name, template.strip())
     return {"message": "病历草案生成成功", "draft_id": draft_id}
 
 @app.get("/api/drafts")
-def get_drafts():
-    return database.get_drafts()
+def get_drafts(teacher_name: str = None):
+    return database.get_drafts(teacher_name)
 
 @app.put("/api/drafts/{draft_id}")
 def update_draft(draft_id: int, update_data: DraftUpdate):
@@ -301,23 +311,11 @@ def sign_draft_endpoint(draft_id: int, input_data: SignInput):
     if not patient_name:
         return {"error": "找不到该病历"}
     database.transfer_points(patient_name, "李老师", 50)
-    return {"message": "签字确认成功，已归档至患者健康档案，医嘱已自动转为患者作业，学费已支付"}
+    return {"message": "签字确认成功，已归档，作业已生成，学费已支付"}
 
 @app.get("/api/patient-records")
-def get_patient_records(patient_name: str = None):
-    return database.get_patient_records(patient_name)
-
-# 【第25天新增】修改病历
-class RecordUpdate(BaseModel):
-    patient_name: str
-    content: str
-
-@app.put("/api/patient-records/{record_id}")
-def update_patient_record_endpoint(record_id: int, input_data: RecordUpdate):
-    success = database.update_patient_record(record_id, input_data.patient_name, input_data.content)
-    if not success:
-        return {"error": "该病历已成为历史记录，不可修改"}
-    return {"message": "病历已更新"}
+def get_patient_records(patient_name: str = None, teacher_name: str = None):
+    return database.get_patient_records(patient_name, teacher_name)
 
 @app.get("/api/points")
 def get_points(patient_name: str = "张三"):
