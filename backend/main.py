@@ -62,9 +62,29 @@ class AddPatientInput(BaseModel):
     birth_place: str
     location: str
 
-class TeacherStudentInput(BaseModel):
+class TeacherLinkInput(BaseModel):
+    patient_name: str
     teacher_name: str
-    student_name: str
+
+def build_draft_template(patient_name, content_desc, past_content):
+    lines = [
+        "【中医病历草案】",
+        "学生姓名：" + patient_name,
+        "就诊时间：" + datetime.now().strftime('%Y年%m月%d日'),
+        "",
+        "【主诉（学生原话）】",
+        content_desc,
+        "",
+        "【既往病历参考】",
+        past_content,
+        "",
+        "【待老师补充】",
+        "- 舌象：",
+        "- 脉象：",
+        "- 辨证：",
+        "- 施治方案：",
+    ]
+    return "\n".join(lines)
 
 @app.get("/api/huangli")
 def get_huangli():
@@ -85,7 +105,7 @@ def get_huangli():
     lunar_obj = cnlunar.Lunar(now, godType='8char')
     term_list = sorted(lunar_obj.thisYearSolarTermsDic.items(), key=lambda x: str(x[1]))
     today_str = now.strftime('%Y-%m-%d')
-    
+
     prev_term = None
     next_term = None
     for name, date_val in term_list:
@@ -126,38 +146,38 @@ def get_huangli():
         "current_shi": current_shi
     }
 
-# ---------- 老师 ----------
 @app.get("/api/teachers")
 def get_teachers():
     return database.get_teachers()
 
-# ---------- 师生关系 ----------
-@app.get("/api/teacher-students")
-def get_teacher_students(teacher_name: str):
-    return database.get_teacher_students(teacher_name)
+@app.get("/api/patient-teachers")
+def get_patient_teachers(patient_name: str):
+    return database.get_patient_teachers(patient_name)
 
-@app.get("/api/student-teachers")
-def get_student_teachers(student_name: str):
-    return database.get_student_teachers(student_name)
+@app.get("/api/teacher-patients")
+def get_teacher_patients(teacher_name: str):
+    return database.get_teacher_patients(teacher_name)
 
-@app.post("/api/teacher-students")
-def add_teacher_student(input_data: TeacherStudentInput):
-    return database.add_teacher_student(input_data.teacher_name, input_data.student_name)
+@app.post("/api/patient-teachers")
+def add_patient_teacher(input_data: TeacherLinkInput):
+    return database.add_patient_teacher(input_data.patient_name, input_data.teacher_name)
 
-@app.delete("/api/teacher-students")
-def remove_teacher_student(teacher_name: str, student_name: str):
-    return database.remove_teacher_student(teacher_name, student_name)
+@app.delete("/api/patient-teachers")
+def remove_patient_teacher(patient_name: str, teacher_name: str):
+    return database.remove_patient_teacher(patient_name, teacher_name)
 
-@app.delete("/api/student-teachers")
-def leave_teacher(student_name: str, teacher_name: str):
-    return database.leave_teacher(student_name, teacher_name)
-
-# ---------- 患者 ----------
 @app.get("/api/patients")
 def get_patients(guardian_name: str = None):
     return database.get_patients(guardian_name)
 
 @app.post("/api/patients/add")
+class TeacherAddStudentInput(BaseModel):
+    teacher_name: str
+    student_name: str
+
+@app.post("/api/teacher/add-student")
+def teacher_add_student(input_data: TeacherAddStudentInput):
+    return database.teacher_add_student(input_data.teacher_name, input_data.student_name)
 def add_patient(input_data: AddPatientInput):
     database.add_patient(input_data.name, input_data.guardian_name, input_data.relation,
                          input_data.gender, input_data.birth_date, input_data.birth_time,
@@ -186,16 +206,13 @@ def get_patient_profile(patient_name: str):
                 else:
                     wuxing_str = str(elems)
             else:
-                try:
-                    bazi_chars = [lunar_obj.year8Char[0], lunar_obj.month8Char[0], lunar_obj.day8Char[0], lunar_obj.twohour8Char[0]]
-                    wuxing_map = {'甲':'木','乙':'木','丙':'火','丁':'火','戊':'土','己':'土','庚':'金','辛':'金','壬':'水','癸':'水'}
-                    counts = {"木":0, "火":0, "土":0, "金":0, "水":0}
-                    for c in bazi_chars:
-                        if c in wuxing_map:
-                            counts[wuxing_map[c]] += 1
-                    wuxing_str = " ".join([f"{k}:{v}" for k, v in counts.items()])
-                except Exception:
-                    wuxing_str = "五行推算暂不可用"
+                bazi_chars = [lunar_obj.year8Char[0], lunar_obj.month8Char[0], lunar_obj.day8Char[0], lunar_obj.twohour8Char[0]]
+                wuxing_map = {'甲':'木','乙':'木','丙':'火','丁':'火','戊':'土','己':'土','庚':'金','辛':'金','壬':'水','癸':'水'}
+                counts = {"木":0, "火":0, "土":0, "金":0, "水":0}
+                for c in bazi_chars:
+                    if c in wuxing_map:
+                        counts[wuxing_map[c]] += 1
+                wuxing_str = " ".join([f"{k}:{v}" for k, v in counts.items()])
             profile["wuxing"] = wuxing_str
         except Exception:
             profile["bazi"] = "八字推算失败"
@@ -211,11 +228,10 @@ def save_patient_profile(input_data: ProfileInput):
                                   input_data.birth_time, input_data.birth_place, input_data.location)
     return {"message": "档案保存成功"}
 
-# ---------- 角色数据 ----------
 @app.get("/api/role-data")
 def get_role_data(role: str, patient_name: str = "张三", teacher_name: str = "李老师"):
     hw = database.get_homework(patient_name, teacher_name)
-    
+
     if role == "李老师":
         if not hw:
             return {"role_type": "teacher", "name": teacher_name, "task": "待审核", "detail": f"{patient_name}尚未打卡。"}
@@ -225,7 +241,7 @@ def get_role_data(role: str, patient_name: str = "张三", teacher_name: str = "
             return {"role_type": "teacher", "name": teacher_name, "task": "待审核", "detail": f"{patient_name}：{hw['task']}（已打卡，待签字确认）"}
         else:
             return {"role_type": "teacher", "name": teacher_name, "task": "已审核", "detail": f"{patient_name}的作业已签字确认。"}
-    elif role == "患者" or role == "患者智能体":
+    elif role in ["学生", "学生智能体", "患者", "患者智能体"]:
         if not hw:
             return {"role_type": "patient", "name": patient_name, "task": "暂无作业", "detail": "等待老师布置作业。"}
         if hw["status"] == "pending":
@@ -255,7 +271,26 @@ def approve(patient_name: str = "张三", teacher_name: str = "李老师"):
 @app.post("/api/transcribe")
 def transcribe(input_data: TranscriptionInput):
     database.insert_transcription(input_data.patient_name, input_data.teacher_name, input_data.content, input_data.data_type)
-    return {"message": "转述成功"}
+
+    transcripts = database.get_transcriptions(input_data.patient_name, input_data.teacher_name)
+    if not transcripts:
+        return {"message": "转述失败"}
+    latest = transcripts[0]
+
+    patient_name = latest['patient_name']
+    teacher_name = latest['teacher_name']
+    past_records = database.get_patient_records(patient_name, teacher_name)
+    past_content = "\n".join([f"- {r['final_plan']}" for r in past_records]) if past_records else "暂无过往病历"
+
+    if latest['data_type'] == 'image':
+        content_desc = "[学生上传了图片：" + str(latest['content']) + "]"
+    else:
+        content_desc = str(latest['content'])
+
+    template = build_draft_template(patient_name, content_desc, past_content)
+    database.insert_draft(latest['id'], patient_name, teacher_name, template.strip())
+
+    return {"message": "转述成功，病历草案已自动生成"}
 
 @app.post("/api/upload")
 async def upload_image(patient_name: str = "张三", teacher_name: str = "李老师", file: UploadFile = File(...)):
@@ -266,7 +301,27 @@ async def upload_image(patient_name: str = "张三", teacher_name: str = "李老
         shutil.copyfileobj(file.file, buffer)
     file_url = f"/uploads/{unique_name}"
     database.insert_transcription(patient_name, teacher_name, file_url, "image")
+
+    transcripts = database.get_transcriptions(patient_name, teacher_name)
+    if transcripts:
+        latest = transcripts[0]
+        past_records = database.get_patient_records(patient_name, teacher_name)
+        past_content = "\n".join([f"- {r['final_plan']}" for r in past_records]) if past_records else "暂无过往病历"
+        content_desc = "[学生上传了图片：" + file_url + "]"
+        template = build_draft_template(patient_name, content_desc, past_content)
+        database.insert_draft(latest['id'], patient_name, teacher_name, template.strip())
+
     return {"message": "图片转述成功", "url": file_url}
+
+@app.post("/api/upload-temp")
+async def upload_temp(file: UploadFile = File(...)):
+    ext = os.path.splitext(file.filename)[1] if file.filename else ".jpg"
+    unique_name = f"{uuid.uuid4().hex}{ext}"
+    file_path = os.path.join(UPLOAD_DIR, unique_name)
+    with open(file_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+    file_url = f"/uploads/{unique_name}"
+    return {"message": "临时上传成功", "url": file_url}
 
 @app.get("/api/transcriptions")
 def get_transcriptions(patient_name: str = None, teacher_name: str = None):
@@ -283,16 +338,10 @@ def generate_draft(transcript_id: int):
     past_records = database.get_patient_records(patient_name, teacher_name)
     past_content = "\n".join([f"- {r['final_plan']}" for r in past_records]) if past_records else "暂无过往病历"
     if transcript['data_type'] == 'image':
-        content_desc = f"[患者上传了图片：{transcript['content']}]"
+        content_desc = "[学生上传了图片：" + str(transcript['content']) + "]"
     else:
-        content_desc = transcript['content']
-    template = f"""【{patient_name}过往病历】
-{past_content}
-
-【{patient_name}最新陈述】
-{content_desc}
-
-（以上内容仅供老师辨证参考）"""
+        content_desc = str(transcript['content'])
+    template = build_draft_template(patient_name, content_desc, past_content)
     draft_id = database.insert_draft(transcript_id, patient_name, teacher_name, template.strip())
     return {"message": "病历草案生成成功", "draft_id": draft_id}
 
