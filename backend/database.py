@@ -1,5 +1,6 @@
 import sqlite3
 import os
+from datetime import datetime, timedelta
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "zhiheng.db")
 
@@ -111,6 +112,18 @@ def init_db():
     CREATE TABLE IF NOT EXISTS accounts (
         role_name TEXT PRIMARY KEY,
         points INTEGER DEFAULT 0
+    )
+    """)
+
+    # 【第38天新增】邀请码表
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS invites (
+        code TEXT PRIMARY KEY,
+        teacher_name TEXT,
+        created_at TEXT,
+        expires_at TEXT,
+        used_by TEXT,
+        used_at TEXT
     )
     """)
 
@@ -413,6 +426,53 @@ def get_patient_records(patient_name=None, teacher_name=None):
     rows = conn.execute(query, params).fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
+# ---------- 邀请码相关操作 ----------
+def create_invite(code, teacher_name):
+    conn = get_connection()
+    now = datetime.now()
+    expires = (now + timedelta(days=7)).strftime('%Y-%m-%d %H:%M:%S')
+    conn.execute("INSERT INTO invites (code, teacher_name, created_at, expires_at) VALUES (?, ?, ?, ?)",
+                 (code, teacher_name, now.strftime('%Y-%m-%d %H:%M:%S'), expires))
+    conn.commit()
+    conn.close()
+
+def get_invites(teacher_name):
+    conn = get_connection()
+    rows = conn.execute("SELECT * FROM invites WHERE teacher_name = ? ORDER BY created_at DESC", (teacher_name,)).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+def accept_invite(code, student_name):
+    conn = get_connection()
+    invite = conn.execute("SELECT * FROM invites WHERE code = ?", (code,)).fetchone()
+    if not invite:
+        conn.close()
+        return {"error": "邀请码不存在"}
+    if invite["used_by"]:
+        conn.close()
+        return {"error": "邀请码已被使用"}
+    if invite["expires_at"] < datetime.now().strftime('%Y-%m-%d %H:%M:%S'):
+        conn.close()
+        return {"error": "邀请码已过期"}
+
+    # 创建学生账户
+    conn.execute("INSERT OR IGNORE INTO patients (name, guardian_name, relation, created_at) VALUES (?, 'self', '本人', ?)",
+                 (student_name, datetime.now().strftime('%Y-%m-%d')))
+    # 建立师生关系
+    try:
+        conn.execute("INSERT INTO patient_teachers (patient_name, teacher_name, status, created_at) VALUES (?, ?, 'active', ?)",
+                     (student_name, invite["teacher_name"], datetime.now().strftime('%Y-%m-%d')))
+    except sqlite3.IntegrityError:
+        pass
+    # 初始积分
+    conn.execute("INSERT OR IGNORE INTO accounts (role_name, points) VALUES (?, 100)", (student_name,))
+    # 标记邀请码已使用
+    conn.execute("UPDATE invites SET used_by = ?, used_at = ? WHERE code = ?",
+                 (student_name, datetime.now().strftime('%Y-%m-%d %H:%M:%S'), code))
+    conn.commit()
+    conn.close()
+    return {"message": "加入成功", "teacher_name": invite["teacher_name"]}
 
 # ---------- 积分相关操作 ----------
 def get_points(role_name):

@@ -6,6 +6,7 @@ from datetime import datetime
 import lunardate
 import cnlunar
 import database
+import agent
 import os
 import shutil
 import uuid
@@ -228,6 +229,148 @@ def save_patient_profile(input_data: ProfileInput):
                                   input_data.birth_time, input_data.birth_place, input_data.location)
     return {"message": "档案保存成功"}
 
+@app.get("/api/health-trend")
+def get_health_trend(patient_name: str):
+    profile = database.get_patient_profile(patient_name)
+    if not profile or not profile["birth_date"]:
+        return {"error": "缺少出生日期，无法推算"}
+
+    time_str = profile["birth_time"] if profile["birth_time"] else "00:00"
+    birth_dt = datetime.strptime(f"{profile['birth_date']} {time_str}", "%Y-%m-%d %H:%M")
+    lunar_obj = cnlunar.Lunar(birth_dt, godType='8char')
+
+    tiangan_wuxing = {'甲':'木','乙':'木','丙':'火','丁':'火','戊':'土','己':'土','庚':'金','辛':'金','壬':'水','癸':'水'}
+    dizhi_wuxing = {'子':'水','丑':'土','寅':'木','卯':'木','辰':'土','巳':'火','午':'火','未':'土','申':'金','酉':'金','戌':'土','亥':'水'}
+    yang_gan = ['甲','丙','戊','庚','壬']
+    yin_gan = ['乙','丁','己','辛','癸']
+    yang_zhi = ['子','寅','辰','午','申','戌']
+    yin_zhi = ['丑','卯','巳','未','酉','亥']
+
+    bazi = [lunar_obj.year8Char, lunar_obj.month8Char, lunar_obj.day8Char, lunar_obj.twohour8Char]
+
+    counts = {"木": 0, "火": 0, "土": 0, "金": 0, "水": 0}
+    yang_count = 0
+    yin_count = 0
+
+    for pillar in bazi:
+        for char in pillar:
+            if char in tiangan_wuxing:
+                counts[tiangan_wuxing[char]] += 1
+                if char in yang_gan: yang_count += 1
+                if char in yin_gan: yin_count += 1
+            if char in dizhi_wuxing:
+                counts[dizhi_wuxing[char]] += 1
+                if char in yang_zhi: yang_count += 1
+                if char in yin_zhi: yin_count += 1
+
+    weakest = min(counts, key=counts.get)
+    strongest = max(counts, key=counts.get)
+
+    wuxing_organ = {"木": "肝胆", "火": "心小肠", "土": "脾胃", "金": "肺大肠", "水": "肾膀胱"}
+    wuxing_zang = {"木": "肝", "火": "心", "土": "脾", "金": "肺", "水": "肾"}
+
+    if counts[weakest] == 0:
+        tendency = f"{wuxing_organ[weakest]}系统先天偏虚，建议重点养护{wuxing_zang[weakest]}"
+    elif counts[strongest] >= 3:
+        tendency = f"{wuxing_organ[strongest]}系统先天偏旺，注意疏导{wuxing_zang[strongest]}"
+    else:
+        tendency = "五行相对平衡，保持日常养护即可"
+
+    if yang_count > yin_count + 1:
+        yinyang = "偏阳体质"
+    elif yin_count > yang_count + 1:
+        yinyang = "偏阴体质"
+    else:
+        yinyang = "阴阳相对平衡"
+
+    return {
+        "bazi": " ".join(bazi),
+        "counts": counts,
+        "weakest": weakest,
+        "strongest": strongest,
+        "tendency": tendency,
+        "yinyang": yinyang,
+        "yang_count": yang_count,
+        "yin_count": yin_count,
+    }
+
+@app.get("/api/daily-advice")
+def get_daily_advice(patient_name: str):
+    profile = database.get_patient_profile(patient_name)
+
+    now = datetime.now()
+    lunar_obj = cnlunar.Lunar(now, godType='8char')
+    today_term = lunar_obj.todaySolarTerms or "平气"
+    if today_term == "无":
+        today_term = "平气"
+
+    term_advice = {
+        "立春": {"eat": "韭菜、豆芽、香椿", "avoid": "生冷、油腻", "wear": "不宜过早减衣"},
+        "惊蛰": {"eat": "梨、菠菜、山药", "avoid": "辛辣、暴怒", "wear": "注意防风"},
+        "清明": {"eat": "荠菜、香椿、青团", "avoid": "发物、海鲜", "wear": "早晚添衣"},
+        "谷雨": {"eat": "薏米、赤小豆、冬瓜", "avoid": "甜腻、久坐", "wear": "注意祛湿"},
+        "立夏": {"eat": "绿豆、苦瓜、莲子", "avoid": "大热、暴晒", "wear": "轻薄透气"},
+        "小满": {"eat": "冬瓜、丝瓜、绿豆汤", "avoid": "寒凉冰饮", "wear": "勤换衣"},
+        "芒种": {"eat": "青梅、薏米、西瓜", "avoid": "甜食、熬夜", "wear": "棉麻为宜"},
+        "夏至": {"eat": "苦瓜、莲子、绿豆", "avoid": "贪凉、冷饮", "wear": "注意遮阳"},
+        "小暑": {"eat": "冬瓜、丝瓜、荷叶粥", "avoid": "烈酒、辛辣", "wear": "透气散热"},
+        "大暑": {"eat": "绿豆、莲子、薏米", "avoid": "大汗、贪凉", "wear": "防晒防暑"},
+        "立秋": {"eat": "百合、银耳、莲藕", "avoid": "辛辣、燥热", "wear": "早晚添衣"},
+        "处暑": {"eat": "梨、蜂蜜、银耳", "avoid": "燥热、熬夜", "wear": "防秋燥"},
+        "白露": {"eat": "银耳、百合、雪梨、山药", "avoid": "辛辣、燥热、凉性瓜果", "wear": "早晚添衣、护住肚脐"},
+        "秋分": {"eat": "莲藕、银耳、芝麻", "avoid": "辛辣、熬夜", "wear": "昼夜温差大，添衣"},
+        "寒露": {"eat": "芝麻、核桃、红枣", "avoid": "寒凉、生冷", "wear": "注意足部保暖"},
+        "霜降": {"eat": "萝卜、栗子、山药", "avoid": "生冷、久坐", "wear": "护膝护脚"},
+        "立冬": {"eat": "羊肉、核桃、黑芝麻", "avoid": "寒凉、过咸", "wear": "保暖护肾"},
+        "小雪": {"eat": "羊肉、红枣、黑豆", "avoid": "生冷、熬夜", "wear": "厚衣厚袜"},
+        "大雪": {"eat": "黑豆、核桃、山药", "avoid": "寒凉、大汗", "wear": "严冬保暖"},
+        "冬至": {"eat": "饺子、羊肉、枸杞", "avoid": "寒凉、久坐", "wear": "护住头颈"},
+        "小寒": {"eat": "红枣、桂圆、羊肉", "avoid": "生冷、烈酒", "wear": "全副武装"},
+        "大寒": {"eat": "羊肉、核桃、黑芝麻", "avoid": "寒凉、大汗", "wear": "防寒保暖"},
+    }
+
+    base = term_advice.get(today_term, {"eat": "当季新鲜食材", "avoid": "过度油腻", "wear": "顺应天气增减衣物"})
+
+    wuxing_supplement = {
+        "木": {"eat": "绿色蔬菜、枸杞、菊花茶", "avoid": "久视屏幕", "wear": "早睡养肝"},
+        "火": {"eat": "莲子、百合、苦瓜", "avoid": "熬夜、辛辣", "wear": "静心养神"},
+        "土": {"eat": "小米、山药、南瓜", "avoid": "生冷、思虑过度", "wear": "三餐规律"},
+        "金": {"eat": "银耳、雪梨、百合", "avoid": "悲伤、燥热", "wear": "润肺养气"},
+        "水": {"eat": "黑豆、核桃、黑芝麻、海带", "avoid": "寒凉、熬夜", "wear": "护腰养肾"},
+    }
+
+    wuxing_tip = {"eat": "均衡饮食", "avoid": "寒凉生冷", "wear": "注意保暖"}
+    tendency_note = ""
+    if profile and profile.get("birth_date"):
+        time_str = profile["birth_time"] if profile["birth_time"] else "00:00"
+        try:
+            birth_dt = datetime.strptime(f"{profile['birth_date']} {time_str}", "%Y-%m-%d %H:%M")
+            lunar_birth = cnlunar.Lunar(birth_dt, godType='8char')
+            tiangan_wuxing = {'甲':'木','乙':'木','丙':'火','丁':'火','戊':'土','己':'土','庚':'金','辛':'金','壬':'水','癸':'水'}
+            dizhi_wuxing = {'子':'水','丑':'土','寅':'木','卯':'木','辰':'土','巳':'火','午':'火','未':'土','申':'金','酉':'金','戌':'土','亥':'水'}
+            bazi = [lunar_birth.year8Char, lunar_birth.month8Char, lunar_birth.day8Char, lunar_birth.twohour8Char]
+            counts = {"木": 0, "火": 0, "土": 0, "金": 0, "水": 0}
+            for pillar in bazi:
+                for char in pillar:
+                    if char in tiangan_wuxing:
+                        counts[tiangan_wuxing[char]] += 1
+                    if char in dizhi_wuxing:
+                        counts[dizhi_wuxing[char]] += 1
+            weakest = min(counts, key=counts.get)
+            wuxing_tip = wuxing_supplement[weakest]
+            tendency_note = f"您的五行中「{weakest}」最弱，今日特别照顾"
+        except Exception:
+            pass
+
+    return {
+        "solar_term": today_term,
+        "date": now.strftime("%Y年%m月%d日"),
+        "eat": base["eat"] + "，另可补充：" + wuxing_tip["eat"],
+        "avoid": base["avoid"] + "，" + wuxing_tip["avoid"],
+        "wear": base["wear"] + "；" + wuxing_tip["wear"],
+        "tendency_note": tendency_note,
+    }
+
 @app.get("/api/role-data")
 def get_role_data(role: str, patient_name: str = "张三", teacher_name: str = "李老师"):
     hw = database.get_homework(patient_name, teacher_name)
@@ -268,6 +411,25 @@ def approve(patient_name: str = "张三", teacher_name: str = "李老师"):
     database.update_homework_status(patient_name, teacher_name, "approved")
     return {"message": "审核通过"}
 
+# 【第41天新增】患者端智能体：整理患者原话（带标点、结构化）
+class PatientStructurizeInput(BaseModel):
+    patient_name: str
+    raw_text: str
+
+@app.post("/api/patient-structurize")
+def patient_structurize(input_data: PatientStructurizeInput):
+    result = agent.structurize_patient_input(input_data.raw_text)
+    return {"structured": result}
+
+# 【第42天新增】老师端现场口述整理
+class TeacherStructurizeInput(BaseModel):
+    raw_text: str
+
+@app.post("/api/teacher-structurize")
+def teacher_structurize(input_data: TeacherStructurizeInput):
+    result = agent.structurize_teacher_note(input_data.raw_text)
+    return {"structured": result}
+
 @app.post("/api/transcribe")
 def transcribe(input_data: TranscriptionInput):
     database.insert_transcription(input_data.patient_name, input_data.teacher_name, input_data.content, input_data.data_type)
@@ -282,12 +444,11 @@ def transcribe(input_data: TranscriptionInput):
     past_records = database.get_patient_records(patient_name, teacher_name)
     past_content = "\n".join([f"- {r['final_plan']}" for r in past_records]) if past_records else "暂无过往病历"
 
-    if latest['data_type'] == 'image':
-        content_desc = "[学生上传了图片：" + str(latest['content']) + "]"
-    else:
-        content_desc = str(latest['content'])
+    # 【第41天修复】学生端已做过结构化，后端不再调 structurize，直接交给老师智能体
+    content_desc = str(latest['content'])
 
-    template = build_draft_template(patient_name, content_desc, past_content)
+    visit_date = datetime.now().strftime('%Y年%m月%d日')
+    template = agent.generate_medical_draft(patient_name, visit_date, content_desc, past_content)
     database.insert_draft(latest['id'], patient_name, teacher_name, template.strip())
 
     return {"message": "转述成功，病历草案已自动生成"}
@@ -308,7 +469,8 @@ async def upload_image(patient_name: str = "张三", teacher_name: str = "李老
         past_records = database.get_patient_records(patient_name, teacher_name)
         past_content = "\n".join([f"- {r['final_plan']}" for r in past_records]) if past_records else "暂无过往病历"
         content_desc = "[学生上传了图片：" + file_url + "]"
-        template = build_draft_template(patient_name, content_desc, past_content)
+        visit_date = datetime.now().strftime('%Y年%m月%d日')
+        template = agent.generate_medical_draft(patient_name, visit_date, content_desc, past_content)
         database.insert_draft(latest['id'], patient_name, teacher_name, template.strip())
 
     return {"message": "图片转述成功", "url": file_url}
@@ -322,6 +484,15 @@ async def upload_temp(file: UploadFile = File(...)):
         shutil.copyfileobj(file.file, buffer)
     file_url = f"/uploads/{unique_name}"
     return {"message": "临时上传成功", "url": file_url}
+
+@app.post("/api/upload-audio")
+async def upload_audio(file: UploadFile = File(...)):
+    ext = os.path.splitext(file.filename)[1] if file.filename else ".webm"
+    unique_name = f"audio_{uuid.uuid4().hex}{ext}"
+    file_path = os.path.join(UPLOAD_DIR, unique_name)
+    with open(file_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+    return {"url": f"/uploads/{unique_name}"}
 
 @app.get("/api/transcriptions")
 def get_transcriptions(patient_name: str = None, teacher_name: str = None):
@@ -365,6 +536,29 @@ def sign_draft_endpoint(draft_id: int, input_data: SignInput):
 @app.get("/api/patient-records")
 def get_patient_records(patient_name: str = None, teacher_name: str = None):
     return database.get_patient_records(patient_name, teacher_name)
+# ---------- 邀请码 ----------
+class InviteInput(BaseModel):
+    teacher_name: str
+
+class AcceptInviteInput(BaseModel):
+    code: str
+    student_name: str
+
+@app.post("/api/invites")
+def create_invite(input_data: InviteInput):
+    import random
+    import string
+    code = "ZHI-" + "".join(random.choices(string.ascii_uppercase + string.digits, k=6))
+    database.create_invite(code, input_data.teacher_name)
+    return {"code": code, "message": "邀请码已生成"}
+
+@app.get("/api/invites")
+def get_invites(teacher_name: str):
+    return database.get_invites(teacher_name)
+
+@app.post("/api/invites/accept")
+def accept_invite(input_data: AcceptInviteInput):
+    return database.accept_invite(input_data.code, input_data.student_name)
 
 @app.get("/api/points")
 def get_points(patient_name: str = "张三"):
