@@ -23,7 +23,6 @@ export default function App() {
   const [currentRole, setCurrentRole] = useState('学生')
   const [roleData, setRoleData] = useState<RoleData | null>(null)
   const [inputText, setInputText] = useState('')
-  const [transcriptions, setTranscriptions] = useState<Transcription[]>([])
   const [drafts, setDrafts] = useState<Draft[]>([])
   const [patientRecords, setPatientRecords] = useState<PatientRecord[]>([])
   const [finalPlans, setFinalPlans] = useState<{ [key: number]: string }>({})
@@ -39,7 +38,7 @@ export default function App() {
   const [patientTeachers, setPatientTeachers] = useState<string[]>([])
   const [selectedTeacher, setSelectedTeacher] = useState('李老师')
   const [showTeacherPicker, setShowTeacherPicker] = useState(false)
-  const [teacherPatients, setTeacherPatients] = useState<string[]>([])
+  const [teacherPatients, setTeacherPatients] = useState<any[]>([])
 
   const [showAddFamily, setShowAddFamily] = useState(false)
   const [newFamilyName, setNewFamilyName] = useState('')
@@ -62,7 +61,6 @@ export default function App() {
   const [pendingInviteCode, setPendingInviteCode] = useState<string>('')
   const [newStudentNameFromInvite, setNewStudentNameFromInvite] = useState<string>('')
 
-  // 学生端：录音/图片/音频/结构化预览
   const [structuredPreview, setStructuredPreview] = useState<string | null>(null)
   const [pendingImages, setPendingImages] = useState<string[]>([])
   const [pendingAudios, setPendingAudios] = useState<string[]>([])
@@ -72,12 +70,25 @@ export default function App() {
   const [uploading, setUploading] = useState(false)
   const fileInputRef = useRef<HTMLInputElement>(null)
 
-  // 老师端：现场辅助记录
   const [teacherLiveText, setTeacherLiveText] = useState<{ [draftId: number]: string }>({})
   const [teacherLiveRecording, setTeacherLiveRecording] = useState<number | null>(null)
   const [teacherLiveRecognition, setTeacherLiveRecognition] = useState<any>(null)
   const [teacherLiveStructurizing, setTeacherLiveStructurizing] = useState<{ [draftId: number]: boolean }>({})
   const [liveUploading, setLiveUploading] = useState<{ [draftId: number]: boolean }>({})
+
+  const [previewDraft, setPreviewDraft] = useState<{ id: number; content: string } | null>(null)
+  const [draftTags, setDraftTags] = useState<{ [draftId: number]: { area: string; symptom: string } }>({})
+    // 【第47天新增】预约
+  const [appointments, setAppointments] = useState<any[]>([])
+  const [showApptForm, setShowApptForm] = useState(false)
+  const [apptDate, setApptDate] = useState('')
+  const [apptTime, setApptTime] = useState('')
+  const [apptReason, setApptReason] = useState('')
+    // 【第48天新增】老师工作时间 + 预约防呆
+  const [teacherSettings, setTeacherSettings] = useState<{ work_days_list: number[]; work_hours_list: number[] } | null>(null)
+  const [editingSettings, setEditingSettings] = useState(false)
+  const [settingsDays, setSettingsDays] = useState<number[]>([])
+  const [settingsHours, setSettingsHours] = useState<number[]>([])
 
   const yearOptions = Array.from({ length: currentYear - 1920 + 1 }, (_, i) => currentYear - i)
   const monthOptions = Array.from({ length: 12 }, (_, i) => i + 1).filter(m => {
@@ -115,23 +126,20 @@ export default function App() {
     const matches = content.match(regex)
     return matches ? Array.from(new Set(matches)) : []
   }
-
   const extractAudioUrls = (content: string): string[] => {
     const regex = /\/uploads\/audio_[a-zA-Z0-9._-]+/g
     const matches = content.match(regex)
     return matches ? Array.from(new Set(matches)) : []
   }
 
-  // ============== 数据获取 ==============
+  // ============== 初始化 ==============
   useEffect(() => {
     fetch('/api/huangli').then(r => r.json()).then(d => setHuangli(d)).catch(() => setHuangli(null))
     fetch('/api/teachers').then(r => r.json()).then(d => setTeachers(d)).catch(() => setTeachers([]))
     fetchPatients('张三')
-
     const urlParams = new URLSearchParams(window.location.search)
     const inviteCode = urlParams.get('invite')
     if (inviteCode) setPendingInviteCode(inviteCode)
-
     fetch('/api/patient-profile?patient_name=张三')
       .then(r => r.json())
       .then(d => {
@@ -162,35 +170,29 @@ export default function App() {
 
   useEffect(() => {
     fetchRoleData()
-    fetchTranscriptions()
     fetchDrafts()
     fetchPatientRecords()
     fetchPoints()
     fetchProfile()
     fetchHealthTrend()
     fetchDailyAdvice()
+    fetchAppointments()
+    fetchTeacherSettings()
     setShowHistory(false)
   }, [currentRole, selectedPatient, selectedTeacher])
 
+  // ============== 数据获取 ==============
   const fetchPatients = (guardian: string) => {
     fetch(`/api/patients?guardian_name=${guardian}`).then(r => r.json()).then(d => setPatients(d)).catch(() => setPatients([]))
   }
-
   const fetchRoleData = () => {
     fetch(`/api/role-data?role=${currentRole}&patient_name=${selectedPatient}&teacher_name=${selectedTeacher}`)
       .then(r => r.json()).then(d => setRoleData(d)).catch(() => setRoleData(null))
   }
-
-  const fetchTranscriptions = () => {
-    fetch(`/api/transcriptions?patient_name=${selectedPatient}&teacher_name=${selectedTeacher}`)
-      .then(r => r.json()).then(d => setTranscriptions(d)).catch(() => setTranscriptions([]))
-  }
-
   const fetchDrafts = () => {
     fetch(`/api/drafts?teacher_name=${selectedTeacher}`)
       .then(r => r.json()).then(d => setDrafts(d)).catch(() => setDrafts([]))
   }
-
   const fetchPatientRecords = () => {
     fetch(`/api/patient-records?patient_name=${selectedPatient}&teacher_name=${selectedTeacher}`)
       .then(r => r.json()).then(d => {
@@ -198,29 +200,109 @@ export default function App() {
         setPatientRecords(sorted)
       }).catch(() => setPatientRecords([]))
   }
-
   const fetchPoints = () => {
     fetch(`/api/points?patient_name=${selectedPatient}`).then(r => r.json()).then(d => setPoints(d)).catch(() => setPoints(null))
   }
-
   const fetchProfile = () => {
     fetch(`/api/patient-profile?patient_name=${selectedPatient}`).then(r => r.json()).then(d => setProfile(d)).catch(() => setProfile(null))
   }
-
   const fetchHealthTrend = () => {
     fetch(`/api/health-trend?patient_name=${selectedPatient}`)
       .then(r => r.json()).then(d => setHealthTrend(d && !d.error ? d : null))
       .catch(() => setHealthTrend(null))
   }
-
   const fetchDailyAdvice = () => {
     fetch(`/api/daily-advice?patient_name=${selectedPatient}`)
       .then(r => r.json()).then(d => setDailyAdvice(d && !d.error ? d : null))
       .catch(() => setDailyAdvice(null))
   }
-
   const fetchInvites = () => {
     fetch(`/api/invites?teacher_name=${selectedTeacher}`).then(r => r.json()).then(d => setInvites(d)).catch(() => setInvites([]))
+  }
+
+    // 【第47天新增】预约
+  const fetchAppointments = () => {
+    const url = currentRole.includes('老师')
+      ? `/api/appointments?teacher_name=${selectedTeacher}`
+      : `/api/appointments?patient_name=${selectedPatient}`
+    fetch(url).then(r => r.json()).then(d => setAppointments(d)).catch(() => setAppointments([]))
+  }
+
+  const handleCreateAppointment = () => {
+    if (!apptDate || !apptTime || !apptReason.trim()) {
+      alert("请填写完整的预约信息（日期、时间、原因）")
+      return
+    }
+    const initiator = currentRole.includes('老师') ? 'teacher' : 'student'
+    fetch('/api/appointments', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        patient_name: selectedPatient,
+        teacher_name: selectedTeacher,
+        initiator,
+        scheduled_date: apptDate,
+        scheduled_time: apptTime,
+        reason: apptReason.trim()
+      })
+    }).then(() => {
+      setShowApptForm(false)
+      setApptDate(''); setApptTime(''); setApptReason('')
+      fetchAppointments()
+    })
+  }
+
+  const handleConfirmAppt = (id: number) => {
+    fetch(`/api/appointments/${id}/confirm`, { method: 'POST' }).then(() => fetchAppointments())
+  }
+
+  const handleCancelAppt = (id: number) => {
+    if (!confirm("确定要取消这个预约吗？")) return
+    fetch(`/api/appointments/${id}/cancel`, { method: 'POST' }).then(() => fetchAppointments())
+  }
+  
+    // 【第48天新增】老师工作时间
+  const fetchTeacherSettings = () => {
+    fetch(`/api/teacher-settings?teacher_name=${selectedTeacher}`)
+      .then(r => r.json())
+      .then(d => {
+        setTeacherSettings(d)
+        setSettingsDays(d.work_days_list || [])
+        setSettingsHours(d.work_hours_list || [])
+      })
+      .catch(() => setTeacherSettings(null))
+  }
+
+  const handleSaveSettings = () => {
+    if (settingsDays.length === 0 || settingsHours.length === 0) {
+      alert("请至少选择一天工作日和一个工作时段")
+      return
+    }
+    fetch('/api/teacher-settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        teacher_name: selectedTeacher,
+        work_days: settingsDays.join(','),
+        work_hours: settingsHours.join(',')
+      })
+    }).then(() => {
+      setEditingSettings(false)
+      fetchTeacherSettings()
+    })
+  }
+
+  // 计算明天的日期（用于预约最早日期）
+  const getTomorrowStr = () => {
+    const t = new Date()
+    t.setDate(t.getDate() + 1)
+    return t.toISOString().split('T')[0]
+  }
+  // 计算一个月后的日期
+  const getMaxDateStr = () => {
+    const t = new Date()
+    t.setMonth(t.getMonth() + 1)
+    return t.toISOString().split('T')[0]
   }
 
   // ============== 学生端行为 ==============
@@ -228,7 +310,6 @@ export default function App() {
     fetch(`/api/check-in?patient_name=${selectedPatient}&teacher_name=${selectedTeacher}`, { method: 'POST' })
       .then(() => { fetchRoleData(); fetchPoints() })
   }
-
   const handleApprove = () => {
     fetch(`/api/approve?patient_name=${selectedPatient}&teacher_name=${selectedTeacher}`, { method: 'POST' })
       .then(() => fetchRoleData())
@@ -284,8 +365,7 @@ export default function App() {
 
   const handleTranscribe = () => {
     if (!inputText.trim() && pendingImages.length === 0 && pendingAudios.length === 0) {
-      alert("请先输入文字、录音或上传图片")
-      return
+      alert("请先输入文字、录音或上传图片"); return
     }
     fetch('/api/patient-structurize', {
       method: 'POST',
@@ -294,10 +374,10 @@ export default function App() {
     })
       .then(r => r.json())
       .then(d => {
-        const attachmentNote: string[] = []
-        if (pendingImages.length > 0) attachmentNote.push(`${pendingImages.length} 张图片`)
-        if (pendingAudios.length > 0) attachmentNote.push(`${pendingAudios.length} 段录音`)
-        const attachText = attachmentNote.length > 0 ? `\n\n（本次将随附：${attachmentNote.join('、')}）` : ''
+        const notes: string[] = []
+        if (pendingImages.length > 0) notes.push(`${pendingImages.length} 张图片`)
+        if (pendingAudios.length > 0) notes.push(`${pendingAudios.length} 段录音`)
+        const attachText = notes.length > 0 ? `\n\n（本次将随附：${notes.join('、')}）` : ''
         const preview = `【学生自述】\n学生姓名：${selectedPatient}\n就诊时间：${now.getFullYear()}年${now.getMonth()+1}月${now.getDate()}日\n\n${d.structured}${attachText}\n\n（以上内容已经过学生智能体整理，待学生确认后发送给老师）`
         setStructuredPreview(preview)
       })
@@ -310,11 +390,9 @@ export default function App() {
   const handleConfirmSend = async () => {
     if (!structuredPreview) return
     const imagePart = pendingImages.length > 0
-      ? '\n\n【学生上传的图片】\n' + pendingImages.map((url, i) => `图片${i+1}：${url}`).join('\n')
-      : ''
+      ? '\n\n【学生上传的图片】\n' + pendingImages.map((url, i) => `图片${i+1}：${url}`).join('\n') : ''
     const audioPart = pendingAudios.length > 0
-      ? '\n\n【学生上传的录音】\n' + pendingAudios.map((url, i) => `录音${i+1}：${url}`).join('\n')
-      : ''
+      ? '\n\n【学生上传的录音】\n' + pendingAudios.map((url, i) => `录音${i+1}：${url}`).join('\n') : ''
     const fullContent = structuredPreview + imagePart + audioPart
 
     await fetch('/api/transcribe', {
@@ -323,11 +401,7 @@ export default function App() {
       body: JSON.stringify({ patient_name: selectedPatient, teacher_name: selectedTeacher, content: fullContent, data_type: 'text' })
     })
 
-    setInputText('')
-    setPendingImages([])
-    setPendingAudios([])
-    setStructuredPreview(null)
-    fetchTranscriptions()
+    setInputText(''); setPendingImages([]); setPendingAudios([]); setStructuredPreview(null)
     fetchDrafts()
   }
 
@@ -354,9 +428,7 @@ export default function App() {
   // ============== 老师端行为 ==============
   const startTeacherLiveRecording = (draftId: number) => {
     if (teacherLiveRecording === draftId) {
-      teacherLiveRecognition?.stop()
-      setTeacherLiveRecording(null)
-      return
+      teacherLiveRecognition?.stop(); setTeacherLiveRecording(null); return
     }
     const SR = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition
     if (!SR) { alert("当前浏览器不支持语音识别。"); return }
@@ -369,9 +441,7 @@ export default function App() {
       for (let i = event.resultIndex; i < event.results.length; i++) {
         if (event.results[i].isFinal) finalTranscript += event.results[i][0].transcript
       }
-      if (finalTranscript) {
-        setTeacherLiveText(prev => ({ ...prev, [draftId]: (prev[draftId] || '') + finalTranscript }))
-      }
+      if (finalTranscript) setTeacherLiveText(prev => ({ ...prev, [draftId]: (prev[draftId] || '') + finalTranscript }))
     }
     rec.onerror = () => setTeacherLiveRecording(null)
     rec.onend = () => setTeacherLiveRecording(null)
@@ -397,17 +467,6 @@ export default function App() {
       .catch(() => { setTeacherLiveStructurizing(prev => ({ ...prev, [draftId]: false })); alert("AI 整理失败") })
   }
 
-  const handleAppendTeacherNote = (draftId: number) => {
-    const text = teacherLiveText[draftId]
-    if (!text || !text.trim()) { alert("请先录音或输入内容"); return }
-    const draft = drafts.find(x => x.id === draftId)
-    if (draft) {
-      const newContent = draft.content + '\n\n【现场记录】\n' + text
-      handleEditDraft(draftId, newContent)
-      setTeacherLiveText(prev => ({ ...prev, [draftId]: '' }))
-    }
-  }
-
   const handleEditDraft = (draftId: number, newContent: string) => {
     fetch(`/api/drafts/${draftId}`, {
       method: 'PUT',
@@ -416,17 +475,14 @@ export default function App() {
     }).then(() => fetchDrafts())
   }
 
-  const handleSignDraft = (draftId: number) => {
-    const plan = finalPlans[draftId]?.trim()
-    if (!plan) { alert("请先填写给学生的最终辨证施治方案！"); return }
-    fetch(`/api/drafts/${draftId}/sign`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ final_plan: plan })
-    }).then(() => {
-      fetchDrafts(); fetchPatientRecords(); fetchPoints()
-      setFinalPlans(prev => ({ ...prev, [draftId]: '' }))
-    })
+  const handleAppendTeacherNote = (draftId: number) => {
+    const text = teacherLiveText[draftId]
+    if (!text || !text.trim()) { alert("请先录音或输入内容"); return }
+    const draft = drafts.find(x => x.id === draftId)
+    if (draft) {
+      handleEditDraft(draftId, draft.content + '\n\n【现场记录】\n' + text)
+      setTeacherLiveText(prev => ({ ...prev, [draftId]: '' }))
+    }
   }
 
   const handleLivePhotoUpload = (draftId: number, e: React.ChangeEvent<HTMLInputElement>) => {
@@ -440,12 +496,58 @@ export default function App() {
       .then(d => {
         const draft = drafts.find(x => x.id === draftId)
         if (draft) {
-          const newContent = draft.content + `\n\n【现场照片】\n[老师现场拍摄：${d.url}]`
-          handleEditDraft(draftId, newContent)
+          handleEditDraft(draftId, draft.content + `\n\n【现场照片】\n[老师现场拍摄：${d.url}]`)
         }
         setLiveUploading(prev => ({ ...prev, [draftId]: false }))
       })
       .catch(() => { setLiveUploading(prev => ({ ...prev, [draftId]: false })); alert("照片上传失败") })
+  }
+
+  // 预览完整病历
+  const handlePreviewFullRecord = (draftId: number) => {
+    const draft = drafts.find(x => x.id === draftId)
+    if (!draft) return
+    const plan = finalPlans[draftId] || ''
+    if (!plan.trim()) { alert("请先填写施治方案，再预览完整病历"); return }
+    const fullContent = draft.content + '\n\n【辨证施治方案】\n' + plan + '\n\n【签字】\n' + selectedTeacher + ' · ' + currentYear + '年' + currentMonth + '月' + currentDay + '日'
+    setPreviewDraft({ id: draftId, content: fullContent })
+  }
+
+  // 最终签字
+  const handleFinalSign = () => {
+    if (!previewDraft) return
+    const currentPreview = previewDraft
+    const tagData = draftTags[currentPreview.id]
+
+    const saveTags = (): Promise<any> => {
+      const tags: any[] = []
+      if (tagData?.area?.trim()) tags.push({ tag_type: '部位', tag_value: tagData.area.trim() })
+      if (tagData?.symptom?.trim()) tags.push({ tag_type: '症状', tag_value: tagData.symptom.trim() })
+      if (tags.length === 0) return Promise.resolve()
+      return fetch('/api/tags', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ record_id: currentPreview.id, teacher_name: selectedTeacher, tags })
+      })
+    }
+
+    saveTags().then(() => {
+      return fetch(`/api/drafts/${currentPreview.id}/sign`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          final_plan: finalPlans[currentPreview.id] || '',
+          final_content: currentPreview.content
+        })
+      })
+    }).then(() => {
+      setPreviewDraft(null)
+      setDraftTags(prev => ({ ...prev, [currentPreview.id]: { area: '', symptom: '' } }))
+      fetchDrafts()
+      fetchPatientRecords()
+      fetchPoints()
+      setFinalPlans(prev => ({ ...prev, [currentPreview.id]: '' }))
+    })
   }
 
   // ============== 档案 ==============
@@ -465,7 +567,7 @@ export default function App() {
     else if (value === '配偶') {
       if (guardianGender === '男') setNewGender('女')
       else if (guardianGender === '女') setNewGender('男')
-      else { setNewGender(''); alert("提示：请先填写您的性别。") }
+      else { setNewGender(''); alert("请先填写您的性别。") }
     } else setNewGender('')
   }
 
@@ -551,13 +653,9 @@ export default function App() {
     })
   }
 
-  const getInviteLink = (code: string) => `${window.location.origin}/?invite=${code}`
-
   const handleCopyInviteLink = (code: string) => {
-    const link = getInviteLink(code)
-    navigator.clipboard.writeText(link).then(() => {
-      alert(`已复制邀请链接：\n${link}`)
-    }).catch(() => alert(`请手动复制：\n${link}`))
+    const link = `${window.location.origin}/?invite=${code}`
+    navigator.clipboard.writeText(link).then(() => alert(`已复制：\n${link}`)).catch(() => alert(`请手动复制：\n${link}`))
   }
 
   const handleAcceptInvite = () => {
@@ -581,14 +679,12 @@ export default function App() {
     backgroundColor: currentRole === role ? '#8b4513' : '#fdfcf0',
     color: currentRole === role ? '#fff' : '#8b4513', transition: 'all 0.2s'
   })
-
   const patientBtnStyle = (name: string): React.CSSProperties => ({
     padding: '6px 14px', margin: '4px', borderRadius: '15px', border: '1px solid #5a7d5a',
     cursor: 'pointer', fontFamily: 'serif', fontSize: '13px',
     backgroundColor: selectedPatient === name ? '#5a7d5a' : '#f7fcf9',
     color: selectedPatient === name ? '#fff' : '#5a7d5a', transition: 'all 0.2s'
   })
-
   const teacherBtnStyle = (name: string): React.CSSProperties => ({
     padding: '6px 14px', margin: '4px', borderRadius: '15px', border: '1px solid #8b4513',
     cursor: 'pointer', fontFamily: 'serif', fontSize: '13px',
@@ -606,29 +702,32 @@ export default function App() {
     <div style={{ minHeight: '100vh', background: '#f5f1e6', padding: '40px 20px', fontFamily: 'serif' }}>
       <div style={{ maxWidth: '600px', margin: '0 auto' }}>
 
-        {/* 接受邀请弹窗 */}
         {pendingInviteCode && (
           <div style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, background: 'rgba(0,0,0,0.5)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 999 }}>
             <div style={{ background: '#fdfcf0', padding: '24px', borderRadius: '12px', maxWidth: '400px', width: '90%', border: '2px solid #8b4513' }}>
               <div style={{ fontSize: '18px', color: '#8b4513', fontWeight: 'bold', marginBottom: '10px', textAlign: 'center' }}>🎫 接受老师邀请</div>
-              <div style={{ fontSize: '13px', color: '#666', marginBottom: '15px', textAlign: 'center' }}>
-                邀请码：<span style={{ fontFamily: 'monospace', color: '#8b4513', fontWeight: 'bold' }}>{pendingInviteCode}</span>
-              </div>
-              <input
-                placeholder="请输入您的姓名"
-                value={newStudentNameFromInvite}
-                onChange={e => setNewStudentNameFromInvite(e.target.value)}
-                style={inputStyle}
-              />
+              <div style={{ fontSize: '13px', color: '#666', marginBottom: '15px', textAlign: 'center' }}>邀请码：<span style={{ fontFamily: 'monospace', color: '#8b4513', fontWeight: 'bold' }}>{pendingInviteCode}</span></div>
+              <input placeholder="请输入您的姓名" value={newStudentNameFromInvite} onChange={e => setNewStudentNameFromInvite(e.target.value)} style={inputStyle} />
               <div style={{ display: 'flex', gap: '10px' }}>
-                <button
-                  onClick={() => { setPendingInviteCode(''); window.history.replaceState({}, '', '/') }}
-                  style={{ flex: 1, padding: '10px', borderRadius: '20px', border: '1px solid #999', background: 'transparent', color: '#666', cursor: 'pointer' }}
-                >取消</button>
-                <button
-                  onClick={handleAcceptInvite}
-                  style={{ flex: 1, padding: '10px', borderRadius: '20px', border: 'none', background: '#8b4513', color: '#fff', cursor: 'pointer' }}
-                >加入</button>
+                <button onClick={() => { setPendingInviteCode(''); window.history.replaceState({}, '', '/') }} style={{ flex: 1, padding: '10px', borderRadius: '20px', border: '1px solid #999', background: 'transparent', color: '#666', cursor: 'pointer' }}>取消</button>
+                <button onClick={handleAcceptInvite} style={{ flex: 1, padding: '10px', borderRadius: '20px', border: 'none', background: '#8b4513', color: '#fff', cursor: 'pointer' }}>加入</button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {previewDraft && (
+          <div style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, background: 'rgba(0,0,0,0.5)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 999 }}>
+            <div style={{ background: '#fdfcf0', padding: '24px', borderRadius: '12px', maxWidth: '700px', width: '90%', maxHeight: '85vh', overflowY: 'auto', border: '2px solid #8b4513' }}>
+              <div style={{ fontSize: '18px', color: '#8b4513', fontWeight: 'bold', marginBottom: '10px', textAlign: 'center' }}>📄 完整病历预览</div>
+              <div style={{ fontSize: '13px', color: '#666', marginBottom: '15px', textAlign: 'center', lineHeight: '1.6' }}>
+                请审核，可再编辑一次；<br />
+                <span style={{ color: '#c0392b', fontWeight: 'bold' }}>确认签字后，AI 原草案将销毁，音频文件将删除。</span>
+              </div>
+              <textarea value={previewDraft.content} onChange={e => setPreviewDraft({ ...previewDraft, content: e.target.value })} style={{ width: '100%', minHeight: '400px', padding: '12px', borderRadius: '8px', border: '1px solid #d4c8a8', fontFamily: 'serif', fontSize: '14px', marginBottom: '15px', boxSizing: 'border-box', whiteSpace: 'pre-wrap', lineHeight: '1.6' }} />
+              <div style={{ display: 'flex', gap: '10px', justifyContent: 'flex-end' }}>
+                <button onClick={() => setPreviewDraft(null)} style={{ padding: '8px 20px', borderRadius: '20px', border: '1px solid #999', background: 'transparent', color: '#666', cursor: 'pointer' }}>取消（返回修改）</button>
+                <button onClick={handleFinalSign} style={{ padding: '8px 24px', borderRadius: '20px', border: 'none', background: '#5a7d5a', color: '#fff', cursor: 'pointer', fontWeight: 'bold' }}>✅ 确认签字</button>
               </div>
             </div>
           </div>
@@ -636,32 +735,23 @@ export default function App() {
 
         <h1 style={{ textAlign: 'center', color: '#8b4513', borderBottom: '2px solid #d4c8a8', paddingBottom: '15px', marginBottom: '30px', fontSize: '28px', letterSpacing: '2px' }}>知衡 · 中医治未病社区</h1>
 
-        {/* 黄历 */}
         {huangli && (
           <div style={boxStyle}>
             <div style={{ textAlign: 'center', fontSize: '18px', color: '#333', marginBottom: '5px' }}>
               <span style={{ fontWeight: 'bold' }}>{huangli.date}</span> · {huangli.lunar}
             </div>
             {huangli.solar_term_tip && huangli.solar_term_tip !== '无' && (
-              <div style={{ textAlign: 'center', color: '#8b4513', fontSize: '14px', marginBottom: '15px' }}>
-                🌿 {huangli.solar_term_tip}
-              </div>
+              <div style={{ textAlign: 'center', color: '#8b4513', fontSize: '14px', marginBottom: '15px' }}>🌿 {huangli.solar_term_tip}</div>
             )}
-            <div style={{ textAlign: 'center', color: '#5a7d5a', fontSize: '16px', marginBottom: '10px' }}>
-              🌿 {huangli.solar_term}：{huangli.health_trend}
-            </div>
-            <div style={{ textAlign: 'center', background: '#fff8e7', padding: '15px', borderRadius: '8px', color: '#8b4513' }}>
-              📝 今日作业：{huangli.homework}
-            </div>
+            <div style={{ textAlign: 'center', color: '#5a7d5a', fontSize: '16px', marginBottom: '10px' }}>🌿 {huangli.solar_term}：{huangli.health_trend}</div>
+            <div style={{ textAlign: 'center', background: '#fff8e7', padding: '15px', borderRadius: '8px', color: '#8b4513' }}>📝 今日作业：{huangli.homework}</div>
           </div>
         )}
 
-        {/* 健康趋势卡片 */}
         {(currentRole === '学生' || currentRole === '学生智能体') && healthTrend && (
           <div style={boxStyle}>
             <div style={{ textAlign: 'center', fontSize: '18px', color: '#8b4513', fontWeight: 'bold', marginBottom: '15px' }}>📊 我的健康趋势</div>
             <div style={{ textAlign: 'center', fontSize: '13px', color: '#666', marginBottom: '12px' }}>八字：{healthTrend.bazi}</div>
-
             <div style={{ marginBottom: '15px' }}>
               <div style={{ fontSize: '13px', color: '#5a7d5a', fontWeight: 'bold', marginBottom: '8px' }}>五行分布：</div>
               {(['木', '火', '土', '金', '水'] as const).map((el) => {
@@ -679,33 +769,23 @@ export default function App() {
                 )
               })}
             </div>
-
             <div style={{ textAlign: 'center', padding: '10px', background: '#fff8e7', borderRadius: '8px', marginBottom: '12px' }}>
               <span style={{ fontSize: '14px', color: '#8b4513', fontWeight: 'bold' }}>☯ 阴阳状态：{healthTrend.yinyang}</span>
             </div>
-
             <div style={{ padding: '12px', background: '#f7fcf9', borderRadius: '8px', border: '1px dashed #b8d8c0' }}>
               <div style={{ fontSize: '13px', color: '#5a7d5a', fontWeight: 'bold', marginBottom: '5px' }}>💡 体质参考：</div>
               <div style={{ fontSize: '14px', color: '#333', lineHeight: '1.6' }}>{healthTrend.tendency}</div>
             </div>
-
-            <div style={{ textAlign: 'center', fontSize: '11px', color: '#999', marginTop: '10px', fontStyle: 'italic' }}>
-              基于出生八字的先天体质参考，具体辨证请以老师当面问诊为准
-            </div>
+            <div style={{ textAlign: 'center', fontSize: '11px', color: '#999', marginTop: '10px', fontStyle: 'italic' }}>基于出生八字的先天体质参考，具体辨证请以老师当面问诊为准</div>
           </div>
         )}
 
-        {/* 今日宜忌建议 */}
         {(currentRole === '学生' || currentRole === '学生智能体') && dailyAdvice && (
           <div style={boxStyle}>
             <div style={{ textAlign: 'center', fontSize: '18px', color: '#8b4513', fontWeight: 'bold', marginBottom: '15px' }}>🌤️ 今日建议 · {dailyAdvice.solar_term}</div>
-
             {dailyAdvice.tendency_note && (
-              <div style={{ textAlign: 'center', padding: '8px', background: '#fff8e7', borderRadius: '8px', marginBottom: '15px', fontSize: '13px', color: '#8b4513' }}>
-                💡 {dailyAdvice.tendency_note}
-              </div>
+              <div style={{ textAlign: 'center', padding: '8px', background: '#fff8e7', borderRadius: '8px', marginBottom: '15px', fontSize: '13px', color: '#8b4513' }}>💡 {dailyAdvice.tendency_note}</div>
             )}
-
             <div style={{ display: 'flex', gap: '10px', marginBottom: '10px' }}>
               <div style={{ flex: 1, padding: '12px', background: '#f0f7f0', borderRadius: '8px' }}>
                 <div style={{ fontSize: '14px', color: '#5a7d5a', fontWeight: 'bold', marginBottom: '6px' }}>🥗 宜食</div>
@@ -716,7 +796,6 @@ export default function App() {
                 <div style={{ fontSize: '13px', color: '#333', lineHeight: '1.6' }}>{dailyAdvice.avoid}</div>
               </div>
             </div>
-
             <div style={{ padding: '12px', background: '#f0f4f8', borderRadius: '8px' }}>
               <div style={{ fontSize: '14px', color: '#5a7d5a', fontWeight: 'bold', marginBottom: '6px' }}>👕 衣着起居</div>
               <div style={{ fontSize: '13px', color: '#333', lineHeight: '1.6' }}>{dailyAdvice.wear}</div>
@@ -724,7 +803,6 @@ export default function App() {
           </div>
         )}
 
-        {/* 我的老师（学生端） */}
         {(currentRole === '学生' || currentRole === '学生智能体') && (
           <div style={{ ...boxStyle, background: '#fdf8f0' }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '10px' }}>
@@ -733,9 +811,7 @@ export default function App() {
                 {showTeacherPicker ? '收起' : '管理'}
               </button>
             </div>
-            <div style={{ fontSize: '13px', color: '#666', marginBottom: '8px' }}>
-              当前咨询：<span style={{ color: '#8b4513', fontWeight: 'bold' }}>{selectedTeacher}</span>
-            </div>
+            <div style={{ fontSize: '13px', color: '#666', marginBottom: '8px' }}>当前咨询：<span style={{ color: '#8b4513', fontWeight: 'bold' }}>{selectedTeacher}</span></div>
             <div style={{ display: 'flex', flexWrap: 'wrap' }}>
               {patientTeachers.map(t => (
                 <div key={t} style={{ display: 'flex', alignItems: 'center', margin: '4px' }}>
@@ -750,46 +826,26 @@ export default function App() {
               <div style={{ marginTop: '12px', borderTop: '1px dashed #d4c8a8', paddingTop: '12px' }}>
                 <div style={{ fontSize: '13px', color: '#666', marginBottom: '8px' }}>可选老师：</div>
                 {teachers.filter(t => !patientTeachers.includes(t.name)).map(t => (
-                  <button key={t.name} onClick={() => handleAddTeacher(t.name)} style={{ padding: '6px 14px', margin: '4px', borderRadius: '15px', border: '1px dashed #8b4513', background: 'transparent', color: '#8b4513', cursor: 'pointer', fontSize: '13px' }}>
-                    + {t.name}
-                  </button>
+                  <button key={t.name} onClick={() => handleAddTeacher(t.name)} style={{ padding: '6px 14px', margin: '4px', borderRadius: '15px', border: '1px dashed #8b4513', background: 'transparent', color: '#8b4513', cursor: 'pointer', fontSize: '13px' }}>+ {t.name}</button>
                 ))}
               </div>
             )}
           </div>
         )}
 
-        {/* 学生管理（老师端） */}
         {(currentRole === '李老师' || currentRole === '李老师智能体') && (
           <div style={{ ...boxStyle, background: '#f0f7f0' }}>
             <div style={{ fontSize: '18px', color: '#5a7d5a', fontWeight: 'bold', marginBottom: '10px' }}>👥 学生管理（{teacherPatients.length}人）</div>
             <div style={{ display: 'flex', gap: '8px', marginBottom: '15px' }}>
-              <input
-                id="newStudentInput"
-                placeholder="输入学生姓名，添加为新学生"
-                style={{ flex: 1, padding: '8px', borderRadius: '6px', border: '1px solid #b8d8c0', fontFamily: 'serif' }}
-              />
-              <button
-                onClick={() => {
-                  const input = document.getElementById('newStudentInput') as HTMLInputElement
-                  const name = input?.value.trim()
-                  if (!name) { alert("请输入学生姓名"); return }
-                  fetch('/api/teacher/add-student', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ teacher_name: selectedTeacher, student_name: name })
-                  }).then(() => {
-                    input.value = ''
-                    fetch(`/api/teacher-patients?teacher_name=${selectedTeacher}`).then(r => r.json()).then(d => setTeacherPatients(d))
-                    fetchPatients('张三')
-                  })
-                }}
-                style={{ padding: '8px 16px', borderRadius: '6px', border: 'none', background: '#5a7d5a', color: '#fff', cursor: 'pointer' }}
-              >+ 添加学生</button>
-              <button
-                onClick={handleCreateInvite}
-                style={{ padding: '8px 16px', borderRadius: '6px', border: '1px solid #8b4513', background: 'transparent', color: '#8b4513', cursor: 'pointer' }}
-              >🎫 生成邀请码</button>
+              <input id="newStudentInput" placeholder="输入学生姓名，添加为新学生" style={{ flex: 1, padding: '8px', borderRadius: '6px', border: '1px solid #b8d8c0', fontFamily: 'serif' }} />
+              <button onClick={() => {
+                const input = document.getElementById('newStudentInput') as HTMLInputElement
+                const name = input?.value.trim()
+                if (!name) { alert("请输入学生姓名"); return }
+                fetch('/api/teacher/add-student', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ teacher_name: selectedTeacher, student_name: name }) })
+                  .then(() => { input.value = ''; fetch(`/api/teacher-patients?teacher_name=${selectedTeacher}`).then(r => r.json()).then(d => setTeacherPatients(d)); fetchPatients('张三') })
+              }} style={{ padding: '8px 16px', borderRadius: '6px', border: 'none', background: '#5a7d5a', color: '#fff', cursor: 'pointer' }}>+ 添加学生</button>
+              <button onClick={handleCreateInvite} style={{ padding: '8px 16px', borderRadius: '6px', border: '1px solid #8b4513', background: 'transparent', color: '#8b4513', cursor: 'pointer' }}>🎫 生成邀请码</button>
             </div>
 
             {invites.length > 0 && (
@@ -798,9 +854,7 @@ export default function App() {
                 {invites.map((inv: any) => (
                   <div key={inv.code} style={{ display: 'flex', alignItems: 'center', padding: '6px', background: '#fff', borderRadius: '6px', marginBottom: '5px', fontSize: '13px' }}>
                     <div style={{ flex: 1, color: '#8b4513', fontWeight: 'bold', fontFamily: 'monospace' }}>{inv.code}</div>
-                    <div style={{ flex: 1, fontSize: '11px', color: '#999' }}>
-                      {inv.used_by ? `已使用：${inv.used_by}` : '未使用'}
-                    </div>
+                    <div style={{ flex: 1, fontSize: '11px', color: '#999' }}>{inv.used_by ? `已使用：${inv.used_by}` : '未使用'}</div>
                     {!inv.used_by && (
                       <button onClick={() => handleCopyInviteLink(inv.code)} style={{ padding: '3px 10px', borderRadius: '12px', border: '1px solid #5a7d5a', background: 'transparent', color: '#5a7d5a', cursor: 'pointer', fontSize: '11px' }}>复制链接</button>
                     )}
@@ -818,24 +872,20 @@ export default function App() {
               {teacherPatients.length === 0 ? (
                 <div style={{ padding: '20px', textAlign: 'center', color: '#999', fontSize: '13px' }}>暂无学生，请在上方添加</div>
               ) : (
-                teacherPatients.map(name => (
-                  <div key={name} style={{ display: 'flex', alignItems: 'center', padding: '10px', borderTop: '1px solid #f0f0f0', fontSize: '14px' }}>
-                    <div style={{ flex: 2, color: '#333' }}>👤 {name}</div>
+                teacherPatients.map((s: any) => (
+                  <div key={s.name} style={{ display: 'flex', alignItems: 'center', padding: '10px', borderTop: '1px solid #f0f0f0', fontSize: '14px' }}>
+                    <div style={{ flex: 2, color: '#333' }}>👤 {s.name}</div>
                     <div style={{ flex: 1, textAlign: 'center' }}>
-                      <span style={{ padding: '2px 10px', borderRadius: '12px', fontSize: '12px', background: '#e8f4e8', color: '#5a7d5a' }}>活跃</span>
+                      <span style={{ padding: '2px 10px', borderRadius: '12px', fontSize: '12px', background: `${s.status_color}15`, color: s.status_color, fontWeight: 'bold', border: `1px solid ${s.status_color}40` }}>{s.status_label}</span>
                     </div>
                     <div style={{ flex: 1, textAlign: 'right' }}>
-                      <button style={{ padding: '4px 10px', borderRadius: '12px', border: '1px solid #5a7d5a', background: 'transparent', color: '#5a7d5a', cursor: 'pointer', fontSize: '12px', marginRight: '6px' }}
-                        onClick={() => setSelectedPatient(name)}>查看</button>
-                      {name !== '张三' && name !== '李四' && (
-                        <button
-                          onClick={() => {
-                            if (!confirm(`确定要将学生【${name}】从您的名单中移除吗？`)) return
-                            fetch(`/api/patient-teachers?patient_name=${name}&teacher_name=${selectedTeacher}`, { method: 'DELETE' })
-                              .then(() => { fetch(`/api/teacher-patients?teacher_name=${selectedTeacher}`).then(r => r.json()).then(d => setTeacherPatients(d)) })
-                          }}
-                          style={{ padding: '4px 10px', borderRadius: '12px', border: '1px solid #c0392b', background: 'transparent', color: '#c0392b', cursor: 'pointer', fontSize: '12px' }}
-                        >移除</button>
+                      <button style={{ padding: '4px 10px', borderRadius: '12px', border: '1px solid #5a7d5a', background: 'transparent', color: '#5a7d5a', cursor: 'pointer', fontSize: '12px', marginRight: '6px' }} onClick={() => setSelectedPatient(s.name)}>查看</button>
+                      {s.name !== '张三' && s.name !== '李四' && (
+                        <button onClick={() => {
+                          if (!confirm(`确定要将学生【${s.name}】从您的名单中移除吗？`)) return
+                          fetch(`/api/patient-teachers?patient_name=${s.name}&teacher_name=${selectedTeacher}`, { method: 'DELETE' })
+                            .then(() => fetch(`/api/teacher-patients?teacher_name=${selectedTeacher}`).then(r => r.json()).then(d => setTeacherPatients(d)))
+                        }} style={{ padding: '4px 10px', borderRadius: '12px', border: '1px solid #c0392b', background: 'transparent', color: '#c0392b', cursor: 'pointer', fontSize: '12px' }}>移除</button>
                       )}
                     </div>
                   </div>
@@ -845,14 +895,11 @@ export default function App() {
           </div>
         )}
 
-        {/* 我的家庭（学生端） */}
         {(currentRole === '学生' || currentRole === '学生智能体') && (
           <div style={{ ...boxStyle, background: '#f0f7f5' }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
               <div style={{ fontSize: '18px', color: '#5a7d5a', fontWeight: 'bold' }}>🏠 我的家庭（{patients.length}人）</div>
-              <button onClick={handleToggleAddFamily} style={{ padding: '4px 12px', borderRadius: '15px', border: '1px solid #5a7d5a', background: 'transparent', color: '#5a7d5a', cursor: 'pointer', fontSize: '12px' }}>
-                {showAddFamily ? '取消' : '+ 添加亲友'}
-              </button>
+              <button onClick={handleToggleAddFamily} style={{ padding: '4px 12px', borderRadius: '15px', border: '1px solid #5a7d5a', background: 'transparent', color: '#5a7d5a', cursor: 'pointer', fontSize: '12px' }}>{showAddFamily ? '取消' : '+ 添加亲友'}</button>
             </div>
             <div style={{ display: 'flex', flexWrap: 'wrap', justifyContent: 'center' }}>
               {patients.map(p => (
@@ -866,7 +913,6 @@ export default function App() {
                 </div>
               ))}
             </div>
-
             {showAddFamily && (
               <div style={{ marginTop: '15px', borderTop: '1px dashed #b8d8c0', paddingTop: '15px' }}>
                 <div style={{ fontSize: '14px', color: '#5a7d5a', fontWeight: 'bold', marginBottom: '10px' }}>📝 亲友基础信息</div>
@@ -916,7 +962,6 @@ export default function App() {
           </div>
         )}
 
-        {/* 基础档案（学生端） */}
         {(currentRole === '学生' || currentRole === '学生智能体') && profile && (
           <div style={{ ...boxStyle, background: '#fffaf0' }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '15px' }}>
@@ -930,7 +975,6 @@ export default function App() {
                 <button onClick={() => { setDraftProfile({ ...profile }); setEditingProfile(true) }} style={{ padding: '4px 12px', borderRadius: '15px', border: '1px solid #8b4513', background: 'transparent', color: '#8b4513', cursor: 'pointer', fontSize: '12px' }}>编辑/补充</button>
               )}
             </div>
-
             {editingProfile && draftProfile ? (
               <div>
                 <label style={{ fontSize: '13px', color: '#666' }}>性别</label>
@@ -941,7 +985,6 @@ export default function App() {
                     <option value="女">女</option>
                   </select>
                 ) : (<div style={{ fontSize: '14px', color: '#333', marginBottom: '8px' }}>{profile.gender}</div>)}
-
                 <label style={{ fontSize: '13px', color: '#666' }}>出生日期</label>
                 {needBirthDate ? (
                   <div style={{ display: 'flex', flexWrap: 'wrap', marginBottom: '8px' }}>
@@ -974,19 +1017,16 @@ export default function App() {
                     </select>
                   </div>
                 ) : (<div style={{ fontSize: '14px', color: '#333', marginBottom: '8px' }}>{profile.birth_date}</div>)}
-
                 <label style={{ fontSize: '13px', color: '#666' }}>出生时间</label>
                 {needBirthTime ? (
                   <select value={draftProfile.birth_time} onChange={e => setDraftProfile({ ...draftProfile, birth_time: e.target.value })} style={inputStyle}>
                     {timeOptions.map(t => <option key={t.value} value={t.value}>{t.label}</option>)}
                   </select>
                 ) : (<div style={{ fontSize: '14px', color: '#333', marginBottom: '8px' }}>{timeOptions.find(t => t.value === profile.birth_time)?.label || profile.birth_time}</div>)}
-
                 <label style={{ fontSize: '13px', color: '#666' }}>出生地</label>
                 {needBirthPlace ? (
                   <input type="text" value={draftProfile.birth_place} onChange={e => setDraftProfile({ ...draftProfile, birth_place: e.target.value })} placeholder="例如：浙江省绍兴市" style={inputStyle} />
                 ) : (<div style={{ fontSize: '14px', color: '#333', marginBottom: '8px' }}>{profile.birth_place}</div>)}
-
                 <label style={{ fontSize: '13px', color: '#666' }}>现居住地（可修改）</label>
                 <input type="text" value={draftProfile.location} onChange={e => setDraftProfile({ ...draftProfile, location: e.target.value })} placeholder="例如：广东省广州市" style={inputStyle} />
               </div>
@@ -1001,8 +1041,132 @@ export default function App() {
             )}
           </div>
         )}
+        {/* 【第47天新增】预约卡片（学生端 + 老师端通用） */}
+        {(currentRole === '学生' || currentRole === '学生智能体' || currentRole === '李老师' || currentRole === '李老师智能体') && (
+          <div style={boxStyle}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
+              <div style={{ fontSize: '18px', color: '#8b4513', fontWeight: 'bold' }}>
+                📅 {currentRole.includes('老师') ? '预约管理' : '我的预约'}
+              </div>
+              <button onClick={() => setShowApptForm(!showApptForm)} style={{ padding: '4px 12px', borderRadius: '15px', border: '1px solid #8b4513', background: 'transparent', color: '#8b4513', cursor: 'pointer', fontSize: '12px' }}>
+                {showApptForm ? '取消' : '+ 发起预约'}
+              </button>
+            </div>
 
-        {/* 角色切换 */}
+            {/* 【第48天新增】老师工作时间设置 */}
+            {currentRole.includes('老师') && teacherSettings && (
+              <div style={{ marginBottom: '12px', padding: '10px', background: '#f0f7f0', borderRadius: '8px', border: '1px dashed #5a7d5a' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '6px' }}>
+                  <div style={{ fontSize: '13px', color: '#5a7d5a', fontWeight: 'bold' }}>⚙️ 我的工作时间</div>
+                  <button onClick={() => setEditingSettings(!editingSettings)} style={{ padding: '2px 10px', borderRadius: '12px', border: '1px solid #5a7d5a', background: 'transparent', color: '#5a7d5a', cursor: 'pointer', fontSize: '11px' }}>
+                    {editingSettings ? '取消' : '修改'}
+                  </button>
+                </div>
+                {!editingSettings ? (
+                  <div style={{ fontSize: '12px', color: '#666' }}>
+                    工作日：{teacherSettings.work_days_list?.map(d => ['日', '一', '二', '三', '四', '五', '六'][d]).join('、') || '未设置'}<br/>
+                    工作时段：{teacherSettings.work_hours_list?.map(h => `${h}:00`).join('、') || '未设置'}
+                  </div>
+                ) : (
+                  <div>
+                    <div style={{ fontSize: '12px', color: '#666', marginBottom: '4px' }}>工作日（可多选）：</div>
+                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px', marginBottom: '8px' }}>
+                      {[0, 1, 2, 3, 4, 5, 6].map(d => (
+                        <button key={d} onClick={() => {
+                          setSettingsDays(prev => prev.includes(d) ? prev.filter(x => x !== d) : [...prev, d])
+                        }} style={{ padding: '4px 10px', borderRadius: '12px', border: '1px solid #5a7d5a', background: settingsDays.includes(d) ? '#5a7d5a' : 'transparent', color: settingsDays.includes(d) ? '#fff' : '#5a7d5a', cursor: 'pointer', fontSize: '12px' }}>
+                          {['日', '一', '二', '三', '四', '五', '六'][d]}
+                        </button>
+                      ))}
+                    </div>
+                    <div style={{ fontSize: '12px', color: '#666', marginBottom: '4px' }}>工作时段（可多选）：</div>
+                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px', marginBottom: '8px' }}>
+                      {Array.from({ length: 12 }, (_, i) => i + 8).map(h => (
+                        <button key={h} onClick={() => {
+                          setSettingsHours(prev => prev.includes(h) ? prev.filter(x => x !== h) : [...prev, h])
+                        }} style={{ padding: '4px 8px', borderRadius: '12px', border: '1px solid #5a7d5a', background: settingsHours.includes(h) ? '#5a7d5a' : 'transparent', color: settingsHours.includes(h) ? '#fff' : '#5a7d5a', cursor: 'pointer', fontSize: '12px' }}>
+                          {h}:00
+                        </button>
+                      ))}
+                    </div>
+                    <div style={{ textAlign: 'right' }}>
+                      <button onClick={handleSaveSettings} style={{ padding: '4px 16px', borderRadius: '20px', border: 'none', background: '#5a7d5a', color: '#fff', cursor: 'pointer', fontSize: '12px' }}>保存</button>
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {showApptForm && (
+              <div style={{ marginBottom: '15px', padding: '12px', background: '#fffaf0', borderRadius: '8px', border: '1px dashed #d4c8a8' }}>
+                <div style={{ fontSize: '13px', color: '#8b4513', fontWeight: 'bold', marginBottom: '8px' }}>
+                  {currentRole.includes('老师') ? `为 ${selectedPatient} 预约复诊` : `预约 ${selectedTeacher}`}
+                </div>
+                <div style={{ display: 'flex', gap: '8px', marginBottom: '8px' }}>
+                                    <input type="date" min={getTomorrowStr()} max={getMaxDateStr()} value={apptDate} onChange={e => setApptDate(e.target.value)} style={{ flex: 1, padding: '6px', borderRadius: '6px', border: '1px solid #d4c8a8', fontSize: '13px', fontFamily: 'serif' }} />
+                                    <select value={apptTime} onChange={e => setApptTime(e.target.value)} style={{ flex: 1, padding: '6px', borderRadius: '6px', border: '1px solid #d4c8a8', fontSize: '13px', fontFamily: 'serif' }}>
+                    <option value="">请选择时段</option>
+                    {teacherSettings?.work_hours_list?.map(h => (
+                      <option key={h} value={`${h}:00`}>{h}:00</option>
+                    ))}
+                  </select>
+                </div>
+                <textarea
+                  placeholder="预约原因（如：复诊/症状变化/家人新症状...）"
+                  value={apptReason}
+                  onChange={e => setApptReason(e.target.value)}
+                  style={{ width: '100%', height: '60px', padding: '8px', borderRadius: '6px', border: '1px solid #d4c8a8', fontFamily: 'serif', fontSize: '13px', marginBottom: '8px', boxSizing: 'border-box' }}
+                />
+                <div style={{ textAlign: 'right' }}>
+                  <button onClick={handleCreateAppointment} style={{ padding: '6px 20px', borderRadius: '20px', border: 'none', background: '#8b4513', color: '#fff', cursor: 'pointer', fontSize: '13px' }}>提交预约</button>
+                </div>
+              </div>
+            )}
+
+            {appointments.length === 0 ? (
+              <div style={{ textAlign: 'center', color: '#999', padding: '15px', fontSize: '13px' }}>暂无预约</div>
+            ) : (
+              appointments.map((a: any) => (
+                <div key={a.id} style={{ padding: '12px', background: '#fff', borderRadius: '8px', border: '1px solid #e0e0e0', marginBottom: '10px', fontSize: '13px' }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '6px' }}>
+                    <div style={{ fontWeight: 'bold', color: '#8b4513' }}>
+                      {a.scheduled_date} · {a.scheduled_time}
+                    </div>
+                    <div>
+                      <span style={{
+                        padding: '2px 10px', borderRadius: '12px', fontSize: '11px', fontWeight: 'bold',
+                        background: a.status === 'confirmed' ? '#e8f4e8' : a.status === 'cancelled' ? '#f5f5f5' : '#fff8e7',
+                        color: a.status === 'confirmed' ? '#5a7d5a' : a.status === 'cancelled' ? '#999' : '#8b4513'
+                      }}>
+                        {a.status === 'confirmed' ? '✅ 已确认' : a.status === 'cancelled' ? '❌ 已取消' : '⏳ 待确认'}
+                      </span>
+                    </div>
+                  </div>
+                  <div style={{ color: '#666', marginBottom: '6px' }}>
+                    患者：{a.patient_name} · 老师：{a.teacher_name}
+                  </div>
+                  <div style={{ color: '#333', marginBottom: '8px' }}>
+                    原因：{a.reason}
+                  </div>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                    <div style={{ fontSize: '11px', color: '#999' }}>
+                      由 {a.initiator === 'teacher' ? '老师' : '学生'} 发起
+                    </div>
+                    {a.status === 'pending' && (
+                      <div>
+                        {currentRole.includes('老师') && (
+                          <button onClick={() => handleConfirmAppt(a.id)} style={{ padding: '4px 12px', borderRadius: '12px', border: 'none', background: '#5a7d5a', color: '#fff', cursor: 'pointer', fontSize: '12px', marginRight: '6px' }}>确认</button>
+                        )}
+                        <button onClick={() => handleCancelAppt(a.id)} style={{ padding: '4px 12px', borderRadius: '12px', border: '1px solid #c0392b', background: 'transparent', color: '#c0392b', cursor: 'pointer', fontSize: '12px' }}>取消</button>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              ))
+            )}
+          </div>
+        )}
+
         <div style={boxStyle}>
           <div style={{ textAlign: 'center', marginBottom: '15px', color: '#8b4513', fontWeight: 'bold' }}>🧑‍⚕️ 角色切换</div>
           <div style={{ display: 'flex', flexWrap: 'wrap', justifyContent: 'center' }}>
@@ -1012,7 +1176,6 @@ export default function App() {
           </div>
         </div>
 
-        {/* 积分 */}
         {points && (
           <div style={{ ...boxStyle, display: 'flex', justifyContent: 'space-around', textAlign: 'center', background: '#fffdf5' }}>
             <div>
@@ -1026,7 +1189,6 @@ export default function App() {
           </div>
         )}
 
-        {/* 角色任务 */}
         <div style={{ ...boxStyle, background: currentRole.includes('老师') ? '#e8f0e8' : '#fdfcf0' }}>
           <div style={{ textAlign: 'center', fontSize: '18px', color: '#8b4513', marginBottom: '10px' }}>{roleData ? `📋 ${roleData.name} 的任务` : '加载中...'}</div>
           <div style={{ textAlign: 'center', color: '#555', lineHeight: '1.8' }}>{roleData ? roleData.detail : '正在获取数据...'}</div>
@@ -1042,7 +1204,6 @@ export default function App() {
           )}
         </div>
 
-        {/* 历史病历（老师端） */}
         {(currentRole === '李老师' || currentRole === '李老师智能体') && (
           <div style={{ ...boxStyle, background: '#fff9f0' }}>
             <div style={{ textAlign: 'center', fontSize: '18px', color: '#8b4513', fontWeight: 'bold', cursor: 'pointer', display: 'flex', justifyContent: 'center', alignItems: 'center', gap: '5px' }} onClick={() => setShowHistory(!showHistory)}>
@@ -1068,7 +1229,6 @@ export default function App() {
           </div>
         )}
 
-        {/* 基础档案（老师端） */}
         {(currentRole === '李老师' || currentRole === '李老师智能体') && profile && (
           <div style={{ ...boxStyle, background: '#fffaf0' }}>
             <div style={{ fontSize: '18px', color: '#8b4513', fontWeight: 'bold', marginBottom: '15px' }}>📋 {selectedPatient} 的基础档案（供辨证参考）</div>
@@ -1078,50 +1238,22 @@ export default function App() {
               <div>出生时间：{profile.birth_time ? (timeOptions.find(t => t.value === profile.birth_time)?.label || profile.birth_time) : '未填写（时辰未知，按子时推算）'}</div>
               <div>出生地：{profile.birth_place || '未填写'}</div>
               <div>现居住地：{profile.location || '未填写'}</div>
-              <div style={{ marginTop: '8px', paddingTop: '8px', borderTop: '1px dashed #d4c8a8', color: '#8b4513', fontWeight: 'bold' }}>
-                八字：{profile.bazi || '缺少出生日期，无法推算'}
-              </div>
-              {profile.wuxing && (
-                <div style={{ color: '#5a7d5a', fontWeight: 'bold' }}>五行体质参考：{profile.wuxing}</div>
-              )}
+              <div style={{ marginTop: '8px', paddingTop: '8px', borderTop: '1px dashed #d4c8a8', color: '#8b4513', fontWeight: 'bold' }}>八字：{profile.bazi || '缺少出生日期，无法推算'}</div>
+              {profile.wuxing && (<div style={{ color: '#5a7d5a', fontWeight: 'bold' }}>五行体质参考：{profile.wuxing}</div>)}
             </div>
           </div>
         )}
 
-        {/* 学生智能体（学生端） */}
         {(currentRole === '学生' || currentRole === '学生智能体') && (
           <div style={boxStyle}>
             <div style={{ textAlign: 'center', fontSize: '18px', color: '#8b4513', marginBottom: '15px' }}>🗣️ 学生智能体（先结构化，再发送）</div>
-            <textarea
-              value={inputText}
-              onChange={(e) => setInputText(e.target.value)}
-              placeholder="在此输入您的感受、症状，或点下方🎤录音..."
-              style={{ width: '100%', height: '80px', padding: '10px', borderRadius: '8px', border: '1px solid #d4c8a8', fontFamily: 'serif', marginBottom: '10px', boxSizing: 'border-box' }}
-            />
-
+            <textarea value={inputText} onChange={(e) => setInputText(e.target.value)} placeholder="在此输入您的感受、症状，或点下方🎤录音..." style={{ width: '100%', height: '80px', padding: '10px', borderRadius: '8px', border: '1px solid #d4c8a8', fontFamily: 'serif', marginBottom: '10px', boxSizing: 'border-box' }} />
             <div style={{ marginBottom: '15px', textAlign: 'center' }}>
-              <button
-                onClick={startStudentRecording}
-                style={{
-                  padding: '8px 24px',
-                  borderRadius: '30px',
-                  border: 'none',
-                  background: isRecordingStudent ? '#c0392b' : '#8b4513',
-                  color: '#fff',
-                  cursor: 'pointer',
-                  fontSize: '14px',
-                  fontFamily: 'serif',
-                }}
-              >
+              <button onClick={startStudentRecording} style={{ padding: '8px 24px', borderRadius: '30px', border: 'none', background: isRecordingStudent ? '#c0392b' : '#8b4513', color: '#fff', cursor: 'pointer', fontSize: '14px', fontFamily: 'serif' }}>
                 {isRecordingStudent ? '⏹ 停止录音（点击结束）' : '🎤 开始录音'}
               </button>
-              {isRecordingStudent && (
-                <div style={{ fontSize: '12px', color: '#c0392b', marginTop: '5px' }}>
-                  ● 正在录音，请说话...（说完再点一次停止）
-                </div>
-              )}
+              {isRecordingStudent && (<div style={{ fontSize: '12px', color: '#c0392b', marginTop: '5px' }}>● 正在录音，请说话...（说完再点一次停止）</div>)}
             </div>
-
             {pendingAudios.length > 0 && (
               <div style={{ marginBottom: '15px', padding: '10px', border: '1px dashed #b8d8c0', borderRadius: '8px', background: '#f7fcf9' }}>
                 <div style={{ fontSize: '13px', color: '#5a7d5a', fontWeight: 'bold', marginBottom: '8px' }}>🎙️ 待发送的录音（{pendingAudios.length}段）</div>
@@ -1133,21 +1265,19 @@ export default function App() {
                 ))}
               </div>
             )}
-
             {pendingImages.length > 0 && (
               <div style={{ marginBottom: '15px', padding: '10px', border: '1px dashed #b8d8c0', borderRadius: '8px', background: '#f7fcf9' }}>
                 <div style={{ fontSize: '13px', color: '#5a7d5a', fontWeight: 'bold', marginBottom: '8px' }}>📎 待发送的图片（{pendingImages.length}张）</div>
                 <div style={{ display: 'flex', flexWrap: 'wrap' }}>
                   {pendingImages.map((url, i) => (
                     <div key={i} style={{ position: 'relative', margin: '4px' }}>
-                      <img src={url} alt={`待发送${i+1}`} style={{ width: '100px', height: '100px', objectFit: 'cover', borderRadius: '8px', border: '1px solid #b8d8c0' }} />
+                      <img src={url} alt={`待发送${i + 1}`} style={{ width: '100px', height: '100px', objectFit: 'cover', borderRadius: '8px', border: '1px solid #b8d8c0' }} />
                       <button onClick={() => handleRemovePendingImage(url)} style={{ position: 'absolute', top: '2px', right: '2px', width: '22px', height: '22px', borderRadius: '50%', border: 'none', background: '#c0392b', color: '#fff', cursor: 'pointer', fontSize: '12px', lineHeight: '22px', padding: 0 }}>✕</button>
                     </div>
                   ))}
                 </div>
               </div>
             )}
-
             <div style={{ display: 'flex', justifyContent: 'center', gap: '10px', marginBottom: '15px' }}>
               <button onClick={handleTranscribe} style={{ padding: '10px 24px', borderRadius: '30px', border: 'none', background: '#8b4513', color: '#fff', fontSize: '16px', cursor: 'pointer' }}>整理成结构化陈述</button>
               <button onClick={() => fileInputRef.current?.click()} style={{ padding: '10px 24px', borderRadius: '30px', border: '1px solid #8b4513', background: '#fdfcf0', color: '#8b4513', fontSize: '16px', cursor: 'pointer' }} disabled={uploading}>
@@ -1155,15 +1285,10 @@ export default function App() {
               </button>
               <input type="file" ref={fileInputRef} onChange={handleImageUpload} accept="image/*" style={{ display: 'none' }} />
             </div>
-
             {structuredPreview && (
               <div style={{ marginTop: '15px', borderTop: '1px dashed #d4c8a8', paddingTop: '15px' }}>
                 <div style={{ fontSize: '14px', color: '#5a7d5a', fontWeight: 'bold', marginBottom: '8px' }}>📋 请确认以下内容后发送：</div>
-                <textarea
-                  value={structuredPreview}
-                  onChange={(e) => setStructuredPreview(e.target.value)}
-                  style={{ width: '100%', height: '150px', padding: '10px', borderRadius: '8px', border: '1px solid #b8d8c0', background: '#f7fcf9', fontFamily: 'serif', fontSize: '13px', marginBottom: '10px', boxSizing: 'border-box' }}
-                />
+                <textarea value={structuredPreview} onChange={(e) => setStructuredPreview(e.target.value)} style={{ width: '100%', height: '150px', padding: '10px', borderRadius: '8px', border: '1px solid #b8d8c0', background: '#f7fcf9', fontFamily: 'serif', fontSize: '13px', marginBottom: '10px', boxSizing: 'border-box' }} />
                 <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '10px' }}>
                   <button onClick={() => setStructuredPreview(null)} style={{ padding: '6px 16px', borderRadius: '20px', border: '1px solid #999', background: 'transparent', color: '#666', cursor: 'pointer', fontSize: '13px' }}>取消</button>
                   <button onClick={handleConfirmSend} style={{ padding: '6px 20px', borderRadius: '20px', border: 'none', background: '#8b4513', color: '#fff', cursor: 'pointer', fontSize: '13px' }}>确认发送给 {selectedTeacher}</button>
@@ -1173,7 +1298,6 @@ export default function App() {
           </div>
         )}
 
-        {/* 病历草案（老师端） */}
         {(currentRole === '李老师' || currentRole === '李老师智能体') && (
           <div style={{ ...boxStyle, background: '#fcfdfa' }}>
             <div style={{ textAlign: 'center', fontSize: '18px', color: '#8b4513', marginBottom: '15px' }}>📄 病历草案（老师智能体生成，待老师补充）</div>
@@ -1183,15 +1307,10 @@ export default function App() {
               drafts.map(d => (
                 <div key={d.id} style={{ padding: '15px', border: '1px solid #e0e0e0', borderRadius: '8px', marginBottom: '15px', background: '#fff' }}>
                   <div style={{ color: '#8b4513', fontWeight: 'bold', marginBottom: '5px' }}>学生：{d.patient_name}</div>
-
-                  <textarea
-                    value={d.content}
-                    onChange={(e) => {
-                      const newDrafts = drafts.map(item => item.id === d.id ? { ...item, content: e.target.value } : item)
-                      setDrafts(newDrafts)
-                    }}
-                    style={{ width: '100%', height: '180px', padding: '10px', borderRadius: '8px', border: '1px solid #d4c8a8', fontFamily: 'serif', fontSize: '13px', marginBottom: '10px', boxSizing: 'border-box', whiteSpace: 'pre-wrap' }}
-                  />
+                  <textarea value={d.content} onChange={(e) => { setDrafts(drafts.map(item => item.id === d.id ? { ...item, content: e.target.value } : item)) }} style={{ width: '100%', height: '180px', padding: '10px', borderRadius: '8px', border: '1px solid #d4c8a8', fontFamily: 'serif', fontSize: '13px', marginBottom: '10px', boxSizing: 'border-box', whiteSpace: 'pre-wrap' }} />
+                  <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: '10px' }}>
+                    <button onClick={() => handleEditDraft(d.id, d.content)} style={{ padding: '6px 16px', borderRadius: '20px', border: '1px solid #8b4513', background: 'transparent', color: '#8b4513', cursor: 'pointer' }}>保存病历修改</button>
+                  </div>
 
                   {extractImageUrls(d.content).length > 0 && (
                     <div style={{ marginBottom: '15px', padding: '10px', background: '#f7fcf9', borderRadius: '8px', border: '1px dashed #b8d8c0' }}>
@@ -1215,26 +1334,12 @@ export default function App() {
 
                   <div style={{ marginTop: '15px', padding: '12px', background: '#f0f7f0', borderRadius: '8px', border: '1px dashed #5a7d5a' }}>
                     <div style={{ fontSize: '14px', color: '#5a7d5a', fontWeight: 'bold', marginBottom: '10px' }}>📸 现场辅助记录（老师口述 → AI整理）</div>
-
-                    <textarea
-                      placeholder="点击下方 🎤 录音，口述望闻问切内容；或直接打字..."
-                      value={teacherLiveText[d.id] || ''}
-                      onChange={e => setTeacherLiveText(prev => ({ ...prev, [d.id]: e.target.value }))}
-                      style={{ width: '100%', minHeight: '100px', padding: '10px', borderRadius: '8px', border: '1px solid #b8d8c0', background: '#fff', fontFamily: 'serif', fontSize: '13px', marginBottom: '10px', boxSizing: 'border-box' }}
-                    />
-
+                    <textarea placeholder="点击下方 🎤 录音，口述望闻问切内容；或直接打字..." value={teacherLiveText[d.id] || ''} onChange={e => setTeacherLiveText(prev => ({ ...prev, [d.id]: e.target.value }))} style={{ width: '100%', minHeight: '100px', padding: '10px', borderRadius: '8px', border: '1px solid #b8d8c0', background: '#fff', fontFamily: 'serif', fontSize: '13px', marginBottom: '10px', boxSizing: 'border-box' }} />
                     <div style={{ display: 'flex', gap: '8px', marginBottom: '10px' }}>
-                      <button
-                        onClick={() => startTeacherLiveRecording(d.id)}
-                        style={{ flex: 1, padding: '8px', borderRadius: '20px', border: 'none', background: teacherLiveRecording === d.id ? '#c0392b' : '#8b4513', color: '#fff', cursor: 'pointer', fontSize: '13px' }}
-                      >
+                      <button onClick={() => startTeacherLiveRecording(d.id)} style={{ flex: 1, padding: '8px', borderRadius: '20px', border: 'none', background: teacherLiveRecording === d.id ? '#c0392b' : '#8b4513', color: '#fff', cursor: 'pointer', fontSize: '13px' }}>
                         {teacherLiveRecording === d.id ? '⏹ 停止录音' : '🎤 开始录音'}
                       </button>
-                      <button
-                        onClick={() => handleTeacherStructurize(d.id)}
-                        disabled={teacherLiveStructurizing[d.id]}
-                        style={{ flex: 1, padding: '8px', borderRadius: '20px', border: '1px solid #5a7d5a', background: 'transparent', color: '#5a7d5a', cursor: 'pointer', fontSize: '13px' }}
-                      >
+                      <button onClick={() => handleTeacherStructurize(d.id)} disabled={teacherLiveStructurizing[d.id]} style={{ flex: 1, padding: '8px', borderRadius: '20px', border: '1px solid #5a7d5a', background: 'transparent', color: '#5a7d5a', cursor: 'pointer', fontSize: '13px' }}>
                         {teacherLiveStructurizing[d.id] ? 'AI整理中...' : '🤖 AI整理成病历格式'}
                       </button>
                       <label style={{ flex: 1, padding: '8px', borderRadius: '20px', border: '1px solid #8b4513', background: 'transparent', color: '#8b4513', cursor: 'pointer', fontSize: '13px', textAlign: 'center' }}>
@@ -1242,22 +1347,24 @@ export default function App() {
                         <input type="file" accept="image/*" capture="environment" onChange={(e) => handleLivePhotoUpload(d.id, e)} style={{ display: 'none' }} />
                       </label>
                     </div>
-
                     <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
                       <button onClick={() => handleAppendTeacherNote(d.id)} style={{ padding: '6px 20px', borderRadius: '20px', border: 'none', background: '#5a7d5a', color: '#fff', cursor: 'pointer', fontSize: '13px' }}>追加到病历</button>
                     </div>
                   </div>
 
+                  <div style={{ marginTop: '10px', padding: '10px', background: '#fffaf0', borderRadius: '8px', border: '1px dashed #d4c8a8' }}>
+                    <div style={{ fontSize: '13px', color: '#8b4513', fontWeight: 'bold', marginBottom: '8px' }}>🏷️ 病历标签（用于知识库归类）</div>
+                    <div style={{ display: 'flex', gap: '8px' }}>
+                      <input placeholder="部位（如：舌苔/皮肤/面色）" value={draftTags[d.id]?.area || ''} onChange={e => setDraftTags(prev => ({ ...prev, [d.id]: { area: e.target.value, symptom: prev[d.id]?.symptom || '' } }))} style={{ flex: 1, padding: '6px', borderRadius: '6px', border: '1px solid #d4c8a8', fontSize: '13px', fontFamily: 'serif' }} />
+                      <input placeholder="症状（如：湿/热/虚/瘀）" value={draftTags[d.id]?.symptom || ''} onChange={e => setDraftTags(prev => ({ ...prev, [d.id]: { area: prev[d.id]?.area || '', symptom: e.target.value } }))} style={{ flex: 1, padding: '6px', borderRadius: '6px', border: '1px solid #d4c8a8', fontSize: '13px', fontFamily: 'serif' }} />
+                    </div>
+                  </div>
+
                   <div style={{ borderTop: '1px dashed #d4c8a8', paddingTop: '15px', marginTop: '15px' }}>
                     <div style={{ color: '#5a7d5a', fontWeight: 'bold', marginBottom: '8px' }}>📝 给 {d.patient_name} 的辨证施治方案（学生会看到这里的内容）</div>
-                    <textarea
-                      value={finalPlans[d.id] || ''}
-                      onChange={(e) => setFinalPlans({ ...finalPlans, [d.id]: e.target.value })}
-                      placeholder="例：抓药xxx，三碗水煲成一碗，饭后服；或今日宜喝姜茶，多休息..."
-                      style={{ width: '100%', height: '80px', padding: '10px', borderRadius: '8px', border: '1px solid #b8d8c0', background: '#f7fcf9', fontFamily: 'serif', fontSize: '14px', marginBottom: '10px', boxSizing: 'border-box' }}
-                    />
+                    <textarea value={finalPlans[d.id] || ''} onChange={(e) => setFinalPlans({ ...finalPlans, [d.id]: e.target.value })} placeholder="例：抓药xxx，三碗水煲成一碗，饭后服；或今日宜喝姜茶，多休息..." style={{ width: '100%', height: '80px', padding: '10px', borderRadius: '8px', border: '1px solid #b8d8c0', background: '#f7fcf9', fontFamily: 'serif', fontSize: '14px', marginBottom: '10px', boxSizing: 'border-box' }} />
                     <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
-                      <button onClick={() => handleSignDraft(d.id)} style={{ padding: '8px 20px', borderRadius: '20px', border: 'none', background: '#5a7d5a', color: '#fff', cursor: 'pointer', fontWeight: 'bold' }}>签字并回复学生</button>
+                      <button onClick={() => handlePreviewFullRecord(d.id)} style={{ padding: '8px 20px', borderRadius: '20px', border: 'none', background: '#5a7d5a', color: '#fff', cursor: 'pointer', fontWeight: 'bold' }}>📄 预览完整病历</button>
                     </div>
                   </div>
                 </div>
@@ -1266,7 +1373,6 @@ export default function App() {
           </div>
         )}
 
-        {/* 老师的回应（学生端） */}
         {(currentRole === '学生' || currentRole === '学生智能体') && (
           <div style={{ ...boxStyle, background: '#f7fcf9' }}>
             <div style={{ textAlign: 'center', fontSize: '18px', color: '#5a7d5a', marginBottom: '15px' }}>💬 {selectedTeacher}的回应</div>

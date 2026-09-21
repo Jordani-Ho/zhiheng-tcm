@@ -1,8 +1,8 @@
 import sqlite3
 import os
 from datetime import datetime, timedelta
+DB_PATH = os.path.join(os.path.dirname(__file__), os.environ.get("ZHIENG_DB", "zhiheng.db"))
 
-DB_PATH = os.path.join(os.path.dirname(__file__), "zhiheng.db")
 
 def get_connection():
     conn = sqlite3.connect(DB_PATH)
@@ -115,6 +115,47 @@ def init_db():
     )
     """)
 
+    # 【第48天新增】老师工作时间设置（work_schedule 存 JSON）
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS teacher_settings (
+        teacher_name TEXT PRIMARY KEY,
+        work_days TEXT DEFAULT '1,2,3,4,5',
+        work_hours TEXT DEFAULT '9,10,11,14,15,16',
+        work_schedule TEXT DEFAULT ''
+    )
+    """)
+    cursor.execute("SELECT COUNT(*) as count FROM teacher_settings WHERE teacher_name = '李老师'")
+    if cursor.fetchone()["count"] == 0:
+        cursor.execute("INSERT INTO teacher_settings (teacher_name, work_days, work_hours, work_schedule) VALUES ('李老师', '1,2,3,4,5', '9,10,11,14,15,16', '')")
+        
+    # 【第47天新增】预约表
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS appointments (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        patient_name TEXT,
+        teacher_name TEXT,
+        initiator TEXT,
+        scheduled_date TEXT,
+        scheduled_time TEXT,
+        reason TEXT,
+        status TEXT DEFAULT 'pending',
+        created_at TEXT,
+        confirmed_at TEXT
+    )
+    """)
+
+    # 【第46天新增】病历标签表（知识库素材）
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS record_tags (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        record_id INTEGER,
+        teacher_name TEXT,
+        tag_type TEXT,
+        tag_value TEXT,
+        created_at TEXT
+    )
+    """)
+
     # 【第38天新增】邀请码表
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS invites (
@@ -195,9 +236,48 @@ def get_patient_teachers(patient_name):
 
 def get_teacher_patients(teacher_name):
     conn = get_connection()
-    rows = conn.execute("SELECT patient_name FROM patient_teachers WHERE teacher_name = ? AND status = 'active'", (teacher_name,)).fetchall()
+    rows = conn.execute("""
+        SELECT p.name, p.last_active_at,
+               COALESCE(a.points, 0) as points
+        FROM patients p
+        INNER JOIN patient_teachers pt ON p.name = pt.patient_name
+        LEFT JOIN accounts a ON p.name = a.role_name
+        WHERE pt.teacher_name = ? AND pt.status = 'active'
+        ORDER BY p.name
+    """, (teacher_name,)).fetchall()
     conn.close()
-    return [r["patient_name"] for r in rows]
+    return [dict(r) for r in rows]
+
+def get_student_status(patient_name):
+    """【第44天新增】根据最后活跃时间 + 积分，返回学生状态"""
+    conn = get_connection()
+    row = conn.execute("SELECT last_active_at FROM patients WHERE name = ?", (patient_name,)).fetchone()
+    pts_row = conn.execute("SELECT points FROM accounts WHERE role_name = ?", (patient_name,)).fetchone()
+    conn.close()
+
+    points = pts_row["points"] if pts_row else 0
+    last_active = row["last_active_at"] if row else None
+
+    # 积分规则
+    if points <= 0:
+        return {"status": "warning", "label": "欠费预警", "color": "#c0392b"}
+    if points < 30:
+        return {"status": "low", "label": "余额偏低", "color": "#e67e22"}
+
+    # 活跃度规则
+    if not last_active:
+        return {"status": "silent", "label": "从未活跃", "color": "#999"}
+    try:
+        last_dt = datetime.strptime(last_active, "%Y-%m-%d")
+        days = (datetime.now() - last_dt).days
+        if days >= 30:
+            return {"status": "silent", "label": f"沉默 {days} 天", "color": "#999"}
+        if days >= 14:
+            return {"status": "inactive", "label": f"{days} 天未活跃", "color": "#e67e22"}
+    except Exception:
+        pass
+
+    return {"status": "active", "label": "活跃", "color": "#5a7d5a"}
 
 def add_patient_teacher(patient_name, teacher_name):
     conn = get_connection()
@@ -392,12 +472,31 @@ def update_draft_content(draft_id, content):
     conn.commit()
     conn.close()
 
-def sign_draft(draft_id, final_plan):
+def sign_draft(draft_id, final_plan, final_content=None):
+    """【第45天修改】签字时同时保存 AI 原草案与老师最终版（学习轨迹）"""
     conn = get_connection()
     draft = conn.execute("SELECT * FROM drafts WHERE id = ?", (draft_id,)).fetchone()
     if not draft:
         conn.close()
         return None
+
+    # 完整病历（如果传了）或退回到最终方案
+    patient_record_content = final_content if final_content else final_plan
+
+    conn.execute(
+        "INSERT INTO patient_records (patient_name, teacher_name, ai_draft, final_plan, doctor) VALUES (?, ?, ?, ?, ?)",
+        (draft["patient_name"], draft["teacher_name"], draft["content"], patient_record_content, draft["teacher_name"])
+    )
+    conn.execute(
+        "INSERT INTO homework (patient_name, teacher_name, task, detail, status, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+        (draft["patient_name"], draft["teacher_name"], f"今日医嘱：{final_plan}", "请严格遵医嘱执行", "pending", "2026-09-19")
+    )
+    conn.execute("DELETE FROM transcriptions WHERE id = ?", (draft["transcript_id"],))
+    conn.execute("DELETE FROM drafts WHERE id = ?", (draft_id,))
+
+    conn.commit()
+    conn.close()
+    return draft["patient_name"]
 
     conn.execute("INSERT INTO patient_records (patient_name, teacher_name, ai_draft, final_plan, doctor) VALUES (?, ?, ?, ?, ?)",
                  (draft["patient_name"], draft["teacher_name"], draft["content"], final_plan, draft["teacher_name"]))
@@ -473,6 +572,210 @@ def accept_invite(code, student_name):
     conn.commit()
     conn.close()
     return {"message": "加入成功", "teacher_name": invite["teacher_name"]}
+# ---------- 【第48天扩展】老师工作时间（按天 + 半小时粒度） ----------
+import json
+
+ALL_SLOTS = [
+    "08:00","08:30","09:00","09:30","10:00","10:30","11:00","11:30",
+    "12:00","12:30","13:00","13:30","14:00","14:30","15:00","15:30",
+    "16:00","16:30","17:00","17:30","18:00","18:30","19:00","19:30","20:00"
+]
+
+def _default_schedule():
+    weekday_slots = [s for s in ALL_SLOTS if ("09:00" <= s <= "11:30") or ("14:00" <= s <= "16:30")]
+    return {
+        "0": [],
+        "1": list(weekday_slots),
+        "2": list(weekday_slots),
+        "3": list(weekday_slots),
+        "4": list(weekday_slots),
+        "5": list(weekday_slots),
+        "6": []
+    }
+
+def get_teacher_schedule(teacher_name):
+    """返回该老师按天划分的半小时时段"""
+    conn = get_connection()
+    row = conn.execute("SELECT * FROM teacher_settings WHERE teacher_name = ?", (teacher_name,)).fetchone()
+    conn.close()
+    if not row:
+        return _default_schedule()
+    d = dict(row)
+    if d.get("work_schedule"):
+        try:
+            parsed = json.loads(d["work_schedule"])
+            # 补齐缺失的日
+            for k in ["0","1","2","3","4","5","6"]:
+                if k not in parsed:
+                    parsed[k] = []
+            return parsed
+        except Exception:
+            pass
+    # 兼容旧的 work_days + work_hours
+    days = [int(x) for x in d["work_days"].split(",") if x]
+    hours = [int(x) for x in d["work_hours"].split(",") if x]
+    slots = []
+    for h in hours:
+        slots.append(f"{h:02d}:00")
+        slots.append(f"{h:02d}:30")
+    schedule = {}
+    for day in range(7):
+        schedule[str(day)] = list(slots) if day in days else []
+    return schedule
+
+def save_teacher_schedule(teacher_name, schedule):
+    conn = get_connection()
+    conn.execute("""
+        INSERT INTO teacher_settings (teacher_name, work_schedule) VALUES (?, ?)
+        ON CONFLICT(teacher_name) DO UPDATE SET work_schedule = excluded.work_schedule
+    """, (teacher_name, json.dumps(schedule)))
+    conn.commit()
+    conn.close()
+    return {"message": "工作时间已保存"}
+
+# ---------- 【第48天扩展】老师工作时间（按天 + 半小时粒度） ----------
+import json as _json
+
+ALL_SLOTS = [
+    "08:00","08:30","09:00","09:30","10:00","10:30","11:00","11:30",
+    "12:00","12:30","13:00","13:30","14:00","14:30","15:00","15:30",
+    "16:00","16:30","17:00","17:30","18:00","18:30","19:00","19:30","20:00"
+]
+
+def _default_schedule():
+    weekday_slots = [s for s in ALL_SLOTS if ("09:00" <= s <= "11:30") or ("14:00" <= s <= "16:30")]
+    return {
+        "0": [],
+        "1": list(weekday_slots),
+        "2": list(weekday_slots),
+        "3": list(weekday_slots),
+        "4": list(weekday_slots),
+        "5": list(weekday_slots),
+        "6": []
+    }
+
+def get_teacher_schedule(teacher_name):
+    """返回该老师按天划分的半小时时段"""
+    conn = get_connection()
+    row = conn.execute("SELECT * FROM teacher_settings WHERE teacher_name = ?", (teacher_name,)).fetchone()
+    conn.close()
+    if not row:
+        return _default_schedule()
+    d = dict(row)
+    if d.get("work_schedule"):
+        try:
+            parsed = _json.loads(d["work_schedule"])
+            for k in ["0","1","2","3","4","5","6"]:
+                if k not in parsed:
+                    parsed[k] = []
+            return parsed
+        except Exception:
+            pass
+    days = [int(x) for x in d["work_days"].split(",") if x]
+    hours = [int(x) for x in d["work_hours"].split(",") if x]
+    slots = []
+    for h in hours:
+        slots.append(f"{h:02d}:00")
+        slots.append(f"{h:02d}:30")
+    schedule = {}
+    for day in range(7):
+        schedule[str(day)] = list(slots) if day in days else []
+    return schedule
+
+def save_teacher_schedule(teacher_name, schedule):
+    conn = get_connection()
+    conn.execute("""
+        INSERT INTO teacher_settings (teacher_name, work_schedule) VALUES (?, ?)
+        ON CONFLICT(teacher_name) DO UPDATE SET work_schedule = excluded.work_schedule
+    """, (teacher_name, _json.dumps(schedule)))
+    conn.commit()
+    conn.close()
+    return {"message": "工作时间已保存"}
+
+# ---------- 老师工作时间 ----------
+def get_teacher_settings(teacher_name):
+    conn = get_connection()
+    row = conn.execute("SELECT * FROM teacher_settings WHERE teacher_name = ?", (teacher_name,)).fetchone()
+    conn.close()
+    if not row:
+        return {"teacher_name": teacher_name, "work_days": "1,2,3,4,5", "work_hours": "9,10,11,14,15,16"}
+    d = dict(row)
+    d["work_days_list"] = [int(x) for x in d["work_days"].split(",") if x]
+    d["work_hours_list"] = [int(x) for x in d["work_hours"].split(",") if x]
+    return d
+
+def save_teacher_settings(teacher_name, work_days, work_hours):
+    conn = get_connection()
+    conn.execute("""
+        INSERT INTO teacher_settings (teacher_name, work_days, work_hours) VALUES (?, ?, ?)
+        ON CONFLICT(teacher_name) DO UPDATE SET work_days = excluded.work_days, work_hours = excluded.work_hours
+    """, (teacher_name, work_days, work_hours))
+    conn.commit()
+    conn.close()
+    return {"message": "工作时间已保存"}
+
+# ---------- 预约相关操作 ----------
+def create_appointment(patient_name, teacher_name, initiator, scheduled_date, scheduled_time, reason):
+    conn = get_connection()
+    conn.execute(
+        "INSERT INTO appointments (patient_name, teacher_name, initiator, scheduled_date, scheduled_time, reason, status, created_at) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)",
+        (patient_name, teacher_name, initiator, scheduled_date, scheduled_time, reason, "2026-09-20")
+    )
+    conn.commit()
+    conn.close()
+    return {"message": "预约已提交"}
+
+def get_appointments(patient_name=None, teacher_name=None):
+    conn = get_connection()
+    conditions = []
+    params = []
+    if patient_name:
+        conditions.append("patient_name = ?")
+        params.append(patient_name)
+    if teacher_name:
+        conditions.append("teacher_name = ?")
+        params.append(teacher_name)
+    where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+    rows = conn.execute(f"SELECT * FROM appointments {where} ORDER BY id DESC", params).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+def update_appointment_status(appt_id, status):
+    conn = get_connection()
+    conn.execute("UPDATE appointments SET status = ?, confirmed_at = ? WHERE id = ?",
+                 (status, "2026-09-20", appt_id))
+    conn.commit()
+    conn.close()
+    return {"message": "预约状态已更新"}
+
+# ---------- 标签/知识库相关操作 ----------
+def insert_tag(record_id, teacher_name, tag_type, tag_value):
+    conn = get_connection()
+    conn.execute(
+        "INSERT INTO record_tags (record_id, teacher_name, tag_type, tag_value, created_at) VALUES (?, ?, ?, ?, ?)",
+        (record_id, teacher_name, tag_type, tag_value, "2026-09-20")
+    )
+    conn.commit()
+    conn.close()
+
+def get_tags_for_record(record_id):
+    conn = get_connection()
+    rows = conn.execute("SELECT * FROM record_tags WHERE record_id = ?", (record_id,)).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+def get_teacher_tags_summary(teacher_name):
+    """返回该老师所有标签的汇总（用于知识库视图）"""
+    conn = get_connection()
+    rows = conn.execute("""
+        SELECT tag_type, tag_value, COUNT(*) as count
+        FROM record_tags
+        WHERE teacher_name = ?
+        GROUP BY tag_type, tag_value
+        ORDER BY count DESC
+    """, (teacher_name,)).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
 
 # ---------- 积分相关操作 ----------
 def get_points(role_name):

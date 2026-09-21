@@ -38,6 +38,7 @@ class DraftUpdate(BaseModel):
 
 class SignInput(BaseModel):
     final_plan: str
+    final_content: str = ""
 
 class HomeworkInput(BaseModel):
     patient_name: str
@@ -157,7 +158,19 @@ def get_patient_teachers(patient_name: str):
 
 @app.get("/api/teacher-patients")
 def get_teacher_patients(teacher_name: str):
-    return database.get_teacher_patients(teacher_name)
+    # 【第44天修改】返回学生列表 + 状态标记
+    students = database.get_teacher_patients(teacher_name)
+    result = []
+    for s in students:
+        status = database.get_student_status(s["name"])
+        result.append({
+            "name": s["name"],
+            "points": s["points"],
+            "last_active_at": s["last_active_at"],
+            "status_label": status["label"],
+            "status_color": status["color"],
+        })
+    return result
 
 @app.post("/api/patient-teachers")
 def add_patient_teacher(input_data: TeacherLinkInput):
@@ -172,18 +185,21 @@ def get_patients(guardian_name: str = None):
     return database.get_patients(guardian_name)
 
 @app.post("/api/patients/add")
-class TeacherAddStudentInput(BaseModel):
-    teacher_name: str
-    student_name: str
-
-@app.post("/api/teacher/add-student")
-def teacher_add_student(input_data: TeacherAddStudentInput):
-    return database.teacher_add_student(input_data.teacher_name, input_data.student_name)
 def add_patient(input_data: AddPatientInput):
     database.add_patient(input_data.name, input_data.guardian_name, input_data.relation,
                          input_data.gender, input_data.birth_date, input_data.birth_time,
                          input_data.birth_place, input_data.location)
     return {"message": "亲友档案添加成功"}
+
+
+class TeacherAddStudentInput(BaseModel):
+    teacher_name: str
+    student_name: str
+
+
+@app.post("/api/teacher/add-student")
+def teacher_add_student(input_data: TeacherAddStudentInput):
+    return database.teacher_add_student(input_data.teacher_name, input_data.student_name)
 
 @app.delete("/api/patients/{name}")
 def delete_patient(name: str):
@@ -527,11 +543,50 @@ def update_draft(draft_id: int, update_data: DraftUpdate):
 
 @app.post("/api/drafts/{draft_id}/sign")
 def sign_draft_endpoint(draft_id: int, input_data: SignInput):
-    patient_name = database.sign_draft(draft_id, input_data.final_plan)
+    # 【第45天修改】签字前，先提取音频URL并删除物理文件（音频转文字已确认，即销毁）
+    import re
+    conn = database.get_connection()
+    draft = conn.execute("SELECT content FROM drafts WHERE id = ?", (draft_id,)).fetchone()
+    conn.close()
+    if not draft:
+        return {"error": "找不到该草案"}
+
+    audio_urls = re.findall(r'/uploads/audio_[a-zA-Z0-9._-]+', draft["content"])
+    for url in audio_urls:
+        filename = url.replace('/uploads/', '')
+        file_path = os.path.join(UPLOAD_DIR, filename)
+        if os.path.exists(file_path):
+            try:
+                os.remove(file_path)
+            except Exception:
+                pass
+
+    # 签字
+    patient_name = database.sign_draft(draft_id, input_data.final_plan, input_data.final_content)
     if not patient_name:
         return {"error": "找不到该病历"}
     database.transfer_points(patient_name, "李老师", 50)
-    return {"message": "签字确认成功，已归档，作业已生成，学费已支付"}
+    return {"message": "签字成功，完整病历已归档，音频已销毁，积分已支付"}
+
+# ---------- 【第46天新增】病历标签 ----------
+class TagInput(BaseModel):
+    record_id: int
+    teacher_name: str
+    tags: list  # [{"tag_type": "部位", "tag_value": "舌苔"}, ...]
+
+@app.post("/api/tags")
+def add_tags(input_data: TagInput):
+    for tag in input_data.tags:
+        database.insert_tag(input_data.record_id, input_data.teacher_name, tag["tag_type"], tag["tag_value"])
+    return {"message": "标签已保存"}
+
+@app.get("/api/tags")
+def get_tags(record_id: int):
+    return database.get_tags_for_record(record_id)
+
+@app.get("/api/tags-summary")
+def get_tags_summary(teacher_name: str):
+    return database.get_teacher_tags_summary(teacher_name)
 
 @app.get("/api/patient-records")
 def get_patient_records(patient_name: str = None, teacher_name: str = None):
@@ -559,6 +614,74 @@ def get_invites(teacher_name: str):
 @app.post("/api/invites/accept")
 def accept_invite(input_data: AcceptInviteInput):
     return database.accept_invite(input_data.code, input_data.student_name)
+
+# ---------- 【第48天新增】老师工作时间 ----------
+class TeacherSettingsInput(BaseModel):
+    teacher_name: str
+    work_days: str
+    work_hours: str
+
+@app.get("/api/teacher-settings")
+def get_teacher_settings(teacher_name: str):
+    return database.get_teacher_settings(teacher_name)
+
+@app.post("/api/teacher-settings")
+def save_teacher_settings(input_data: TeacherSettingsInput):
+    return database.save_teacher_settings(input_data.teacher_name, input_data.work_days, input_data.work_hours)
+
+# ---------- 【第48天扩展】按天的工作时间 ----------
+class TeacherScheduleInput(BaseModel):
+    teacher_name: str
+    schedule: dict
+
+@app.get("/api/teacher-schedule")
+def get_teacher_schedule(teacher_name: str):
+    return database.get_teacher_schedule(teacher_name)
+
+@app.post("/api/teacher-schedule")
+def save_teacher_schedule(input_data: TeacherScheduleInput):
+    return database.save_teacher_schedule(input_data.teacher_name, input_data.schedule)
+
+# ---------- 【第48天扩展】按天的工作时间 ----------
+class TeacherScheduleInput(BaseModel):
+    teacher_name: str
+    schedule: dict
+
+@app.get("/api/teacher-schedule")
+def get_teacher_schedule(teacher_name: str):
+    return database.get_teacher_schedule(teacher_name)
+
+@app.post("/api/teacher-schedule")
+def save_teacher_schedule(input_data: TeacherScheduleInput):
+    return database.save_teacher_schedule(input_data.teacher_name, input_data.schedule)
+
+# ---------- 【第47天新增】预约 ----------
+class AppointmentInput(BaseModel):
+    patient_name: str
+    teacher_name: str
+    initiator: str
+    scheduled_date: str
+    scheduled_time: str
+    reason: str
+
+@app.post("/api/appointments")
+def create_appointment(input_data: AppointmentInput):
+    return database.create_appointment(
+        input_data.patient_name, input_data.teacher_name, input_data.initiator,
+        input_data.scheduled_date, input_data.scheduled_time, input_data.reason
+    )
+
+@app.get("/api/appointments")
+def get_appointments(patient_name: str = None, teacher_name: str = None):
+    return database.get_appointments(patient_name, teacher_name)
+
+@app.post("/api/appointments/{appt_id}/confirm")
+def confirm_appointment(appt_id: int):
+    return database.update_appointment_status(appt_id, "confirmed")
+
+@app.post("/api/appointments/{appt_id}/cancel")
+def cancel_appointment(appt_id: int):
+    return database.update_appointment_status(appt_id, "cancelled")
 
 @app.get("/api/points")
 def get_points(patient_name: str = "张三"):
