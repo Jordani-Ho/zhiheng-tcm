@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -639,6 +639,19 @@ def get_teacher_schedule(teacher_name: str):
     return database.get_teacher_schedule(teacher_name)
 
 @app.post("/api/teacher-schedule")
+# ---------- 【第49天新增】节假日 ----------
+class HolidaysInput(BaseModel):
+    teacher_name: str
+    holidays: list
+
+@app.get("/api/teacher-holidays")
+def get_teacher_holidays(teacher_name: str):
+    return database.get_teacher_holidays(teacher_name)
+
+@app.post("/api/teacher-holidays")
+def save_teacher_holidays(input_data: HolidaysInput):
+    return database.save_teacher_holidays(input_data.teacher_name, input_data.holidays)
+
 def save_teacher_schedule(input_data: TeacherScheduleInput):
     return database.save_teacher_schedule(input_data.teacher_name, input_data.schedule)
 
@@ -672,8 +685,61 @@ def create_appointment(input_data: AppointmentInput):
     )
 
 @app.get("/api/appointments")
-def get_appointments(patient_name: str = None, teacher_name: str = None):
-    return database.get_appointments(patient_name, teacher_name)
+def get_appointments(
+    patient_name: str = None,
+    teacher_name: str = None,
+    start_date: str = None,
+    end_date: str = None
+):
+    return database.get_appointments(patient_name, teacher_name, start_date, end_date)
+
+@app.get("/api/appointments/calendar")
+def get_appointments_calendar(teacher_name: str):
+    """【第49天】返回未来 7 天 × 所有时段 的预约情况，供可视化网格用"""
+    from datetime import timedelta
+    today = datetime.now()
+    end = today + timedelta(days=7)
+    start_str = today.strftime("%Y-%m-%d")
+    end_str = end.strftime("%Y-%m-%d")
+
+    # 该老师的排班
+    schedule = database.get_teacher_schedule(teacher_name)
+    holidays = database.get_teacher_holidays(teacher_name)
+
+    # 未来 7 天该老师的所有预约
+    appts = database.get_appointments(teacher_name=teacher_name, start_date=start_str, end_date=end_str)
+
+    # 生成 7 天数据
+    days = []
+    for i in range(7):
+        d = today + timedelta(days=i)
+        date_str = d.strftime("%Y-%m-%d")
+        day_of_week = d.weekday()  # 0=周一...6=周日
+        # 注意：Python weekday 与 JS getDay 不同，转换一下
+        js_day = (day_of_week + 1) % 7
+        day_key = str(js_day)
+
+        slots_available = schedule.get(day_key, []) if date_str not in holidays else []
+
+        # 该天已被预约的时段
+        booked = {}
+        for a in appts:
+            if a["scheduled_date"] == date_str and a["status"] != "cancelled":
+                booked[a["scheduled_time"]] = {
+                    "patient_name": a["patient_name"],
+                    "status": a["status"],
+                    "id": a["id"]
+                }
+
+        days.append({
+            "date": date_str,
+            "weekday": js_day,
+            "is_holiday": date_str in holidays,
+            "slots": slots_available,
+            "booked": booked
+        })
+
+    return {"teacher_name": teacher_name, "days": days, "holidays": holidays}
 
 @app.post("/api/appointments/{appt_id}/confirm")
 def confirm_appointment(appt_id: int):
@@ -689,3 +755,65 @@ def get_points(patient_name: str = "张三"):
         "patient_points": database.get_points(patient_name),
         "teacher_points": database.get_points("李老师")
     }
+# ============ Pydantic 模型：中药材库存 ============
+
+class HerbInput(BaseModel):
+    teacher_name: str
+    herb_name: str
+    stock_amount: float = 0
+    unit: str = "克"
+    warn_threshold: float = 50
+
+
+class HerbAdjustInput(BaseModel):
+    delta: float
+
+
+class HerbBatchDeductInput(BaseModel):
+    teacher_name: str
+    items: list  # [{herb_name: str, amount: float}]
+
+
+# ============ 接口：中药材库存 ============
+
+@app.get("/api/herbs")
+def api_get_herbs(teacher_name: str):
+    return database.get_herbs(teacher_name)
+
+
+@app.get("/api/herbs/low")
+def api_get_low_herbs(teacher_name: str):
+    return database.get_low_herbs(teacher_name)
+
+
+@app.post("/api/herbs")
+def api_upsert_herb(data: HerbInput):
+    herb = database.upsert_herb(data.teacher_name, data.herb_name, data.stock_amount, data.unit, data.warn_threshold)
+    return {"message": "已保存", "herb": herb}
+
+
+@app.post("/api/herbs/batch-deduct")
+def api_batch_deduct_herbs(data: HerbBatchDeductInput):
+    result = database.batch_deduct_herbs(data.teacher_name, data.items)
+    if not result["success"]:
+        return {"message": "扣减失败，库存不足", "failed_herb": result["failed_herb"]}
+    return {"message": "批量扣减成功", "failed_herb": None}
+
+
+@app.post("/api/herbs/{herb_id}/adjust")
+def api_adjust_herb(herb_id: int, data: HerbAdjustInput):
+    try:
+        herb = database.adjust_herb(herb_id, data.delta)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if herb is None:
+        raise HTTPException(status_code=404, detail="药材不存在")
+    return {"message": "已调整", "herb": herb}
+
+
+@app.delete("/api/herbs/{herb_id}")
+def api_delete_herb(herb_id: int):
+    ok = database.delete_herb(herb_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="药材不存在")
+    return {"message": "已删除"}

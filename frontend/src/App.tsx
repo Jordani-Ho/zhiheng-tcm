@@ -2,7 +2,6 @@ import { useEffect, useState, useRef } from 'react'
 
 interface HuangliData { date: string; lunar: string; solar_term: string; solar_term_tip: string; health_trend: string; homework: string; }
 interface RoleData { role_type: string; name: string; task: string; detail: string; }
-interface Transcription { id: number; patient_name: string; content: string; data_type: string; }
 interface Draft { id: number; transcript_id: number; patient_name: string; content: string; signed: boolean; doctor?: string; }
 interface Patient { name: string; teacher_name: string; guardian_name: string; relation: string; }
 interface PatientRecord { id: number; patient_name: string; ai_draft: string; final_plan: string; doctor: string; }
@@ -78,18 +77,32 @@ export default function App() {
 
   const [previewDraft, setPreviewDraft] = useState<{ id: number; content: string } | null>(null)
   const [draftTags, setDraftTags] = useState<{ [draftId: number]: { area: string; symptom: string } }>({})
-    // 【第47天新增】预约
+
+  // 预约相关
   const [appointments, setAppointments] = useState<any[]>([])
   const [showApptForm, setShowApptForm] = useState(false)
   const [apptDate, setApptDate] = useState('')
   const [apptTime, setApptTime] = useState('')
   const [apptReason, setApptReason] = useState('')
-    // 【第48天新增】老师工作时间 + 预约防呆
-  const [teacherSettings, setTeacherSettings] = useState<{ work_days_list: number[]; work_hours_list: number[] } | null>(null)
-  const [editingSettings, setEditingSettings] = useState(false)
-  const [settingsDays, setSettingsDays] = useState<number[]>([])
-  const [settingsHours, setSettingsHours] = useState<number[]>([])
 
+  // 老师工作时间（新）
+  const [schedule, setSchedule] = useState<{ [day: string]: string[] } | null>(null)
+  const [scheduleEditDay, setScheduleEditDay] = useState('1') // 当前编辑的星期，默认周一
+  const [editingSchedule, setEditingSchedule] = useState(false)
+  const [tempSchedule, setTempSchedule] = useState<{ [day: string]: string[] }>({})
+  // 【第49天新增】节假日管理
+  const [holidays, setHolidays] = useState<string[]>([])
+  const [newHolidayDate, setNewHolidayDate] = useState('')
+    // 【第51天新增】中药材库存
+  const [herbs, setHerbs] = useState<any[]>([])
+  const [showHerbForm, setShowHerbForm] = useState(false)
+  const [herbForm, setHerbForm] = useState({ herb_name: '', stock_amount: 0, unit: '克', warn_threshold: 50 })
+  const [showLowOnly, setShowLowOnly] = useState(false)
+  const [adjustingHerb, setAdjustingHerb] = useState<any>(null)
+  const [adjustDelta, setAdjustDelta] = useState(0)
+    // 【第50天新增】可视化排班网格
+  const [calendarData, setCalendarData] = useState<any>(null)
+  const [selectedDayIndex, setSelectedDayIndex] = useState(0)
   const yearOptions = Array.from({ length: currentYear - 1920 + 1 }, (_, i) => currentYear - i)
   const monthOptions = Array.from({ length: 12 }, (_, i) => i + 1).filter(m => {
     if (parseInt(newBirthYear) === currentYear) return m <= currentMonth
@@ -165,6 +178,10 @@ export default function App() {
       fetch(`/api/teacher-patients?teacher_name=${selectedTeacher}`)
         .then(r => r.json()).then(d => setTeacherPatients(d))
         .catch(() => setTeacherPatients([]))
+      fetchSchedule()
+      fetchHolidays()
+      fetchCalendar()
+      fetchHerbs()
     }
   }, [currentRole, selectedTeacher])
 
@@ -177,7 +194,7 @@ export default function App() {
     fetchHealthTrend()
     fetchDailyAdvice()
     fetchAppointments()
-    fetchTeacherSettings()
+    fetchCalendar()
     setShowHistory(false)
   }, [currentRole, selectedPatient, selectedTeacher])
 
@@ -220,89 +237,165 @@ export default function App() {
     fetch(`/api/invites?teacher_name=${selectedTeacher}`).then(r => r.json()).then(d => setInvites(d)).catch(() => setInvites([]))
   }
 
-    // 【第47天新增】预约
-  const fetchAppointments = () => {
-    const url = currentRole.includes('老师')
-      ? `/api/appointments?teacher_name=${selectedTeacher}`
-      : `/api/appointments?patient_name=${selectedPatient}`
-    fetch(url).then(r => r.json()).then(d => setAppointments(d)).catch(() => setAppointments([]))
-  }
-
-  const handleCreateAppointment = () => {
-    if (!apptDate || !apptTime || !apptReason.trim()) {
-      alert("请填写完整的预约信息（日期、时间、原因）")
-      return
-    }
-    const initiator = currentRole.includes('老师') ? 'teacher' : 'student'
-    fetch('/api/appointments', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        patient_name: selectedPatient,
-        teacher_name: selectedTeacher,
-        initiator,
-        scheduled_date: apptDate,
-        scheduled_time: apptTime,
-        reason: apptReason.trim()
-      })
-    }).then(() => {
-      setShowApptForm(false)
-      setApptDate(''); setApptTime(''); setApptReason('')
-      fetchAppointments()
-    })
-  }
-
-  const handleConfirmAppt = (id: number) => {
-    fetch(`/api/appointments/${id}/confirm`, { method: 'POST' }).then(() => fetchAppointments())
-  }
-
-  const handleCancelAppt = (id: number) => {
-    if (!confirm("确定要取消这个预约吗？")) return
-    fetch(`/api/appointments/${id}/cancel`, { method: 'POST' }).then(() => fetchAppointments())
-  }
-  
-    // 【第48天新增】老师工作时间
-  const fetchTeacherSettings = () => {
-    fetch(`/api/teacher-settings?teacher_name=${selectedTeacher}`)
+  // 老师工作时间
+  const fetchSchedule = () => {
+    fetch(`/api/teacher-schedule?teacher_name=${selectedTeacher}`)
       .then(r => r.json())
       .then(d => {
-        setTeacherSettings(d)
-        setSettingsDays(d.work_days_list || [])
-        setSettingsHours(d.work_hours_list || [])
+        setSchedule(d)
+        setTempSchedule(JSON.parse(JSON.stringify(d)))
       })
-      .catch(() => setTeacherSettings(null))
+      .catch(() => setSchedule(null))
   }
 
-  const handleSaveSettings = () => {
-    if (settingsDays.length === 0 || settingsHours.length === 0) {
-      alert("请至少选择一天工作日和一个工作时段")
-      return
-    }
-    fetch('/api/teacher-settings', {
+  const handleSaveSchedule = () => {
+    fetch('/api/teacher-schedule', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ teacher_name: selectedTeacher, schedule: tempSchedule })
+    }).then(() => {
+      setSchedule(JSON.parse(JSON.stringify(tempSchedule)))
+      setEditingSchedule(false)
+      alert("工作时间已保存")
+    })
+  }
+
+    // 【第49天新增】节假日
+  const fetchHolidays = () => {
+    fetch(`/api/teacher-holidays?teacher_name=${selectedTeacher}`)
+      .then(r => r.json())
+      .then(d => setHolidays(Array.isArray(d) ? d : []))
+      .catch(() => setHolidays([]))
+  }
+
+  const handleAddHoliday = () => {
+    if (!newHolidayDate) { alert("请选择日期"); return }
+    if (holidays.includes(newHolidayDate)) { alert("该日期已在节假日列表"); return }
+    const updated = [...holidays, newHolidayDate].sort()
+    fetch('/api/teacher-holidays', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ teacher_name: selectedTeacher, holidays: updated })
+    }).then(() => { setHolidays(updated); setNewHolidayDate('') })
+  }
+
+  const handleRemoveHoliday = (date: string) => {
+    if (!confirm(`确定要移除【${date}】吗？`)) return
+    const updated = holidays.filter(d => d !== date)
+    fetch('/api/teacher-holidays', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ teacher_name: selectedTeacher, holidays: updated })
+    }).then(() => setHolidays(updated))
+  }
+
+  
+  // 【第51天新增】中药材库存
+  const fetchHerbs = () => {
+    fetch(`/api/herbs?teacher_name=${encodeURIComponent(selectedTeacher)}`)
+      .then(res => res.json())
+      .then(data => setHerbs(data))
+  }
+
+  const toggleLowOnly = () => {
+    const next = !showLowOnly
+    setShowLowOnly(next)
+    const url = next
+      ? `/api/herbs/low?teacher_name=${encodeURIComponent(selectedTeacher)}`
+      : `/api/herbs?teacher_name=${encodeURIComponent(selectedTeacher)}`
+    fetch(url).then(res => res.json()).then(data => setHerbs(data))
+  }
+
+  const handleSaveHerb = () => {
+    fetch('/api/herbs', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         teacher_name: selectedTeacher,
-        work_days: settingsDays.join(','),
-        work_hours: settingsHours.join(',')
+        herb_name: herbForm.herb_name,
+        stock_amount: herbForm.stock_amount,
+        unit: herbForm.unit,
+        warn_threshold: herbForm.warn_threshold
       })
-    }).then(() => {
-      setEditingSettings(false)
-      fetchTeacherSettings()
+    })
+      .then(res => res.json())
+      .then(() => {
+        setShowHerbForm(false)
+        setHerbForm({ herb_name: '', stock_amount: 0, unit: '克', warn_threshold: 50 })
+        fetchHerbs()
+      })
+  }
+
+  const openAdjustModal = (herb: any) => {
+    setAdjustingHerb(herb)
+    setAdjustDelta(0)
+  }
+
+  const submitAdjust = () => {
+    if (!adjustingHerb) return
+    fetch(`/api/herbs/${adjustingHerb.id}/adjust`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ delta: adjustDelta })
+    })
+      .then(res => {
+        if (!res.ok) {
+          return res.json().then(err => { throw new Error(err.detail || '调整失败') })
+        }
+        return res.json()
+      })
+      .then(() => {
+        setAdjustingHerb(null)
+        setAdjustDelta(0)
+        fetchHerbs()
+      })
+      .catch(err => alert(err.message))
+  }
+
+  const handleDeleteHerb = (herbId: number) => {
+    if (!window.confirm('确定删除该药材记录吗？')) return
+    fetch(`/api/herbs/${herbId}`, { method: 'DELETE' })
+      .then(res => res.json())
+      .then(() => fetchHerbs())
+  }
+    // 【第50天新增】拉取可视化排班数据
+  const fetchCalendar = () => {
+    fetch(`/api/appointments/calendar?teacher_name=${selectedTeacher}`)
+      .then(r => r.json())
+      .then(d => setCalendarData(d))
+      .catch(() => setCalendarData(null))
+  }
+  
+  // 切换某天某个时段
+  const toggleSlot = (day: string, slot: string) => {
+    setTempSchedule(prev => {
+      const daySlots = prev[day] || []
+      const newSlots = daySlots.includes(slot) ? daySlots.filter(s => s !== slot) : [...daySlots, slot].sort()
+      return { ...prev, [day]: newSlots }
     })
   }
 
-  // 计算明天的日期（用于预约最早日期）
-  const getTomorrowStr = () => {
-    const t = new Date()
-    t.setDate(t.getDate() + 1)
-    return t.toISOString().split('T')[0]
+  // 获取某个日期对应的星期几（0=周日...6=周六）
+  const getDayOfWeek = (dateStr: string) => {
+    if (!dateStr) return -1
+    // 【第49天修复】兼容多种日期格式，统一为 YYYY-MM-DD
+    let normalized = dateStr.replace(/\//g, '-')
+    if (normalized.match(/^\d{2}-\d{2}-\d{4}$/)) {
+      const parts = normalized.split('-')
+      normalized = `${parts[2]}-${parts[0]}-${parts[1]}`
+    }
+    const d = new Date(normalized + 'T00:00:00')
+    return isNaN(d.getTime()) ? -1 : d.getDay()
   }
-  // 计算一个月后的日期
-  const getMaxDateStr = () => {
-    const t = new Date()
-    t.setMonth(t.getMonth() + 1)
-    return t.toISOString().split('T')[0]
+
+  // 根据日期获取该日期的可用时间段
+  const getAvailableSlotsForDate = (dateStr: string) => {
+    if (!dateStr || !schedule) return []
+    // 【第49天新增】节假日优先判断
+    if (holidays.includes(dateStr)) return []
+    const day = getDayOfWeek(dateStr)
+    if (day < 0) return []
+    return schedule[String(day)] || []
   }
 
   // ============== 学生端行为 ==============
@@ -503,7 +596,6 @@ export default function App() {
       .catch(() => { setLiveUploading(prev => ({ ...prev, [draftId]: false })); alert("照片上传失败") })
   }
 
-  // 预览完整病历
   const handlePreviewFullRecord = (draftId: number) => {
     const draft = drafts.find(x => x.id === draftId)
     if (!draft) return
@@ -513,12 +605,10 @@ export default function App() {
     setPreviewDraft({ id: draftId, content: fullContent })
   }
 
-  // 最终签字
   const handleFinalSign = () => {
     if (!previewDraft) return
     const currentPreview = previewDraft
     const tagData = draftTags[currentPreview.id]
-
     const saveTags = (): Promise<any> => {
       const tags: any[] = []
       if (tagData?.area?.trim()) tags.push({ tag_type: '部位', tag_value: tagData.area.trim() })
@@ -530,7 +620,6 @@ export default function App() {
         body: JSON.stringify({ record_id: currentPreview.id, teacher_name: selectedTeacher, tags })
       })
     }
-
     saveTags().then(() => {
       return fetch(`/api/drafts/${currentPreview.id}/sign`, {
         method: 'POST',
@@ -543,9 +632,7 @@ export default function App() {
     }).then(() => {
       setPreviewDraft(null)
       setDraftTags(prev => ({ ...prev, [currentPreview.id]: { area: '', symptom: '' } }))
-      fetchDrafts()
-      fetchPatientRecords()
-      fetchPoints()
+      fetchDrafts(); fetchPatientRecords(); fetchPoints()
       setFinalPlans(prev => ({ ...prev, [currentPreview.id]: '' }))
     })
   }
@@ -673,6 +760,57 @@ export default function App() {
     })
   }
 
+  // ============== 预约 ==============
+  const fetchAppointments = () => {
+    const url = currentRole.includes('老师')
+      ? `/api/appointments?teacher_name=${selectedTeacher}`
+      : `/api/appointments?patient_name=${selectedPatient}`
+    fetch(url).then(r => r.json()).then(d => setAppointments(d)).catch(() => setAppointments([]))
+  }
+
+  const handleCreateAppointment = () => {
+    if (!apptDate || !apptTime || !apptReason.trim()) {
+      alert("请填写完整的预约信息（日期、时间、原因）")
+      return
+    }
+    const initiator = currentRole.includes('老师') ? 'teacher' : 'student'
+    fetch('/api/appointments', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        patient_name: selectedPatient,
+        teacher_name: selectedTeacher,
+        initiator,
+        scheduled_date: apptDate,
+        scheduled_time: apptTime,
+        reason: apptReason.trim()
+      })
+    }).then(() => {
+      setShowApptForm(false)
+      setApptDate(''); setApptTime(''); setApptReason('')
+      fetchAppointments()
+    })
+  }
+
+  const handleConfirmAppt = (id: number) => {
+    fetch(`/api/appointments/${id}/confirm`, { method: 'POST' }).then(() => fetchAppointments())
+  }
+
+  const handleCancelAppt = (id: number) => {
+    if (!confirm("确定要取消这个预约吗？")) return
+    fetch(`/api/appointments/${id}/cancel`, { method: 'POST' }).then(() => fetchAppointments())
+  }
+
+  // 日期辅助
+  const getTomorrowStr = () => {
+    const t = new Date(); t.setDate(t.getDate() + 1)
+    return t.toISOString().split('T')[0]
+  }
+  const getMaxDateStr = () => {
+    const t = new Date(); t.setMonth(t.getMonth() + 1)
+    return t.toISOString().split('T')[0]
+  }
+
   const roleBtnStyle = (role: string): React.CSSProperties => ({
     padding: '8px 16px', margin: '5px', borderRadius: '20px', border: '1px solid #8b4513',
     cursor: 'pointer', fontFamily: 'serif', fontSize: '14px',
@@ -696,6 +834,18 @@ export default function App() {
   const needBirthDate = !profile?.birth_date
   const needBirthTime = !profile?.birth_time
   const needBirthPlace = !profile?.birth_place
+
+  // 时间段分组
+  const morningSlots = ['08:00','08:30','09:00','09:30','10:00','10:30','11:00','11:30']
+  const afternoonSlots = ['12:00','12:30','13:00','13:30','14:00','14:30','15:00','15:30','16:00','16:30','17:00','17:30']
+  const eveningSlots = ['18:00','18:30','19:00','19:30','20:00']
+
+  const weekDayNames = ['日', '一', '二', '三', '四', '五', '六']
+
+  const formatSlots = (slots: string[]) => {
+    if (!slots || slots.length === 0) return '休息'
+    return slots.map(s => s).join('、')
+  }
 
   // ============== 渲染 ==============
   return (
@@ -1041,75 +1191,191 @@ export default function App() {
             )}
           </div>
         )}
-        {/* 【第47天新增】预约卡片（学生端 + 老师端通用） */}
+
+        {/* 预约卡片（可视化网格） */}
         {(currentRole === '学生' || currentRole === '学生智能体' || currentRole === '李老师' || currentRole === '李老师智能体') && (
           <div style={boxStyle}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
-              <div style={{ fontSize: '18px', color: '#8b4513', fontWeight: 'bold' }}>
-                📅 {currentRole.includes('老师') ? '预约管理' : '我的预约'}
-              </div>
-              <button onClick={() => setShowApptForm(!showApptForm)} style={{ padding: '4px 12px', borderRadius: '15px', border: '1px solid #8b4513', background: 'transparent', color: '#8b4513', cursor: 'pointer', fontSize: '12px' }}>
-                {showApptForm ? '取消' : '+ 发起预约'}
-              </button>
+            <div style={{ fontSize: '18px', color: '#8b4513', fontWeight: 'bold', marginBottom: '12px' }}>
+              📅 {currentRole.includes('老师') ? '排班与预约管理' : `预约 ${selectedTeacher}`}
             </div>
 
-            {/* 【第48天新增】老师工作时间设置 */}
-            {currentRole.includes('老师') && teacherSettings && (
+            {/* 老师工作时间设置 */}
+            {currentRole.includes('老师') && schedule && (
               <div style={{ marginBottom: '12px', padding: '10px', background: '#f0f7f0', borderRadius: '8px', border: '1px dashed #5a7d5a' }}>
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '6px' }}>
                   <div style={{ fontSize: '13px', color: '#5a7d5a', fontWeight: 'bold' }}>⚙️ 我的工作时间</div>
-                  <button onClick={() => setEditingSettings(!editingSettings)} style={{ padding: '2px 10px', borderRadius: '12px', border: '1px solid #5a7d5a', background: 'transparent', color: '#5a7d5a', cursor: 'pointer', fontSize: '11px' }}>
-                    {editingSettings ? '取消' : '修改'}
+                  <button onClick={() => setEditingSchedule(!editingSchedule)} style={{ padding: '2px 10px', borderRadius: '12px', border: '1px solid #5a7d5a', background: 'transparent', color: '#5a7d5a', cursor: 'pointer', fontSize: '11px' }}>
+                    {editingSchedule ? '取消' : '修改'}
                   </button>
                 </div>
-                {!editingSettings ? (
-                  <div style={{ fontSize: '12px', color: '#666' }}>
-                    工作日：{teacherSettings.work_days_list?.map(d => ['日', '一', '二', '三', '四', '五', '六'][d]).join('、') || '未设置'}<br/>
-                    工作时段：{teacherSettings.work_hours_list?.map(h => `${h}:00`).join('、') || '未设置'}
+                {!editingSchedule ? (
+                  <div style={{ fontSize: '12px', color: '#666', lineHeight: '1.8' }}>
+                    {[1,2,3,4,5,6,0].map(d => (
+                      <div key={d}>周{['日','一','二','三','四','五','六'][d]}：{formatSlots(schedule[String(d)] || [])}</div>
+                    ))}
                   </div>
                 ) : (
                   <div>
-                    <div style={{ fontSize: '12px', color: '#666', marginBottom: '4px' }}>工作日（可多选）：</div>
-                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px', marginBottom: '8px' }}>
-                      {[0, 1, 2, 3, 4, 5, 6].map(d => (
-                        <button key={d} onClick={() => {
-                          setSettingsDays(prev => prev.includes(d) ? prev.filter(x => x !== d) : [...prev, d])
-                        }} style={{ padding: '4px 10px', borderRadius: '12px', border: '1px solid #5a7d5a', background: settingsDays.includes(d) ? '#5a7d5a' : 'transparent', color: settingsDays.includes(d) ? '#fff' : '#5a7d5a', cursor: 'pointer', fontSize: '12px' }}>
-                          {['日', '一', '二', '三', '四', '五', '六'][d]}
+                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px', marginBottom: '10px' }}>
+                      {[1,2,3,4,5,6,0].map(d => (
+                        <button key={d} onClick={() => setScheduleEditDay(String(d))} style={{ padding: '4px 12px', borderRadius: '12px', border: '1px solid #5a7d5a', background: scheduleEditDay === String(d) ? '#5a7d5a' : 'transparent', color: scheduleEditDay === String(d) ? '#fff' : '#5a7d5a', cursor: 'pointer', fontSize: '12px' }}>
+                          周{['日','一','二','三','四','五','六'][d]}
                         </button>
                       ))}
                     </div>
-                    <div style={{ fontSize: '12px', color: '#666', marginBottom: '4px' }}>工作时段（可多选）：</div>
-                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px', marginBottom: '8px' }}>
-                      {Array.from({ length: 12 }, (_, i) => i + 8).map(h => (
-                        <button key={h} onClick={() => {
-                          setSettingsHours(prev => prev.includes(h) ? prev.filter(x => x !== h) : [...prev, h])
-                        }} style={{ padding: '4px 8px', borderRadius: '12px', border: '1px solid #5a7d5a', background: settingsHours.includes(h) ? '#5a7d5a' : 'transparent', color: settingsHours.includes(h) ? '#fff' : '#5a7d5a', cursor: 'pointer', fontSize: '12px' }}>
-                          {h}:00
-                        </button>
-                      ))}
-                    </div>
+                    {[
+                      { label: '🌅 上午', slots: morningSlots },
+                      { label: '☀️ 下午', slots: afternoonSlots },
+                      { label: '🌙 晚间', slots: eveningSlots }
+                    ].map(group => (
+                      <div key={group.label}>
+                        <div style={{ fontSize: '12px', color: '#666', fontWeight: 'bold', marginBottom: '4px' }}>{group.label}</div>
+                        <div style={{ display: 'flex', flexWrap: 'wrap', gap: '3px', marginBottom: '8px' }}>
+                          {group.slots.map(s => (
+                            <button key={s} onClick={() => toggleSlot(scheduleEditDay, s)} style={{ padding: '3px 8px', borderRadius: '10px', border: '1px solid #8b4513', background: (tempSchedule[scheduleEditDay] || []).includes(s) ? '#8b4513' : 'transparent', color: (tempSchedule[scheduleEditDay] || []).includes(s) ? '#fff' : '#8b4513', cursor: 'pointer', fontSize: '11px' }}>{s}</button>
+                          ))}
+                        </div>
+                      </div>
+                    ))}
                     <div style={{ textAlign: 'right' }}>
-                      <button onClick={handleSaveSettings} style={{ padding: '4px 16px', borderRadius: '20px', border: 'none', background: '#5a7d5a', color: '#fff', cursor: 'pointer', fontSize: '12px' }}>保存</button>
+                      <button onClick={handleSaveSchedule} style={{ padding: '6px 20px', borderRadius: '20px', border: 'none', background: '#5a7d5a', color: '#fff', cursor: 'pointer', fontSize: '13px' }}>保存工作时间</button>
                     </div>
                   </div>
                 )}
               </div>
             )}
 
-            {showApptForm && (
-              <div style={{ marginBottom: '15px', padding: '12px', background: '#fffaf0', borderRadius: '8px', border: '1px dashed #d4c8a8' }}>
-                <div style={{ fontSize: '13px', color: '#8b4513', fontWeight: 'bold', marginBottom: '8px' }}>
-                  {currentRole.includes('老师') ? `为 ${selectedPatient} 预约复诊` : `预约 ${selectedTeacher}`}
+            {/* 节假日管理 */}
+            {currentRole.includes('老师') && (
+              <div style={{ marginBottom: '12px', padding: '10px', background: '#fff5f5', borderRadius: '8px', border: '1px dashed #c0392b' }}>
+                <div style={{ fontSize: '13px', color: '#c0392b', fontWeight: 'bold', marginBottom: '8px' }}>🎌 节假日设置</div>
+                <div style={{ display: 'flex', gap: '6px', marginBottom: '8px' }}>
+                  <input type="date" value={newHolidayDate} onChange={e => setNewHolidayDate(e.target.value)} style={{ flex: 1, padding: '6px', borderRadius: '6px', border: '1px solid #c0392b', fontSize: '13px', fontFamily: 'serif' }} />
+                  <button onClick={handleAddHoliday} style={{ padding: '6px 14px', borderRadius: '6px', border: 'none', background: '#c0392b', color: '#fff', cursor: 'pointer', fontSize: '13px' }}>+ 添加</button>
                 </div>
-                <div style={{ display: 'flex', gap: '8px', marginBottom: '8px' }}>
-                                    <input type="date" min={getTomorrowStr()} max={getMaxDateStr()} value={apptDate} onChange={e => setApptDate(e.target.value)} style={{ flex: 1, padding: '6px', borderRadius: '6px', border: '1px solid #d4c8a8', fontSize: '13px', fontFamily: 'serif' }} />
-                                    <select value={apptTime} onChange={e => setApptTime(e.target.value)} style={{ flex: 1, padding: '6px', borderRadius: '6px', border: '1px solid #d4c8a8', fontSize: '13px', fontFamily: 'serif' }}>
-                    <option value="">请选择时段</option>
-                    {teacherSettings?.work_hours_list?.map(h => (
-                      <option key={h} value={`${h}:00`}>{h}:00</option>
+                {holidays.length > 0 && (
+                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px' }}>
+                    {holidays.map(d => (
+                      <div key={d} style={{ display: 'flex', alignItems: 'center', padding: '3px 8px', borderRadius: '12px', background: '#fff', border: '1px solid #c0392b', fontSize: '12px' }}>
+                        <span style={{ color: '#c0392b' }}>{d}</span>
+                        <button onClick={() => handleRemoveHoliday(d)} style={{ marginLeft: '6px', border: 'none', background: 'transparent', color: '#c0392b', cursor: 'pointer', fontSize: '14px', padding: 0 }}>×</button>
+                      </div>
                     ))}
-                  </select>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* 7 天 tab 切换 */}
+            {calendarData && calendarData.days && (
+              <div>
+                <div style={{ display: 'flex', gap: '4px', marginBottom: '12px', overflowX: 'auto' }}>
+                  {calendarData.days.map((d: any, i: number) => (
+                    <button
+                      key={d.date}
+                      onClick={() => setSelectedDayIndex(i)}
+                      style={{
+                        flex: 1, minWidth: '64px', padding: '8px 4px', borderRadius: '8px',
+                        border: selectedDayIndex === i ? '1px solid #8b4513' : '1px solid #d4c8a8',
+                        background: selectedDayIndex === i ? '#8b4513' : '#fff',
+                        color: selectedDayIndex === i ? '#fff' : '#333',
+                        cursor: 'pointer', fontSize: '12px', fontFamily: 'serif'
+                      }}
+                    >
+                      <div style={{ fontWeight: 'bold' }}>周{['日','一','二','三','四','五','六'][d.weekday]}</div>
+                      <div style={{ fontSize: '10px', opacity: 0.8, marginTop: '2px' }}>{d.date.slice(5)}</div>
+                    </button>
+                  ))}
+                </div>
+
+                {/* 时段网格 */}
+                {(() => {
+                  const day = calendarData.days[selectedDayIndex]
+                  if (!day) return null
+                  if (day.is_holiday) {
+                    return <div style={{ textAlign: 'center', padding: '20px', color: '#c0392b', background: '#fff5f5', borderRadius: '8px' }}>🎌 老师今日休息</div>
+                  }
+                  if (!day.slots || day.slots.length === 0) {
+                    return <div style={{ textAlign: 'center', padding: '20px', color: '#999', background: '#f5f5f5', borderRadius: '8px' }}>老师今日无排班</div>
+                  }
+                  return (
+                    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: '6px' }}>
+                      {[...day.slots].sort().map((slot: string) => {
+                        const booked = day.booked[slot]
+                        const isTeacher = currentRole.includes('老师')
+                        return (
+                          <button
+                            key={slot}
+                            onClick={() => {
+                              if (booked) return
+                              setApptDate(day.date)
+                              setApptTime(slot)
+                              setShowApptForm(true)
+                            }}
+                            disabled={!!booked}
+                            style={{
+                              padding: '10px 4px', borderRadius: '6px',
+                              border: booked ? '1px solid #c0392b' : '1px solid #5a7d5a',
+                              background: booked ? '#fdf0f0' : '#f7fcf9',
+                              color: booked ? '#c0392b' : '#5a7d5a',
+                              cursor: booked ? 'not-allowed' : 'pointer',
+                              fontSize: '12px', fontFamily: 'serif', textAlign: 'center'
+                            }}
+                          >
+                            <div style={{ fontWeight: 'bold' }}>{slot}</div>
+                            <div style={{ fontSize: '10px', marginTop: '2px' }}>
+                              {booked ? `${booked.patient_name} ${booked.status === 'confirmed' ? '✅' : '⏳'}` : (isTeacher ? '空闲' : '可约')}
+                            </div>
+                          </button>
+                        )
+                      })}
+                    </div>
+                  )
+                })()}
+
+                {/* 老师端待处理 */}
+                {currentRole.includes('老师') && (
+                  <div style={{ marginTop: '15px' }}>
+                    <div style={{ fontSize: '13px', color: '#5a7d5a', fontWeight: 'bold', marginBottom: '8px' }}>📋 待处理预约</div>
+                    {appointments.filter((a: any) => a.status === 'pending').length === 0 ? (
+                      <div style={{ fontSize: '12px', color: '#999', textAlign: 'center', padding: '10px' }}>暂无</div>
+                    ) : (
+                      appointments.filter((a: any) => a.status === 'pending').map((a: any) => (
+                        <div key={a.id} style={{ padding: '10px', background: '#fff8e7', borderRadius: '6px', marginBottom: '6px', fontSize: '12px' }}>
+                          <div style={{ color: '#8b4513', fontWeight: 'bold' }}>{a.scheduled_date} · {a.scheduled_time}</div>
+                          <div style={{ color: '#666', marginTop: '3px' }}>患者：{a.patient_name} · 原因：{a.reason}</div>
+                          <div style={{ display: 'flex', gap: '6px', marginTop: '6px', justifyContent: 'flex-end' }}>
+                            <button onClick={() => handleConfirmAppt(a.id)} style={{ padding: '3px 12px', borderRadius: '12px', border: 'none', background: '#5a7d5a', color: '#fff', cursor: 'pointer', fontSize: '11px' }}>确认</button>
+                            <button onClick={() => handleCancelAppt(a.id)} style={{ padding: '3px 12px', borderRadius: '12px', border: '1px solid #c0392b', background: 'transparent', color: '#c0392b', cursor: 'pointer', fontSize: '11px' }}>取消</button>
+                          </div>
+                        </div>
+                      ))
+                    )}
+                  </div>
+                )}
+
+                {/* 学生端预约记录 */}
+                {!currentRole.includes('老师') && appointments.length > 0 && (
+                  <div style={{ marginTop: '15px' }}>
+                    <div style={{ fontSize: '13px', color: '#5a7d5a', fontWeight: 'bold', marginBottom: '8px' }}>📋 我的预约记录</div>
+                    {appointments.map((a: any) => (
+                      <div key={a.id} style={{ padding: '8px', background: '#fff', borderRadius: '6px', marginBottom: '5px', fontSize: '12px', border: '1px solid #e0e0e0' }}>
+                        <span style={{ color: '#8b4513', fontWeight: 'bold' }}>{a.scheduled_date} · {a.scheduled_time}</span>
+                        <span style={{ float: 'right' }}>
+                          {a.status === 'confirmed' ? '✅ 已确认' : a.status === 'cancelled' ? '❌ 已取消' : '⏳ 待确认'}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* 预约表单 */}
+            {showApptForm && (
+              <div style={{ marginTop: '15px', padding: '12px', background: '#fffaf0', borderRadius: '8px', border: '1px dashed #d4c8a8' }}>
+                <div style={{ fontSize: '13px', color: '#8b4513', fontWeight: 'bold', marginBottom: '8px' }}>
+                  确认预约：{apptDate} · {apptTime}
                 </div>
                 <textarea
                   placeholder="预约原因（如：复诊/症状变化/家人新症状...）"
@@ -1117,57 +1383,88 @@ export default function App() {
                   onChange={e => setApptReason(e.target.value)}
                   style={{ width: '100%', height: '60px', padding: '8px', borderRadius: '6px', border: '1px solid #d4c8a8', fontFamily: 'serif', fontSize: '13px', marginBottom: '8px', boxSizing: 'border-box' }}
                 />
-                <div style={{ textAlign: 'right' }}>
-                  <button onClick={handleCreateAppointment} style={{ padding: '6px 20px', borderRadius: '20px', border: 'none', background: '#8b4513', color: '#fff', cursor: 'pointer', fontSize: '13px' }}>提交预约</button>
+                <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '8px' }}>
+                  <button onClick={() => { setShowApptForm(false); setApptDate(''); setApptTime(''); setApptReason('') }} style={{ padding: '6px 16px', borderRadius: '20px', border: '1px solid #999', background: 'transparent', color: '#666', cursor: 'pointer', fontSize: '12px' }}>取消</button>
+                  <button onClick={handleCreateAppointment} style={{ padding: '6px 20px', borderRadius: '20px', border: 'none', background: '#8b4513', color: '#fff', cursor: 'pointer', fontSize: '12px' }}>提交预约</button>
                 </div>
               </div>
-            )}
-
-            {appointments.length === 0 ? (
-              <div style={{ textAlign: 'center', color: '#999', padding: '15px', fontSize: '13px' }}>暂无预约</div>
-            ) : (
-              appointments.map((a: any) => (
-                <div key={a.id} style={{ padding: '12px', background: '#fff', borderRadius: '8px', border: '1px solid #e0e0e0', marginBottom: '10px', fontSize: '13px' }}>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '6px' }}>
-                    <div style={{ fontWeight: 'bold', color: '#8b4513' }}>
-                      {a.scheduled_date} · {a.scheduled_time}
-                    </div>
-                    <div>
-                      <span style={{
-                        padding: '2px 10px', borderRadius: '12px', fontSize: '11px', fontWeight: 'bold',
-                        background: a.status === 'confirmed' ? '#e8f4e8' : a.status === 'cancelled' ? '#f5f5f5' : '#fff8e7',
-                        color: a.status === 'confirmed' ? '#5a7d5a' : a.status === 'cancelled' ? '#999' : '#8b4513'
-                      }}>
-                        {a.status === 'confirmed' ? '✅ 已确认' : a.status === 'cancelled' ? '❌ 已取消' : '⏳ 待确认'}
-                      </span>
-                    </div>
-                  </div>
-                  <div style={{ color: '#666', marginBottom: '6px' }}>
-                    患者：{a.patient_name} · 老师：{a.teacher_name}
-                  </div>
-                  <div style={{ color: '#333', marginBottom: '8px' }}>
-                    原因：{a.reason}
-                  </div>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                    <div style={{ fontSize: '11px', color: '#999' }}>
-                      由 {a.initiator === 'teacher' ? '老师' : '学生'} 发起
-                    </div>
-                    {a.status === 'pending' && (
-                      <div>
-                        {currentRole.includes('老师') && (
-                          <button onClick={() => handleConfirmAppt(a.id)} style={{ padding: '4px 12px', borderRadius: '12px', border: 'none', background: '#5a7d5a', color: '#fff', cursor: 'pointer', fontSize: '12px', marginRight: '6px' }}>确认</button>
-                        )}
-                        <button onClick={() => handleCancelAppt(a.id)} style={{ padding: '4px 12px', borderRadius: '12px', border: '1px solid #c0392b', background: 'transparent', color: '#c0392b', cursor: 'pointer', fontSize: '12px' }}>取消</button>
-                      </div>
-                    )}
-                  </div>
-                </div>
-              ))
             )}
           </div>
         )}
 
         <div style={boxStyle}>
+                  {/* 【第51天新增】中药材库存 */}
+        {(currentRole === '李老师' || currentRole === '李老师智能体') && (
+          <div style={boxStyle}>
+            <h3 style={{ color: '#8b4513', textAlign: 'center', marginBottom: '12px' }}>💊 中药材库存</h3>
+            <div style={{ marginBottom: '12px' }}>
+              <button
+                onClick={() => setShowHerbForm(true)}
+                style={{ marginRight: '8px', background: '#8b4513', color: '#fdfcf0', border: 'none', padding: '6px 12px', borderRadius: '4px', cursor: 'pointer', fontFamily: 'serif' }}
+              >+ 新增药材</button>
+              <button
+                onClick={toggleLowOnly}
+                style={{ background: showLowOnly ? '#c0392b' : '#5a7d5a', color: '#fdfcf0', border: 'none', padding: '6px 12px', borderRadius: '4px', cursor: 'pointer', fontFamily: 'serif' }}
+              >{showLowOnly ? '显示全部' : '查看预警'}</button>
+            </div>
+            <table style={{ width: '100%', borderCollapse: 'collapse', fontFamily: 'serif' }}>
+              <thead>
+                <tr style={{ borderBottom: '1px solid #d4c8a8' }}>
+                  <th style={{ textAlign: 'left', padding: '6px' }}>药材名</th>
+                  <th style={{ textAlign: 'left', padding: '6px' }}>库存</th>
+                  <th style={{ textAlign: 'left', padding: '6px' }}>单位</th>
+                  <th style={{ textAlign: 'left', padding: '6px' }}>预警</th>
+                  <th style={{ textAlign: 'left', padding: '6px' }}>操作</th>
+                </tr>
+              </thead>
+              <tbody>
+                {herbs.map(h => (
+                  <tr key={h.id} style={{ borderBottom: '1px solid #d4c8a8', color: h.is_low ? '#c0392b' : 'inherit' }}>
+                    <td style={{ padding: '6px' }}>{h.is_low ? '⚠️ ' : ''}{h.herb_name}</td>
+                    <td style={{ padding: '6px' }}>{h.stock_amount}</td>
+                    <td style={{ padding: '6px' }}>{h.unit}</td>
+                    <td style={{ padding: '6px' }}>{h.warn_threshold}</td>
+                    <td style={{ padding: '6px' }}>
+                      <button onClick={() => openAdjustModal(h)} style={{ marginRight: '6px', cursor: 'pointer' }}>调整</button>
+                      <button onClick={() => handleDeleteHerb(h.id)} style={{ cursor: 'pointer' }}>删除</button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+
+        {showHerbForm && (
+          <div style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, background: 'rgba(0,0,0,0.4)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 999 }}>
+            <div style={{ ...boxStyle, width: '320px' }}>
+              <h4 style={{ color: '#8b4513' }}>新增 / 更新药材</h4>
+              <input style={inputStyle} placeholder="药材名" value={herbForm.herb_name} onChange={e => setHerbForm({ ...herbForm, herb_name: e.target.value })} />
+              <input style={inputStyle} type="number" placeholder="库存量" value={herbForm.stock_amount} onChange={e => setHerbForm({ ...herbForm, stock_amount: parseFloat(e.target.value) || 0 })} />
+              <input style={inputStyle} placeholder="单位" value={herbForm.unit} onChange={e => setHerbForm({ ...herbForm, unit: e.target.value })} />
+              <input style={inputStyle} type="number" placeholder="预警阈值" value={herbForm.warn_threshold} onChange={e => setHerbForm({ ...herbForm, warn_threshold: parseFloat(e.target.value) || 0 })} />
+              <div style={{ marginTop: '12px' }}>
+                <button onClick={handleSaveHerb} style={{ marginRight: '8px', background: '#8b4513', color: '#fdfcf0', border: 'none', padding: '6px 12px', borderRadius: '4px', cursor: 'pointer', fontFamily: 'serif' }}>保存</button>
+                <button onClick={() => setShowHerbForm(false)} style={{ background: '#d4c8a8', border: 'none', padding: '6px 12px', borderRadius: '4px', cursor: 'pointer', fontFamily: 'serif' }}>取消</button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {adjustingHerb && (
+          <div style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, background: 'rgba(0,0,0,0.4)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 999 }}>
+            <div style={{ ...boxStyle, width: '280px' }}>
+              <h4 style={{ color: '#8b4513' }}>调整库存：{adjustingHerb.herb_name}</h4>
+              <p>当前库存：{adjustingHerb.stock_amount} {adjustingHerb.unit}</p>
+              <input style={inputStyle} type="number" placeholder="入库填正数，出库填负数" value={adjustDelta} onChange={e => setAdjustDelta(parseFloat(e.target.value) || 0)} />
+              <div style={{ marginTop: '12px' }}>
+                <button onClick={submitAdjust} style={{ marginRight: '8px', background: '#8b4513', color: '#fdfcf0', border: 'none', padding: '6px 12px', borderRadius: '4px', cursor: 'pointer', fontFamily: 'serif' }}>确认</button>
+                <button onClick={() => setAdjustingHerb(null)} style={{ background: '#d4c8a8', border: 'none', padding: '6px 12px', borderRadius: '4px', cursor: 'pointer', fontFamily: 'serif' }}>取消</button>
+              </div>
+            </div>
+          </div>
+        )}
+
           <div style={{ textAlign: 'center', marginBottom: '15px', color: '#8b4513', fontWeight: 'bold' }}>🧑‍⚕️ 角色切换</div>
           <div style={{ display: 'flex', flexWrap: 'wrap', justifyContent: 'center' }}>
             {['李老师', '李老师智能体', '学生', '学生智能体'].map((role) => (

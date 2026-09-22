@@ -115,19 +115,25 @@ def init_db():
     )
     """)
 
-    # 【第48天新增】老师工作时间设置（work_schedule 存 JSON）
+       # 【第48天新增】老师工作时间设置（work_schedule 存 JSON）
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS teacher_settings (
         teacher_name TEXT PRIMARY KEY,
         work_days TEXT DEFAULT '1,2,3,4,5',
         work_hours TEXT DEFAULT '9,10,11,14,15,16',
-        work_schedule TEXT DEFAULT ''
+        work_schedule TEXT DEFAULT '',
+        holidays TEXT DEFAULT '[]'
     )
     """)
+    # 【第49天新增】如果表已存在，尝试加 holidays 字段
+    try:
+        cursor.execute("ALTER TABLE teacher_settings ADD COLUMN holidays TEXT DEFAULT '[]'")
+    except sqlite3.OperationalError:
+        pass
     cursor.execute("SELECT COUNT(*) as count FROM teacher_settings WHERE teacher_name = '李老师'")
     if cursor.fetchone()["count"] == 0:
-        cursor.execute("INSERT INTO teacher_settings (teacher_name, work_days, work_hours, work_schedule) VALUES ('李老师', '1,2,3,4,5', '9,10,11,14,15,16', '')")
-        
+        cursor.execute("INSERT INTO teacher_settings (teacher_name, work_days, work_hours, work_schedule, holidays) VALUES ('李老师', '1,2,3,4,5', '9,10,11,14,15,16', '', '[]')")
+
     # 【第47天新增】预约表
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS appointments (
@@ -219,6 +225,8 @@ def init_db():
         conn.commit()
 
     conn.close()
+    # 【第51天新增】中药材库存表
+    init_herb_table()
 
 # ---------- 老师相关操作 ----------
 def get_teachers():
@@ -633,6 +641,29 @@ def save_teacher_schedule(teacher_name, schedule):
     conn.close()
     return {"message": "工作时间已保存"}
 
+def get_teacher_holidays(teacher_name):
+    """【第49天新增】获取老师节假日列表"""
+    conn = get_connection()
+    row = conn.execute("SELECT holidays FROM teacher_settings WHERE teacher_name = ?", (teacher_name,)).fetchone()
+    conn.close()
+    if not row or not row["holidays"]:
+        return []
+    try:
+        return _json.loads(row["holidays"])
+    except Exception:
+        return []
+
+def save_teacher_holidays(teacher_name, holidays):
+    """【第49天新增】保存老师节假日列表"""
+    conn = get_connection()
+    conn.execute("""
+        INSERT INTO teacher_settings (teacher_name, holidays) VALUES (?, ?)
+        ON CONFLICT(teacher_name) DO UPDATE SET holidays = excluded.holidays
+    """, (teacher_name, _json.dumps(holidays)))
+    conn.commit()
+    conn.close()
+    return {"message": "节假日已保存"}
+
 # ---------- 【第48天扩展】老师工作时间（按天 + 半小时粒度） ----------
 import json as _json
 
@@ -725,7 +756,7 @@ def create_appointment(patient_name, teacher_name, initiator, scheduled_date, sc
     conn.close()
     return {"message": "预约已提交"}
 
-def get_appointments(patient_name=None, teacher_name=None):
+def get_appointments(patient_name=None, teacher_name=None, start_date=None, end_date=None):
     conn = get_connection()
     conditions = []
     params = []
@@ -735,10 +766,49 @@ def get_appointments(patient_name=None, teacher_name=None):
     if teacher_name:
         conditions.append("teacher_name = ?")
         params.append(teacher_name)
+    if start_date:
+        conditions.append("scheduled_date >= ?")
+        params.append(start_date)
+    if end_date:
+        conditions.append("scheduled_date <= ?")
+        params.append(end_date)
     where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
-    rows = conn.execute(f"SELECT * FROM appointments {where} ORDER BY id DESC", params).fetchall()
+    rows = conn.execute(f"SELECT * FROM appointments {where} ORDER BY scheduled_date, scheduled_time", params).fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
+
+def check_slot_available(teacher_name, scheduled_date, scheduled_time, exclude_appt_id=None):
+    """【第49天新增】检查某个时段是否已被预约"""
+    conn = get_connection()
+    if exclude_appt_id:
+        row = conn.execute("""
+            SELECT COUNT(*) as count FROM appointments
+            WHERE teacher_name = ? AND scheduled_date = ? AND scheduled_time = ?
+              AND status != 'cancelled' AND id != ?
+        """, (teacher_name, scheduled_date, scheduled_time, exclude_appt_id)).fetchone()
+    else:
+        row = conn.execute("""
+            SELECT COUNT(*) as count FROM appointments
+            WHERE teacher_name = ? AND scheduled_date = ? AND scheduled_time = ?
+              AND status != 'cancelled'
+        """, (teacher_name, scheduled_date, scheduled_time)).fetchone()
+    conn.close()
+    return row["count"] == 0
+
+
+def create_appointment(patient_name, teacher_name, initiator, scheduled_date, scheduled_time, reason):
+    # 【第49天新增】先检查冲突
+    if not check_slot_available(teacher_name, scheduled_date, scheduled_time):
+        return {"error": "该时段已被预约，请选择其他时间"}
+    conn = get_connection()
+    conn.execute(
+        "INSERT INTO appointments (patient_name, teacher_name, initiator, scheduled_date, scheduled_time, reason, status, created_at) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)",
+        (patient_name, teacher_name, initiator, scheduled_date, scheduled_time, reason, "2026-09-21")
+    )
+    conn.commit()
+    conn.close()
+    return {"message": "预约已提交"}
 
 def update_appointment_status(appt_id, status):
     conn = get_connection()
@@ -796,3 +866,117 @@ def transfer_points(from_role, to_role, amount):
     conn.execute("UPDATE accounts SET points = points + ? WHERE role_name = ?", (amount, to_role))
     conn.commit()
     conn.close()
+    # ============ 中药材库存管理 ============
+
+def init_herb_table():
+    """建表语句，需要在现有的建表初始化流程里调用一次（和其他15张表的建表放在一起）。"""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE IF NOT EXISTS herb_inventory (id INTEGER PRIMARY KEY AUTOINCREMENT, teacher_name TEXT, herb_name TEXT, stock_amount REAL DEFAULT 0, unit TEXT DEFAULT '克', warn_threshold REAL DEFAULT 50, updated_at TEXT, UNIQUE(teacher_name, herb_name))")
+    conn.commit()
+    conn.close()
+
+
+def _herb_row_to_dict(row):
+    """内部工具函数：把一行 herb_inventory 转成带 is_low 字段的 dict。"""
+    d = dict(row)
+    d["is_low"] = d["stock_amount"] <= d["warn_threshold"]
+    return d
+
+
+def get_herbs(teacher_name):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM herb_inventory WHERE teacher_name = ? ORDER BY herb_name", (teacher_name,))
+    rows = cur.fetchall()
+    conn.close()
+    return [_herb_row_to_dict(r) for r in rows]
+
+
+def upsert_herb(teacher_name, herb_name, stock_amount, unit, warn_threshold):
+    conn = get_connection()
+    cur = conn.cursor()
+    now = datetime.now().isoformat()
+    cur.execute("SELECT id FROM herb_inventory WHERE teacher_name = ? AND herb_name = ?", (teacher_name, herb_name))
+    existing = cur.fetchone()
+    if existing:
+        cur.execute("UPDATE herb_inventory SET stock_amount = ?, unit = ?, warn_threshold = ?, updated_at = ? WHERE id = ?", (stock_amount, unit, warn_threshold, now, existing["id"]))
+        herb_id = existing["id"]
+    else:
+        cur.execute("INSERT INTO herb_inventory (teacher_name, herb_name, stock_amount, unit, warn_threshold, updated_at) VALUES (?, ?, ?, ?, ?, ?)", (teacher_name, herb_name, stock_amount, unit, warn_threshold, now))
+        herb_id = cur.lastrowid
+    conn.commit()
+    cur.execute("SELECT * FROM herb_inventory WHERE id = ?", (herb_id,))
+    row = cur.fetchone()
+    conn.close()
+    return _herb_row_to_dict(row)
+
+
+def adjust_herb(herb_id, delta):
+    """delta 正数入库，负数出库。不允许调整后 stock_amount < 0，此时抛出 ValueError（由 main.py 捕获并返回 400）。"""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM herb_inventory WHERE id = ?", (herb_id,))
+    row = cur.fetchone()
+    if row is None:
+        conn.close()
+        return None
+    new_amount = row["stock_amount"] + delta
+    if new_amount < 0:
+        conn.close()
+        raise ValueError("库存不足，无法调整：" + row["herb_name"])
+    now = datetime.now().isoformat()
+    cur.execute("UPDATE herb_inventory SET stock_amount = ?, updated_at = ? WHERE id = ?", (new_amount, now, herb_id))
+    conn.commit()
+    cur.execute("SELECT * FROM herb_inventory WHERE id = ?", (herb_id,))
+    updated = cur.fetchone()
+    conn.close()
+    return _herb_row_to_dict(updated)
+
+
+def delete_herb(herb_id):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM herb_inventory WHERE id = ?", (herb_id,))
+    existing = cur.fetchone()
+    if existing is None:
+        conn.close()
+        return False
+    cur.execute("DELETE FROM herb_inventory WHERE id = ?", (herb_id,))
+    conn.commit()
+    conn.close()
+    return True
+
+
+def get_low_herbs(teacher_name):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM herb_inventory WHERE teacher_name = ? AND stock_amount <= warn_threshold ORDER BY herb_name", (teacher_name,))
+    rows = cur.fetchall()
+    conn.close()
+    return [_herb_row_to_dict(r) for r in rows]
+
+
+def batch_deduct_herbs(teacher_name, items):
+    """原子批量扣减：先逐一检查库存是否充足，任一不足则整体失败、不做任何修改；全部充足才真正执行扣减。"""
+    conn = get_connection()
+    cur = conn.cursor()
+
+    checked = []
+    for item in items:
+        herb_name = item["herb_name"]
+        amount = item["amount"]
+        cur.execute("SELECT * FROM herb_inventory WHERE teacher_name = ? AND herb_name = ?", (teacher_name, herb_name))
+        row = cur.fetchone()
+        if row is None or row["stock_amount"] < amount:
+            conn.close()
+            return {"success": False, "failed_herb": herb_name}
+        checked.append((row["id"], row["stock_amount"], amount))
+
+    now = datetime.now().isoformat()
+    for herb_id, current_amount, amount in checked:
+        new_amount = current_amount - amount
+        cur.execute("UPDATE herb_inventory SET stock_amount = ?, updated_at = ? WHERE id = ?", (new_amount, now, herb_id))
+    conn.commit()
+    conn.close()
+    return {"success": True, "failed_herb": None}

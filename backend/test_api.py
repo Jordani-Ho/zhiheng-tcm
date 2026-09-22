@@ -212,3 +212,29 @@ def test_add_family(client):
     r = client.get("/api/patients?guardian_name=张三")
     names = [p["name"] for p in r.json()]
     assert "王小明" in names
+    # ============ 测试：中药材库存管理 ============
+
+def test_herbs_crud(client):
+    # 新增
+    r = client.post("/api/herbs", json={"teacher_name": "李老师", "herb_name": "甘草", "stock_amount": 100, "unit": "克", "warn_threshold": 50})
+    assert r.status_code == 200
+    # 查询
+    r = client.get("/api/herbs?teacher_name=李老师")
+    assert r.status_code == 200
+    herbs = r.json()
+    assert len(herbs) == 1
+    assert herbs[0]["herb_name"] == "甘草"
+    # 调整
+    r = client.post(f"/api/herbs/{herbs[0]['id']}/adjust", json={"delta": -60})
+    assert r.status_code == 200
+    # 查询预警
+    r = client.get("/api/herbs/low?teacher_name=李老师")
+    assert r.status_code == 200
+    low = r.json()
+    assert len(low) == 1  # 100-60=40 < 50
+
+
+def test_herbs_batch_deduct(client):
+    client.post("/api/herbs", json={"teacher_name": "李老师", "herb_name": "黄芪", "stock_amount": 200, "unit": "克", "warn_threshold": 50})
+    r = client.post("/api/herbs/batch-deduct", json={"teacher_name": "李老师", "items": [{"herb_name": "黄芪", "amount": 30}]})
+    assert r.status_code == 200
