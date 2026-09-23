@@ -583,6 +583,30 @@ def accept_invite(code, student_name):
 # ---------- 【第48天扩展】老师工作时间（按天 + 半小时粒度） ----------
 import json
 
+def get_teacher_holidays(teacher_name):
+    """【第49天新增】获取老师节假日列表"""
+    conn = get_connection()
+    row = conn.execute("SELECT holidays FROM teacher_settings WHERE teacher_name = ?", (teacher_name,)).fetchone()
+    conn.close()
+    if not row or not row["holidays"]:
+        return []
+    try:
+        return json.loads(row["holidays"])
+    except Exception:
+        return []
+
+def save_teacher_holidays(teacher_name, holidays):
+    """【第49天新增】保存老师节假日列表"""
+    conn = get_connection()
+    conn.execute("""
+        INSERT INTO teacher_settings (teacher_name, holidays) VALUES (?, ?)
+        ON CONFLICT(teacher_name) DO UPDATE SET holidays = excluded.holidays
+    """, (teacher_name, json.dumps(holidays)))
+    conn.commit()
+    conn.close()
+    return {"message": "节假日已保存"}
+
+# ---------- 【第48天扩展】老师工作时间（按天 + 半小时粒度） ----------
 ALL_SLOTS = [
     "08:00","08:30","09:00","09:30","10:00","10:30","11:00","11:30",
     "12:00","12:30","13:00","13:30","14:00","14:30","15:00","15:30",
@@ -612,14 +636,12 @@ def get_teacher_schedule(teacher_name):
     if d.get("work_schedule"):
         try:
             parsed = json.loads(d["work_schedule"])
-            # 补齐缺失的日
             for k in ["0","1","2","3","4","5","6"]:
                 if k not in parsed:
                     parsed[k] = []
             return parsed
         except Exception:
             pass
-    # 兼容旧的 work_days + work_hours
     days = [int(x) for x in d["work_days"].split(",") if x]
     hours = [int(x) for x in d["work_hours"].split(",") if x]
     slots = []
@@ -637,88 +659,6 @@ def save_teacher_schedule(teacher_name, schedule):
         INSERT INTO teacher_settings (teacher_name, work_schedule) VALUES (?, ?)
         ON CONFLICT(teacher_name) DO UPDATE SET work_schedule = excluded.work_schedule
     """, (teacher_name, json.dumps(schedule)))
-    conn.commit()
-    conn.close()
-    return {"message": "工作时间已保存"}
-
-def get_teacher_holidays(teacher_name):
-    """【第49天新增】获取老师节假日列表"""
-    conn = get_connection()
-    row = conn.execute("SELECT holidays FROM teacher_settings WHERE teacher_name = ?", (teacher_name,)).fetchone()
-    conn.close()
-    if not row or not row["holidays"]:
-        return []
-    try:
-        return _json.loads(row["holidays"])
-    except Exception:
-        return []
-
-def save_teacher_holidays(teacher_name, holidays):
-    """【第49天新增】保存老师节假日列表"""
-    conn = get_connection()
-    conn.execute("""
-        INSERT INTO teacher_settings (teacher_name, holidays) VALUES (?, ?)
-        ON CONFLICT(teacher_name) DO UPDATE SET holidays = excluded.holidays
-    """, (teacher_name, _json.dumps(holidays)))
-    conn.commit()
-    conn.close()
-    return {"message": "节假日已保存"}
-
-# ---------- 【第48天扩展】老师工作时间（按天 + 半小时粒度） ----------
-import json as _json
-
-ALL_SLOTS = [
-    "08:00","08:30","09:00","09:30","10:00","10:30","11:00","11:30",
-    "12:00","12:30","13:00","13:30","14:00","14:30","15:00","15:30",
-    "16:00","16:30","17:00","17:30","18:00","18:30","19:00","19:30","20:00"
-]
-
-def _default_schedule():
-    weekday_slots = [s for s in ALL_SLOTS if ("09:00" <= s <= "11:30") or ("14:00" <= s <= "16:30")]
-    return {
-        "0": [],
-        "1": list(weekday_slots),
-        "2": list(weekday_slots),
-        "3": list(weekday_slots),
-        "4": list(weekday_slots),
-        "5": list(weekday_slots),
-        "6": []
-    }
-
-def get_teacher_schedule(teacher_name):
-    """返回该老师按天划分的半小时时段"""
-    conn = get_connection()
-    row = conn.execute("SELECT * FROM teacher_settings WHERE teacher_name = ?", (teacher_name,)).fetchone()
-    conn.close()
-    if not row:
-        return _default_schedule()
-    d = dict(row)
-    if d.get("work_schedule"):
-        try:
-            parsed = _json.loads(d["work_schedule"])
-            for k in ["0","1","2","3","4","5","6"]:
-                if k not in parsed:
-                    parsed[k] = []
-            return parsed
-        except Exception:
-            pass
-    days = [int(x) for x in d["work_days"].split(",") if x]
-    hours = [int(x) for x in d["work_hours"].split(",") if x]
-    slots = []
-    for h in hours:
-        slots.append(f"{h:02d}:00")
-        slots.append(f"{h:02d}:30")
-    schedule = {}
-    for day in range(7):
-        schedule[str(day)] = list(slots) if day in days else []
-    return schedule
-
-def save_teacher_schedule(teacher_name, schedule):
-    conn = get_connection()
-    conn.execute("""
-        INSERT INTO teacher_settings (teacher_name, work_schedule) VALUES (?, ?)
-        ON CONFLICT(teacher_name) DO UPDATE SET work_schedule = excluded.work_schedule
-    """, (teacher_name, _json.dumps(schedule)))
     conn.commit()
     conn.close()
     return {"message": "工作时间已保存"}
@@ -746,16 +686,6 @@ def save_teacher_settings(teacher_name, work_days, work_hours):
     return {"message": "工作时间已保存"}
 
 # ---------- 预约相关操作 ----------
-def create_appointment(patient_name, teacher_name, initiator, scheduled_date, scheduled_time, reason):
-    conn = get_connection()
-    conn.execute(
-        "INSERT INTO appointments (patient_name, teacher_name, initiator, scheduled_date, scheduled_time, reason, status, created_at) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)",
-        (patient_name, teacher_name, initiator, scheduled_date, scheduled_time, reason, "2026-09-20")
-    )
-    conn.commit()
-    conn.close()
-    return {"message": "预约已提交"}
-
 def get_appointments(patient_name=None, teacher_name=None, start_date=None, end_date=None):
     conn = get_connection()
     conditions = []
