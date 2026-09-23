@@ -78,6 +78,11 @@ export default function App() {
   const [previewDraft, setPreviewDraft] = useState<{ id: number; content: string } | null>(null)
   const [draftTags, setDraftTags] = useState<{ [draftId: number]: { area: string; symptom: string } }>({})
 
+  // 【第57天新增】老师端页签（首页/诊室/学生/库存/设置），切换时不清空 selectedPatient
+  const [teacherTab, setTeacherTab] = useState('home')
+  // 【第57天新增】诊室：老师搜索学生（前端过滤 teacherPatients）
+  const [studentSearch, setStudentSearch] = useState('')
+
   // 预约相关
   const [appointments, setAppointments] = useState<any[]>([])
   const [showApptForm, setShowApptForm] = useState(false)
@@ -938,6 +943,37 @@ export default function App() {
     return slots.map(s => s).join('、')
   }
 
+  // 【第57天新增】老师端页签定义
+  const isTeacherRole = currentRole === '李老师' || currentRole === '李老师智能体'
+  const teacherTabs = [
+    { key: 'home', label: '🏠 首页' },
+    { key: 'clinic', label: '🩺 诊室' },
+    { key: 'students', label: '👥 学生' },
+    { key: 'inventory', label: '💊 库存' },
+    { key: 'settings', label: '⚙️ 设置' }
+  ]
+  const teacherTabBtnStyle = (key: string): React.CSSProperties => ({
+    flex: 1, padding: '10px 4px', borderRadius: '10px', border: '1px solid #8b4513',
+    cursor: 'pointer', fontFamily: 'serif', fontSize: '13px', whiteSpace: 'nowrap',
+    backgroundColor: teacherTab === key ? '#8b4513' : '#fdfcf0',
+    color: teacherTab === key ? '#fff' : '#8b4513', transition: 'all 0.2s'
+  })
+
+  // 【第57天新增】诊室：面诊队列（已确认 + 今天及以后，按日期时间升序）
+  const todayStr = `${currentYear}-${String(currentMonth).padStart(2, '0')}-${String(currentDay).padStart(2, '0')}`
+  const clinicQueue = appointments
+    .filter((a: any) => a.status === 'confirmed' && a.scheduled_date >= todayStr)
+    .sort((a: any, b: any) => (a.scheduled_date + a.scheduled_time).localeCompare(b.scheduled_date + b.scheduled_time))
+
+  // 【第57天新增】诊室：老师搜索学生（前端过滤 teacherPatients，不做后端接口）
+  const studentSearchResults = studentSearch.trim()
+    ? teacherPatients.filter((s: any) => s.name.includes(studentSearch.trim()))
+    : []
+
+  // 【第57天新增】诊室：当前就诊学生信息（上次就诊时间 + 当前状态）
+  const currentStudentInfo = teacherPatients.find((s: any) => s.name === selectedPatient)
+  const lastVisitDate = patientRecords.length > 0 ? `第 ${patientRecords[0].id} 号病历` : '首次就诊'
+
   // ============== 渲染 ==============
   return (
     <div style={{ minHeight: '100vh', background: '#f5f1e6', padding: '40px 20px', fontFamily: 'serif' }}>
@@ -976,6 +1012,15 @@ export default function App() {
 
         <h1 style={{ textAlign: 'center', color: '#8b4513', borderBottom: '2px solid #d4c8a8', paddingBottom: '15px', marginBottom: '30px', fontSize: '28px', letterSpacing: '2px' }}>知衡 · 中医治未病社区</h1>
 
+        {/* 【第57天新增】老师端 5 页签导航（学生端不显示） */}
+        {isTeacherRole && (
+          <div style={{ display: 'flex', gap: '6px', marginBottom: '20px', background: '#fdfcf0', border: '1px solid #d4c8a8', borderRadius: '12px', padding: '6px', boxShadow: '0 4px 12px rgba(0,0,0,0.06)' }}>
+            {teacherTabs.map(t => (
+              <button key={t.key} style={teacherTabBtnStyle(t.key)} onClick={() => setTeacherTab(t.key)}>{t.label}</button>
+            ))}
+          </div>
+        )}
+
         {huangli && (
           <div style={boxStyle}>
             <div style={{ textAlign: 'center', fontSize: '18px', color: '#333', marginBottom: '5px' }}>
@@ -990,7 +1035,7 @@ export default function App() {
         )}
 
         {/* 【第56天新增】智能体工作台（老师端：沉默学生请示闭环） */}
-        {(currentRole === '李老师' || currentRole === '李老师智能体') && (
+        {(currentRole === '李老师' || currentRole === '李老师智能体') && teacherTab === 'home' && (
           <div style={boxStyle}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '10px' }}>
               <div style={{ fontSize: '18px', color: '#8b4513', fontWeight: 'bold' }}>🤖 智能体工作台</div>
@@ -1104,7 +1149,7 @@ export default function App() {
           </div>
         )}
 
-        {(currentRole === '李老师' || currentRole === '李老师智能体') && (
+        {(currentRole === '李老师' || currentRole === '李老师智能体') && teacherTab === 'students' && (
           <div style={{ ...boxStyle, background: '#f0f7f0' }}>
             <div style={{ fontSize: '18px', color: '#5a7d5a', fontWeight: 'bold', marginBottom: '10px' }}>👥 学生管理（{teacherPatients.length}人）</div>
             <div style={{ display: 'flex', gap: '8px', marginBottom: '15px' }}>
@@ -1314,7 +1359,7 @@ export default function App() {
         )}
 
         {/* 预约卡片（可视化网格） */}
-        {(currentRole === '学生' || currentRole === '学生智能体' || currentRole === '李老师' || currentRole === '李老师智能体') && (
+        {(currentRole === '学生' || currentRole === '学生智能体' || ((currentRole === '李老师' || currentRole === '李老师智能体') && teacherTab === 'settings')) && (
           <div style={boxStyle}>
             <div style={{ fontSize: '18px', color: '#8b4513', fontWeight: 'bold', marginBottom: '12px' }}>
               📅 {currentRole.includes('老师') ? '排班与预约管理' : `预约 ${selectedTeacher}`}
@@ -1515,7 +1560,7 @@ export default function App() {
 
         <div style={boxStyle}>
                   {/* 【第51天新增】中药材库存 */}
-        {(currentRole === '李老师' || currentRole === '李老师智能体') && (
+        {(currentRole === '李老师' || currentRole === '李老师智能体') && teacherTab === 'inventory' && (
           <div style={boxStyle}>
             <h3 style={{ color: '#8b4513', textAlign: 'center', marginBottom: '12px' }}>💊 中药材库存</h3>
             <div style={{ marginBottom: '12px' }}>
@@ -1587,7 +1632,7 @@ export default function App() {
         )}
 
         {/* 【第52天新增】开方（中药材首字联想 + 结构化存储） */}
-        {(currentRole === '李老师' || currentRole === '李老师智能体') && (
+        {(currentRole === '李老师' || currentRole === '李老师智能体') && teacherTab === 'inventory' && (
           <div style={boxStyle}>
             <h3 style={{ color: '#8b4513', textAlign: 'center', marginBottom: '12px' }}>📝 开方</h3>
             <input
@@ -1690,7 +1735,7 @@ export default function App() {
           )}
         </div>
 
-        {(currentRole === '李老师' || currentRole === '李老师智能体') && (
+        {(currentRole === '李老师' || currentRole === '李老师智能体') && teacherTab === 'clinic' && (
           <div style={{ ...boxStyle, background: '#fff9f0' }}>
             <div style={{ textAlign: 'center', fontSize: '18px', color: '#8b4513', fontWeight: 'bold', cursor: 'pointer', display: 'flex', justifyContent: 'center', alignItems: 'center', gap: '5px' }} onClick={() => setShowHistory(!showHistory)}>
               📂 {selectedPatient} 的历史病历 {showHistory ? '▲' : '▼'}
@@ -1715,7 +1760,7 @@ export default function App() {
           </div>
         )}
 
-        {(currentRole === '李老师' || currentRole === '李老师智能体') && profile && (
+        {(currentRole === '李老师' || currentRole === '李老师智能体') && teacherTab === 'students' && profile && (
           <div style={{ ...boxStyle, background: '#fffaf0' }}>
             <div style={{ fontSize: '18px', color: '#8b4513', fontWeight: 'bold', marginBottom: '15px' }}>📋 {selectedPatient} 的基础档案（供辨证参考）</div>
             <div style={{ fontSize: '14px', color: '#333', lineHeight: '2' }}>
@@ -1784,7 +1829,76 @@ export default function App() {
           </div>
         )}
 
-        {(currentRole === '李老师' || currentRole === '李老师智能体') && (
+        {/* 【第57天新增】诊室：面诊队列 */}
+        {(currentRole === '李老师' || currentRole === '李老师智能体') && teacherTab === 'clinic' && (
+          <div style={{ ...boxStyle, background: '#f7fcf9' }}>
+            <div style={{ fontSize: '18px', color: '#5a7d5a', fontWeight: 'bold', marginBottom: '12px' }}>🩺 面诊队列</div>
+            {clinicQueue.length === 0 ? (
+              <div style={{ textAlign: 'center', color: '#999', fontSize: '13px', padding: '10px' }}>暂无已确认预约</div>
+            ) : (
+              clinicQueue.map((a: any) => (
+                <div
+                  key={a.id}
+                  onClick={() => setSelectedPatient(a.patient_name)}
+                  style={{
+                    display: 'flex', alignItems: 'center', padding: '10px', marginBottom: '6px',
+                    background: selectedPatient === a.patient_name ? '#e8f4e8' : '#fff',
+                    border: selectedPatient === a.patient_name ? '1px solid #5a7d5a' : '1px solid #d4e8d4',
+                    borderRadius: '8px', cursor: 'pointer', fontSize: '13px'
+                  }}
+                >
+                  <div style={{ flex: 1, color: '#8b4513', fontWeight: 'bold' }}>{a.scheduled_date} · {a.scheduled_time}</div>
+                  <div style={{ flex: 1, color: '#333' }}>👤 {a.patient_name}</div>
+                  <div style={{ color: '#5a7d5a', fontSize: '12px' }}>✅ 已确认</div>
+                </div>
+              ))
+            )}
+          </div>
+        )}
+
+        {/* 【第57天新增】诊室：老师搜索学生（前端过滤，不做后端接口） */}
+        {(currentRole === '李老师' || currentRole === '李老师智能体') && teacherTab === 'clinic' && (
+          <div style={{ ...boxStyle, background: '#fdf8f0' }}>
+            <div style={{ fontSize: '18px', color: '#8b4513', fontWeight: 'bold', marginBottom: '12px' }}>🔍 搜索学生</div>
+            <div style={{ position: 'relative' }}>
+              <input
+                style={{ ...inputStyle, marginBottom: 0 }}
+                placeholder="输入学生名首字"
+                value={studentSearch}
+                onChange={e => setStudentSearch(e.target.value)}
+              />
+              {studentSearchResults.length > 0 && (
+                <div style={{ position: 'absolute', top: '100%', left: 0, right: 0, background: '#fffdf5', border: '1px solid #d4c8a8', borderRadius: '4px', zIndex: 20, maxHeight: '200px', overflowY: 'auto' }}>
+                  {studentSearchResults.map((s: any) => (
+                    <div
+                      key={s.name}
+                      onClick={() => { setSelectedPatient(s.name); setStudentSearch('') }}
+                      style={{ padding: '8px', cursor: 'pointer', fontFamily: 'serif', borderBottom: '1px solid #f0e9d6', fontSize: '14px' }}
+                    >
+                      👤 {s.name}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+            {studentSearch.trim() && studentSearchResults.length === 0 && (
+              <div style={{ fontSize: '12px', color: '#999', marginTop: '8px' }}>未找到匹配的学生</div>
+            )}
+          </div>
+        )}
+
+        {/* 【第57天新增】诊室：当前就诊学生（纯展示） */}
+        {(currentRole === '李老师' || currentRole === '李老师智能体') && teacherTab === 'clinic' && (
+          <div style={{ ...boxStyle, background: '#fffaf0' }}>
+            <div style={{ fontSize: '18px', color: '#8b4513', fontWeight: 'bold', marginBottom: '12px' }}>👤 当前就诊学生：{selectedPatient}</div>
+            <div style={{ fontSize: '14px', color: '#333', lineHeight: '2' }}>
+              <div>上次就诊：{lastVisitDate}</div>
+              <div>当前状态：{currentStudentInfo ? currentStudentInfo.status_label : '未在您的学生名单中'}</div>
+            </div>
+          </div>
+        )}
+
+        {(currentRole === '李老师' || currentRole === '李老师智能体') && teacherTab === 'clinic' && (
           <div style={{ ...boxStyle, background: '#fcfdfa' }}>
             <div style={{ textAlign: 'center', fontSize: '18px', color: '#8b4513', marginBottom: '15px' }}>📄 病历草案（老师智能体生成，待老师补充）</div>
             {drafts.length === 0 ? (
