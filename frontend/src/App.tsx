@@ -16,6 +16,8 @@ const PULSE_TYPES = ['浮', '沉', '迟', '数', '虚', '实', '滑', '涩']
 // 【第59天重构】拍照清晰度检测阈值：Canvas 取灰度 → 3x3 拉普拉斯卷积 → 求灰度方差，< 100 视为“可能不够清晰”，
 // 弹「重拍 / 继续使用」让老师自己决定是否仍要使用
 const IMAGE_SHARPNESS_THRESHOLD = 100
+// 【第61天新增】首页「今日备忘录」本地存储 key：{ date, keys }，存的数据不是今天就自动清空（前端模拟每日 00:00 重置）
+const MEMO_DONE_STORE_KEY = 'zh_memo_done'
 
 export default function App() {
   const now = new Date()
@@ -158,6 +160,10 @@ export default function App() {
   // 【第56天新增】智能体工作台（沉默学生请示闭环）
   const [agentTasks, setAgentTasks] = useState<any[]>([])
   const [scanningAgent, setScanningAgent] = useState(false)
+  // 【第61天新增】首页「今日备忘录」时间轴：已完成事项（key 列表；点“完成”后从列表移除）+ 当前时间 + 本地记录日期
+  const [memoDoneKeys, setMemoDoneKeys] = useState<string[]>([])
+  const [memoNow, setMemoNow] = useState(() => Date.now())
+  const [memoStoreDate, setMemoStoreDate] = useState('')
     // 【第50天新增】可视化排班网格
   const [calendarData, setCalendarData] = useState<any>(null)
   const [selectedDayIndex, setSelectedDayIndex] = useState(0)
@@ -1119,31 +1125,83 @@ export default function App() {
     .filter((a: any) => a.status === 'confirmed' && a.scheduled_date >= todayStr)
     .sort((a: any, b: any) => (a.scheduled_date + a.scheduled_time).localeCompare(b.scheduled_date + b.scheduled_time))
 
-  // ============== 【第60天新增】📋 今日备忘录（老师端首页）：晨间安排 / 晚间安排 ==============
-  // 全部用现有 state + 静态提示拼接（roleData / appointments / teacherPatients / drafts / habitList / holidays / huangli），不新增后端接口
+  // ============== 【第61天新增】📋 今日备忘录（老师端首页）：时间轴 + 未排期事项 ==============
+  // 数据全部来自现有 state + 静态模拟（roleData / appointments / teacherPatients / drafts / habitList / holidays / huangli），不新增后端接口
   const tomorrow = new Date(currentYear, currentMonth - 1, currentDay + 1)
   const tomorrowStr = `${tomorrow.getFullYear()}-${String(tomorrow.getMonth() + 1).padStart(2, '0')}-${String(tomorrow.getDate()).padStart(2, '0')}`
-  // 🌅 今日工作提醒：优先复用老师端 roleData（如“张三尚未打卡。”），沿用原“李老师的任务”卡片的数据源
+  // 今日工作提醒：优先复用老师端 roleData（如“张三尚未打卡。”），沿用原“李老师的任务”卡片的数据源
   const memoWorkHint = roleData ? roleData.detail : '正在获取任务数据...'
-  // 🌅 今日面诊：今天已确认的预约（现有 appointments state）
-  const memoTodayAppointments = appointments.filter((a: any) => a.status === 'confirmed' && a.scheduled_date === todayStr)
-  const memoTodayApptText = memoTodayAppointments.length > 0
-    ? '今日面诊：' + memoTodayAppointments.map((a: any) => `${a.patient_name} ${a.scheduled_time}`).join('、')
-    : ''
-  // 🌅 今日生活提醒：优先用现有习惯列表，兜底静态提示
+  // 今日生活提醒：优先用现有习惯列表，兜底静态提示
   const memoLifeHint = (habitList.length > 0 ? habitList : ['多喝水', '揉太渊', '早睡']).join('、')
-  // 🌙 今日未完成事项：待签字打卡 + 未签字病历草案 + 长期未活跃/未提交周报的学生（全部来自现有 state）
-  const memoPendingItems: string[] = []
-  if (roleData && roleData.detail.includes('已打卡')) memoPendingItems.push(`${selectedPatient} 的作业待签字确认`)
-  drafts.filter(d => !d.signed).forEach(d => memoPendingItems.push(`${d.patient_name} 的病历草案待签字`))
-  teacherPatients.filter((s: any) => s.status_label !== '活跃').slice(0, 3).forEach((s: any) => memoPendingItems.push(`${s.name} 未提交周报（${s.status_label}）`))
-  // 🌙 明日预备提示：明日预约 + 明日是否落在老师自己设置的节假日
+  // “HH:MM” → 分钟数（统一按分钟比较，兼容未补零的历史数据；时间轴排序与逾期判断都用它）
+  const memoMinutes = (hm: string) => {
+    const [h, m] = (hm || '').split(':')
+    return (parseInt(h || '0', 10) || 0) * 60 + (parseInt(m || '0', 10) || 0)
+  }
+  const memoNowHM = `${String(new Date(memoNow).getHours()).padStart(2, '0')}:${String(new Date(memoNow).getMinutes()).padStart(2, '0')}`
+  const memoNowMinutes = memoMinutes(memoNowHM)
+
+  // ① 有明确时间的今日事项：静态模拟项 + 现有 appointments（今日已确认），统一按时间升序排列
+  const memoTodayAppointments = appointments.filter((a: any) => a.status === 'confirmed' && a.scheduled_date === todayStr)
+  const memoTimedItems = [
+    { key: 'fixed-0830', time: '08:30', text: '吃药 / 晨起生活提醒：多喝温水' },
+    ...memoTodayAppointments.map((a: any) => ({ key: `appt-${a.id}`, time: a.scheduled_time, text: `面诊 ${a.patient_name}${a.reason ? `（${a.reason}）` : ''}` })),
+    { key: 'fixed-2100', time: '21:00', text: `晚间生活提醒：${memoLifeHint}` }
+  ].sort((a, b) => memoMinutes(a.time) - memoMinutes(b.time))
+
+  // ② 没有明确时间的事项：单独进“未排期事项”列，不混入时间轴
+  const memoUnscheduledItems: { key: string; text: string }[] = [
+    { key: 'work-hint', text: `今日工作提醒：${memoWorkHint}` }
+  ]
+  if (roleData && roleData.detail.includes('已打卡')) memoUnscheduledItems.push({ key: 'approve-hint', text: `${selectedPatient} 的作业待签字确认` })
+  drafts.filter(d => !d.signed).forEach(d => memoUnscheduledItems.push({ key: `draft-${d.id}`, text: `${d.patient_name} 的病历草案待签字` }))
+  teacherPatients.filter((s: any) => s.status_label !== '活跃').slice(0, 3).forEach((s: any) => memoUnscheduledItems.push({ key: `student-${s.name}`, text: `${s.name} 未提交周报（${s.status_label}）` }))
+  // 明日预备提示：明日预约 + 明日是否落在老师自己设置的节假日
   const memoTomorrowAppointments = appointments.filter((a: any) => a.status === 'confirmed' && a.scheduled_date === tomorrowStr)
   const memoTomorrowHint = memoTomorrowAppointments.length === 1
     ? `明日有一位学生预约：${memoTomorrowAppointments[0].patient_name} ${memoTomorrowAppointments[0].scheduled_time}`
     : memoTomorrowAppointments.length > 1
       ? `明日有 ${memoTomorrowAppointments.length} 位学生预约：` + memoTomorrowAppointments.map((a: any) => `${a.patient_name} ${a.scheduled_time}`).join('、')
       : (holidays.includes(tomorrowStr) ? '明日是您设置的节假日，暂无预约，好好休息。' : '明日暂无学生预约，可整理病历或休息。')
+  memoUnscheduledItems.push({ key: 'tomorrow-hint', text: `明日预备提示：${memoTomorrowHint}` })
+
+  // ③ 状态：已被标记“已处理”（点过完成按钮）的事项，直接从两个列表里移除
+  const memoTimedVisible = memoTimedItems.filter(it => !memoDoneKeys.includes(it.key))
+  const memoUnscheduledVisible = memoUnscheduledItems.filter(it => !memoDoneKeys.includes(it.key))
+
+  // 【第61天新增】每日更新与清理：读 localStorage 里的完成记录，存的不是今天就自动清空（前端模拟“每日 00:00 后台智能体重置清理”）
+  useEffect(() => {
+    if (memoStoreDate === todayStr) return   // 今天已初始化过（跨天时 todayStr 变化会重新走下面的清理流程）
+    let keys: string[] = []
+    try {
+      const raw = localStorage.getItem(MEMO_DONE_STORE_KEY)
+      const parsed = raw ? JSON.parse(raw) : null
+      if (parsed && parsed.date === todayStr && Array.isArray(parsed.keys)) keys = parsed.keys
+    } catch (e) { /* 忽略解析错误，按空处理 */ }
+    setMemoDoneKeys(keys)                                             // 存的不是今天 → keys = []，等于自动清空
+    setMemoStoreDate(todayStr)
+    localStorage.setItem(MEMO_DONE_STORE_KEY, JSON.stringify({ date: todayStr, keys }))
+  }, [memoStoreDate, todayStr])
+
+  // 完成状态持久化（当日记录一经初始化，之后每次变更都写回 localStorage）
+  useEffect(() => {
+    if (memoStoreDate !== todayStr) return
+    localStorage.setItem(MEMO_DONE_STORE_KEY, JSON.stringify({ date: todayStr, keys: memoDoneKeys }))
+  }, [memoDoneKeys, memoStoreDate, todayStr])
+
+  // 每分钟刷新一次“当前时间”，让逾期事项到点自动变灰，无需刷新页面
+  useEffect(() => {
+    const timer = setInterval(() => setMemoNow(Date.now()), 60 * 1000)
+    return () => clearInterval(timer)
+  }, [])
+
+  // 点“完成”：标记为已处理 → 从时间轴 / 未排期列表移除（同时写入 localStorage）
+  const handleMemoDone = (key: string) => {
+    setMemoDoneKeys(prev => prev.includes(key) ? prev : [...prev, key])
+  }
+
+  // 逾期判断：未处理 且 当前时间已过该事项时间 → 文字变灰（见渲染处的 overdue 分支）
+  const isMemoOverdue = (time: string) => memoMinutes(time) < memoNowMinutes
 
   // 【第57天新增】诊室：老师搜索学生（前端过滤 teacherPatients，不做后端接口）
   const studentSearchResults = studentSearch.trim()
@@ -1358,40 +1416,57 @@ export default function App() {
           </div>
         )}
 
-        {/* 【第60天新增】老师端：📋 今日备忘录（从“诊室 → 📋 李老师 的任务”卡片迁到首页，黄历卡片下方） */}
+        {/* 【第61天新增】老师端：📋 今日备忘录（动态时间轴 + 未排期事项列；已完成移除、逾期变灰、跨天自动清空） */}
         {(currentRole === '李老师' || currentRole === '李老师智能体') && teacherTab === 'home' && (
           <div style={{ ...boxStyle, background: '#fffdf5' }}>
             <div style={{ textAlign: 'center', fontSize: '18px', color: '#8b4513', fontWeight: 'bold', marginBottom: '12px' }}>📋 今日备忘录</div>
 
-            {/* 🌅 晨间安排 */}
-            <div style={{ padding: '12px', background: '#fff8e7', borderRadius: '8px', border: '1px solid #f0e9d6', marginBottom: '12px' }}>
-              <div style={{ fontSize: '15px', color: '#8b4513', fontWeight: 'bold', marginBottom: '8px' }}>🌅 晨间安排</div>
-              <div style={{ fontSize: '13px', color: '#333', lineHeight: '1.9' }}>
-                <div>📌 今日工作提醒：{memoWorkHint}</div>
-                {memoTodayApptText && <div>🩺 {memoTodayApptText}</div>}
-                <div>🌿 今日生活提醒：{memoLifeHint}{huangli?.health_trend ? `（今日养生：${huangli.health_trend}）` : ''}</div>
-              </div>
-              {currentRole === '李老师' && roleData?.task === '待审核' && roleData?.detail.includes('已打卡') && (
-                <div style={{ textAlign: 'center', marginTop: '12px' }}>
-                  <button onClick={handleApprove} style={{ padding: '8px 20px', borderRadius: '20px', border: 'none', background: '#5a7d5a', color: '#fff', fontSize: '14px', cursor: 'pointer', fontFamily: 'serif' }}>签字确认</button>
-                </div>
-              )}
-            </div>
-
-            {/* 🌙 晚间安排 */}
-            <div style={{ padding: '12px', background: '#f0f4f8', borderRadius: '8px', border: '1px solid #dde5ee' }}>
-              <div style={{ fontSize: '15px', color: '#5a7d5a', fontWeight: 'bold', marginBottom: '8px' }}>🌙 晚间安排</div>
-              <div style={{ fontSize: '13px', color: '#333', lineHeight: '1.9' }}>
-                <div>⏳ 今日未完成事项：</div>
-                {memoPendingItems.length === 0 ? (
-                  <div style={{ paddingLeft: '16px', color: '#5a7d5a' }}>今日事项已全部完成 🎉</div>
+            <div style={{ display: 'flex', gap: '12px', flexWrap: 'wrap', alignItems: 'flex-start' }}>
+              {/* 左列：时间轴（有明确时间的事项，按时间升序；已处理的移除，逾期的变灰） */}
+              <div style={{ flex: '1 1 320px', padding: '12px', background: '#fff8e7', borderRadius: '8px', border: '1px solid #f0e9d6' }}>
+                <div style={{ fontSize: '13px', color: '#8b4513', fontWeight: 'bold', marginBottom: '8px' }}>⏱ 今日时间轴（按时间升序）</div>
+                {memoTimedVisible.length === 0 ? (
+                  <div style={{ fontSize: '13px', color: '#5a7d5a' }}>今日事项已全部处理 🎉</div>
                 ) : (
-                  memoPendingItems.map(item => (
-                    <div key={item} style={{ paddingLeft: '16px' }}>· {item}</div>
+                  memoTimedVisible.map(it => {
+                    const overdue = isMemoOverdue(it.time)   // 未处理 且 已过事项时间 → 逾期
+                    return (
+                      <div key={it.key} style={{ display: 'flex', alignItems: 'center', padding: '6px 0', borderBottom: '1px dashed #f0e9d6' }}>
+                        <div style={{ width: '46px', fontSize: '12px', color: overdue ? '#999' : '#8b4513', fontWeight: 'bold' }}>{it.time}</div>
+                        <div style={{ flex: 1, fontSize: '13px', color: overdue ? '#999' : '#333', textDecoration: overdue ? 'line-through' : 'none' }}>
+                          {it.text}{overdue ? ' · 已逾期' : ''}
+                        </div>
+                        <button onClick={() => handleMemoDone(it.key)} style={{ padding: '2px 10px', borderRadius: '12px', border: '1px solid #5a7d5a', background: 'transparent', color: '#5a7d5a', cursor: 'pointer', fontSize: '11px', fontFamily: 'serif', whiteSpace: 'nowrap' }}>完成</button>
+                      </div>
+                    )
+                  })
+                )}
+              </div>
+
+              {/* 右列：未排期事项（没有明确时间的事项，不混入时间轴） */}
+              <div style={{ flex: '1 1 220px', padding: '12px', background: '#f0f4f8', borderRadius: '8px', border: '1px solid #dde5ee' }}>
+                <div style={{ fontSize: '13px', color: '#5a7d5a', fontWeight: 'bold', marginBottom: '8px' }}>🗂 未排期事项（无明确时间）</div>
+                {memoUnscheduledVisible.length === 0 ? (
+                  <div style={{ fontSize: '13px', color: '#5a7d5a' }}>暂无未排期事项 🎉</div>
+                ) : (
+                  memoUnscheduledVisible.map(it => (
+                    <div key={it.key} style={{ display: 'flex', alignItems: 'flex-start', padding: '6px 0', borderBottom: '1px dashed #dde5ee' }}>
+                      <div style={{ flex: 1, fontSize: '13px', color: '#333', lineHeight: '1.7' }}>· {it.text}</div>
+                      <button onClick={() => handleMemoDone(it.key)} style={{ marginLeft: '8px', padding: '2px 10px', borderRadius: '12px', border: '1px solid #5a7d5a', background: 'transparent', color: '#5a7d5a', cursor: 'pointer', fontSize: '11px', fontFamily: 'serif', whiteSpace: 'nowrap' }}>完成</button>
+                    </div>
                   ))
                 )}
-                <div style={{ marginTop: '6px' }}>📅 明日预备提示：{memoTomorrowHint}</div>
+                {currentRole === '李老师' && roleData?.task === '待审核' && roleData?.detail.includes('已打卡') && (
+                  <div style={{ textAlign: 'center', marginTop: '10px' }}>
+                    <button onClick={handleApprove} style={{ padding: '6px 16px', borderRadius: '20px', border: 'none', background: '#5a7d5a', color: '#fff', fontSize: '13px', cursor: 'pointer', fontFamily: 'serif' }}>签字确认</button>
+                  </div>
+                )}
               </div>
+            </div>
+
+            {/* 每日重置占位提示（尚未接后端，仅 UI 占位 + 前端跨天自动清空） */}
+            <div style={{ textAlign: 'center', fontSize: '11px', color: '#999', marginTop: '10px' }}>
+              ℹ️ 每日 00:00 由后台智能体自动重置清理（当前未接后端，此处为界面占位提示；前端已做跨天自动清空）
             </div>
           </div>
         )}
