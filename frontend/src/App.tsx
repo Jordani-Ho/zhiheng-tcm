@@ -83,6 +83,17 @@ export default function App() {
   // 【第57天新增】诊室：老师搜索学生（前端过滤 teacherPatients）
   const [studentSearch, setStudentSearch] = useState('')
 
+  // 【第58天新增】学生智能体一期：照镜子 + 习惯追踪 + 周报（纯前端 localStorage）
+  // 照镜子：记录今日早/晚是否已完成，key 形如 { patientName: { 'YYYY-MM-DD': { morning: true, evening: false } } }
+  const [mirrorLog, setMirrorLog] = useState<{ [patient: string]: { [date: string]: { morning: boolean; evening: boolean } } }>({})
+  // 习惯打卡：key 形如 { patientName: { 'YYYY-MM-DD': { '早睡': true, ... } } }
+  const [habitLog, setHabitLog] = useState<{ [patient: string]: { [date: string]: { [habit: string]: boolean } } }>({})
+  // 习惯列表（学生可增删，默认三条）
+  const [habitList, setHabitList] = useState<string[]>(['早睡', '揉太渊', '喝温水'])
+  const [newHabitName, setNewHabitName] = useState('')
+  // 提醒频率：A 每天 / B 隔天 / C 每周（老师端可设置，学生端只读展示）
+  const [reminderFrequency, setReminderFrequency] = useState<'A' | 'B' | 'C'>('A')
+
   // 预约相关
   const [appointments, setAppointments] = useState<any[]>([])
   const [showApptForm, setShowApptForm] = useState(false)
@@ -974,6 +985,105 @@ export default function App() {
   const currentStudentInfo = teacherPatients.find((s: any) => s.name === selectedPatient)
   const lastVisitDate = patientRecords.length > 0 ? `第 ${patientRecords[0].id} 号病历` : '首次就诊'
 
+  // ============== 【第58天新增】学生智能体一期：照镜子 + 习惯追踪 + 周报 ==============
+  // 从 localStorage 读取（首次挂载时）
+  useEffect(() => {
+    try {
+      const m = localStorage.getItem('zh_mirror_log')
+      if (m) setMirrorLog(JSON.parse(m))
+      const h = localStorage.getItem('zh_habit_log')
+      if (h) setHabitLog(JSON.parse(h))
+      const hl = localStorage.getItem('zh_habit_list')
+      if (hl) setHabitList(JSON.parse(hl))
+      const f = localStorage.getItem('zh_reminder_frequency')
+      if (f === 'A' || f === 'B' || f === 'C') setReminderFrequency(f)
+    } catch (e) { /* 忽略解析错误 */ }
+  }, [])
+
+  // 写入 localStorage（变化时）
+  useEffect(() => { localStorage.setItem('zh_mirror_log', JSON.stringify(mirrorLog)) }, [mirrorLog])
+  useEffect(() => { localStorage.setItem('zh_habit_log', JSON.stringify(habitLog)) }, [habitLog])
+  useEffect(() => { localStorage.setItem('zh_habit_list', JSON.stringify(habitList)) }, [habitList])
+  useEffect(() => { localStorage.setItem('zh_reminder_frequency', reminderFrequency) }, [reminderFrequency])
+
+  // 当前小时：<12 视为早间，否则晚间
+  const isMorning = now.getHours() < 12
+  const mirrorPeriod: 'morning' | 'evening' = isMorning ? 'morning' : 'evening'
+  const todayMirror = mirrorLog[selectedPatient]?.[todayStr] || { morning: false, evening: false }
+  const mirrorDone = todayMirror[mirrorPeriod]
+
+  // 照镜子提示语
+  const mirrorTip = isMorning
+    ? '观察面色，是否红润？观察舌苔，是否白腻？'
+    : '回顾今日饮食起居，是否早睡？是否心平气和？'
+
+  // 点击"我已完成"：记录今日该时段已完成
+  const handleMirrorDone = () => {
+    setMirrorLog(prev => {
+      const patientLog = prev[selectedPatient] || {}
+      const dayLog = patientLog[todayStr] || { morning: false, evening: false }
+      return { ...prev, [selectedPatient]: { ...patientLog, [todayStr]: { ...dayLog, [mirrorPeriod]: true } } }
+    })
+  }
+
+  // 提醒频率 → 今日是否需要打卡
+  // A 每天：总是需要；B 隔天：按日期奇偶；C 每周：仅周一
+  const shouldRemindToday = (() => {
+    if (reminderFrequency === 'A') return true
+    const dayOfMonth = currentDay
+    if (reminderFrequency === 'B') return dayOfMonth % 2 === 1
+    // C：每周一
+    return now.getDay() === 1
+  })()
+  const frequencyLabel = reminderFrequency === 'A' ? 'A · 每天提醒' : reminderFrequency === 'B' ? 'B · 隔天提醒' : 'C · 每周提醒'
+
+  // 今日习惯打卡状态
+  const todayHabits = habitLog[selectedPatient]?.[todayStr] || {}
+  const handleToggleHabit = (habit: string) => {
+    setHabitLog(prev => {
+      const patientLog = prev[selectedPatient] || {}
+      const dayLog = patientLog[todayStr] || {}
+      return { ...prev, [selectedPatient]: { ...patientLog, [todayStr]: { ...dayLog, [habit]: !dayLog[habit] } } }
+    })
+  }
+  const handleAddHabit = () => {
+    const name = newHabitName.trim()
+    if (!name) { alert('请输入习惯名称'); return }
+    if (habitList.includes(name)) { alert('该习惯已存在'); return }
+    setHabitList(prev => [...prev, name])
+    setNewHabitName('')
+  }
+  const handleRemoveHabit = (habit: string) => {
+    if (!confirm(`确定删除习惯【${habit}】吗？`)) return
+    setHabitList(prev => prev.filter(h => h !== habit))
+  }
+
+  // 本周（周一至周日）打卡统计
+  const weekStats = (() => {
+    const patientLog = habitLog[selectedPatient] || {}
+    const day = now.getDay() // 0=周日
+    const mondayOffset = day === 0 ? -6 : 1 - day
+    const monday = new Date(now)
+    monday.setDate(now.getDate() + mondayOffset)
+    let done = 0
+    let total = 0
+    for (let i = 0; i < 7; i++) {
+      const d = new Date(monday)
+      d.setDate(monday.getDate() + i)
+      const ds = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+      const dayLog = patientLog[ds] || {}
+      habitList.forEach(h => { total += 1; if (dayLog[h]) done += 1 })
+    }
+    const rate = total > 0 ? Math.round((done / total) * 100) : 0
+    let summary = ''
+    if (total === 0) summary = '本周还没有习惯记录，从今天开始吧！'
+    else if (rate >= 80) summary = '本周坚持得不错，继续加油！'
+    else if (rate >= 50) summary = '本周完成过半，再坚持一下会更好。'
+    else if (rate > 0) summary = '本周打卡偏少，明天试着多完成一项吧。'
+    else summary = '本周还没有打卡，今天就从一项开始吧！'
+    return { done, total, rate, summary }
+  })()
+
   // ============== 渲染 ==============
   return (
     <div style={{ minHeight: '100vh', background: '#f5f1e6', padding: '40px 20px', fontFamily: 'serif' }}>
@@ -1031,6 +1141,85 @@ export default function App() {
             )}
             <div style={{ textAlign: 'center', color: '#5a7d5a', fontSize: '16px', marginBottom: '10px' }}>🌿 {huangli.solar_term}：{huangli.health_trend}</div>
             <div style={{ textAlign: 'center', background: '#fff8e7', padding: '15px', borderRadius: '8px', color: '#8b4513' }}>📝 今日作业：{huangli.homework}</div>
+          </div>
+        )}
+
+        {/* 【第58天新增】学生端：照镜子卡片（黄历下方） */}
+        {(currentRole === '学生' || currentRole === '学生智能体') && (
+          <div style={{ ...boxStyle, background: '#f7fcf9' }}>
+            <div style={{ fontSize: '18px', color: '#5a7d5a', fontWeight: 'bold', marginBottom: '12px' }}>
+              🪞 {isMorning ? '早间照镜子' : '晚间照镜子'}
+            </div>
+            <div style={{ padding: '12px', background: '#fff', borderRadius: '8px', border: '1px dashed #b8d8c0', marginBottom: '12px' }}>
+              <div style={{ fontSize: '14px', color: '#333', lineHeight: '1.8' }}>💡 {mirrorTip}</div>
+            </div>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <div style={{ fontSize: '12px', color: '#999' }}>
+                今日：早间 {todayMirror.morning ? '✅' : '⬜'} · 晚间 {todayMirror.evening ? '✅' : '⬜'}
+              </div>
+              <button
+                onClick={handleMirrorDone}
+                disabled={mirrorDone}
+                style={{
+                  padding: '8px 24px', borderRadius: '20px', border: 'none',
+                  background: mirrorDone ? '#b8d8c0' : '#5a7d5a', color: '#fff',
+                  cursor: mirrorDone ? 'default' : 'pointer', fontSize: '14px', fontFamily: 'serif'
+                }}
+              >{mirrorDone ? '✅ 已完成' : '我已完成'}</button>
+            </div>
+          </div>
+        )}
+
+        {/* 【第58天新增】学生端：习惯追踪 + A/B/C 提醒频率 */}
+        {(currentRole === '学生' || currentRole === '学生智能体') && (
+          <div style={{ ...boxStyle, background: '#fdf8f0' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
+              <div style={{ fontSize: '18px', color: '#8b4513', fontWeight: 'bold' }}>🌱 习惯追踪</div>
+              <div style={{ fontSize: '12px', color: '#8b4513', padding: '3px 10px', borderRadius: '12px', background: '#fff8e7', border: '1px solid #d4c8a8' }}>{frequencyLabel}</div>
+            </div>
+            {!shouldRemindToday && (
+              <div style={{ fontSize: '12px', color: '#999', marginBottom: '10px', textAlign: 'center' }}>今日按频率无需打卡，仍可自愿完成 ✅</div>
+            )}
+            {habitList.length === 0 ? (
+              <div style={{ textAlign: 'center', color: '#999', fontSize: '13px', padding: '10px' }}>暂无习惯，请在下方添加</div>
+            ) : (
+              habitList.map(h => (
+                <div key={h} style={{ display: 'flex', alignItems: 'center', padding: '10px', marginBottom: '6px', background: todayHabits[h] ? '#e8f4e8' : '#fff', border: todayHabits[h] ? '1px solid #5a7d5a' : '1px solid #e0e0e0', borderRadius: '8px' }}>
+                  <div style={{ flex: 1, fontSize: '14px', color: '#333' }}>{todayHabits[h] ? '✅' : '⬜'} {h}</div>
+                  <button
+                    onClick={() => handleToggleHabit(h)}
+                    style={{ padding: '4px 14px', borderRadius: '15px', border: '1px solid #5a7d5a', background: todayHabits[h] ? '#5a7d5a' : 'transparent', color: todayHabits[h] ? '#fff' : '#5a7d5a', cursor: 'pointer', fontSize: '12px', fontFamily: 'serif' }}
+                  >{todayHabits[h] ? '已打卡 +1' : '打卡 +1'}</button>
+                  <button onClick={() => handleRemoveHabit(h)} style={{ marginLeft: '6px', padding: '2px 8px', borderRadius: '12px', border: '1px solid #c0392b', background: 'transparent', color: '#c0392b', cursor: 'pointer', fontSize: '11px' }}>✕</button>
+                </div>
+              ))
+            )}
+            <div style={{ display: 'flex', gap: '8px', marginTop: '10px' }}>
+              <input
+                placeholder="添加新习惯（如：散步）"
+                value={newHabitName}
+                onChange={e => setNewHabitName(e.target.value)}
+                style={{ flex: 1, padding: '8px', borderRadius: '6px', border: '1px solid #d4c8a8', fontFamily: 'serif', boxSizing: 'border-box' }}
+              />
+              <button onClick={handleAddHabit} style={{ padding: '8px 16px', borderRadius: '6px', border: 'none', background: '#8b4513', color: '#fff', cursor: 'pointer', fontFamily: 'serif' }}>+ 添加</button>
+            </div>
+          </div>
+        )}
+
+        {/* 【第58天新增】学生端：习惯追踪周报 */}
+        {(currentRole === '学生' || currentRole === '学生智能体') && (
+          <div style={{ ...boxStyle, background: '#fffdf5' }}>
+            <div style={{ fontSize: '18px', color: '#8b4513', fontWeight: 'bold', marginBottom: '12px' }}>📊 本周习惯周报</div>
+            <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '13px', color: '#666', marginBottom: '6px' }}>
+              <span>本周打卡</span>
+              <span style={{ color: '#8b4513', fontWeight: 'bold' }}>{weekStats.done} / {weekStats.total} 次（{weekStats.rate}%）</span>
+            </div>
+            <div style={{ height: '16px', background: '#f0f0f0', borderRadius: '8px', overflow: 'hidden', marginBottom: '12px' }}>
+              <div style={{ width: `${weekStats.rate}%`, height: '100%', background: weekStats.rate >= 80 ? '#5a7d5a' : weekStats.rate >= 50 ? '#8b4513' : '#c0392b', borderRadius: '8px', transition: 'width 0.5s' }} />
+            </div>
+            <div style={{ padding: '12px', background: '#f7fcf9', borderRadius: '8px', border: '1px dashed #b8d8c0', fontSize: '14px', color: '#333', lineHeight: '1.6' }}>
+              📝 本周小结：{weekStats.summary}
+            </div>
           </div>
         )}
 
@@ -1152,6 +1341,19 @@ export default function App() {
         {(currentRole === '李老师' || currentRole === '李老师智能体') && teacherTab === 'students' && (
           <div style={{ ...boxStyle, background: '#f0f7f0' }}>
             <div style={{ fontSize: '18px', color: '#5a7d5a', fontWeight: 'bold', marginBottom: '10px' }}>👥 学生管理（{teacherPatients.length}人）</div>
+            {/* 【第58天新增】老师端设置学生提醒频率（A 每天 / B 隔天 / C 每周），与学生端 localStorage 共享 */}
+            <div style={{ marginBottom: '12px', padding: '10px', background: '#fff', borderRadius: '8px', border: '1px dashed #b8d8c0' }}>
+              <div style={{ fontSize: '13px', color: '#5a7d5a', fontWeight: 'bold', marginBottom: '8px' }}>⏰ 提醒频率设置（当前学生：{selectedPatient}）</div>
+              <div style={{ display: 'flex', gap: '6px' }}>
+                {([['A', 'A · 每天'], ['B', 'B · 隔天'], ['C', 'C · 每周']] as const).map(([key, label]) => (
+                  <button
+                    key={key}
+                    onClick={() => setReminderFrequency(key)}
+                    style={{ flex: 1, padding: '6px 4px', borderRadius: '8px', border: '1px solid #5a7d5a', background: reminderFrequency === key ? '#5a7d5a' : 'transparent', color: reminderFrequency === key ? '#fff' : '#5a7d5a', cursor: 'pointer', fontSize: '12px', fontFamily: 'serif' }}
+                  >{label}</button>
+                ))}
+              </div>
+            </div>
             <div style={{ display: 'flex', gap: '8px', marginBottom: '15px' }}>
               <input id="newStudentInput" placeholder="输入学生姓名，添加为新学生" style={{ flex: 1, padding: '8px', borderRadius: '6px', border: '1px solid #b8d8c0', fontFamily: 'serif' }} />
               <button onClick={() => {
@@ -1558,8 +1760,7 @@ export default function App() {
           </div>
         )}
 
-        <div style={boxStyle}>
-                  {/* 【第51天新增】中药材库存 */}
+        {/* 【第51天新增】中药材库存 */}
         {(currentRole === '李老师' || currentRole === '李老师智能体') && teacherTab === 'inventory' && (
           <div style={boxStyle}>
             <h3 style={{ color: '#8b4513', textAlign: 'center', marginBottom: '12px' }}>💊 中药材库存</h3>
@@ -1699,6 +1900,8 @@ export default function App() {
           </div>
         )}
 
+        {/* 角色切换卡片 */}
+        <div style={boxStyle}>
           <div style={{ textAlign: 'center', marginBottom: '15px', color: '#8b4513', fontWeight: 'bold' }}>🧑‍⚕️ 角色切换</div>
           <div style={{ display: 'flex', flexWrap: 'wrap', justifyContent: 'center' }}>
             {['李老师', '李老师智能体', '学生', '学生智能体'].map((role) => (
