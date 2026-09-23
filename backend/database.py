@@ -1,5 +1,6 @@
 import sqlite3
 import os
+import json
 from datetime import datetime, timedelta
 DB_PATH = os.path.join(os.path.dirname(__file__), os.environ.get("ZHIENG_DB", "zhiheng.db"))
 
@@ -580,8 +581,6 @@ def accept_invite(code, student_name):
     conn.commit()
     conn.close()
     return {"message": "加入成功", "teacher_name": invite["teacher_name"]}
-# ---------- 【第48天扩展】老师工作时间（按天 + 半小时粒度） ----------
-import json
 
 def get_teacher_holidays(teacher_name):
     """【第49天新增】获取老师节假日列表"""
