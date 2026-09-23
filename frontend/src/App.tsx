@@ -13,7 +13,8 @@ const inputStyle: React.CSSProperties = { width: '100%', padding: '8px', borderR
 const dateSelectStyle: React.CSSProperties = { padding: '8px', borderRadius: '6px', border: '1px solid #d4c8a8', fontFamily: 'serif', marginRight: '6px', marginBottom: '8px' }
 // 【第59天新增】诊室二期：把脉可选的脉象（可多选）
 const PULSE_TYPES = ['浮', '沉', '迟', '数', '虚', '实', '滑', '涩']
-// 【第59天重构】拍照清晰度检测阈值：用 Canvas 计算拉普拉斯方差，< 100 视为“可能不够清晰”，弹提示让老师确认
+// 【第59天重构】拍照清晰度检测阈值：Canvas 取灰度 → 3x3 拉普拉斯卷积 → 求灰度方差，< 100 视为“可能不够清晰”，
+// 弹「重拍 / 继续使用」让老师自己决定是否仍要使用
 const IMAGE_SHARPNESS_THRESHOLD = 100
 
 export default function App() {
@@ -91,6 +92,11 @@ export default function App() {
   const [pulseTypes, setPulseTypes] = useState<string[]>([])
   const [pulseRate, setPulseRate] = useState('')
   const [pulseNote, setPulseNote] = useState('')
+
+  // 【第59天重构】拍照清晰度不通过时，弹「重拍 / 继续使用」两个选项（老师自己决定是否仍要使用）
+  const [blurryPhoto, setBlurryPhoto] = useState<{ draftId: number; file: File } | null>(null)
+  // 诊室拍照 input 引用：选“重拍”时直接再次唤起相机（同一个 input，选完即清空，可重复选同一张图片）
+  const clinicPhotoInputRef = useRef<HTMLInputElement>(null)
 
   // 【第59天修复】本地占位草案：诊室里选中学生、但该学生还没有“正在编辑的草案”时，
   // 前端本地先生成一条空草案（id 为负数），让录音 / 拍照 / 把脉立刻可用；老师点“保存病历修改”时再落库。
@@ -809,16 +815,8 @@ export default function App() {
     })
   }
 
-  // 【第59天重构】拍照/上传（诊室页签内唯一拍照入口）：清晰度检测 → 上传 /api/upload-temp → URL 追加到文本框末尾
-  const handleLivePhotoUpload = async (draftId: number, e: React.ChangeEvent<HTMLInputElement>) => {
-    const input = e.target
-    const file = input.files?.[0]
-    if (!file) return
-    const sharp = await checkImageSharpness(file)
-    if (!sharp && !window.confirm('图片可能不够清晰，建议重拍。是否仍要使用？\n\n【确定】继续使用　【取消】重拍')) {
-      input.value = ''
-      return
-    }
+  // 【第59天重构】清晰度检测通过（或老师点“继续使用”）后：上传 /api/upload-temp → URL 追加到文本框末尾
+  const uploadLivePhoto = (draftId: number, file: File) => {
     setLiveUploading(prev => ({ ...prev, [draftId]: true }))
     const formData = new FormData()
     formData.append('file', file)
@@ -826,14 +824,36 @@ export default function App() {
       .then(r => r.json())
       .then(d => {
         setLiveUploading(prev => ({ ...prev, [draftId]: false }))
-        input.value = ''
         if (d && d.url) {
           setTeacherLiveText(prev => ({ ...prev, [draftId]: (prev[draftId] || '') + '\n\n【上传的图片】' + d.url }))
         } else {
           alert('图片上传失败，请重试')
         }
       })
-      .catch(() => { setLiveUploading(prev => ({ ...prev, [draftId]: false })); input.value = ''; alert('图片上传失败，请重试') })
+      .catch(() => { setLiveUploading(prev => ({ ...prev, [draftId]: false })); alert('图片上传失败，请重试') })
+  }
+
+  // 【第59天重构】拍照/上传（诊室页签内唯一拍照入口）：
+  // 先用 Canvas 检测清晰度 → 通过则直接上传；不清晰则弹「重拍 / 继续使用」，由老师决定
+  const handleLivePhotoUpload = async (draftId: number, e: React.ChangeEvent<HTMLInputElement>) => {
+    const input = e.target
+    const file = input.files?.[0]
+    input.value = ''   // 立刻清空：同一张图片再次拍/选也能触发 onChange（“重拍”复用同一个 input）
+    if (!file) return
+    const sharp = await checkImageSharpness(file)
+    if (!sharp) { setBlurryPhoto({ draftId, file }); return }
+    uploadLivePhoto(draftId, file)
+  }
+
+  // 清晰度提示：点“继续使用” → 照常上传；“重拍” → 关掉提示并再次唤起相机
+  const handleUseBlurryPhoto = () => {
+    const pending = blurryPhoto
+    setBlurryPhoto(null)
+    if (pending) uploadLivePhoto(pending.draftId, pending.file)
+  }
+  const handleRetakePhoto = () => {
+    setBlurryPhoto(null)
+    clinicPhotoInputRef.current?.click()
   }
 
   const handlePreviewFullRecord = (draftId: number) => {
@@ -2237,6 +2257,7 @@ export default function App() {
               <label style={{ flex: 1, padding: '8px', borderRadius: '20px', border: '1px solid #8b4513', background: 'transparent', color: '#8b4513', cursor: clinicTargetId === null ? 'not-allowed' : 'pointer', fontSize: '13px', textAlign: 'center' }}>
                 {(clinicTargetId !== null && liveUploading[clinicTargetId]) ? '上传中...' : '📷 拍照'}
                 <input
+                  ref={clinicPhotoInputRef}
                   type="file"
                   accept="image/*"
                   capture="environment"
@@ -2290,6 +2311,22 @@ export default function App() {
             {/* d) 追加到病历：把文本框内容写入病历草案 */}
             <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: '12px' }}>
               <button onClick={() => { if (clinicTargetId !== null) handleAppendTeacherNote(clinicTargetId) }} disabled={clinicTargetId === null} style={{ padding: '8px 24px', borderRadius: '20px', border: 'none', background: clinicTargetId === null ? '#ccc' : '#5a7d5a', color: '#fff', cursor: clinicTargetId === null ? 'not-allowed' : 'pointer', fontSize: '13px', fontWeight: 'bold' }}>追加到病历</button>
+            </div>
+          </div>
+        )}
+
+        {/* 【第59天重构】拍照清晰度不足提示：只提供「重拍 / 继续使用」两个选项（纯前端，无新依赖） */}
+        {blurryPhoto && (
+          <div style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, background: 'rgba(0,0,0,0.5)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 999 }}>
+            <div style={{ background: '#fdfcf0', padding: '24px', borderRadius: '12px', maxWidth: '400px', width: '90%', border: '2px solid #8b4513' }}>
+              <div style={{ fontSize: '18px', color: '#8b4513', fontWeight: 'bold', marginBottom: '10px', textAlign: 'center' }}>📷 清晰度提示</div>
+              <div style={{ fontSize: '14px', color: '#666', marginBottom: '20px', textAlign: 'center', lineHeight: '1.6' }}>
+                图片可能不够清晰，建议重拍。是否仍要使用？
+              </div>
+              <div style={{ display: 'flex', gap: '10px' }}>
+                <button onClick={handleRetakePhoto} style={{ flex: 1, padding: '10px', borderRadius: '20px', border: '1px solid #8b4513', background: 'transparent', color: '#8b4513', cursor: 'pointer' }}>重拍</button>
+                <button onClick={handleUseBlurryPhoto} style={{ flex: 1, padding: '10px', borderRadius: '20px', border: 'none', background: '#5a7d5a', color: '#fff', cursor: 'pointer' }}>继续使用</button>
+              </div>
             </div>
           </div>
         )}
