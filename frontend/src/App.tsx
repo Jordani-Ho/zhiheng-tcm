@@ -1119,6 +1119,32 @@ export default function App() {
     .filter((a: any) => a.status === 'confirmed' && a.scheduled_date >= todayStr)
     .sort((a: any, b: any) => (a.scheduled_date + a.scheduled_time).localeCompare(b.scheduled_date + b.scheduled_time))
 
+  // ============== 【第60天新增】📋 今日备忘录（老师端首页）：晨间安排 / 晚间安排 ==============
+  // 全部用现有 state + 静态提示拼接（roleData / appointments / teacherPatients / drafts / habitList / holidays / huangli），不新增后端接口
+  const tomorrow = new Date(currentYear, currentMonth - 1, currentDay + 1)
+  const tomorrowStr = `${tomorrow.getFullYear()}-${String(tomorrow.getMonth() + 1).padStart(2, '0')}-${String(tomorrow.getDate()).padStart(2, '0')}`
+  // 🌅 今日工作提醒：优先复用老师端 roleData（如“张三尚未打卡。”），沿用原“李老师的任务”卡片的数据源
+  const memoWorkHint = roleData ? roleData.detail : '正在获取任务数据...'
+  // 🌅 今日面诊：今天已确认的预约（现有 appointments state）
+  const memoTodayAppointments = appointments.filter((a: any) => a.status === 'confirmed' && a.scheduled_date === todayStr)
+  const memoTodayApptText = memoTodayAppointments.length > 0
+    ? '今日面诊：' + memoTodayAppointments.map((a: any) => `${a.patient_name} ${a.scheduled_time}`).join('、')
+    : ''
+  // 🌅 今日生活提醒：优先用现有习惯列表，兜底静态提示
+  const memoLifeHint = (habitList.length > 0 ? habitList : ['多喝水', '揉太渊', '早睡']).join('、')
+  // 🌙 今日未完成事项：待签字打卡 + 未签字病历草案 + 长期未活跃/未提交周报的学生（全部来自现有 state）
+  const memoPendingItems: string[] = []
+  if (roleData && roleData.detail.includes('已打卡')) memoPendingItems.push(`${selectedPatient} 的作业待签字确认`)
+  drafts.filter(d => !d.signed).forEach(d => memoPendingItems.push(`${d.patient_name} 的病历草案待签字`))
+  teacherPatients.filter((s: any) => s.status_label !== '活跃').slice(0, 3).forEach((s: any) => memoPendingItems.push(`${s.name} 未提交周报（${s.status_label}）`))
+  // 🌙 明日预备提示：明日预约 + 明日是否落在老师自己设置的节假日
+  const memoTomorrowAppointments = appointments.filter((a: any) => a.status === 'confirmed' && a.scheduled_date === tomorrowStr)
+  const memoTomorrowHint = memoTomorrowAppointments.length === 1
+    ? `明日有一位学生预约：${memoTomorrowAppointments[0].patient_name} ${memoTomorrowAppointments[0].scheduled_time}`
+    : memoTomorrowAppointments.length > 1
+      ? `明日有 ${memoTomorrowAppointments.length} 位学生预约：` + memoTomorrowAppointments.map((a: any) => `${a.patient_name} ${a.scheduled_time}`).join('、')
+      : (holidays.includes(tomorrowStr) ? '明日是您设置的节假日，暂无预约，好好休息。' : '明日暂无学生预约，可整理病历或休息。')
+
   // 【第57天新增】诊室：老师搜索学生（前端过滤 teacherPatients，不做后端接口）
   const studentSearchResults = studentSearch.trim()
     ? teacherPatients.filter((s: any) => s.name.includes(studentSearch.trim()))
@@ -1329,6 +1355,44 @@ export default function App() {
             )}
             <div style={{ textAlign: 'center', color: '#5a7d5a', fontSize: '16px', marginBottom: '10px' }}>🌿 {huangli.solar_term}：{huangli.health_trend}</div>
             <div style={{ textAlign: 'center', background: '#fff8e7', padding: '15px', borderRadius: '8px', color: '#8b4513' }}>📝 今日作业：{huangli.homework}</div>
+          </div>
+        )}
+
+        {/* 【第60天新增】老师端：📋 今日备忘录（从“诊室 → 📋 李老师 的任务”卡片迁到首页，黄历卡片下方） */}
+        {(currentRole === '李老师' || currentRole === '李老师智能体') && teacherTab === 'home' && (
+          <div style={{ ...boxStyle, background: '#fffdf5' }}>
+            <div style={{ textAlign: 'center', fontSize: '18px', color: '#8b4513', fontWeight: 'bold', marginBottom: '12px' }}>📋 今日备忘录</div>
+
+            {/* 🌅 晨间安排 */}
+            <div style={{ padding: '12px', background: '#fff8e7', borderRadius: '8px', border: '1px solid #f0e9d6', marginBottom: '12px' }}>
+              <div style={{ fontSize: '15px', color: '#8b4513', fontWeight: 'bold', marginBottom: '8px' }}>🌅 晨间安排</div>
+              <div style={{ fontSize: '13px', color: '#333', lineHeight: '1.9' }}>
+                <div>📌 今日工作提醒：{memoWorkHint}</div>
+                {memoTodayApptText && <div>🩺 {memoTodayApptText}</div>}
+                <div>🌿 今日生活提醒：{memoLifeHint}{huangli?.health_trend ? `（今日养生：${huangli.health_trend}）` : ''}</div>
+              </div>
+              {currentRole === '李老师' && roleData?.task === '待审核' && roleData?.detail.includes('已打卡') && (
+                <div style={{ textAlign: 'center', marginTop: '12px' }}>
+                  <button onClick={handleApprove} style={{ padding: '8px 20px', borderRadius: '20px', border: 'none', background: '#5a7d5a', color: '#fff', fontSize: '14px', cursor: 'pointer', fontFamily: 'serif' }}>签字确认</button>
+                </div>
+              )}
+            </div>
+
+            {/* 🌙 晚间安排 */}
+            <div style={{ padding: '12px', background: '#f0f4f8', borderRadius: '8px', border: '1px solid #dde5ee' }}>
+              <div style={{ fontSize: '15px', color: '#5a7d5a', fontWeight: 'bold', marginBottom: '8px' }}>🌙 晚间安排</div>
+              <div style={{ fontSize: '13px', color: '#333', lineHeight: '1.9' }}>
+                <div>⏳ 今日未完成事项：</div>
+                {memoPendingItems.length === 0 ? (
+                  <div style={{ paddingLeft: '16px', color: '#5a7d5a' }}>今日事项已全部完成 🎉</div>
+                ) : (
+                  memoPendingItems.map(item => (
+                    <div key={item} style={{ paddingLeft: '16px' }}>· {item}</div>
+                  ))
+                )}
+                <div style={{ marginTop: '6px' }}>📅 明日预备提示：{memoTomorrowHint}</div>
+              </div>
+            </div>
           </div>
         )}
 
@@ -2045,20 +2109,18 @@ export default function App() {
           </div>
         )}
 
-        <div style={{ ...boxStyle, background: currentRole.includes('老师') ? '#e8f0e8' : '#fdfcf0' }}>
-          <div style={{ textAlign: 'center', fontSize: '18px', color: '#8b4513', marginBottom: '10px' }}>{roleData ? `📋 ${roleData.name} 的任务` : '加载中...'}</div>
-          <div style={{ textAlign: 'center', color: '#555', lineHeight: '1.8' }}>{roleData ? roleData.detail : '正在获取数据...'}</div>
-          {currentRole === '学生' && roleData?.detail.includes('请记得') && (
-            <div style={{ textAlign: 'center', marginTop: '20px' }}>
-              <button onClick={handleCheckIn} style={{ padding: '10px 24px', borderRadius: '30px', border: 'none', background: '#8b4513', color: '#fff', fontSize: '16px', cursor: 'pointer' }}>立即打卡（+10积分）</button>
-            </div>
-          )}
-          {currentRole === '李老师' && roleData?.task === '待审核' && roleData?.detail.includes('已打卡') && (
-            <div style={{ textAlign: 'center', marginTop: '20px' }}>
-              <button onClick={handleApprove} style={{ padding: '10px 24px', borderRadius: '30px', border: 'none', background: '#5a7d5a', color: '#fff', fontSize: '16px', cursor: 'pointer' }}>签字确认</button>
-            </div>
-          )}
-        </div>
+        {/* 【第60天新增】角色任务卡：老师端已迁至首页「📋 今日备忘录」（移走不复制），这里只保留学生端原有卡片（内容与样式不变） */}
+        {(currentRole === '学生' || currentRole === '学生智能体') && (
+          <div style={{ ...boxStyle, background: '#fdfcf0' }}>
+            <div style={{ textAlign: 'center', fontSize: '18px', color: '#8b4513', marginBottom: '10px' }}>{roleData ? `📋 ${roleData.name} 的任务` : '加载中...'}</div>
+            <div style={{ textAlign: 'center', color: '#555', lineHeight: '1.8' }}>{roleData ? roleData.detail : '正在获取数据...'}</div>
+            {currentRole === '学生' && roleData?.detail.includes('请记得') && (
+              <div style={{ textAlign: 'center', marginTop: '20px' }}>
+                <button onClick={handleCheckIn} style={{ padding: '10px 24px', borderRadius: '30px', border: 'none', background: '#8b4513', color: '#fff', fontSize: '16px', cursor: 'pointer' }}>立即打卡（+10积分）</button>
+              </div>
+            )}
+          </div>
+        )}
 
         {(currentRole === '李老师' || currentRole === '李老师智能体') && teacherTab === 'clinic' && (
           <div style={{ ...boxStyle, background: '#fff9f0' }}>
@@ -2226,7 +2288,7 @@ export default function App() {
         {/* 【第59天重构】📸 现场辅助记录（三卡合一：🎙️录音 + 📷拍照 + 💓把脉 → 先写入文本框，再“追加到病历”） */}
         {(currentRole === '李老师' || currentRole === '李老师智能体') && teacherTab === 'clinic' && (
           <div style={{ ...boxStyle, background: '#f0f7f0' }}>
-            <div style={{ fontSize: '18px', color: '#5a7d5a', fontWeight: 'bold', marginBottom: '6px' }}>📸 现场辅助记录（老师口述 → AI整理）</div>
+            <div style={{ fontSize: '18px', color: '#5a7d5a', fontWeight: 'bold', marginBottom: '6px' }}>📸 现场辅助记录（录音 → AI整理）</div>
             <div style={{ fontSize: '12px', color: '#999', marginBottom: '12px' }}>
               写入目标：{clinicTargetDraft ? `${clinicTargetDraft.patient_name} 的病历草案` : '（暂无待处理病历草案，请先在“面诊队列”或“搜索学生”里选一位学生）'}
             </div>
