@@ -7,6 +7,8 @@ interface Patient { name: string; teacher_name: string; guardian_name: string; r
 interface PatientRecord { id: number; patient_name: string; ai_draft: string; final_plan: string; doctor: string; }
 interface PatientProfile { patient_name: string; gender: string; birth_date: string; birth_time: string; birth_place: string; location: string; bazi?: string; wuxing?: string; }
 interface Teacher { name: string; description: string; }
+// 【第62天调整】老师端页签：首页 / 诊室 / 管理（原「学生」+「库存」合并） / 设置
+type TeacherTab = 'home' | 'clinic' | 'manage' | 'settings'
 
 const boxStyle: React.CSSProperties = { background: '#fdfcf0', border: '1px solid #d4c8a8', borderRadius: '12px', padding: '24px', marginBottom: '20px', boxShadow: '0 4px 12px rgba(0,0,0,0.06)' }
 const inputStyle: React.CSSProperties = { width: '100%', padding: '8px', borderRadius: '6px', border: '1px solid #d4c8a8', fontFamily: 'serif', marginBottom: '8px', boxSizing: 'border-box' }
@@ -85,8 +87,8 @@ export default function App() {
   const [previewDraft, setPreviewDraft] = useState<{ id: number; content: string } | null>(null)
   const [draftTags, setDraftTags] = useState<{ [draftId: number]: { area: string; symptom: string } }>({})
 
-  // 【第57天新增】老师端页签（首页/诊室/学生/库存/设置），切换时不清空 selectedPatient
-  const [teacherTab, setTeacherTab] = useState('home')
+  // 【第57天新增 / 第62天调整】老师端页签（首页/诊室/管理/设置），切换时不清空 selectedPatient
+  const [teacherTab, setTeacherTab] = useState<TeacherTab>('home')
   // 【第57天新增】诊室：老师搜索学生（前端过滤 teacherPatients）
   const [studentSearch, setStudentSearch] = useState('')
 
@@ -1103,16 +1105,15 @@ export default function App() {
     return slots.map(s => s).join('、')
   }
 
-  // 【第57天新增】老师端页签定义
+  // 【第57天新增 / 第62天调整】老师端页签定义：首页 / 诊室 / 管理（原「学生」+「库存」合并为 1 个页签） / 设置
   const isTeacherRole = currentRole === '李老师' || currentRole === '李老师智能体'
-  const teacherTabs = [
+  const teacherTabs: { key: TeacherTab; label: string }[] = [
     { key: 'home', label: '🏠 首页' },
     { key: 'clinic', label: '🩺 诊室' },
-    { key: 'students', label: '👥 学生' },
-    { key: 'inventory', label: '💊 库存' },
+    { key: 'manage', label: '🗂️ 管理' },
     { key: 'settings', label: '⚙️ 设置' }
   ]
-  const teacherTabBtnStyle = (key: string): React.CSSProperties => ({
+  const teacherTabBtnStyle = (key: TeacherTab): React.CSSProperties => ({
     flex: 1, padding: '10px 4px', borderRadius: '10px', border: '1px solid #8b4513',
     cursor: 'pointer', fontFamily: 'serif', fontSize: '13px', whiteSpace: 'nowrap',
     backgroundColor: teacherTab === key ? '#8b4513' : '#fdfcf0',
@@ -1394,7 +1395,7 @@ export default function App() {
 
         <h1 style={{ textAlign: 'center', color: '#8b4513', borderBottom: '2px solid #d4c8a8', paddingBottom: '15px', marginBottom: '30px', fontSize: '28px', letterSpacing: '2px' }}>知衡 · 中医治未病社区</h1>
 
-        {/* 【第57天新增】老师端 5 页签导航（学生端不显示） */}
+        {/* 【第57天新增 / 第62天调整】老师端 4 页签导航（首页/诊室/管理/设置；学生端不显示） */}
         {isTeacherRole && (
           <div style={{ display: 'flex', gap: '6px', marginBottom: '20px', background: '#fdfcf0', border: '1px solid #d4c8a8', borderRadius: '12px', padding: '6px', boxShadow: '0 4px 12px rgba(0,0,0,0.06)' }}>
             {teacherTabs.map(t => (
@@ -1403,7 +1404,8 @@ export default function App() {
           </div>
         )}
 
-        {huangli && (
+        {/* 【第62天调整】黄历卡片只在首页显示（老师端切到诊室/管理/设置时隐藏；学生端始终显示） */}
+        {(huangli && (!isTeacherRole || teacherTab === 'home')) && (
           <div style={boxStyle}>
             <div style={{ textAlign: 'center', fontSize: '18px', color: '#333', marginBottom: '5px' }}>
               <span style={{ fontWeight: 'bold' }}>{huangli.date}</span> · {huangli.lunar}
@@ -1665,7 +1667,8 @@ export default function App() {
           </div>
         )}
 
-        {(currentRole === '李老师' || currentRole === '李老师智能体') && teacherTab === 'students' && (
+        {/* 【第62天调整】管理页签 · 学生（在上）：学生管理 */}
+        {(currentRole === '李老师' || currentRole === '李老师智能体') && teacherTab === 'manage' && (
           <div style={{ ...boxStyle, background: '#f0f7f0' }}>
             <div style={{ fontSize: '18px', color: '#5a7d5a', fontWeight: 'bold', marginBottom: '10px' }}>👥 学生管理（{teacherPatients.length}人）</div>
             {/* 【第58天新增】老师端设置学生提醒频率（A 每天 / B 隔天 / C 每周），与学生端 localStorage 共享 */}
@@ -2087,8 +2090,24 @@ export default function App() {
           </div>
         )}
 
-        {/* 【第51天新增】中药材库存 */}
-        {(currentRole === '李老师' || currentRole === '李老师智能体') && teacherTab === 'inventory' && (
+        {/* 【第62天调整】管理页签 · 学生（在上）：基础档案（原「学生」页签卡片，并入学生管理区，排在库存上方） */}
+        {isTeacherRole && teacherTab === 'manage' && profile && (
+          <div style={{ ...boxStyle, background: '#fffaf0' }}>
+            <div style={{ fontSize: '18px', color: '#8b4513', fontWeight: 'bold', marginBottom: '15px' }}>📋 {selectedPatient} 的基础档案（供辨证参考）</div>
+            <div style={{ fontSize: '14px', color: '#333', lineHeight: '2' }}>
+              <div>性别：{profile.gender || '未填写'}</div>
+              <div>出生日期：{profile.birth_date || '未填写'}</div>
+              <div>出生时间：{profile.birth_time ? (timeOptions.find(t => t.value === profile.birth_time)?.label || profile.birth_time) : '未填写（时辰未知，按子时推算）'}</div>
+              <div>出生地：{profile.birth_place || '未填写'}</div>
+              <div>现居住地：{profile.location || '未填写'}</div>
+              <div style={{ marginTop: '8px', paddingTop: '8px', borderTop: '1px dashed #d4c8a8', color: '#8b4513', fontWeight: 'bold' }}>八字：{profile.bazi || '缺少出生日期，无法推算'}</div>
+              {profile.wuxing && (<div style={{ color: '#5a7d5a', fontWeight: 'bold' }}>五行体质参考：{profile.wuxing}</div>)}
+            </div>
+          </div>
+        )}
+
+        {/* 【第51天新增 / 第62天调整】中药材库存（合并进「管理」页签，排在学生卡片下方） */}
+        {(currentRole === '李老师' || currentRole === '李老师智能体') && teacherTab === 'manage' && (
           <div style={boxStyle}>
             <h3 style={{ color: '#8b4513', textAlign: 'center', marginBottom: '12px' }}>💊 中药材库存</h3>
             <div style={{ marginBottom: '12px' }}>
@@ -2219,21 +2238,6 @@ export default function App() {
                 )}
               </div>
             )}
-          </div>
-        )}
-
-        {(currentRole === '李老师' || currentRole === '李老师智能体') && teacherTab === 'students' && profile && (
-          <div style={{ ...boxStyle, background: '#fffaf0' }}>
-            <div style={{ fontSize: '18px', color: '#8b4513', fontWeight: 'bold', marginBottom: '15px' }}>📋 {selectedPatient} 的基础档案（供辨证参考）</div>
-            <div style={{ fontSize: '14px', color: '#333', lineHeight: '2' }}>
-              <div>性别：{profile.gender || '未填写'}</div>
-              <div>出生日期：{profile.birth_date || '未填写'}</div>
-              <div>出生时间：{profile.birth_time ? (timeOptions.find(t => t.value === profile.birth_time)?.label || profile.birth_time) : '未填写（时辰未知，按子时推算）'}</div>
-              <div>出生地：{profile.birth_place || '未填写'}</div>
-              <div>现居住地：{profile.location || '未填写'}</div>
-              <div style={{ marginTop: '8px', paddingTop: '8px', borderTop: '1px dashed #d4c8a8', color: '#8b4513', fontWeight: 'bold' }}>八字：{profile.bazi || '缺少出生日期，无法推算'}</div>
-              {profile.wuxing && (<div style={{ color: '#5a7d5a', fontWeight: 'bold' }}>五行体质参考：{profile.wuxing}</div>)}
-            </div>
           </div>
         )}
 
