@@ -6,6 +6,8 @@
 """
 import agent
 import json
+import database
+from datetime import datetime, timedelta
 
 
 # ============ 基础接口 ============
@@ -350,3 +352,67 @@ def test_remote_prescription_does_not_deduct(client):
     pres = client.get("/api/prescriptions?teacher_name=李老师").json()
     assert len(pres) == 1
     assert pres[0]["is_remote"] == 1
+
+
+# ============ 测试：老师智能体（沉默学生请示闭环） ============
+
+def _seed_silent_student(name, days=40):
+    """测试用：建学生 + 关联到李老师，并把 last_active_at 改成 days 天前"""
+    database.add_patient(name, "self", "本人", "男", "2015-05-01", "09:00", "广东省广州市", "广东省广州市")
+    database.add_patient_teacher(name, "李老师")
+    conn = database.get_connection()
+    conn.execute("UPDATE patients SET last_active_at = ? WHERE name = ?",
+                 ((datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d"), name))
+    conn.commit()
+    conn.close()
+
+
+def test_agent_scan_silent_student(client):
+    """智能体扫描：发现沉默学生 → 生成请示 → 老师确认执行后从待办中消失"""
+    _seed_silent_student("王小明", days=40)
+
+    r = client.post("/api/agent/scan?teacher_name=李老师")
+    assert r.status_code == 200
+    assert r.json()["new_tasks"] >= 1
+
+    r = client.get("/api/agent/tasks?teacher_name=李老师&status=pending")
+    assert r.status_code == 200
+    tasks = r.json()
+    assert any("王小明" in t["title"] for t in tasks)
+
+    task = [t for t in tasks if "王小明" in t["title"]][0]
+    assert "40" in task["title"]  # 例："王小明 已沉默 40 天"
+    assert task["category"] == "student"
+    assert task["task_type"] == "request"
+    assert task["status"] == "pending"
+    assert task["action"]["action"] == "send_care_notice"
+    assert task["action"]["patient_name"] == "王小明"
+
+    r = client.post(f"/api/agent/tasks/{task['id']}/resolve", json={"decision": "approved"})
+    assert r.status_code == 200
+    assert r.json()["message"] == "已处理"
+
+    r = client.get("/api/agent/tasks?teacher_name=李老师&status=pending")
+    assert all(t["id"] != task["id"] for t in r.json())
+
+
+def test_agent_task_reject(client):
+    """智能体扫描：老师忽略请示 → 状态变为 rejected，不再出现在待办里"""
+    _seed_silent_student("王小明", days=40)
+
+    r = client.post("/api/agent/scan?teacher_name=李老师")
+    assert r.status_code == 200
+
+    tasks = client.get("/api/agent/tasks?teacher_name=李老师&status=pending").json()
+    task = [t for t in tasks if "王小明" in t["title"]][0]
+
+    r = client.post(f"/api/agent/tasks/{task['id']}/resolve", json={"decision": "rejected"})
+    assert r.status_code == 200
+    assert r.json()["message"] == "已处理"
+
+    pending = client.get("/api/agent/tasks?teacher_name=李老师&status=pending").json()
+    assert all(t["id"] != task["id"] for t in pending)
+
+    rejected = client.get("/api/agent/tasks?teacher_name=李老师&status=rejected").json()
+    assert [t["id"] for t in rejected] == [task["id"]]
+    assert rejected[0]["status"] == "rejected"

@@ -110,6 +110,9 @@ export default function App() {
   const [savingPrescription, setSavingPrescription] = useState(false)
   // 【第53天新增】远程诊疗（勾选则不扣库存；默认当面诊疗，扣库存）
   const [prescriptionRemote, setPrescriptionRemote] = useState(false)
+  // 【第56天新增】智能体工作台（沉默学生请示闭环）
+  const [agentTasks, setAgentTasks] = useState<any[]>([])
+  const [scanningAgent, setScanningAgent] = useState(false)
     // 【第50天新增】可视化排班网格
   const [calendarData, setCalendarData] = useState<any>(null)
   const [selectedDayIndex, setSelectedDayIndex] = useState(0)
@@ -192,6 +195,13 @@ export default function App() {
       fetchHolidays()
       fetchCalendar()
       fetchHerbs()
+    }
+  }, [currentRole, selectedTeacher])
+
+  // 【第56天新增】智能体工作台：进入老师端时拉取待办请示
+  useEffect(() => {
+    if (currentRole === '李老师' || currentRole === '李老师智能体') {
+      fetchAgentTasks()
     }
   }, [currentRole, selectedTeacher])
 
@@ -443,6 +453,37 @@ export default function App() {
       })
       .catch(() => { setSavingPrescription(false); alert('保存失败，请重试') })
   }
+
+  // 【第56天新增】智能体工作台：拉取待办 / 触发扫描 / 处理请示（确认执行或忽略）
+  const fetchAgentTasks = () => {
+    fetch(`/api/agent/tasks?teacher_name=${encodeURIComponent(selectedTeacher)}&status=pending`)
+      .then(res => res.json())
+      .then(data => setAgentTasks(data))
+      .catch(() => setAgentTasks([]))
+  }
+
+  const handleAgentScan = () => {
+    setScanningAgent(true)
+    fetch(`/api/agent/scan?teacher_name=${encodeURIComponent(selectedTeacher)}`, { method: 'POST' })
+      .then(res => res.json())
+      .then(data => {
+        setScanningAgent(false)
+        fetchAgentTasks()
+        alert(data.new_tasks > 0 ? `智能体发现 ${data.new_tasks} 条新请示` : '没有发现新的待办')
+      })
+      .catch(() => { setScanningAgent(false); alert('扫描失败，请重试') })
+  }
+
+  const handleResolveAgentTask = (taskId: number, decision: 'approved' | 'rejected') => {
+    fetch(`/api/agent/tasks/${taskId}/resolve`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ decision })
+    })
+      .then(res => res.json())
+      .then(() => fetchAgentTasks())
+      .catch(() => alert('处理失败，请重试'))
+  }
     // 【第50天新增】拉取可视化排班数据
   const fetchCalendar = () => {
     fetch(`/api/appointments/calendar?teacher_name=${selectedTeacher}`)
@@ -458,29 +499,6 @@ export default function App() {
       const newSlots = daySlots.includes(slot) ? daySlots.filter(s => s !== slot) : [...daySlots, slot].sort()
       return { ...prev, [day]: newSlots }
     })
-  }
-
-  // 获取某个日期对应的星期几（0=周日...6=周六）
-  const getDayOfWeek = (dateStr: string) => {
-    if (!dateStr) return -1
-    // 【第49天修复】兼容多种日期格式，统一为 YYYY-MM-DD
-    let normalized = dateStr.replace(/\//g, '-')
-    if (normalized.match(/^\d{2}-\d{2}-\d{4}$/)) {
-      const parts = normalized.split('-')
-      normalized = `${parts[2]}-${parts[0]}-${parts[1]}`
-    }
-    const d = new Date(normalized + 'T00:00:00')
-    return isNaN(d.getTime()) ? -1 : d.getDay()
-  }
-
-  // 根据日期获取该日期的可用时间段
-  const getAvailableSlotsForDate = (dateStr: string) => {
-    if (!dateStr || !schedule) return []
-    // 【第49天新增】节假日优先判断
-    if (holidays.includes(dateStr)) return []
-    const day = getDayOfWeek(dateStr)
-    if (day < 0) return []
-    return schedule[String(day)] || []
   }
 
   // ============== 学生端行为 ==============
@@ -886,16 +904,6 @@ export default function App() {
     fetch(`/api/appointments/${id}/cancel`, { method: 'POST' }).then(() => fetchAppointments())
   }
 
-  // 日期辅助
-  const getTomorrowStr = () => {
-    const t = new Date(); t.setDate(t.getDate() + 1)
-    return t.toISOString().split('T')[0]
-  }
-  const getMaxDateStr = () => {
-    const t = new Date(); t.setMonth(t.getMonth() + 1)
-    return t.toISOString().split('T')[0]
-  }
-
   const roleBtnStyle = (role: string): React.CSSProperties => ({
     padding: '8px 16px', margin: '5px', borderRadius: '20px', border: '1px solid #8b4513',
     cursor: 'pointer', fontFamily: 'serif', fontSize: '14px',
@@ -924,8 +932,6 @@ export default function App() {
   const morningSlots = ['08:00','08:30','09:00','09:30','10:00','10:30','11:00','11:30']
   const afternoonSlots = ['12:00','12:30','13:00','13:30','14:00','14:30','15:00','15:30','16:00','16:30','17:00','17:30']
   const eveningSlots = ['18:00','18:30','19:00','19:30','20:00']
-
-  const weekDayNames = ['日', '一', '二', '三', '四', '五', '六']
 
   const formatSlots = (slots: string[]) => {
     if (!slots || slots.length === 0) return '休息'
@@ -980,6 +986,36 @@ export default function App() {
             )}
             <div style={{ textAlign: 'center', color: '#5a7d5a', fontSize: '16px', marginBottom: '10px' }}>🌿 {huangli.solar_term}：{huangli.health_trend}</div>
             <div style={{ textAlign: 'center', background: '#fff8e7', padding: '15px', borderRadius: '8px', color: '#8b4513' }}>📝 今日作业：{huangli.homework}</div>
+          </div>
+        )}
+
+        {/* 【第56天新增】智能体工作台（老师端：沉默学生请示闭环） */}
+        {(currentRole === '李老师' || currentRole === '李老师智能体') && (
+          <div style={boxStyle}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '10px' }}>
+              <div style={{ fontSize: '18px', color: '#8b4513', fontWeight: 'bold' }}>🤖 智能体工作台</div>
+              <button
+                onClick={handleAgentScan}
+                disabled={scanningAgent}
+                style={{ padding: '4px 12px', borderRadius: '15px', border: '1px solid #8b4513', background: 'transparent', color: '#8b4513', cursor: 'pointer', fontSize: '12px', fontFamily: 'serif' }}
+              >{scanningAgent ? '扫描中…' : '🔍 立即扫描'}</button>
+            </div>
+            {agentTasks.length === 0 ? (
+              <div style={{ textAlign: 'center', color: '#999', fontSize: '13px', padding: '8px' }}>暂无待办</div>
+            ) : (
+              agentTasks.map(task => (
+                <div key={task.id} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '10px', background: '#fffdf5', border: '1px solid #f0e9d6', borderRadius: '8px', marginBottom: '8px' }}>
+                  <div style={{ flex: 1, marginRight: '10px' }}>
+                    <div style={{ fontSize: '14px', color: '#8b4513', fontWeight: 'bold', marginBottom: '4px' }}>{task.title}</div>
+                    <div style={{ fontSize: '12px', color: '#666', lineHeight: '1.5' }}>{task.content}</div>
+                  </div>
+                  <div style={{ whiteSpace: 'nowrap' }}>
+                    <button onClick={() => handleResolveAgentTask(task.id, 'approved')} style={{ marginRight: '6px', padding: '4px 10px', borderRadius: '4px', border: 'none', background: '#5a7d5a', color: '#fdfcf0', cursor: 'pointer', fontSize: '12px', fontFamily: 'serif' }}>确认执行</button>
+                    <button onClick={() => handleResolveAgentTask(task.id, 'rejected')} style={{ padding: '4px 10px', borderRadius: '4px', border: 'none', background: '#d4c8a8', color: '#333', cursor: 'pointer', fontSize: '12px', fontFamily: 'serif' }}>忽略</button>
+                  </div>
+                </div>
+              ))
+            )}
           </div>
         )}
 

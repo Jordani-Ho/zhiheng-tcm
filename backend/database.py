@@ -204,6 +204,34 @@ def init_db():
     except sqlite3.OperationalError:
         pass
 
+    # 【第56天新增】老师智能体任务表（请示 / 汇报）
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS agent_tasks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        teacher_name TEXT,
+        task_type TEXT,       -- 'request'（请示）或 'report'（汇报）
+        category TEXT,        -- 'student' / 'schedule' / 'inventory' / 'appointment' / 'billing'
+        title TEXT,           -- 短标题（如"张三已沉默 35 天"）
+        content TEXT,         -- 详细描述
+        action_data TEXT,     -- JSON，可执行的行动参数
+        status TEXT DEFAULT 'pending',  -- pending / approved / rejected / done
+        created_at TEXT,
+        resolved_at TEXT
+    )
+    """)
+
+    # 【第56天新增】智能体行动日志表（闭环留痕）
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS agent_action_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        teacher_name TEXT,
+        task_id INTEGER,
+        action TEXT,          -- 'send_notice' / 'approve' / 'reject'
+        detail TEXT,
+        created_at TEXT
+    )
+    """)
+
     conn.commit()
 
     # 初始化默认数据
@@ -987,3 +1015,119 @@ def get_prescriptions(teacher_name, patient_name=None):
     rows = conn.execute(f"SELECT * FROM prescriptions WHERE {where} ORDER BY id DESC", params).fetchall()
     conn.close()
     return [_prescription_row_to_dict(r) for r in rows]
+
+
+# ============ 老师智能体（一期：沉默学生请示闭环） ============
+
+def _agent_task_row_to_dict(row):
+    """内部工具函数：一行 agent_tasks 转 dict，并把 action_data 解析成 action 参数字典。"""
+    d = dict(row)
+    try:
+        d["action"] = json.loads(d["action_data"]) if d["action_data"] else {}
+    except Exception:
+        d["action"] = {}
+    return d
+
+
+def scan_silent_students(teacher_name, silent_days=30):
+    """扫描该老师名下的「沉默学生」（last_active_at 为空，或距今 >= silent_days 天），
+    给还没有 pending 同类请示的学生各建一条 agent_tasks 请示，返回新建任务数。"""
+    conn = get_connection()
+    cur = conn.cursor()
+    students = cur.execute("""
+        SELECT p.name AS name, p.last_active_at AS last_active_at
+        FROM patients p
+        INNER JOIN patient_teachers pt ON p.name = pt.patient_name
+        WHERE pt.teacher_name = ? AND pt.status = 'active'
+        ORDER BY p.name
+    """, (teacher_name,)).fetchall()
+
+    now = datetime.now()
+    created = 0
+    for student in students:
+        name = student["name"]
+        last_active = student["last_active_at"]
+        if last_active:
+            # last_active_at 统一存 "YYYY-MM-DD"（见 insert_transcription / update_homework_status）
+            try:
+                last_dt = datetime.strptime(last_active[:10], "%Y-%m-%d")
+                days = max(0, (now - last_dt).days)
+            except Exception:
+                days = silent_days  # 时间格式异常，按沉默阈值处理
+            if days < silent_days:
+                continue
+        else:
+            days = silent_days  # 从未互动过：按沉默阈值计
+
+        action_data = json.dumps({"action": "send_care_notice", "patient_name": name}, ensure_ascii=False)
+        # 该学生已有 pending 同类请示 → 不重复建（用 action_data 全等匹配，避免同名子串误判）
+        exists = cur.execute(
+            "SELECT id FROM agent_tasks WHERE teacher_name = ? AND category = 'student' AND status = 'pending' AND action_data = ?",
+            (teacher_name, action_data)
+        ).fetchone()
+        if exists:
+            continue
+
+        cur.execute("""
+            INSERT INTO agent_tasks (teacher_name, task_type, category, title, content, action_data, status, created_at)
+            VALUES (?, 'request', 'student', ?, ?, ?, 'pending', ?)
+        """, (teacher_name, f"{name} 已沉默 {days} 天",
+              f"该学生已 {days} 天未打卡或发陈述。是否发送关怀通知？",
+              action_data, now.isoformat()))
+        created += 1
+
+    conn.commit()
+    conn.close()
+    return created
+
+
+def get_agent_tasks(teacher_name, status='pending'):
+    """按 created_at DESC 返回该老师的智能体任务；status 传空则不过滤状态。"""
+    conn = get_connection()
+    if status:
+        rows = conn.execute(
+            "SELECT * FROM agent_tasks WHERE teacher_name = ? AND status = ? ORDER BY created_at DESC, id DESC",
+            (teacher_name, status)
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM agent_tasks WHERE teacher_name = ? ORDER BY created_at DESC, id DESC",
+            (teacher_name,)
+        ).fetchall()
+    conn.close()
+    return [_agent_task_row_to_dict(r) for r in rows]
+
+
+def resolve_agent_task(task_id, decision):
+    """老师决策：decision='approved' / 'rejected'。
+    更新任务状态 + 记一条 agent_action_log；approved 且 action 为 send_care_notice 时再记一条发送日志（暂不真实推送）。"""
+    conn = get_connection()
+    cur = conn.cursor()
+    task = cur.execute("SELECT * FROM agent_tasks WHERE id = ?", (task_id,)).fetchone()
+    if task is None:
+        conn.close()
+        return None
+
+    now = datetime.now().isoformat()
+    new_status = 'approved' if decision == 'approved' else 'rejected'
+    cur.execute("UPDATE agent_tasks SET status = ?, resolved_at = ? WHERE id = ?", (new_status, now, task_id))
+    cur.execute("""
+        INSERT INTO agent_action_log (teacher_name, task_id, action, detail, created_at)
+        VALUES (?, ?, ?, ?, ?)
+    """, (task["teacher_name"], task_id, 'approve' if new_status == 'approved' else 'reject',
+          ("老师确认执行：" if new_status == 'approved' else "老师忽略：") + str(task["title"]), now))
+
+    if new_status == 'approved':
+        try:
+            action = json.loads(task["action_data"]) if task["action_data"] else {}
+        except Exception:
+            action = {}
+        if action.get("action") == "send_care_notice":
+            cur.execute("""
+                INSERT INTO agent_action_log (teacher_name, task_id, action, detail, created_at)
+                VALUES (?, ?, 'send_notice', ?, ?)
+            """, (task["teacher_name"], task_id, f"已发送关怀通知给 {action.get('patient_name')}", now))
+
+    conn.commit()
+    conn.close()
+    return {"message": "已处理", "status": new_status}

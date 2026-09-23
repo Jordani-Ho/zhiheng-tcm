@@ -846,3 +846,34 @@ def api_create_prescription(data: PrescriptionInput):
 @app.get("/api/prescriptions")
 def api_get_prescriptions(teacher_name: str, patient_name: str = ""):
     return database.get_prescriptions(teacher_name, patient_name or None)
+
+
+# ============ Pydantic 模型：老师智能体 ============
+
+class AgentResolveInput(BaseModel):
+    decision: str  # 'approved'（确认执行）或 'rejected'（忽略）
+
+
+# ============ 接口：老师智能体（一期：沉默学生请示闭环） ============
+
+@app.post("/api/agent/scan")
+def api_agent_scan(teacher_name: str):
+    """扫描沉默学生，生成请示任务。"""
+    return {"new_tasks": database.scan_silent_students(teacher_name)}
+
+
+@app.get("/api/agent/tasks")
+def api_get_agent_tasks(teacher_name: str, status: str = "pending"):
+    """老师智能体待办列表。"""
+    return database.get_agent_tasks(teacher_name, status)
+
+
+@app.post("/api/agent/tasks/{task_id}/resolve")
+def api_resolve_agent_task(task_id: int, data: AgentResolveInput):
+    """老师决策：确认执行 / 忽略。"""
+    if data.decision not in ("approved", "rejected"):
+        raise HTTPException(status_code=400, detail="decision 只能是 approved 或 rejected")
+    result = database.resolve_agent_task(task_id, data.decision)
+    if result is None:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    return {"message": "已处理"}
