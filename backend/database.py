@@ -186,6 +186,24 @@ def init_db():
     )
     """)
 
+    # 【第52天新增】药方表（结构化存储，便于后续按药方自动扣减库存）
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS prescriptions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        teacher_name TEXT,
+        patient_name TEXT DEFAULT '',
+        items_json TEXT,       -- [{herb_name, amount, unit}]
+        note TEXT DEFAULT '',  -- 药方备注，可空
+        created_at TEXT,
+        is_remote INTEGER DEFAULT 0  -- 【第53天新增】0=当面诊疗(扣库存) 1=远程诊疗(不扣库存)
+    )
+    """)
+    # 【第53天新增】如果表已存在（旧表），尝试补加 is_remote 字段
+    try:
+        cursor.execute("ALTER TABLE prescriptions ADD COLUMN is_remote INTEGER DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass
+
     conn.commit()
 
     # 初始化默认数据
@@ -909,3 +927,63 @@ def batch_deduct_herbs(teacher_name, items):
     conn.commit()
     conn.close()
     return {"success": True, "failed_herb": None}
+
+
+# ============ 药方（开方：中药首字联想 + 结构化存储） ============
+
+def search_herbs_by_prefix(teacher_name, prefix):
+    """首字联想：只看药材名首字。输入「甘」匹配「甘草」，不匹配「炙甘草」。prefix 为空返回 []。"""
+    if not prefix:
+        return []
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT * FROM herb_inventory WHERE teacher_name = ? AND herb_name LIKE ? || '%' ORDER BY herb_name",
+        (teacher_name, prefix)
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return [{"id": r["id"], "herb_name": r["herb_name"], "stock_amount": r["stock_amount"], "unit": r["unit"]} for r in rows]
+
+
+def create_prescription(teacher_name, patient_name, items, note="", is_remote=0):
+    """保存药方：当面诊疗（is_remote=0）先原子扣减库存，扣成功才保存药方；
+    远程诊疗（is_remote=1）只保存药方、不动库存。"""
+    # 1. 当面诊疗：先扣库存
+    if not is_remote:
+        deducted = batch_deduct_herbs(teacher_name, items)
+        # 2. 扣失败 → 整体失败，不写药方
+        if not deducted["success"]:
+            return {"error": "库存不足：" + str(deducted["failed_herb"]), "failed_herb": deducted["failed_herb"]}
+    # 3. 扣成功（或远程）→ 插入 prescriptions 表
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO prescriptions (teacher_name, patient_name, items_json, note, is_remote, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+        (teacher_name, patient_name or "", json.dumps(items, ensure_ascii=False), note or "", 1 if is_remote else 0, datetime.now().isoformat())
+    )
+    conn.commit()
+    prescription_id = cur.lastrowid
+    conn.close()
+    return {"message": "已保存", "id": prescription_id}
+
+
+def _prescription_row_to_dict(row):
+    """内部工具函数：一行 prescriptions 转 dict，并顺带把 items_json 解析成 items 列表。"""
+    d = dict(row)
+    d["items"] = json.loads(d["items_json"]) if d["items_json"] else []
+    return d
+
+
+def get_prescriptions(teacher_name, patient_name=None):
+    """返回该老师的药方；给了 patient_name 就再按患者过滤。最新在前。"""
+    conn = get_connection()
+    conditions = ["teacher_name = ?"]
+    params = [teacher_name]
+    if patient_name:
+        conditions.append("patient_name = ?")
+        params.append(patient_name)
+    where = " AND ".join(conditions)
+    rows = conn.execute(f"SELECT * FROM prescriptions WHERE {where} ORDER BY id DESC", params).fetchall()
+    conn.close()
+    return [_prescription_row_to_dict(r) for r in rows]

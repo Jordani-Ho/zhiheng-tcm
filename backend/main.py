@@ -817,3 +817,32 @@ def api_delete_herb(herb_id: int):
     if not ok:
         raise HTTPException(status_code=404, detail="药材不存在")
     return {"message": "已删除"}
+
+
+# ============ Pydantic 模型：开方 ============
+
+class PrescriptionInput(BaseModel):
+    teacher_name: str
+    patient_name: str = ""
+    items: list  # [{herb_name: str, amount: float, unit: str}]
+    note: str = ""
+    is_remote: bool = False  # 【第53天新增】True=远程诊疗（学生自采，不扣库存）；默认当面诊疗（扣库存）
+
+
+# ============ 接口：开方（中药材首字联想 + 药方结构化存储） ============
+
+@app.get("/api/herbs/search")
+def api_search_herbs(teacher_name: str, prefix: str = ""):
+    """药材首字联想：prefix 为空时返回空数组。"""
+    return database.search_herbs_by_prefix(teacher_name, prefix)
+
+
+@app.post("/api/prescriptions")
+def api_create_prescription(data: PrescriptionInput):
+    """【第53天新增】当面诊疗（默认）先扣库存，扣失败返回 {"error": ...} 且不保存；远程诊疗只存药方。"""
+    return database.create_prescription(data.teacher_name, data.patient_name, data.items, data.note, data.is_remote)
+
+
+@app.get("/api/prescriptions")
+def api_get_prescriptions(teacher_name: str, patient_name: str = ""):
+    return database.get_prescriptions(teacher_name, patient_name or None)

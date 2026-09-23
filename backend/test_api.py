@@ -5,6 +5,7 @@
     pytest -v
 """
 import agent
+import json
 
 
 # ============ 基础接口 ============
@@ -238,3 +239,114 @@ def test_herbs_batch_deduct(client):
     client.post("/api/herbs", json={"teacher_name": "李老师", "herb_name": "黄芪", "stock_amount": 200, "unit": "克", "warn_threshold": 50})
     r = client.post("/api/herbs/batch-deduct", json={"teacher_name": "李老师", "items": [{"herb_name": "黄芪", "amount": 30}]})
     assert r.status_code == 200
+
+
+# ============ 测试：开方（中药材首字联想 + 药方结构化存储） ============
+
+def test_herbs_search_by_prefix(client):
+    """首字联想：输入「甘」只匹配「甘草」，不匹配「炙甘草」"""
+    client.post("/api/herbs", json={"teacher_name": "李老师", "herb_name": "甘草", "stock_amount": 100, "unit": "克", "warn_threshold": 50})
+    client.post("/api/herbs", json={"teacher_name": "李老师", "herb_name": "炙甘草", "stock_amount": 80, "unit": "克", "warn_threshold": 50})
+
+    r = client.get("/api/herbs/search?teacher_name=李老师&prefix=甘")
+    assert r.status_code == 200
+    names = [h["herb_name"] for h in r.json()]
+    assert names == ["甘草"]
+    assert "炙甘草" not in names
+
+    r = client.get("/api/herbs/search?teacher_name=李老师&prefix=炙")
+    assert r.status_code == 200
+    assert [h["herb_name"] for h in r.json()] == ["炙甘草"]
+
+    # prefix 为空 → 空数组
+    r = client.get("/api/herbs/search?teacher_name=李老师&prefix=")
+    assert r.status_code == 200
+    assert r.json() == []
+
+
+def test_prescriptions_crud(client):
+    """药方结构化存储：items 序列化为 JSON，可按老师/患者查回"""
+    items = [
+        {"herb_name": "甘草", "amount": 6, "unit": "克"},
+        {"herb_name": "黄芪", "amount": 15, "unit": "克"},
+    ]
+    r = client.post("/api/prescriptions", json={
+        "teacher_name": "李老师",
+        "patient_name": "张三",
+        "items": items,
+        "note": "水煎服，日一剂",
+        # 【第53天新增】本用例只验证「结构化存储/查询」，走远程诊疗以免依赖库存；扣减逻辑由下面两个用例覆盖
+        "is_remote": True
+    })
+    assert r.status_code == 200
+    created = r.json()
+    assert created["id"] > 0
+    assert created["message"]
+
+    # 按老师查
+    r = client.get("/api/prescriptions?teacher_name=李老师")
+    assert r.status_code == 200
+    pres = r.json()
+    assert len(pres) == 1
+    assert pres[0]["id"] == created["id"]
+    assert pres[0]["patient_name"] == "张三"
+    assert pres[0]["note"] == "水煎服，日一剂"
+
+    # items_json 反序列化后是 [{herb_name, amount, unit}, ...]
+    restored = json.loads(pres[0]["items_json"])
+    assert restored == items
+    assert [i["herb_name"] for i in restored] == ["甘草", "黄芪"]
+
+    # 再按患者过滤
+    r = client.get("/api/prescriptions?teacher_name=李老师&patient_name=张三")
+    assert r.status_code == 200
+    assert len(r.json()) == 1
+    r = client.get("/api/prescriptions?teacher_name=李老师&patient_name=李四")
+    assert r.status_code == 200
+    assert r.json() == []
+
+
+# ============ 测试：开方后自动扣减库存（区分当面/远程） ============
+
+def test_local_prescription_deducts_stock(client):
+    """当面诊疗（默认）：保存药方时自动扣减库存"""
+    client.post("/api/herbs", json={"teacher_name": "李老师", "herb_name": "当归", "stock_amount": 100, "unit": "克", "warn_threshold": 50})
+
+    r = client.post("/api/prescriptions", json={
+        "teacher_name": "李老师",
+        "patient_name": "张三",
+        "items": [{"herb_name": "当归", "amount": 20, "unit": "克"}],
+        "note": "",
+        "is_remote": False
+    })
+    assert r.status_code == 200
+    assert "error" not in r.json()
+
+    herbs = {h["herb_name"]: h for h in client.get("/api/herbs?teacher_name=李老师").json()}
+    assert herbs["当归"]["stock_amount"] == 80
+
+    pres = client.get("/api/prescriptions?teacher_name=李老师").json()
+    assert len(pres) == 1
+    assert pres[0]["is_remote"] == 0
+
+
+def test_remote_prescription_does_not_deduct(client):
+    """远程诊疗：学生自采，库存不动"""
+    client.post("/api/herbs", json={"teacher_name": "李老师", "herb_name": "白芍", "stock_amount": 100, "unit": "克", "warn_threshold": 50})
+
+    r = client.post("/api/prescriptions", json={
+        "teacher_name": "李老师",
+        "patient_name": "张三",
+        "items": [{"herb_name": "白芍", "amount": 20, "unit": "克"}],
+        "note": "",
+        "is_remote": True
+    })
+    assert r.status_code == 200
+    assert "error" not in r.json()
+
+    herbs = {h["herb_name"]: h for h in client.get("/api/herbs?teacher_name=李老师").json()}
+    assert herbs["白芍"]["stock_amount"] == 100
+
+    pres = client.get("/api/prescriptions?teacher_name=李老师").json()
+    assert len(pres) == 1
+    assert pres[0]["is_remote"] == 1

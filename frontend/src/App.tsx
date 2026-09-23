@@ -96,10 +96,20 @@ export default function App() {
     // 【第51天新增】中药材库存
   const [herbs, setHerbs] = useState<any[]>([])
   const [showHerbForm, setShowHerbForm] = useState(false)
-  const [herbForm, setHerbForm] = useState({ herb_name: '', stock_amount: 0, unit: '克', warn_threshold: 50 })
+  // 【第55天新增】库存量/预警阈值改为默认留空（保存时留空分别按 0 / 50 处理），用户不必先删 0
+  const [herbForm, setHerbForm] = useState({ herb_name: '', stock_amount: '', unit: '克', warn_threshold: '' })
   const [showLowOnly, setShowLowOnly] = useState(false)
   const [adjustingHerb, setAdjustingHerb] = useState<any>(null)
   const [adjustDelta, setAdjustDelta] = useState(0)
+  // 【第52天新增】开方（中药材首字联想 + 药方结构化存储）
+  const [prescriptionPatient, setPrescriptionPatient] = useState('')
+  // 【第54天新增】amount 改为 string：默认留空，用户不必先删 0（保存时按 0 处理）
+  const [prescriptionItems, setPrescriptionItems] = useState<{ herb_name: string; amount: string }[]>([{ herb_name: '', amount: '' }])
+  const [herbSuggestions, setHerbSuggestions] = useState<{ [index: number]: any[] }>({})
+  const herbSearchTimers = useRef<{ [index: number]: any }>({})
+  const [savingPrescription, setSavingPrescription] = useState(false)
+  // 【第53天新增】远程诊疗（勾选则不扣库存；默认当面诊疗，扣库存）
+  const [prescriptionRemote, setPrescriptionRemote] = useState(false)
     // 【第50天新增】可视化排班网格
   const [calendarData, setCalendarData] = useState<any>(null)
   const [selectedDayIndex, setSelectedDayIndex] = useState(0)
@@ -307,21 +317,30 @@ export default function App() {
   }
 
   const handleSaveHerb = () => {
+    // 【第55天新增】两个数字框留空时按默认值处理：库存量 0、预警阈值 50（显式填 0 则按 0）
+    const numOr = (value: string, fallback: number) => {
+      const trimmed = value.trim()
+      if (trimmed === '') return fallback
+      const parsed = parseFloat(trimmed)
+      return Number.isNaN(parsed) ? fallback : parsed
+    }
+    const stockAmount = numOr(herbForm.stock_amount, 0)
+    const warnThreshold = numOr(herbForm.warn_threshold, 50)
     fetch('/api/herbs', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         teacher_name: selectedTeacher,
         herb_name: herbForm.herb_name,
-        stock_amount: herbForm.stock_amount,
+        stock_amount: stockAmount,
         unit: herbForm.unit,
-        warn_threshold: herbForm.warn_threshold
+        warn_threshold: warnThreshold
       })
     })
       .then(res => res.json())
       .then(() => {
         setShowHerbForm(false)
-        setHerbForm({ herb_name: '', stock_amount: 0, unit: '克', warn_threshold: 50 })
+        setHerbForm({ herb_name: '', stock_amount: '', unit: '克', warn_threshold: '' })
         fetchHerbs()
       })
   }
@@ -357,6 +376,72 @@ export default function App() {
     fetch(`/api/herbs/${herbId}`, { method: 'DELETE' })
       .then(res => res.json())
       .then(() => fetchHerbs())
+  }
+
+  // 【第52天新增】开方：药材名首字联想（debounce 300ms）
+  const searchHerbSuggestions = (index: number, prefix: string) => {
+    if (herbSearchTimers.current[index]) clearTimeout(herbSearchTimers.current[index])
+    const keyword = prefix.trim()
+    if (!keyword) {
+      setHerbSuggestions(prev => ({ ...prev, [index]: [] }))
+      return
+    }
+    herbSearchTimers.current[index] = setTimeout(() => {
+      fetch(`/api/herbs/search?teacher_name=${encodeURIComponent(selectedTeacher)}&prefix=${encodeURIComponent(keyword)}`)
+        .then(res => res.json())
+        .then(data => setHerbSuggestions(prev => ({ ...prev, [index]: data })))
+        .catch(() => setHerbSuggestions(prev => ({ ...prev, [index]: [] })))
+    }, 300)
+  }
+
+  const changePrescriptionItem = (index: number, field: 'herb_name' | 'amount', value: string) => {
+    setPrescriptionItems(prev => prev.map((item, i) => {
+      if (i !== index) return item
+      // 【第54天新增】数量按原始字符串存，允许空值
+      return field === 'amount' ? { ...item, amount: value } : { ...item, herb_name: value }
+    }))
+    if (field === 'herb_name') searchHerbSuggestions(index, value)
+  }
+
+  const pickHerbSuggestion = (index: number, herb: any) => {
+    setPrescriptionItems(prev => prev.map((item, i) => (i === index ? { ...item, herb_name: herb.herb_name } : item)))
+    setHerbSuggestions(prev => ({ ...prev, [index]: [] }))
+  }
+
+  const addPrescriptionItem = () => {
+    setPrescriptionItems(prev => [...prev, { herb_name: '', amount: '' }])
+  }
+
+  const handleSavePrescription = () => {
+    const items = prescriptionItems
+      .filter(item => item.herb_name.trim())
+      // 【第54天新增】留空视为 0 克
+      .map(item => ({ herb_name: item.herb_name.trim(), amount: parseFloat(item.amount) || 0, unit: '克' }))
+    if (items.length === 0) { alert('请至少填写一味药材'); return }
+    setSavingPrescription(true)
+    fetch('/api/prescriptions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      // 一期没有备注输入框，note 先传空串（后端/表结构已支持）
+      body: JSON.stringify({ teacher_name: selectedTeacher, patient_name: prescriptionPatient, items, note: '', is_remote: prescriptionRemote })
+    })
+      .then(res => res.json())
+      .then(data => {
+        setSavingPrescription(false)
+        // 当面诊疗扣库存失败 → 弹窗提示，不保存（表单保留，方便老师改数量）
+        if (data.error) { alert(data.error); return }
+        setPrescriptionPatient('')
+        setPrescriptionItems([{ herb_name: '', amount: '' }])
+        setHerbSuggestions({})
+        setPrescriptionRemote(false)
+        if (prescriptionRemote) {
+          alert('药方已保存（远程诊疗，库存未变）')
+        } else {
+          fetchHerbs()
+          alert('药方已保存，库存已扣减')
+        }
+      })
+      .catch(() => { setSavingPrescription(false); alert('保存失败，请重试') })
   }
     // 【第50天新增】拉取可视化排班数据
   const fetchCalendar = () => {
@@ -1440,9 +1525,9 @@ export default function App() {
             <div style={{ ...boxStyle, width: '320px' }}>
               <h4 style={{ color: '#8b4513' }}>新增 / 更新药材</h4>
               <input style={inputStyle} placeholder="药材名" value={herbForm.herb_name} onChange={e => setHerbForm({ ...herbForm, herb_name: e.target.value })} />
-              <input style={inputStyle} type="number" placeholder="库存量" value={herbForm.stock_amount} onChange={e => setHerbForm({ ...herbForm, stock_amount: parseFloat(e.target.value) || 0 })} />
+              <input style={inputStyle} type="number" placeholder="库存量" value={herbForm.stock_amount} onChange={e => setHerbForm({ ...herbForm, stock_amount: e.target.value })} />
               <input style={inputStyle} placeholder="单位" value={herbForm.unit} onChange={e => setHerbForm({ ...herbForm, unit: e.target.value })} />
-              <input style={inputStyle} type="number" placeholder="预警阈值" value={herbForm.warn_threshold} onChange={e => setHerbForm({ ...herbForm, warn_threshold: parseFloat(e.target.value) || 0 })} />
+              <input style={inputStyle} type="number" placeholder="预警阈值" value={herbForm.warn_threshold} onChange={e => setHerbForm({ ...herbForm, warn_threshold: e.target.value })} />
               <div style={{ marginTop: '12px' }}>
                 <button onClick={handleSaveHerb} style={{ marginRight: '8px', background: '#8b4513', color: '#fdfcf0', border: 'none', padding: '6px 12px', borderRadius: '4px', cursor: 'pointer', fontFamily: 'serif' }}>保存</button>
                 <button onClick={() => setShowHerbForm(false)} style={{ background: '#d4c8a8', border: 'none', padding: '6px 12px', borderRadius: '4px', cursor: 'pointer', fontFamily: 'serif' }}>取消</button>
@@ -1461,6 +1546,74 @@ export default function App() {
                 <button onClick={submitAdjust} style={{ marginRight: '8px', background: '#8b4513', color: '#fdfcf0', border: 'none', padding: '6px 12px', borderRadius: '4px', cursor: 'pointer', fontFamily: 'serif' }}>确认</button>
                 <button onClick={() => setAdjustingHerb(null)} style={{ background: '#d4c8a8', border: 'none', padding: '6px 12px', borderRadius: '4px', cursor: 'pointer', fontFamily: 'serif' }}>取消</button>
               </div>
+            </div>
+          </div>
+        )}
+
+        {/* 【第52天新增】开方（中药材首字联想 + 结构化存储） */}
+        {(currentRole === '李老师' || currentRole === '李老师智能体') && (
+          <div style={boxStyle}>
+            <h3 style={{ color: '#8b4513', textAlign: 'center', marginBottom: '12px' }}>📝 开方</h3>
+            <input
+              style={inputStyle}
+              placeholder="患者姓名"
+              value={prescriptionPatient}
+              onChange={e => setPrescriptionPatient(e.target.value)}
+            />
+            {/* 【第53天新增】远程诊疗开关：勾选则不扣老师库存 */}
+            <label style={{ display: 'flex', alignItems: 'center', fontFamily: 'serif', color: '#5a7d5a', marginBottom: '12px', cursor: 'pointer' }}>
+              <input
+                type="checkbox"
+                checked={prescriptionRemote}
+                onChange={e => setPrescriptionRemote(e.target.checked)}
+                style={{ marginRight: '6px' }}
+              />
+              远程诊疗（学生自采，不扣库存）
+            </label>
+            {prescriptionItems.map((item, index) => (
+              <div key={index} style={{ display: 'flex', gap: '8px', marginBottom: '8px' }}>
+                <div style={{ flex: 2, position: 'relative' }}>
+                  <input
+                    style={{ ...inputStyle, marginBottom: 0 }}
+                    placeholder="药材名（输入首字联想）"
+                    value={item.herb_name}
+                    onChange={e => changePrescriptionItem(index, 'herb_name', e.target.value)}
+                  />
+                  {(herbSuggestions[index] || []).length > 0 && (
+                    <div style={{ position: 'absolute', top: '100%', left: 0, right: 0, background: '#fffdf5', border: '1px solid #d4c8a8', borderRadius: '4px', zIndex: 20, maxHeight: '160px', overflowY: 'auto' }}>
+                      {(herbSuggestions[index] || []).map(h => (
+                        <div
+                          key={h.id}
+                          onClick={() => pickHerbSuggestion(index, h)}
+                          style={{ padding: '6px 8px', cursor: 'pointer', fontFamily: 'serif', borderBottom: '1px solid #f0e9d6' }}
+                        >
+                          {h.herb_name}（库存 {h.stock_amount}{h.unit}）
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+                <input
+                  style={{ ...inputStyle, marginBottom: 0, width: '90px' }}
+                  type="number"
+                  placeholder="克数"
+                  value={item.amount}
+                  onChange={e => changePrescriptionItem(index, 'amount', e.target.value)}
+                />
+                {/* 【第54天新增】固定单位标签（暂不支持切换单位） */}
+                <span style={{ alignSelf: 'center', color: '#999', fontSize: '13px', fontFamily: 'serif' }}>克</span>
+              </div>
+            ))}
+            <div style={{ marginTop: '12px' }}>
+              <button
+                onClick={addPrescriptionItem}
+                style={{ marginRight: '8px', background: '#5a7d5a', color: '#fdfcf0', border: 'none', padding: '6px 12px', borderRadius: '4px', cursor: 'pointer', fontFamily: 'serif' }}
+              >+ 添加一味药</button>
+              <button
+                onClick={handleSavePrescription}
+                disabled={savingPrescription}
+                style={{ background: '#8b4513', color: '#fdfcf0', border: 'none', padding: '6px 12px', borderRadius: '4px', cursor: 'pointer', fontFamily: 'serif' }}
+              >{savingPrescription ? '保存中...' : '保存药方'}</button>
             </div>
           </div>
         )}
