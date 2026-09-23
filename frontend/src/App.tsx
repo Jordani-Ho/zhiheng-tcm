@@ -11,6 +11,10 @@ interface Teacher { name: string; description: string; }
 const boxStyle: React.CSSProperties = { background: '#fdfcf0', border: '1px solid #d4c8a8', borderRadius: '12px', padding: '24px', marginBottom: '20px', boxShadow: '0 4px 12px rgba(0,0,0,0.06)' }
 const inputStyle: React.CSSProperties = { width: '100%', padding: '8px', borderRadius: '6px', border: '1px solid #d4c8a8', fontFamily: 'serif', marginBottom: '8px', boxSizing: 'border-box' }
 const dateSelectStyle: React.CSSProperties = { padding: '8px', borderRadius: '6px', border: '1px solid #d4c8a8', fontFamily: 'serif', marginRight: '6px', marginBottom: '8px' }
+// 【第59天新增】诊室二期：把脉可选的脉象（可多选）
+const PULSE_TYPES = ['浮', '沉', '迟', '数', '虚', '实', '滑', '涩']
+// 【第59天重构】拍照清晰度检测阈值：用 Canvas 计算拉普拉斯方差，< 100 视为“可能不够清晰”，弹提示让老师确认
+const IMAGE_SHARPNESS_THRESHOLD = 100
 
 export default function App() {
   const now = new Date()
@@ -82,6 +86,25 @@ export default function App() {
   const [teacherTab, setTeacherTab] = useState('home')
   // 【第57天新增】诊室：老师搜索学生（前端过滤 teacherPatients）
   const [studentSearch, setStudentSearch] = useState('')
+
+  // 【第59天重构】诊室二期：把脉记录（录音 / 拍照 / AI整理 已合并进“现场辅助记录”卡片，复用该卡片自己的 state）
+  const [pulseTypes, setPulseTypes] = useState<string[]>([])
+  const [pulseRate, setPulseRate] = useState('')
+  const [pulseNote, setPulseNote] = useState('')
+
+  // 【第59天修复】本地占位草案：诊室里选中学生、但该学生还没有“正在编辑的草案”时，
+  // 前端本地先生成一条空草案（id 为负数），让录音 / 拍照 / 把脉立刻可用；老师点“保存病历修改”时再落库。
+  const [localDrafts, setLocalDrafts] = useState<Draft[]>([])
+  // 诊室可编辑草案 = 后端草案 + 本地占位草案（同一学生以后端草案为准，避免重复显示）
+  const clinicDrafts: Draft[] = [...drafts, ...localDrafts.filter(ld => !drafts.some(d => d.patient_name === ld.patient_name))]
+
+  // 本地占位草案一旦被后端草案取代（落库成功 / 学生提交陈述），就清理掉，避免签字后又“复活”
+  useEffect(() => {
+    setLocalDrafts(prev => {
+      if (!prev.some(ld => drafts.some(d => d.patient_name === ld.patient_name))) return prev
+      return prev.filter(ld => !drafts.some(d => d.patient_name === ld.patient_name))
+    })
+  }, [drafts])
 
   // 【第58天新增】学生智能体一期：照镜子 + 习惯追踪 + 周报（纯前端 localStorage）
   // 照镜子：记录今日早/晚是否已完成，key 形如 { patientName: { 'YYYY-MM-DD': { morning: true, evening: false } } }
@@ -679,7 +702,37 @@ export default function App() {
       .catch(() => { setTeacherLiveStructurizing(prev => ({ ...prev, [draftId]: false })); alert("AI 整理失败") })
   }
 
+  // 【第59天修复】本地占位草案（id < 0）落库：后端没有“新建草案”接口，因此用已有接口完成三步——
+  // ① 找到该学生最新的一条“学生陈述”→ ② POST /api/generate-draft 生成真实草案 → ③ PUT 写入老师编辑的内容
+  // 如果该学生还没有陈述，则提示老师：内容已暂存在本地草稿。
+  const saveLocalDraftToBackend = (localId: number, newContent: string) => {
+    const local = localDrafts.find(d => d.id === localId)
+    if (!local) return
+    // 先更新本地显示，避免看起来“没保存”
+    setLocalDrafts(prev => prev.map(d => d.id === localId ? { ...d, content: newContent } : d))
+    const keepLocal = () => alert('该学生还没有提交陈述，内容已暂存在本地草稿（学生提交陈述后，再点“保存病历修改”即可落库）')
+    fetch(`/api/transcriptions?patient_name=${encodeURIComponent(local.patient_name)}&teacher_name=${encodeURIComponent(selectedTeacher)}`)
+      .then(r => r.json())
+      .then((list: any[]) => {
+        const latest = Array.isArray(list) && list.length > 0 ? list[0] : null
+        if (!latest) { keepLocal(); return }
+        return fetch(`/api/generate-draft?transcript_id=${latest.id}`, { method: 'POST' })
+          .then(r => r.json())
+          .then((res: any) => {
+            if (!res || !res.draft_id) { keepLocal(); return }
+            return fetch(`/api/drafts/${res.draft_id}`, {
+              method: 'PUT',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ content: newContent })
+            }).then(() => fetchDrafts())
+          })
+      })
+      .catch(() => keepLocal())
+  }
+
   const handleEditDraft = (draftId: number, newContent: string) => {
+    // 【第59天修复】本地占位草案还没有后端 id，先走“落库”流程，不能直接 PUT
+    if (draftId < 0) { saveLocalDraftToBackend(draftId, newContent); return }
     fetch(`/api/drafts/${draftId}`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
@@ -690,33 +743,101 @@ export default function App() {
   const handleAppendTeacherNote = (draftId: number) => {
     const text = teacherLiveText[draftId]
     if (!text || !text.trim()) { alert("请先录音或输入内容"); return }
-    const draft = drafts.find(x => x.id === draftId)
+    const draft = clinicDrafts.find(x => x.id === draftId)   // 【第59天修复】兼容本地占位草案
     if (draft) {
       handleEditDraft(draftId, draft.content + '\n\n【现场记录】\n' + text)
       setTeacherLiveText(prev => ({ ...prev, [draftId]: '' }))
     }
   }
 
-  const handleLivePhotoUpload = (draftId: number, e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0]
+  // 【第59天重构】图片清晰度检测（纯前端，无依赖）：Canvas 画图 → 灰度 → 3x3 拉普拉斯卷积 → 求方差
+  // 返回 true = 通过（或无法读取像素时放行），false = 可能模糊，交给老师决定是否继续使用
+  const checkImageSharpness = (file: File): Promise<boolean> => {
+    return new Promise(resolve => {
+      const url = URL.createObjectURL(file)
+      const img = new Image()
+      img.onload = () => {
+        try {
+          // 缩放到最长边 1000px：兼顾速度与高频细节
+          const scale = Math.min(1, 1000 / Math.max(img.width, img.height))
+          const w = Math.max(3, Math.round(img.width * scale))
+          const h = Math.max(3, Math.round(img.height * scale))
+          const canvas = document.createElement('canvas')
+          canvas.width = w
+          canvas.height = h
+          const ctx = canvas.getContext('2d')
+          if (!ctx) { resolve(true); return }
+          ctx.drawImage(img, 0, 0, w, h)
+          const data = ctx.getImageData(0, 0, w, h).data
+          // 1) 转灰度
+          const gray = new Float64Array(w * h)
+          for (let i = 0; i < w * h; i++) {
+            gray[i] = 0.299 * data[i * 4] + 0.587 * data[i * 4 + 1] + 0.114 * data[i * 4 + 2]
+          }
+          // 2) 拉普拉斯卷积（跳过最外圈像素）：4g(i) - g(i-1) - g(i+1) - g(i-w) - g(i+w)
+          const lap = new Float64Array(w * h)
+          let lapSum = 0
+          let count = 0
+          for (let y = 1; y < h - 1; y++) {
+            for (let x = 1; x < w - 1; x++) {
+              const i = y * w + x
+              const v = 4 * gray[i] - gray[i - 1] - gray[i + 1] - gray[i - w] - gray[i + w]
+              lap[i] = v
+              lapSum += v
+              count++
+            }
+          }
+          if (count === 0) { resolve(true); return }
+          // 3) 拉普拉斯方差：越小越模糊
+          const mean = lapSum / count
+          let variance = 0
+          for (let y = 1; y < h - 1; y++) {
+            for (let x = 1; x < w - 1; x++) {
+              const diff = lap[y * w + x] - mean
+              variance += diff * diff
+            }
+          }
+          resolve(variance / count >= IMAGE_SHARPNESS_THRESHOLD)
+        } catch (e) {
+          resolve(true)   // 取不到像素（如图片跨域）就不拦截
+        } finally {
+          URL.revokeObjectURL(url)
+        }
+      }
+      img.onerror = () => { URL.revokeObjectURL(url); resolve(true) }
+      img.src = url
+    })
+  }
+
+  // 【第59天重构】拍照/上传（诊室页签内唯一拍照入口）：清晰度检测 → 上传 /api/upload-temp → URL 追加到文本框末尾
+  const handleLivePhotoUpload = async (draftId: number, e: React.ChangeEvent<HTMLInputElement>) => {
+    const input = e.target
+    const file = input.files?.[0]
     if (!file) return
+    const sharp = await checkImageSharpness(file)
+    if (!sharp && !window.confirm('图片可能不够清晰，建议重拍。是否仍要使用？\n\n【确定】继续使用　【取消】重拍')) {
+      input.value = ''
+      return
+    }
     setLiveUploading(prev => ({ ...prev, [draftId]: true }))
     const formData = new FormData()
     formData.append('file', file)
     fetch('/api/upload-temp', { method: 'POST', body: formData })
       .then(r => r.json())
       .then(d => {
-        const draft = drafts.find(x => x.id === draftId)
-        if (draft) {
-          handleEditDraft(draftId, draft.content + `\n\n【现场照片】\n[老师现场拍摄：${d.url}]`)
-        }
         setLiveUploading(prev => ({ ...prev, [draftId]: false }))
+        input.value = ''
+        if (d && d.url) {
+          setTeacherLiveText(prev => ({ ...prev, [draftId]: (prev[draftId] || '') + '\n\n【上传的图片】' + d.url }))
+        } else {
+          alert('图片上传失败，请重试')
+        }
       })
-      .catch(() => { setLiveUploading(prev => ({ ...prev, [draftId]: false })); alert("照片上传失败") })
+      .catch(() => { setLiveUploading(prev => ({ ...prev, [draftId]: false })); input.value = ''; alert('图片上传失败，请重试') })
   }
 
   const handlePreviewFullRecord = (draftId: number) => {
-    const draft = drafts.find(x => x.id === draftId)
+    const draft = clinicDrafts.find(x => x.id === draftId)   // 【第59天修复】兼容本地占位草案
     if (!draft) return
     const plan = finalPlans[draftId] || ''
     if (!plan.trim()) { alert("请先填写施治方案，再预览完整病历"); return }
@@ -727,6 +848,8 @@ export default function App() {
   const handleFinalSign = () => {
     if (!previewDraft) return
     const currentPreview = previewDraft
+    // 【第59天修复】本地占位草案还没有后端 id，先落库再签字，否则签字会静默失败
+    if (currentPreview.id < 0) { alert('这是本地新建的草案，请先点“保存病历修改”落库，然后再签字'); return }
     const tagData = draftTags[currentPreview.id]
     const saveTags = (): Promise<any> => {
       const tags: any[] = []
@@ -984,6 +1107,51 @@ export default function App() {
   // 【第57天新增】诊室：当前就诊学生信息（上次就诊时间 + 当前状态）
   const currentStudentInfo = teacherPatients.find((s: any) => s.name === selectedPatient)
   const lastVisitDate = patientRecords.length > 0 ? `第 ${patientRecords[0].id} 号病历` : '首次就诊'
+
+  // ============== 【第59天新增】诊室二期：老师工作状态（录音转文字 / 拍照上传 / 把脉记录） ==============
+  // 目标病历草案：优先“当前就诊学生”，其次第一条可编辑草案（含本地占位草案；老师点“保存病历修改”才落库）
+  const clinicTargetDraft = clinicDrafts.find(x => x.patient_name === selectedPatient) || clinicDrafts[0] || null
+  // 【第59天重构】“现场辅助记录”卡片统一用这个 id 作为读写目标（null = 暂无草案，控件置灰）
+  const clinicTargetId: number | null = clinicTargetDraft ? clinicTargetDraft.id : null
+  const speechSupported = !!((window as any).SpeechRecognition || (window as any).webkitSpeechRecognition)
+
+  // 【第59天修复】按 id 更新编辑框内容：id < 0 = 本地占位草案（只改 state），id > 0 = 后端草案
+  const setClinicDraftById = (draftId: number, updater: (d: Draft) => Draft) => {
+    if (draftId < 0) setLocalDrafts(prev => prev.map(d => d.id === draftId ? updater(d) : d))
+    else setDrafts(prev => prev.map(d => d.id === draftId ? updater(d) : d))
+  }
+
+  // 【第59天修复】诊室里选中学生（面诊队列 / 搜索结果）：
+  // 该学生没有“正在编辑的草案”时，前端本地生成一条空草案（不调后端），让录音/拍照/把脉立刻可用
+  const selectClinicPatient = (name: string) => {
+    setSelectedPatient(name)
+    setLocalDrafts(prev => {
+      if (drafts.some(d => d.patient_name === name)) return prev   // 后端已有草案
+      if (prev.some(d => d.patient_name === name)) return prev     // 本地已有占位草案
+      return [...prev, { id: -Date.now(), transcript_id: 0, patient_name: name, content: '', signed: false }]
+    })
+  }
+
+  // （【第59天重构】原 appendToClinicDraft / stopClinicRecording 已随“三卡合一”移除：
+  //   把脉、拍照改为先写入“现场辅助记录”文本框，录音复用卡片自带的 startTeacherLiveRecording）
+
+
+
+
+
+  // 功能3：把脉记录（纯前端，格式化成一段文字追加到“现场辅助记录”上方文本框末尾）
+  const handlePulseRecord = () => {
+    if (pulseTypes.length === 0 && !pulseRate.trim() && !pulseNote.trim()) { alert('请先选择脉象或填写脉率'); return }
+    if (!clinicTargetDraft) { alert('暂无待处理病历草案，请先在“面诊队列”或“搜索学生”里选一位学生'); return }
+    const parts: string[] = ['脉象：' + (pulseTypes.length > 0 ? pulseTypes.join('、') : '未填写')]
+    if (pulseRate.trim()) parts.push('脉率：' + pulseRate.trim() + '次/分')
+    if (pulseNote.trim()) parts.push('备注：' + pulseNote.trim())
+    const id = clinicTargetDraft.id
+    setTeacherLiveText(prev => ({ ...prev, [id]: (prev[id] || '') + '\n\n【把脉记录】' + parts.join('；') }))
+    setPulseTypes([])
+    setPulseRate('')
+    setPulseNote('')
+  }
 
   // ============== 【第58天新增】学生智能体一期：照镜子 + 习惯追踪 + 周报 ==============
   // 从 localStorage 读取（首次挂载时）
@@ -1832,73 +2000,7 @@ export default function App() {
           </div>
         )}
 
-        {/* 【第52天新增】开方（中药材首字联想 + 结构化存储） */}
-        {(currentRole === '李老师' || currentRole === '李老师智能体') && teacherTab === 'inventory' && (
-          <div style={boxStyle}>
-            <h3 style={{ color: '#8b4513', textAlign: 'center', marginBottom: '12px' }}>📝 开方</h3>
-            <input
-              style={inputStyle}
-              placeholder="患者姓名"
-              value={prescriptionPatient}
-              onChange={e => setPrescriptionPatient(e.target.value)}
-            />
-            {/* 【第53天新增】远程诊疗开关：勾选则不扣老师库存 */}
-            <label style={{ display: 'flex', alignItems: 'center', fontFamily: 'serif', color: '#5a7d5a', marginBottom: '12px', cursor: 'pointer' }}>
-              <input
-                type="checkbox"
-                checked={prescriptionRemote}
-                onChange={e => setPrescriptionRemote(e.target.checked)}
-                style={{ marginRight: '6px' }}
-              />
-              远程诊疗（学生自采，不扣库存）
-            </label>
-            {prescriptionItems.map((item, index) => (
-              <div key={index} style={{ display: 'flex', gap: '8px', marginBottom: '8px' }}>
-                <div style={{ flex: 2, position: 'relative' }}>
-                  <input
-                    style={{ ...inputStyle, marginBottom: 0 }}
-                    placeholder="药材名（输入首字联想）"
-                    value={item.herb_name}
-                    onChange={e => changePrescriptionItem(index, 'herb_name', e.target.value)}
-                  />
-                  {(herbSuggestions[index] || []).length > 0 && (
-                    <div style={{ position: 'absolute', top: '100%', left: 0, right: 0, background: '#fffdf5', border: '1px solid #d4c8a8', borderRadius: '4px', zIndex: 20, maxHeight: '160px', overflowY: 'auto' }}>
-                      {(herbSuggestions[index] || []).map(h => (
-                        <div
-                          key={h.id}
-                          onClick={() => pickHerbSuggestion(index, h)}
-                          style={{ padding: '6px 8px', cursor: 'pointer', fontFamily: 'serif', borderBottom: '1px solid #f0e9d6' }}
-                        >
-                          {h.herb_name}（库存 {h.stock_amount}{h.unit}）
-                        </div>
-                      ))}
-                    </div>
-                  )}
-                </div>
-                <input
-                  style={{ ...inputStyle, marginBottom: 0, width: '90px' }}
-                  type="number"
-                  placeholder="克数"
-                  value={item.amount}
-                  onChange={e => changePrescriptionItem(index, 'amount', e.target.value)}
-                />
-                {/* 【第54天新增】固定单位标签（暂不支持切换单位） */}
-                <span style={{ alignSelf: 'center', color: '#999', fontSize: '13px', fontFamily: 'serif' }}>克</span>
-              </div>
-            ))}
-            <div style={{ marginTop: '12px' }}>
-              <button
-                onClick={addPrescriptionItem}
-                style={{ marginRight: '8px', background: '#5a7d5a', color: '#fdfcf0', border: 'none', padding: '6px 12px', borderRadius: '4px', cursor: 'pointer', fontFamily: 'serif' }}
-              >+ 添加一味药</button>
-              <button
-                onClick={handleSavePrescription}
-                disabled={savingPrescription}
-                style={{ background: '#8b4513', color: '#fdfcf0', border: 'none', padding: '6px 12px', borderRadius: '4px', cursor: 'pointer', fontFamily: 'serif' }}
-              >{savingPrescription ? '保存中...' : '保存药方'}</button>
-            </div>
-          </div>
-        )}
+        {/* 【第59天重构】开方已移入“诊室 → 诊疗记录区”（与病历草案 / 病历标签 / 辨证施治方案同框），此处不再单独显示 */}
 
         {/* 角色切换卡片 */}
         <div style={boxStyle}>
@@ -2042,7 +2144,7 @@ export default function App() {
               clinicQueue.map((a: any) => (
                 <div
                   key={a.id}
-                  onClick={() => setSelectedPatient(a.patient_name)}
+                  onClick={() => selectClinicPatient(a.patient_name)}
                   style={{
                     display: 'flex', alignItems: 'center', padding: '10px', marginBottom: '6px',
                     background: selectedPatient === a.patient_name ? '#e8f4e8' : '#fff',
@@ -2075,7 +2177,7 @@ export default function App() {
                   {studentSearchResults.map((s: any) => (
                     <div
                       key={s.name}
-                      onClick={() => { setSelectedPatient(s.name); setStudentSearch('') }}
+                      onClick={() => { selectClinicPatient(s.name); setStudentSearch('') }}
                       style={{ padding: '8px', cursor: 'pointer', fontFamily: 'serif', borderBottom: '1px solid #f0e9d6', fontSize: '14px' }}
                     >
                       👤 {s.name}
@@ -2101,16 +2203,115 @@ export default function App() {
           </div>
         )}
 
+        {/* 【第59天重构】📸 现场辅助记录（三卡合一：🎙️录音 + 📷拍照 + 💓把脉 → 先写入文本框，再“追加到病历”） */}
         {(currentRole === '李老师' || currentRole === '李老师智能体') && teacherTab === 'clinic' && (
-          <div style={{ ...boxStyle, background: '#fcfdfa' }}>
-            <div style={{ textAlign: 'center', fontSize: '18px', color: '#8b4513', marginBottom: '15px' }}>📄 病历草案（老师智能体生成，待老师补充）</div>
-            {drafts.length === 0 ? (
-              <div style={{ textAlign: 'center', color: '#999' }}>暂无待处理病历</div>
-            ) : (
-              drafts.map(d => (
-                <div key={d.id} style={{ padding: '15px', border: '1px solid #e0e0e0', borderRadius: '8px', marginBottom: '15px', background: '#fff' }}>
-                  <div style={{ color: '#8b4513', fontWeight: 'bold', marginBottom: '5px' }}>学生：{d.patient_name}</div>
-                  <textarea value={d.content} onChange={(e) => { setDrafts(drafts.map(item => item.id === d.id ? { ...item, content: e.target.value } : item)) }} style={{ width: '100%', height: '180px', padding: '10px', borderRadius: '8px', border: '1px solid #d4c8a8', fontFamily: 'serif', fontSize: '13px', marginBottom: '10px', boxSizing: 'border-box', whiteSpace: 'pre-wrap' }} />
+          <div style={{ ...boxStyle, background: '#f0f7f0' }}>
+            <div style={{ fontSize: '18px', color: '#5a7d5a', fontWeight: 'bold', marginBottom: '6px' }}>📸 现场辅助记录（老师口述 → AI整理）</div>
+            <div style={{ fontSize: '12px', color: '#999', marginBottom: '12px' }}>
+              写入目标：{clinicTargetDraft ? `${clinicTargetDraft.patient_name} 的病历草案` : '（暂无待处理病历草案，请先在“面诊队列”或“搜索学生”里选一位学生）'}
+            </div>
+            {/* a) 文本输入 / 显示区 */}
+            <textarea
+              placeholder="点击下方 🎙️ 开始录音口述望闻问切，或直接打字；拍照、把脉也会先追加到这里..."
+              value={clinicTargetId !== null ? (teacherLiveText[clinicTargetId] || '') : ''}
+              onChange={e => { if (clinicTargetId !== null) setTeacherLiveText(prev => ({ ...prev, [clinicTargetId]: e.target.value })) }}
+              disabled={clinicTargetId === null}
+              style={{ width: '100%', minHeight: '110px', padding: '10px', borderRadius: '8px', border: '1px solid #b8d8c0', background: '#fff', fontFamily: 'serif', fontSize: '13px', marginBottom: '10px', boxSizing: 'border-box' }}
+            />
+            {/* b) 按钮行：🎙️ 录音 | 🤖 AI整理 | 📷 拍照（诊室页签内唯一拍照入口） */}
+            <div style={{ display: 'flex', gap: '8px', marginBottom: '10px' }}>
+              <button
+                onClick={() => { if (clinicTargetId !== null) startTeacherLiveRecording(clinicTargetId) }}
+                disabled={clinicTargetId === null || !speechSupported}
+                style={{ flex: 1, padding: '8px', borderRadius: '20px', border: 'none', background: (clinicTargetId === null || !speechSupported) ? '#ccc' : (teacherLiveRecording === clinicTargetId ? '#c0392b' : '#8b4513'), color: '#fff', cursor: (clinicTargetId === null || !speechSupported) ? 'not-allowed' : 'pointer', fontSize: '13px' }}
+              >
+                {clinicTargetId !== null && teacherLiveRecording === clinicTargetId ? '⏹ 停止录音' : '🎙️ 开始录音'}
+              </button>
+              <button
+                onClick={() => { if (clinicTargetId !== null) handleTeacherStructurize(clinicTargetId) }}
+                disabled={clinicTargetId === null || !!teacherLiveStructurizing[clinicTargetId]}
+                style={{ flex: 1, padding: '8px', borderRadius: '20px', border: '1px solid #5a7d5a', background: 'transparent', color: '#5a7d5a', cursor: clinicTargetId === null ? 'not-allowed' : 'pointer', fontSize: '13px' }}
+              >
+                {(clinicTargetId !== null && teacherLiveStructurizing[clinicTargetId]) ? 'AI整理中...' : '🤖 AI整理成病历格式'}
+              </button>
+              <label style={{ flex: 1, padding: '8px', borderRadius: '20px', border: '1px solid #8b4513', background: 'transparent', color: '#8b4513', cursor: clinicTargetId === null ? 'not-allowed' : 'pointer', fontSize: '13px', textAlign: 'center' }}>
+                {(clinicTargetId !== null && liveUploading[clinicTargetId]) ? '上传中...' : '📷 拍照'}
+                <input
+                  type="file"
+                  accept="image/*"
+                  capture="environment"
+                  disabled={clinicTargetId === null}
+                  onChange={(e) => { if (clinicTargetId !== null) { handleLivePhotoUpload(clinicTargetId, e) } }}
+                  style={{ display: 'none' }}
+                />
+              </label>
+            </div>
+            {!speechSupported && (
+              <div style={{ fontSize: '12px', color: '#c0392b', marginBottom: '8px' }}>当前浏览器不支持语音识别，请使用 Chrome 或 Edge</div>
+            )}
+            {clinicTargetId !== null && teacherLiveRecording === clinicTargetId && (
+              <div style={{ fontSize: '12px', color: '#c0392b', marginBottom: '8px' }}>🔴 正在录音，识别到的文字会实时写入上面的文本框</div>
+            )}
+            {/* c) 把脉记录子区域：脉象 / 脉率 / 备注 → 追加到上方文本框 */}
+            <div style={{ marginTop: '12px', padding: '12px', background: '#f7f4fd', borderRadius: '8px', border: '1px dashed #c9bde0' }}>
+              <div style={{ fontSize: '14px', color: '#8b4513', fontWeight: 'bold', marginBottom: '10px' }}>💓 把脉记录</div>
+              <div style={{ fontSize: '13px', color: '#333', marginBottom: '6px' }}>脉象（可多选）</div>
+              <div style={{ marginBottom: '10px' }}>
+                {PULSE_TYPES.map(p => {
+                  const active = pulseTypes.includes(p)
+                  return (
+                    <button
+                      key={p}
+                      onClick={() => setPulseTypes(prev => prev.includes(p) ? prev.filter(x => x !== p) : [...prev, p])}
+                      style={{ padding: '6px 16px', borderRadius: '20px', border: active ? '1px solid #8b4513' : '1px solid #d4c8a8', background: active ? '#8b4513' : '#fff', color: active ? '#fff' : '#8b4513', cursor: 'pointer', fontSize: '14px', fontFamily: 'serif', marginRight: '6px', marginBottom: '6px' }}
+                    >
+                      {p}
+                    </button>
+                  )
+                })}
+              </div>
+              <div style={{ display: 'flex', gap: '12px', marginBottom: '10px' }}>
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontSize: '13px', color: '#333', marginBottom: '6px' }}>脉率（次/分钟）</div>
+                  <input type="number" min="0" placeholder="如：78" value={pulseRate} onChange={e => setPulseRate(e.target.value)} style={{ ...inputStyle, marginBottom: 0 }} />
+                </div>
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontSize: '13px', color: '#333', marginBottom: '6px' }}>备注</div>
+                  <input placeholder="如：左关沉细" value={pulseNote} onChange={e => setPulseNote(e.target.value)} style={{ ...inputStyle, marginBottom: 0 }} />
+                </div>
+              </div>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '10px', flexWrap: 'wrap' }}>
+                <div style={{ fontSize: '12px', color: '#999' }}>
+                  预览：{`【把脉记录】脉象：${pulseTypes.length > 0 ? pulseTypes.join('、') : '未填写'}${pulseRate.trim() ? `；脉率：${pulseRate.trim()}次/分` : ''}${pulseNote.trim() ? `；备注：${pulseNote.trim()}` : ''}`}
+                </div>
+                <button onClick={handlePulseRecord} disabled={clinicTargetId === null} style={{ padding: '6px 18px', borderRadius: '20px', border: 'none', background: clinicTargetId === null ? '#ccc' : '#8b4513', color: '#fff', cursor: clinicTargetId === null ? 'not-allowed' : 'pointer', fontSize: '13px', whiteSpace: 'nowrap' }}>把脉记录追加到上方文本框</button>
+              </div>
+            </div>
+            {/* d) 追加到病历：把文本框内容写入病历草案 */}
+            <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: '12px' }}>
+              <button onClick={() => { if (clinicTargetId !== null) handleAppendTeacherNote(clinicTargetId) }} disabled={clinicTargetId === null} style={{ padding: '8px 24px', borderRadius: '20px', border: 'none', background: clinicTargetId === null ? '#ccc' : '#5a7d5a', color: '#fff', cursor: clinicTargetId === null ? 'not-allowed' : 'pointer', fontSize: '13px', fontWeight: 'bold' }}>追加到病历</button>
+            </div>
+          </div>
+        )}
+
+        {/* 【第59天重构】诊疗记录区：病历草案 / 病历标签 / 开方 / 辨证施治方案 同框（仅诊室页签） */}
+        {(currentRole === '李老师' || currentRole === '李老师智能体') && teacherTab === 'clinic' && (
+          <div style={{ ...boxStyle, background: '#fcfdfa', border: '1px solid #d4c8a8' }}>
+            <div style={{ textAlign: 'center', fontSize: '19px', color: '#8b4513', fontWeight: 'bold', marginBottom: '6px', paddingBottom: '12px', borderBottom: '1px solid #e6dcc2' }}>📋 诊疗记录区</div>
+            <div style={{ textAlign: 'center', fontSize: '12px', color: '#999', marginBottom: '16px' }}>病历草案 → 病历标签 → 开方 → 辨证施治方案（同一容器，分区之间用内嵌分隔线）</div>
+            {clinicDrafts.length === 0 && (
+              <div style={{ textAlign: 'center', color: '#999', marginBottom: '16px' }}>暂无待处理病历（在“面诊队列”或“搜索学生”里选一位学生即可开始记录）</div>
+            )}
+
+            {/* 分区 1/4：病历草案 */}
+            <div style={{ fontSize: '16px', color: '#8b4513', fontWeight: 'bold', marginBottom: '10px' }}>📄 病历草案（老师智能体生成，待老师补充）</div>
+            {clinicDrafts.map(d => (
+                <div key={d.id} style={{ paddingBottom: '12px', marginBottom: '12px', borderBottom: '1px dashed #ece3cd' }}>
+                  <div style={{ color: '#8b4513', fontWeight: 'bold', marginBottom: '5px' }}>
+                    学生：{d.patient_name}
+                    {d.id < 0 && <span style={{ marginLeft: '8px', fontSize: '12px', color: '#e67e22', fontWeight: 'normal' }}>🆕 本地新建（点“保存病历修改”落库）</span>}
+                  </div>
+                  <textarea value={d.content} onChange={(e) => { setClinicDraftById(d.id, item => ({ ...item, content: e.target.value })) }} style={{ width: '100%', height: '180px', padding: '10px', borderRadius: '8px', border: '1px solid #d4c8a8', fontFamily: 'serif', fontSize: '13px', marginBottom: '10px', boxSizing: 'border-box', whiteSpace: 'pre-wrap' }} />
                   <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: '10px' }}>
                     <button onClick={() => handleEditDraft(d.id, d.content)} style={{ padding: '6px 16px', borderRadius: '20px', border: '1px solid #8b4513', background: 'transparent', color: '#8b4513', cursor: 'pointer' }}>保存病历修改</button>
                   </div>
@@ -2134,44 +2335,102 @@ export default function App() {
                       ))}
                     </div>
                   )}
+                </div>
+              ))}
 
-                  <div style={{ marginTop: '15px', padding: '12px', background: '#f0f7f0', borderRadius: '8px', border: '1px dashed #5a7d5a' }}>
-                    <div style={{ fontSize: '14px', color: '#5a7d5a', fontWeight: 'bold', marginBottom: '10px' }}>📸 现场辅助记录（老师口述 → AI整理）</div>
-                    <textarea placeholder="点击下方 🎤 录音，口述望闻问切内容；或直接打字..." value={teacherLiveText[d.id] || ''} onChange={e => setTeacherLiveText(prev => ({ ...prev, [d.id]: e.target.value }))} style={{ width: '100%', minHeight: '100px', padding: '10px', borderRadius: '8px', border: '1px solid #b8d8c0', background: '#fff', fontFamily: 'serif', fontSize: '13px', marginBottom: '10px', boxSizing: 'border-box' }} />
-                    <div style={{ display: 'flex', gap: '8px', marginBottom: '10px' }}>
-                      <button onClick={() => startTeacherLiveRecording(d.id)} style={{ flex: 1, padding: '8px', borderRadius: '20px', border: 'none', background: teacherLiveRecording === d.id ? '#c0392b' : '#8b4513', color: '#fff', cursor: 'pointer', fontSize: '13px' }}>
-                        {teacherLiveRecording === d.id ? '⏹ 停止录音' : '🎤 开始录音'}
-                      </button>
-                      <button onClick={() => handleTeacherStructurize(d.id)} disabled={teacherLiveStructurizing[d.id]} style={{ flex: 1, padding: '8px', borderRadius: '20px', border: '1px solid #5a7d5a', background: 'transparent', color: '#5a7d5a', cursor: 'pointer', fontSize: '13px' }}>
-                        {teacherLiveStructurizing[d.id] ? 'AI整理中...' : '🤖 AI整理成病历格式'}
-                      </button>
-                      <label style={{ flex: 1, padding: '8px', borderRadius: '20px', border: '1px solid #8b4513', background: 'transparent', color: '#8b4513', cursor: 'pointer', fontSize: '13px', textAlign: 'center' }}>
-                        {liveUploading[d.id] ? '上传中...' : '📷 拍照'}
-                        <input type="file" accept="image/*" capture="environment" onChange={(e) => handleLivePhotoUpload(d.id, e)} style={{ display: 'none' }} />
-                      </label>
-                    </div>
-                    <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
-                      <button onClick={() => handleAppendTeacherNote(d.id)} style={{ padding: '6px 20px', borderRadius: '20px', border: 'none', background: '#5a7d5a', color: '#fff', cursor: 'pointer', fontSize: '13px' }}>追加到病历</button>
-                    </div>
+            {/* 分区 2/4：病历标签 */}
+            {clinicDrafts.length > 0 && (
+              <div style={{ borderTop: '1px solid #e6dcc2', paddingTop: '15px', marginBottom: '16px' }}>
+                <div style={{ fontSize: '16px', color: '#8b4513', fontWeight: 'bold', marginBottom: '10px' }}>🏷️ 病历标签（用于知识库归类）</div>
+                {clinicDrafts.map(d => (
+                  <div key={d.id} style={{ display: 'flex', gap: '8px', marginBottom: '8px' }}>
+                    <span style={{ alignSelf: 'center', minWidth: '60px', fontSize: '13px', fontWeight: 'bold', color: '#8b4513' }}>{d.patient_name}</span>
+                    <input placeholder="部位（如：舌苔/皮肤/面色）" value={draftTags[d.id]?.area || ''} onChange={e => setDraftTags(prev => ({ ...prev, [d.id]: { area: e.target.value, symptom: prev[d.id]?.symptom || '' } }))} style={{ flex: 1, padding: '6px', borderRadius: '6px', border: '1px solid #d4c8a8', fontSize: '13px', fontFamily: 'serif' }} />
+                    <input placeholder="症状（如：湿/热/虚/瘀）" value={draftTags[d.id]?.symptom || ''} onChange={e => setDraftTags(prev => ({ ...prev, [d.id]: { area: prev[d.id]?.area || '', symptom: e.target.value } }))} style={{ flex: 1, padding: '6px', borderRadius: '6px', border: '1px solid #d4c8a8', fontSize: '13px', fontFamily: 'serif' }} />
                   </div>
+                ))}
+              </div>
+            )}
 
-                  <div style={{ marginTop: '10px', padding: '10px', background: '#fffaf0', borderRadius: '8px', border: '1px dashed #d4c8a8' }}>
-                    <div style={{ fontSize: '13px', color: '#8b4513', fontWeight: 'bold', marginBottom: '8px' }}>🏷️ 病历标签（用于知识库归类）</div>
-                    <div style={{ display: 'flex', gap: '8px' }}>
-                      <input placeholder="部位（如：舌苔/皮肤/面色）" value={draftTags[d.id]?.area || ''} onChange={e => setDraftTags(prev => ({ ...prev, [d.id]: { area: e.target.value, symptom: prev[d.id]?.symptom || '' } }))} style={{ flex: 1, padding: '6px', borderRadius: '6px', border: '1px solid #d4c8a8', fontSize: '13px', fontFamily: 'serif' }} />
-                      <input placeholder="症状（如：湿/热/虚/瘀）" value={draftTags[d.id]?.symptom || ''} onChange={e => setDraftTags(prev => ({ ...prev, [d.id]: { area: prev[d.id]?.area || '', symptom: e.target.value } }))} style={{ flex: 1, padding: '6px', borderRadius: '6px', border: '1px solid #d4c8a8', fontSize: '13px', fontFamily: 'serif' }} />
-                    </div>
+            {/* 分区 3/4：开方（从“库存”页签移入，字段与接口逻辑保持不变） */}
+            <div style={{ borderTop: '1px solid #e6dcc2', paddingTop: '15px', marginBottom: '16px' }}>
+              <div style={{ fontSize: '16px', color: '#8b4513', fontWeight: 'bold', marginBottom: '10px' }}>📝 开方</div>
+              <input
+                style={inputStyle}
+                placeholder="患者姓名"
+                value={prescriptionPatient}
+                onChange={e => setPrescriptionPatient(e.target.value)}
+              />
+              {/* 【第53天新增】远程诊疗开关：勾选则不扣老师库存 */}
+              <label style={{ display: 'flex', alignItems: 'center', fontFamily: 'serif', color: '#5a7d5a', marginBottom: '12px', cursor: 'pointer' }}>
+                <input
+                  type="checkbox"
+                  checked={prescriptionRemote}
+                  onChange={e => setPrescriptionRemote(e.target.checked)}
+                  style={{ marginRight: '6px' }}
+                />
+                远程诊疗（学生自采，不扣库存）
+              </label>
+              {prescriptionItems.map((item, index) => (
+                <div key={index} style={{ display: 'flex', gap: '8px', marginBottom: '8px' }}>
+                  <div style={{ flex: 2, position: 'relative' }}>
+                    <input
+                      style={{ ...inputStyle, marginBottom: 0 }}
+                      placeholder="药材名（输入首字联想）"
+                      value={item.herb_name}
+                      onChange={e => changePrescriptionItem(index, 'herb_name', e.target.value)}
+                    />
+                    {(herbSuggestions[index] || []).length > 0 && (
+                      <div style={{ position: 'absolute', top: '100%', left: 0, right: 0, background: '#fffdf5', border: '1px solid #d4c8a8', borderRadius: '4px', zIndex: 20, maxHeight: '160px', overflowY: 'auto' }}>
+                        {(herbSuggestions[index] || []).map(h => (
+                          <div
+                            key={h.id}
+                            onClick={() => pickHerbSuggestion(index, h)}
+                            style={{ padding: '6px 8px', cursor: 'pointer', fontFamily: 'serif', borderBottom: '1px solid #f0e9d6' }}
+                          >
+                            {h.herb_name}（库存 {h.stock_amount}{h.unit}）
+                          </div>
+                        ))}
+                      </div>
+                    )}
                   </div>
+                  <input
+                    style={{ ...inputStyle, marginBottom: 0, width: '90px' }}
+                    type="number"
+                    placeholder="克数"
+                    value={item.amount}
+                    onChange={e => changePrescriptionItem(index, 'amount', e.target.value)}
+                  />
+                  {/* 【第54天新增】固定单位标签（暂不支持切换单位） */}
+                  <span style={{ alignSelf: 'center', color: '#999', fontSize: '13px', fontFamily: 'serif' }}>克</span>
+                </div>
+              ))}
+              <div style={{ marginTop: '12px' }}>
+                <button
+                  onClick={addPrescriptionItem}
+                  style={{ marginRight: '8px', background: '#5a7d5a', color: '#fdfcf0', border: 'none', padding: '6px 12px', borderRadius: '4px', cursor: 'pointer', fontFamily: 'serif' }}
+                >+ 添加一味药</button>
+                <button
+                  onClick={handleSavePrescription}
+                  disabled={savingPrescription}
+                  style={{ background: '#8b4513', color: '#fdfcf0', border: 'none', padding: '6px 12px', borderRadius: '4px', cursor: 'pointer', fontFamily: 'serif' }}
+                >{savingPrescription ? '保存中...' : '保存药方'}</button>
+              </div>
+            </div>
 
-                  <div style={{ borderTop: '1px dashed #d4c8a8', paddingTop: '15px', marginTop: '15px' }}>
+            {/* 分区 4/4：辨证施治方案 */}
+            {clinicDrafts.length > 0 && (
+              <div style={{ borderTop: '1px solid #e6dcc2', paddingTop: '15px' }}>
+                {clinicDrafts.map(d => (
+                  <div key={d.id} style={{ marginBottom: '14px' }}>
                     <div style={{ color: '#5a7d5a', fontWeight: 'bold', marginBottom: '8px' }}>📝 给 {d.patient_name} 的辨证施治方案（学生会看到这里的内容）</div>
                     <textarea value={finalPlans[d.id] || ''} onChange={(e) => setFinalPlans({ ...finalPlans, [d.id]: e.target.value })} placeholder="例：抓药xxx，三碗水煲成一碗，饭后服；或今日宜喝姜茶，多休息..." style={{ width: '100%', height: '80px', padding: '10px', borderRadius: '8px', border: '1px solid #b8d8c0', background: '#f7fcf9', fontFamily: 'serif', fontSize: '14px', marginBottom: '10px', boxSizing: 'border-box' }} />
                     <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
                       <button onClick={() => handlePreviewFullRecord(d.id)} style={{ padding: '8px 20px', borderRadius: '20px', border: 'none', background: '#5a7d5a', color: '#fff', cursor: 'pointer', fontWeight: 'bold' }}>📄 预览完整病历</button>
                     </div>
                   </div>
-                </div>
-              ))
+                ))}
+              </div>
             )}
           </div>
         )}
