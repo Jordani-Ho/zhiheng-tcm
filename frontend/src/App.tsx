@@ -87,6 +87,10 @@ export default function App() {
   const [teacherLiveRecognition, setTeacherLiveRecognition] = useState<any>(null)
   const [teacherLiveStructurizing, setTeacherLiveStructurizing] = useState<{ [draftId: number]: boolean }>({})
   const [liveUploading, setLiveUploading] = useState<{ [draftId: number]: boolean }>({})
+  // 【第68天新增】智能体清洗状态：录音停止后调 POST /api/agent/clean_transcript 期间置 true（按钮显示“🔄 智能体处理中...”）
+  const [teacherLiveCleaning, setTeacherLiveCleaning] = useState<{ [draftId: number]: boolean }>({})
+  // 【第68天新增】录音原始转写缓冲区：录音过程中只往这里攒，停止后才交给智能体清洗，再把清洗结果写进文本框
+  const teacherLiveRawRef = useRef<{ [draftId: number]: string }>({})
 
   const [previewDraft, setPreviewDraft] = useState<{ id: number; content: string } | null>(null)
   const [draftTags, setDraftTags] = useState<{ [draftId: number]: { area: string; symptom: string } }>({})
@@ -698,6 +702,36 @@ export default function App() {
   }
 
   // ============== 老师端行为 ==============
+  // 【第68天新增】录音停止后：原始转写先送智能体清洗（去噪 / 提炼 / 结构化），再把 cleaned_text 追加到文本框。
+  // 追加目标仍是“现场辅助记录”文本框（teachersLiveText），老师点“追加到病历”才进病历草案，原有流程不变。
+  // 接口失败（网络错误 / 非 2xx）→ 降级追加原始文本，并提示“智能体处理失败，已追加原始文本”。
+  const flushTeacherLiveTranscript = (draftId: number) => {
+    const raw = (teacherLiveRawRef.current[draftId] || '').trim()
+    teacherLiveRawRef.current[draftId] = ''   // 取走即清空，避免重复清洗
+    if (!raw) return
+    setTeacherLiveCleaning(prev => ({ ...prev, [draftId]: true }))
+    const appendToLiveTextBox = (text: string) => setTeacherLiveText(prev => {
+      const old = prev[draftId] || ''
+      return { ...prev, [draftId]: old.trim() ? old + '\n\n' + text : text }
+    })
+    fetch('/api/agent/clean_transcript', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ raw_text: raw })
+    })
+      .then(r => { if (!r.ok) throw new Error('clean_transcript failed'); return r.json() })
+      .then(d => {
+        setTeacherLiveCleaning(prev => ({ ...prev, [draftId]: false }))
+        const cleaned = (d && typeof d.cleaned_text === 'string' && d.cleaned_text.trim()) ? d.cleaned_text : raw
+        appendToLiveTextBox(cleaned)
+      })
+      .catch(() => {
+        setTeacherLiveCleaning(prev => ({ ...prev, [draftId]: false }))
+        appendToLiveTextBox(raw)   // 降级：接口失败就直接追加原始文本，不阻塞老师
+        alert('智能体处理失败，已追加原始文本')
+      })
+  }
+
   const startTeacherLiveRecording = (draftId: number) => {
     if (teacherLiveRecording === draftId) {
       teacherLiveRecognition?.stop(); setTeacherLiveRecording(null); return
@@ -708,15 +742,20 @@ export default function App() {
     rec.continuous = true
     rec.interimResults = false
     rec.lang = 'zh-CN'
+    // 【第68天新增】本轮录音只 flush 一次（停止按钮 / onend / onerror 可能都触发，避免重复清洗 + 重复追加）
+    let flushed = false
+    const flushOnce = () => { if (flushed) return; flushed = true; flushTeacherLiveTranscript(draftId) }
+    teacherLiveRawRef.current[draftId] = ''   // 开新一段录音前清空缓冲区
     rec.onresult = (event: any) => {
       let finalTranscript = ''
       for (let i = event.resultIndex; i < event.results.length; i++) {
         if (event.results[i].isFinal) finalTranscript += event.results[i][0].transcript
       }
-      if (finalTranscript) setTeacherLiveText(prev => ({ ...prev, [draftId]: (prev[draftId] || '') + finalTranscript }))
+      // 【第68天新增】录音中不再直接写入文本框，先攒进缓冲区，等停止后统一交给智能体清洗
+      if (finalTranscript) teacherLiveRawRef.current[draftId] = (teacherLiveRawRef.current[draftId] || '') + finalTranscript
     }
-    rec.onerror = () => setTeacherLiveRecording(null)
-    rec.onend = () => setTeacherLiveRecording(null)
+    rec.onerror = () => { setTeacherLiveRecording(null); flushOnce() }
+    rec.onend = () => { setTeacherLiveRecording(null); flushOnce() }
     rec.start()
     setTeacherLiveRecognition(rec)
     setTeacherLiveRecording(draftId)
@@ -2606,7 +2645,7 @@ export default function App() {
             </div>
             {/* a) 文本输入 / 显示区 */}
             <textarea
-              placeholder="点击下方 🎙️ 开始录音口述望闻问切，或直接打字；拍照、把脉也会先追加到这里..."
+              placeholder="点击下方 🎙️ 开始录音口述望闻问切（停止后由智能体清洗再写入这里），或直接打字；拍照、把脉也会先追加到这里..."
               value={clinicTargetId !== null ? (teacherLiveText[clinicTargetId] || '') : ''}
               onChange={e => { if (clinicTargetId !== null) setTeacherLiveText(prev => ({ ...prev, [clinicTargetId]: e.target.value })) }}
               disabled={clinicTargetId === null}
@@ -2619,7 +2658,9 @@ export default function App() {
                 disabled={clinicTargetId === null || !speechSupported}
                 style={{ flex: 1, padding: '8px', borderRadius: '20px', border: 'none', background: (clinicTargetId === null || !speechSupported) ? '#ccc' : (teacherLiveRecording === clinicTargetId ? '#c0392b' : '#8b4513'), color: '#fff', cursor: (clinicTargetId === null || !speechSupported) ? 'not-allowed' : 'pointer', fontSize: '13px' }}
               >
-                {clinicTargetId !== null && teacherLiveRecording === clinicTargetId ? '⏹ 停止录音' : '🎙️ 开始录音'}
+                {clinicTargetId !== null && teacherLiveCleaning[clinicTargetId]
+                  ? '🔄 智能体处理中...'
+                  : (clinicTargetId !== null && teacherLiveRecording === clinicTargetId ? '⏹ 停止录音' : '🎙️ 开始录音')}
               </button>
               <button
                 onClick={() => { if (clinicTargetId !== null) handleTeacherStructurize(clinicTargetId) }}
@@ -2645,7 +2686,11 @@ export default function App() {
               <div style={{ fontSize: '12px', color: '#c0392b', marginBottom: '8px' }}>当前浏览器不支持语音识别，请使用 Chrome 或 Edge</div>
             )}
             {clinicTargetId !== null && teacherLiveRecording === clinicTargetId && (
-              <div style={{ fontSize: '12px', color: '#c0392b', marginBottom: '8px' }}>🔴 正在录音，识别到的文字会实时写入上面的文本框</div>
+              <div style={{ fontSize: '12px', color: '#c0392b', marginBottom: '8px' }}>🔴 正在录音，停止后由智能体清洗（去噪 + 提炼 + 结构化）再写入上面的文本框</div>
+            )}
+            {/* 【第68天新增】清洗进行中的提示：录音已停，正在等 POST /api/agent/clean_transcript 返回 */}
+            {clinicTargetId !== null && teacherLiveCleaning[clinicTargetId] && (
+              <div style={{ fontSize: '12px', color: '#8b4513', marginBottom: '8px' }}>🔄 智能体处理中...（处理完成后自动写入上面的文本框）</div>
             )}
             {/* c) 把脉记录子区域：脉象 / 脉率 / 备注 → 追加到上方文本框 */}
             <div style={{ marginTop: '12px', padding: '12px', background: '#f7f4fd', borderRadius: '8px', border: '1px dashed #c9bde0' }}>

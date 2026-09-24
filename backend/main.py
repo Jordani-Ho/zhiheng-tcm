@@ -446,6 +446,20 @@ def teacher_structurize(input_data: TeacherStructurizeInput):
     result = agent.structurize_teacher_note(input_data.raw_text)
     return {"structured": result}
 
+# 【第68天新增】老师端录音转写智能体清洗：录音停止后，原始转写先在这里去噪 + 提炼 + 结构化，
+# 前端拿到 cleaned_text 后再追加到“现场辅助记录”文本框（老师点“追加到病历”才进病历草案）。
+class CleanTranscriptInput(BaseModel):
+    raw_text: str
+
+@app.post("/api/agent/clean_transcript")
+def clean_transcript(input_data: CleanTranscriptInput):
+    """清洗录音转写文本；清洗失败（异常）时降级返回原文，不阻塞前端。"""
+    try:
+        cleaned_text = agent.clean_transcript(input_data.raw_text)
+    except Exception:
+        cleaned_text = input_data.raw_text
+    return {"cleaned_text": cleaned_text}
+
 @app.post("/api/transcribe")
 def transcribe(input_data: TranscriptionInput):
     database.insert_transcription(input_data.patient_name, input_data.teacher_name, input_data.content, input_data.data_type)
