@@ -132,7 +132,7 @@ export default function App() {
   const [localDraftSaving, setLocalDraftSaving] = useState(false)
   // 诊室可编辑草案 = 后端草案 + 本地占位草案（同一学生以后端草案为准，避免重复显示）
   const clinicDrafts: Draft[] = [...drafts, ...localDrafts.filter(ld => !drafts.some(d => d.patient_name === ld.patient_name))]
-  // 【第70天修复 / 数据串台】诊疗记录区（病历草案 / 症状标签 / 开方 / 辨证施治方案）只取“当前就诊学生”的草案：
+  // 【第70天修复 / 数据串台】【第72天改名】🩺 诊室工作台第二～第五部分（病历草案 / 病历标签 / 开方 / 辨证施治方案）只取“当前就诊学生”的草案：
   // 后端 GET /api/drafts 是“按老师”返回全部学生的草案，若直接渲染 clinicDrafts，一屏上就会同时出现多位学生的内容
   const clinicPatientDrafts: Draft[] = clinicDrafts.filter(d => d.patient_name === selectedPatient)
 
@@ -319,7 +319,7 @@ export default function App() {
   // 依赖只有 selectedPatient：老师没切人时（例如只是手动改了开方患者姓名）不会被清掉。
   useEffect(() => {
     clinicPatientRef.current = selectedPatient   // 先让异步回调知道“现在是谁”（拍照上传播后返回时用它比对）
-    // ① 现场记录区：文本框内容 / 录音状态 / 原始转写缓冲 / 智能体清洗与整理标记 / 上传中标记
+    // ① 现场辅助记录（工作台第一部分）：文本框内容 / 录音状态 / 原始转写缓冲 / 智能体清洗与整理标记 / 上传中标记
     //    先清缓冲区再停录音：stop() 会触发 onend → flush，缓冲区已空就不会把上一位学生的口述写回文本框
     teacherLiveRawRef.current = {}
     teacherLiveRecognition?.stop()
@@ -329,7 +329,7 @@ export default function App() {
     setTeacherLiveCleaning({})
     setTeacherLiveStructurizing({})
     setLiveUploading({})
-    // ② 诊疗记录区：症状标签（原「病历标签」）/ 辨证施治方案 / 完整病历预览弹窗
+    // ② 病历标签（原「症状标签」）/ 辨证施治方案：工作台第三、第五部分
     setDraftTags({})
     setFinalPlans({})
     setPreviewDraft(null)
@@ -843,6 +843,10 @@ export default function App() {
     setTeacherLiveRecording(draftId)
   }
 
+  // 【第72天明确化】“🤖 AI整理成病历格式”：原料 = 现场辅助记录文本框，成品 = 病历草案文本框。
+  // ① 把现场辅助记录（teacherLiveText[draftId]）整段 POST /api/teacher-structurize（复用现有接口，后端零改动）；
+  // ② 收到 structured 后【覆盖式】写入该学生的病历草案文本框（setClinicDraftById 直接把 content 换成整理结果，不是追加）；
+  // ③ 原料文本框内容保留不动，方便老师对照 / 再次整理；要落库仍点第二部分的“保存病历修改”。
   const handleTeacherStructurize = (draftId: number) => {
     const raw = teacherLiveText[draftId]
     if (!raw || !raw.trim()) { alert("请先录音或输入内容"); return }
@@ -855,7 +859,7 @@ export default function App() {
       .then(r => r.json())
       .then(d => {
         setTeacherLiveStructurizing(prev => ({ ...prev, [draftId]: false }))
-        if (d.structured) setTeacherLiveText(prev => ({ ...prev, [draftId]: d.structured }))
+        if (d.structured) setClinicDraftById(draftId, item => ({ ...item, content: d.structured }))
       })
       .catch(() => { setTeacherLiveStructurizing(prev => ({ ...prev, [draftId]: false })); alert("AI 整理失败") })
   }
@@ -2582,7 +2586,7 @@ export default function App() {
           </div>
         )}
 
-        {/* 【第59天重构】开方已移入“诊室 → 诊疗记录区”（与病历草案 / 病历标签 / 辨证施治方案同框），此处不再单独显示 */}
+        {/* 【第59天重构】【第72天改名】开方已移入“诊室 → 🩺 诊室工作台 第四部分”（与病历草案 / 病历标签 / 辨证施治方案同框），此处不再单独显示 */}
 
         {/* 【第63天调整】🧑‍⚕️ 角色切换卡片（调试模块）：已从页面顶部附近迁至整页最底部（所有页签内容的最下方），代码见本 return 末尾 */}
 
@@ -2902,22 +2906,28 @@ export default function App() {
 
         {/* 【第71天整合】原「🔍 搜索学生」与「👤 当前就诊学生」两张卡片已合并进上方「🩺 诊室队列」大卡片的第二 / 第三部分，此处不再单独渲染。 */}
 
-        {/* 【第69天整合】🩺 诊室工作台：把原「📸 现场辅助记录」卡片与原「📋 诊疗记录区」容器合并成一个撑满宽度的大卡片。
-            两个部分共享同一个外边框：上半 = 现场记录区（🎙️录音 / 📷拍照 / 💓把脉 → 先写入文本框，再“追加到病历”），
-            下半 = 诊疗记录区（病历草案 / 症状标签 / 开方 / 辨证施治方案），两部分之间用内嵌虚线分隔线。
+        {/* 【第72天整合】🩺 诊室工作台：原「📸 现场辅助记录」卡片与「📋 诊疗记录区」容器合并为**一张**撑满宽度的大卡片（单一外边框，不再有第二层卡片 / 第二层标题）。
+            内部自上而下五个部分，各部分之间只用虚线分隔：
+              第一部分：现场辅助记录（原料：🎙️录音 / 打字 / 📷拍照 / 💓把脉 → 全部先写进本区文本框）
+              第二部分：📋 病历草案（成品：AI 整理结果覆盖式写入，老师可继续编辑后保存）
+              第三部分：🏷️ 病历标签（部位 + 症状）
+              第四部分：📝 开方（患者姓名默认当前学生 / 远程诊疗 / 药材 + 克数）
+              第五部分：📝 辨证施治方案（+ 预览完整病历）
             所有原有按钮、接口、state 逻辑保持不变，只是重新排列（仅诊室页签显示）。 */}
         {(currentRole === '李老师' || currentRole === '李老师智能体') && teacherTab === 'clinic' && (
           <div style={{ ...boxStyle, background: '#fcfdfa', border: '1px solid #d4c8a8', width: '100%' }}>
             <div style={{ textAlign: 'center', fontSize: '20px', color: '#8b4513', fontWeight: 'bold', marginBottom: '6px', paddingBottom: '12px', borderBottom: '2px solid #e6dcc2' }}>🩺 诊室工作台</div>
             <div style={{ textAlign: 'center', fontSize: '12px', color: '#999', marginBottom: '16px' }}>
-              现场记录区（录音 / 拍照 / 把脉 → 写入文本框 → 追加到病历）｜ 诊疗记录区（病历草案 → 症状标签 → 开方 → 辨证施治方案）
+              现场辅助记录（原料）→ 病历草案（AI 整理成品）→ 病历标签 → 开方 → 辨证施治方案（五部分共用一个外边框，部分之间虚线分隔）
             </div>
 
-            {/* ===== 第一部分：现场记录区（原「📸 现场辅助记录」卡片内容，功能 / 按钮 / 接口全部保留） ===== */}
-            <div style={{ background: '#f0f7f0', border: '1px solid #dde9dd', borderRadius: '10px', padding: '14px' }}>
-              <div style={{ fontSize: '17px', color: '#5a7d5a', fontWeight: 'bold', marginBottom: '6px' }}>📸 现场记录区（录音 → AI整理）</div>
+            {/* ===== 第一部分：现场辅助记录（原料区，去掉自己的子卡片边框，直接贴在大卡片里） ===== */}
+            <div>
+              <div style={{ fontSize: '16px', color: '#8b4513', fontWeight: 'bold', marginBottom: '6px' }}>📸 现场辅助记录（原料：录音 / 打字 / 拍照 / 把脉）</div>
               <div style={{ fontSize: '12px', color: '#999', marginBottom: '12px' }}>
                 写入目标：{clinicTargetDraft ? `${clinicTargetDraft.patient_name} 的病历草案` : '（暂无待处理病历草案，请先在“诊室队列”里选一位学生）'}
+                <br />
+                流程：本区是原料（录音 / 打字 / 拍照 / 把脉）→ 点 🤖 AI整理成病历格式 → 结果【覆盖式】写入下方第二部分「📋 病历草案」
               </div>
               {/* a) 文本输入 / 显示区 */}
               <textarea
@@ -2959,29 +2969,6 @@ export default function App() {
                 </label>
               </div>
 
-              {/* 【第69天新增】📷 拍照缩略图预览区（就位于“📷 拍照”按钮下方）：每上传成功一张图片显示一张 80px 小图 */}
-              {uploadedImages.length > 0 && (
-                <div style={{ display: 'flex', flexWrap: 'wrap', gap: '8px', marginBottom: '10px' }}>
-                  {uploadedImages.map((url, i) => (
-                    <div key={`${url}-${i}`} style={{ position: 'relative', width: '80px', height: '80px' }}>
-                      {/* 点缩略图 → 新标签页打开原图 */}
-                      <img
-                        src={url}
-                        alt={`现场图片${i + 1}`}
-                        onClick={() => window.open(url, '_blank')}
-                        title="点击在新标签页查看原图"
-                        style={{ width: '80px', height: '80px', objectFit: 'cover', borderRadius: '8px', border: '1px solid #b8d8c0', cursor: 'zoom-in', display: 'block' }}
-                      />
-                      {/* 右上角 ×：只从缩略图列表移除，已追加到文本框的 URL 不受影响 */}
-                      <button
-                        onClick={() => setUploadedImages(prev => prev.filter((_, idx) => idx !== i))}
-                        title="从预览区移除（已追加到文本框的内容不受影响）"
-                        style={{ position: 'absolute', top: '-6px', right: '-6px', width: '18px', height: '18px', padding: 0, lineHeight: '16px', borderRadius: '50%', border: '1px solid #fff', background: '#c0392b', color: '#fff', fontSize: '12px', cursor: 'pointer' }}
-                      >×</button>
-                    </div>
-                  ))}
-                </div>
-              )}
               {!speechSupported && (
                 <div style={{ fontSize: '12px', color: '#c0392b', marginBottom: '8px' }}>当前浏览器不支持语音识别，请使用 Chrome 或 Edge</div>
               )}
@@ -3027,25 +3014,46 @@ export default function App() {
                   <button onClick={handlePulseRecord} disabled={clinicTargetId === null} style={{ padding: '6px 18px', borderRadius: '20px', border: 'none', background: clinicTargetId === null ? '#ccc' : '#8b4513', color: '#fff', cursor: clinicTargetId === null ? 'not-allowed' : 'pointer', fontSize: '13px', whiteSpace: 'nowrap' }}>把脉记录追加到上方文本框</button>
                 </div>
               </div>
-              {/* d) 追加到病历：把文本框内容写入病历草案 */}
+              {/* d) 拍照缩略图区（本部分末：每上传成功一张图片显示一张 80px 小图） */}
+              {uploadedImages.length > 0 && (
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: '8px', marginTop: '10px', marginBottom: '10px' }}>
+                  {uploadedImages.map((url, i) => (
+                    <div key={`${url}-${i}`} style={{ position: 'relative', width: '80px', height: '80px' }}>
+                      {/* 点缩略图 → 新标签页打开原图 */}
+                      <img
+                        src={url}
+                        alt={`现场图片${i + 1}`}
+                        onClick={() => window.open(url, '_blank')}
+                        title="点击在新标签页查看原图"
+                        style={{ width: '80px', height: '80px', objectFit: 'cover', borderRadius: '8px', border: '1px solid #b8d8c0', cursor: 'zoom-in', display: 'block' }}
+                      />
+                      {/* 右上角 ×：只从缩略图列表移除，已追加到文本框的 URL 不受影响 */}
+                      <button
+                        onClick={() => setUploadedImages(prev => prev.filter((_, idx) => idx !== i))}
+                        title="从预览区移除（已追加到文本框的内容不受影响）"
+                        style={{ position: 'absolute', top: '-6px', right: '-6px', width: '18px', height: '18px', padding: 0, lineHeight: '16px', borderRadius: '50%', border: '1px solid #fff', background: '#c0392b', color: '#fff', fontSize: '12px', cursor: 'pointer' }}
+                      >×</button>
+                    </div>
+                  ))}
+                </div>
+              )}
+              {/* e) 追加到病历：把文本框内容写入病历草案（手工打字时的备用通道；AI整理走上面的 🤖 按钮） */}
               <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: '12px' }}>
                 <button onClick={() => { if (clinicTargetId !== null) handleAppendTeacherNote(clinicTargetId) }} disabled={clinicTargetId === null} style={{ padding: '8px 24px', borderRadius: '20px', border: 'none', background: clinicTargetId === null ? '#ccc' : '#5a7d5a', color: '#fff', cursor: clinicTargetId === null ? 'not-allowed' : 'pointer', fontSize: '13px', fontWeight: 'bold' }}>追加到病历</button>
               </div>
             </div>
 
-            {/* ===== 两部分之间的内嵌分隔线（虚线，浅色）：上半 = 现场记录区，下半 = 诊疗记录区 ===== */}
+            {/* ===== 分界 1/4（虚线）：第一部分 现场辅助记录（原料）↑ ｜ 第二部分 病历草案（成品）↓ ===== */}
             <div style={{ margin: '20px 0', borderTop: '1px dashed #c9bde0' }} />
 
-            {/* ===== 第二部分：诊疗记录区（原「📋 诊疗记录区」容器内容：病历草案 / 症状标签 / 开方 / 辨证施治方案） ===== */}
-            <div style={{ fontSize: '17px', color: '#8b4513', fontWeight: 'bold', marginBottom: '6px' }}>📋 诊疗记录区</div>
-            <div style={{ fontSize: '12px', color: '#999', marginBottom: '16px' }}>病历草案 → 症状标签 → 开方 → 辨证施治方案（同一容器，分区之间用内嵌分隔线）</div>
+            {/* ===== 第二部分：AI 生成的病历草案（AI 整理结果覆盖式写入下方文本框，老师可继续编辑） ===== */}
             {/* 【第70天修复 / 数据串台】只渲染“当前就诊学生”的草案，其他学生的草案不再出现在本屏 */}
             {clinicPatientDrafts.length === 0 && (
               <div style={{ textAlign: 'center', color: '#999', marginBottom: '16px' }}>暂无待处理病历（在“诊室队列”里选一位学生即可开始记录）</div>
             )}
 
-            {/* 分区 1/4：病历草案 */}
-            <div style={{ fontSize: '16px', color: '#8b4513', fontWeight: 'bold', marginBottom: '10px' }}>📄 病历草案（老师智能体生成，待老师补充）</div>
+            {/* 第二部分标题：病历草案（成品区，覆盖式写入） */}
+            <div style={{ fontSize: '16px', color: '#8b4513', fontWeight: 'bold', marginBottom: '10px' }}>📋 病历草案（AI 整理结果，老师可编辑）</div>
             {clinicPatientDrafts.map(d => (
                 <div key={d.id} style={{ paddingBottom: '12px', marginBottom: '12px', borderBottom: '1px dashed #ece3cd' }}>
                   <div style={{ color: '#8b4513', fontWeight: 'bold', marginBottom: '5px' }}>
@@ -3079,10 +3087,10 @@ export default function App() {
                 </div>
               ))}
 
-            {/* 分区 2/4：症状标签（原「病历标签」，仅改名） */}
+            {/* ===== 分界 2/4（虚线）：第二部分 病历草案 ↑ ｜ 第三部分 病历标签 ↓（原「症状标签」，字段 / 接口不变） ===== */}
             {clinicPatientDrafts.length > 0 && (
-              <div style={{ borderTop: '1px solid #e6dcc2', paddingTop: '15px', marginBottom: '16px' }}>
-                <div style={{ fontSize: '16px', color: '#8b4513', fontWeight: 'bold', marginBottom: '10px' }}>🏷️ 症状标签（用于知识库归类）</div>
+              <div style={{ borderTop: '1px dashed #c9bde0', paddingTop: '15px', marginBottom: '16px' }}>
+                <div style={{ fontSize: '16px', color: '#8b4513', fontWeight: 'bold', marginBottom: '10px' }}>🏷️ 病历标签（部位 + 症状）</div>
                 {clinicPatientDrafts.map(d => (
                   <div key={d.id} style={{ display: 'flex', gap: '8px', marginBottom: '8px' }}>
                     <span style={{ alignSelf: 'center', minWidth: '60px', fontSize: '13px', fontWeight: 'bold', color: '#8b4513' }}>{d.patient_name}</span>
@@ -3093,8 +3101,8 @@ export default function App() {
               </div>
             )}
 
-            {/* 分区 3/4：开方（从“库存”页签移入，字段与接口逻辑保持不变） */}
-            <div style={{ borderTop: '1px solid #e6dcc2', paddingTop: '15px', marginBottom: '16px' }}>
+            {/* ===== 分界 3/4（虚线）：第三部分 病历标签 ↑ ｜ 第四部分 开方 ↓（从“库存”页签移入，字段与接口逻辑保持不变） ===== */}
+            <div style={{ borderTop: '1px dashed #c9bde0', paddingTop: '15px', marginBottom: '16px' }}>
               <div style={{ fontSize: '16px', color: '#8b4513', fontWeight: 'bold', marginBottom: '10px' }}>📝 开方</div>
               <input
                 style={inputStyle}
@@ -3159,9 +3167,10 @@ export default function App() {
               </div>
             </div>
 
-            {/* 分区 4/4：辨证施治方案 */}
+            {/* ===== 分界 4/4（虚线）：第四部分 开方 ↑ ｜ 第五部分 辨证施治方案 ↓ ===== */}
             {clinicPatientDrafts.length > 0 && (
-              <div style={{ borderTop: '1px solid #e6dcc2', paddingTop: '15px' }}>
+              <div style={{ borderTop: '1px dashed #c9bde0', paddingTop: '15px' }}>
+                <div style={{ fontSize: '16px', color: '#8b4513', fontWeight: 'bold', marginBottom: '10px' }}>📝 辨证施治方案</div>
                 {clinicPatientDrafts.map(d => (
                   <div key={d.id} style={{ marginBottom: '14px' }}>
                     <div style={{ color: '#5a7d5a', fontWeight: 'bold', marginBottom: '8px' }}>📝 给 {d.patient_name} 的辨证施治方案（学生会看到这里的内容）</div>
