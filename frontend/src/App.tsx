@@ -2180,17 +2180,10 @@ export default function App() {
 
         {/* 【第59天重构】开方已移入“诊室 → 诊疗记录区”（与病历草案 / 病历标签 / 辨证施治方案同框），此处不再单独显示 */}
 
-        {/* 角色切换卡片 */}
-        <div style={boxStyle}>
-          <div style={{ textAlign: 'center', marginBottom: '15px', color: '#8b4513', fontWeight: 'bold' }}>🧑‍⚕️ 角色切换</div>
-          <div style={{ display: 'flex', flexWrap: 'wrap', justifyContent: 'center' }}>
-            {['李老师', '李老师智能体', '学生', '学生智能体'].map((role) => (
-              <button key={role} style={roleBtnStyle(role)} onClick={() => setCurrentRole(role)}>{role}</button>
-            ))}
-          </div>
-        </div>
+        {/* 【第63天调整】🧑‍⚕️ 角色切换卡片（调试模块）：已从页面顶部附近迁至整页最底部（所有页签内容的最下方），代码见本 return 末尾 */}
 
-        {points && (
+        {/* 【第63天调整】积分卡片：老师端只在「⚙️管理」页签显示（🏠首页 / 🩺诊室 / ⚙️设置 均不显示）；学生端无页签，保持原样 */}
+        {points && (!isTeacherRole || teacherTab === 'manage') && (
           <div style={{ ...boxStyle, display: 'flex', justifyContent: 'space-around', textAlign: 'center', background: '#fffdf5' }}>
             <div>
               <div style={{ fontSize: '12px', color: '#999' }}>{selectedPatient} 积分</div>
@@ -2630,6 +2623,16 @@ export default function App() {
             )}
           </div>
         )}
+
+        {/* 【第63天调整】🧑‍⚕️ 角色切换卡片（调试模块）：从页面顶部附近迁至整页最底部（位于所有页签内容的最下方，不显眼） */}
+        <div style={boxStyle}>
+          <div style={{ textAlign: 'center', marginBottom: '15px', color: '#8b4513', fontWeight: 'bold' }}>🧑‍⚕️ 角色切换</div>
+          <div style={{ display: 'flex', flexWrap: 'wrap', justifyContent: 'center' }}>
+            {['李老师', '李老师智能体', '学生', '学生智能体'].map((role) => (
+              <button key={role} style={roleBtnStyle(role)} onClick={() => setCurrentRole(role)}>{role}</button>
+            ))}
+          </div>
+        </div>
 
       </div>
     </div>
