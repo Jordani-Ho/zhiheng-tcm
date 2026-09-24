@@ -140,6 +140,13 @@ export default function App() {
   const [planTemplateApplied, setPlanTemplateApplied] = useState<{ [draftId: number]: boolean }>({})  // 哪些草案的方案是自动套用来的（显示小灰字）
   // 已经自动套用过模板的草案 id：同一位学生只自动套用一次，老师手动清空后不会被立刻填回（随“切学生清场”一起重置）
   const planTemplateFilledRef = useRef<{ [draftId: number]: boolean }>({})
+  // 【第81天修复 / 录音时间太短】Web Speech API 在检测到几秒静音后会自行触发 onend（不是用户点的“停止录音”），
+  // 旧代码在 onend 里直接切回“未录音”，于是停顿一下录音就被中断。isUserStoppedRef 专门区分这两种“结束”：
+  //   false = 用户还在录 → onend 里自动 rec.start() 续上（静音打断不影响继续录）；
+  //   true  = 用户主动点停 → onend 里才走原有的收尾逻辑（清洗 / 追加 / 切回未录音状态）。
+  // 放在顶层用 useRef 而不是 state：不触发重渲染；学生端（🗣️ 学生智能体 / 🩺 面诊前准备）与老师端
+  // （📸 现场辅助记录 / 辨证施治方案）这四处独立写的录音逻辑共用同一个标记（同一时刻只会有一个在录）。
+  const isUserStoppedRef = useRef(true)
 
   const [previewDraft, setPreviewDraft] = useState<{ id: number; content: string } | null>(null)
   const [draftTags, setDraftTags] = useState<{ [draftId: number]: { area: string; symptom: string } }>({})
@@ -454,6 +461,7 @@ export default function App() {
     // ① 现场辅助记录（工作台第一部分）：文本框内容 / 录音状态 / 原始转写缓冲 / 智能体清洗与整理标记 / 上传中标记
     //    先清缓冲区再停录音：stop() 会触发 onend → flush，缓冲区已空就不会把上一位学生的口述写回文本框
     teacherLiveRawRef.current = {}
+    isUserStoppedRef.current = true   // 【第81天修复】切学生是程序主动停录音：onend 里不要再自动续录
     teacherLiveRecognition?.stop()
     setTeacherLiveRecognition(null)
     setTeacherLiveRecording(null)
@@ -468,6 +476,7 @@ export default function App() {
     // 【第75天新增 / 改动1】施治方案语音输入：与现场记录同样“先清缓冲区再停录音”（stop() 会触发 onend → flush，
     // 缓冲区已空就不会把上一位学生的口述追加回施治方案文本框）
     planRawRef.current = {}
+    isUserStoppedRef.current = true   // 【第81天修复】切学生是程序主动停录音：onend 里不要再自动续录
     planRecognition?.stop()
     setPlanRecognition(null)
     setPlanRecording(null)
@@ -883,6 +892,7 @@ export default function App() {
 
   const startStudentRecording = async () => {
     if (isRecordingStudent) {
+      isUserStoppedRef.current = true   // 【第81天修复】用户主动点停：onend 里不再自动续录
       mediaRecorder?.stop()
       recognitionStudent?.stop()
       setIsRecordingStudent(false)
@@ -917,7 +927,18 @@ export default function App() {
           }
           if (finalTranscript) setInputText(prev => prev + finalTranscript)
         }
-        rec.onerror = (e: any) => console.error('语音识别错误:', e)
+        // 【第81天修复】no-speech = 几秒没说话的静音超时（不是真错误），交给 onend 自动续录；其他错误才停
+        rec.onerror = (e: any) => {
+          if (e && e.error === 'no-speech') return
+          isUserStoppedRef.current = true   // 无权限 / 无麦克风等真错误：标记成“用户停了”，避免 onend 反复重试成死循环
+          console.error('语音识别错误:', e)
+        }
+        rec.onend = () => {
+          // 【第81天修复】不是用户主动停的 → 说明是被静音打断，自动续上，录音不会提前结束
+          if (!isUserStoppedRef.current) { try { rec.start() } catch { /* 实例已在运行，忽略 */ } return }
+          // 用户主动停的：MediaRecorder 的停止与状态切换由上面的点击分支处理，这里无需再做
+        }
+        isUserStoppedRef.current = false   // 【第81天修复】开始录音：标记为“用户没停”
         rec.start()
         setRecognitionStudent(rec)
       }
@@ -1056,6 +1077,7 @@ export default function App() {
   // 图片 / 录音附件仍走「🗣️ 学生智能体」卡片原有流程）。
   const startIntakeRecording = () => {
     if (intakeRecording) {
+      isUserStoppedRef.current = true   // 【第81天修复】用户主动点停：onend 里不再自动续录
       intakeRecognition?.stop()
       setIntakeRecording(false)
       return
@@ -1074,8 +1096,18 @@ export default function App() {
         }
         if (finalTranscript) setIntakeAnswer(prev => prev + finalTranscript)
       }
-      rec.onerror = (e: any) => console.error('追问语音识别错误:', e)
-      rec.onend = () => setIntakeRecording(false)
+      // 【第81天修复】no-speech = 几秒没说话的静音超时（不是真错误），交给 onend 自动续录；其他错误才停
+      rec.onerror = (e: any) => {
+        if (e && e.error === 'no-speech') return
+        isUserStoppedRef.current = true   // 无权限 / 无麦克风等真错误：标记成“用户停了”，避免 onend 反复重试成死循环
+        console.error('追问语音识别错误:', e)
+      }
+      rec.onend = () => {
+        // 【第81天修复】不是用户主动停的 → 说明是被静音打断，自动续上，录音不会提前结束
+        if (!isUserStoppedRef.current) { try { rec.start() } catch { /* 实例已在运行，忽略 */ } return }
+        setIntakeRecording(false)   // 用户主动停的：走原有结束逻辑
+      }
+      isUserStoppedRef.current = false   // 【第81天修复】开始录音：标记为“用户没停”
       rec.start()
       setIntakeRecognition(rec)
       setIntakeRecording(true)
@@ -1117,6 +1149,7 @@ export default function App() {
 
   const startTeacherLiveRecording = (draftId: number) => {
     if (teacherLiveRecording === draftId) {
+      isUserStoppedRef.current = true   // 【第81天修复】用户主动点停：onend 里不再自动续录
       teacherLiveRecognition?.stop(); setTeacherLiveRecording(null); return
     }
     const SR = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition
@@ -1137,8 +1170,20 @@ export default function App() {
       // 【第68天新增】录音中不再直接写入文本框，先攒进缓冲区，等停止后统一交给智能体清洗
       if (finalTranscript) teacherLiveRawRef.current[draftId] = (teacherLiveRawRef.current[draftId] || '') + finalTranscript
     }
-    rec.onerror = () => { setTeacherLiveRecording(null); flushOnce() }
-    rec.onend = () => { setTeacherLiveRecording(null); flushOnce() }
+    // 【第81天修复】no-speech = 几秒没说话的静音超时（不是真错误）：不当作结束，交给 onend 自动续录；
+    // 其他错误（无权限 / 无麦克风等）才收尾，并标记成“用户停了”，避免 onend 反复重试成死循环
+    rec.onerror = (e: any) => {
+      if (e && e.error === 'no-speech') return
+      isUserStoppedRef.current = true
+      setTeacherLiveRecording(null); flushOnce()
+    }
+    rec.onend = () => {
+      // 【第81天修复】用户没点停 → 被静音打断的：自动续上（长口述不会中途断掉，转写继续攒进缓冲区）
+      if (!isUserStoppedRef.current) { try { rec.start() } catch { /* 实例已在运行，忽略 */ } return }
+      // 用户主动停的：走原有结束逻辑（清洗 → 追加到“现场辅助记录”文本框）
+      setTeacherLiveRecording(null); flushOnce()
+    }
+    isUserStoppedRef.current = false   // 【第81天修复】开始录音：标记为“用户没停”
     rec.start()
     setTeacherLiveRecognition(rec)
     setTeacherLiveRecording(draftId)
@@ -1283,6 +1328,7 @@ export default function App() {
   // 【改动1】🎙️ 语音输入按钮：未录音 → 开始录音（zh-CN）；正在录音（同一位学生）→ 停止录音（停止后触发上面的清洗）
   const startPlanRecording = (draftId: number) => {
     if (planRecording === draftId) {
+      isUserStoppedRef.current = true   // 【第81天修复】用户主动点停：onend 里不再自动续录
       planRecognition?.stop(); setPlanRecording(null); return
     }
     const SR = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition
@@ -1303,8 +1349,20 @@ export default function App() {
       // 录音中不直接写入文本框，先攒进缓冲区，等停止后统一交给智能体清洗（与“现场辅助记录”一致）
       if (finalTranscript) planRawRef.current[draftId] = (planRawRef.current[draftId] || '') + finalTranscript
     }
-    rec.onerror = () => { setPlanRecording(null); flushOnce() }
-    rec.onend = () => { setPlanRecording(null); flushOnce() }
+    // 【第81天修复】no-speech = 几秒没说话的静音超时（不是真错误）：不当作结束，交给 onend 自动续录；
+    // 其他错误（无权限 / 无麦克风等）才收尾，并标记成“用户停了”，避免 onend 反复重试成死循环
+    rec.onerror = (e: any) => {
+      if (e && e.error === 'no-speech') return
+      isUserStoppedRef.current = true
+      setPlanRecording(null); flushOnce()
+    }
+    rec.onend = () => {
+      // 【第81天修复】用户没点停 → 被静音打断的：自动续上（长口述不会中途断掉，转写继续攒进缓冲区）
+      if (!isUserStoppedRef.current) { try { rec.start() } catch { /* 实例已在运行，忽略 */ } return }
+      // 用户主动停的：走原有结束逻辑（清洗 → 追加到“辨证施治方案”文本框）
+      setPlanRecording(null); flushOnce()
+    }
+    isUserStoppedRef.current = false   // 【第81天修复】开始录音：标记为“用户没停”
     rec.start()
     setPlanRecognition(rec)
     setPlanRecording(draftId)
