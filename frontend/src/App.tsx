@@ -113,6 +113,19 @@ export default function App() {
   // 【第68天新增】录音原始转写缓冲区：录音过程中只往这里攒，停止后才交给智能体清洗，再把清洗结果写进文本框
   const teacherLiveRawRef = useRef<{ [draftId: number]: string }>({})
 
+  // 【第75天新增 / 改动1】「辨证施治方案」语音输入：与“现场辅助记录”的录音完全同套路
+  // （Web Speech API zh-CN 录音 → 停止 → POST /api/agent/clean_transcript 清洗 → 追加到施治方案文本框末尾）。
+  // 全部按 draftId 分开存（第五部分一次只渲染当前学生的草案，但仍按 id 隔离，避免切换学生时串台）。
+  const [planRecording, setPlanRecording] = useState<number | null>(null)                     // 正在录音的草案 id（null = 没在录音）
+  const [planRecognition, setPlanRecognition] = useState<any>(null)                          // 语音识别实例（再次点击按钮时 stop）
+  const [planCleaning, setPlanCleaning] = useState<{ [draftId: number]: boolean }>({})       // 清洗中 → 按钮显示“🔄 智能体处理中...”
+  const planRawRef = useRef<{ [draftId: number]: string }>({})                               // 录音原始转写缓冲（停止后才送清洗）
+  // 【第75天新增 / 改动2】施治方案模板：老师维度的常用写法记忆（后端 plan_templates 表，teacher_name 唯一）
+  const [planTemplate, setPlanTemplate] = useState('')                                       // GET /api/plan_template 拉回来的模板（空串 = 没模板）
+  const [planTemplateApplied, setPlanTemplateApplied] = useState<{ [draftId: number]: boolean }>({})  // 哪些草案的方案是自动套用来的（显示小灰字）
+  // 已经自动套用过模板的草案 id：同一位学生只自动套用一次，老师手动清空后不会被立刻填回（随“切学生清场”一起重置）
+  const planTemplateFilledRef = useRef<{ [draftId: number]: boolean }>({})
+
   const [previewDraft, setPreviewDraft] = useState<{ id: number; content: string } | null>(null)
   const [draftTags, setDraftTags] = useState<{ [draftId: number]: { area: string; symptom: string } }>({})
 
@@ -368,6 +381,18 @@ export default function App() {
     }
   }, [currentRole, selectedTeacher])
 
+  // 【第75天新增 / 改动2】老师进入诊室页时拉一次该老师的「施治方案模板」：
+  // GET /api/plan_template?teacher_name=李老师 → { content }（后端没有记录时返回空串，前端按“无模板”处理）。
+  // 依赖 currentRole / teacherTab / selectedTeacher：切到诊室页、或换了老师时各拉一次；拉取失败就当没模板，不阻塞诊室记录。
+  useEffect(() => {
+    if (currentRole !== '李老师' && currentRole !== '李老师智能体') return
+    if (teacherTab !== 'clinic') return
+    fetch(`/api/plan_template?teacher_name=${selectedTeacher}`)
+      .then(r => r.json())
+      .then(d => setPlanTemplate(d && typeof d.content === 'string' ? d.content : ''))
+      .catch(() => setPlanTemplate(''))
+  }, [currentRole, teacherTab, selectedTeacher])
+
   // 【第56天新增】智能体工作台：进入老师端时拉取待办请示
   useEffect(() => {
     if (currentRole === '李老师' || currentRole === '李老师智能体') {
@@ -407,6 +432,16 @@ export default function App() {
     setDraftTags({})
     setFinalPlans({})
     setPreviewDraft(null)
+    // 【第75天新增 / 改动1】施治方案语音输入：与现场记录同样“先清缓冲区再停录音”（stop() 会触发 onend → flush，
+    // 缓冲区已空就不会把上一位学生的口述追加回施治方案文本框）
+    planRawRef.current = {}
+    planRecognition?.stop()
+    setPlanRecognition(null)
+    setPlanRecording(null)
+    setPlanCleaning({})
+    // 【第75天新增 / 改动2】模板套用标记一起重置：新学生的方案为空时重新自动套用模板（模板本身是按老师存的，不清）
+    planTemplateFilledRef.current = {}
+    setPlanTemplateApplied({})
     // ③ 拍照：缩略图列表 / 「图片不够清晰」提示
     setUploadedImages([])
     setBlurryPhoto(null)
@@ -433,6 +468,23 @@ export default function App() {
     //    学生档案 / 积分 / 历史病历已由上面 [currentRole, selectedPatient, selectedTeacher] 的 effect 重新拉取（未改动）
     fetchDrafts()
   }, [selectedPatient])
+
+  // 【第75天新增 / 改动2】模板套用：老师模板已拉到（planTemplate 非空）、且“当前选中学生”的施治方案为空时，自动填入模板内容。
+  // ① 同一位学生只自动套用一次（planTemplateFilledRef 记录）→ 老师手动清空后不会被立刻填回，能真正改成别的写法；
+  // ② 老师自己已经写过内容时（finalPlans 非空）绝不覆盖；
+  // ③ 自动套用后置 planTemplateApplied[draftId] = true → 第五部分显示小灰字“已套用模板，可修改”。
+  useEffect(() => {
+    if (currentRole !== '李老师' && currentRole !== '李老师智能体') return
+    if (teacherTab !== 'clinic') return
+    if (!planTemplate.trim()) return
+    const target = clinicPatientDrafts[0]
+    if (!target) return
+    if (planTemplateFilledRef.current[target.id]) return
+    if ((finalPlans[target.id] || '').trim()) return
+    planTemplateFilledRef.current[target.id] = true
+    setFinalPlans(prev => ({ ...prev, [target.id]: planTemplate }))
+    setPlanTemplateApplied(prev => ({ ...prev, [target.id]: true }))
+  }, [currentRole, teacherTab, planTemplate, selectedPatient, clinicPatientDrafts.length, finalPlans])
 
   // ============== 数据获取 ==============
   const fetchPatients = (guardian: string) => {
@@ -1018,7 +1070,86 @@ export default function App() {
       })
   }
 
+  // ============== 【第75天新增】施治方案：模板保存（改动2） + 语音输入（改动1） ==============
+
+  // 【改动2】把当前施治方案存成该老师的新模板：POST /api/plan_template { teacher_name, content }（后端 upsert，越用越贴合老师写法）。
+  // · 内容为空时直接跳过：避免把老师已有的模板抹成空串；
+  // · 保存成功后同步更新本地 planTemplate：下一位学生（施治方案为空）进来即可套用新模板；
+  // · 保存失败不打断老师（不弹窗），下次点“保存病历修改 / 预览完整病历”会再试一次。
+  const savePlanTemplate = (content: string) => {
+    const text = (content || '').trim()
+    if (!text) return
+    setPlanTemplate(text)
+    fetch('/api/plan_template', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ teacher_name: selectedTeacher, content: text })
+    }).catch(() => {})
+  }
+
+  // 【改动1】录音停止后：原始转写先送智能体清洗，再把 cleaned_text 追加到「辨证施治方案」文本框末尾。
+  // 接口失败（网络错误 / 非 2xx / 返回空）→ 降级直接追加原始文本，并提示“智能体处理失败，已追加原始文本”。
+  const flushPlanTranscript = (draftId: number) => {
+    const raw = (planRawRef.current[draftId] || '').trim()
+    planRawRef.current[draftId] = ''   // 取走即清空，避免重复清洗
+    if (!raw) return
+    setPlanCleaning(prev => ({ ...prev, [draftId]: true }))
+    const appendToPlanTextBox = (text: string) => setFinalPlans(prev => {
+      const old = prev[draftId] || ''
+      return { ...prev, [draftId]: old.trim() ? old + '\n\n' + text : text }
+    })
+    fetch('/api/agent/clean_plan', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ raw_text: raw })
+    })
+      .then(r => { if (!r.ok) throw new Error('clean_plan failed'); return r.json() })
+      .then(d => {
+        setPlanCleaning(prev => ({ ...prev, [draftId]: false }))
+        const cleaned = (d && typeof d.cleaned_text === 'string' && d.cleaned_text.trim()) ? d.cleaned_text : raw
+        appendToPlanTextBox(cleaned)
+      })
+      .catch(() => {
+        setPlanCleaning(prev => ({ ...prev, [draftId]: false }))
+        appendToPlanTextBox(raw)   // 降级：接口失败就直接追加原始文本，不阻塞老师
+        alert('智能体处理失败，已追加原始文本')
+      })
+  }
+
+  // 【改动1】🎙️ 语音输入按钮：未录音 → 开始录音（zh-CN）；正在录音（同一位学生）→ 停止录音（停止后触发上面的清洗）
+  const startPlanRecording = (draftId: number) => {
+    if (planRecording === draftId) {
+      planRecognition?.stop(); setPlanRecording(null); return
+    }
+    const SR = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition
+    if (!SR) { alert("当前浏览器不支持语音识别。"); return }
+    const rec = new SR()
+    rec.continuous = true
+    rec.interimResults = false
+    rec.lang = 'zh-CN'
+    // 本轮录音只 flush 一次（停止按钮 / onend / onerror 可能都触发，避免重复清洗 + 重复追加）
+    let flushed = false
+    const flushOnce = () => { if (flushed) return; flushed = true; flushPlanTranscript(draftId) }
+    planRawRef.current[draftId] = ''   // 开新一段录音前清空缓冲区
+    rec.onresult = (event: any) => {
+      let finalTranscript = ''
+      for (let i = event.resultIndex; i < event.results.length; i++) {
+        if (event.results[i].isFinal) finalTranscript += event.results[i][0].transcript
+      }
+      // 录音中不直接写入文本框，先攒进缓冲区，等停止后统一交给智能体清洗（与“现场辅助记录”一致）
+      if (finalTranscript) planRawRef.current[draftId] = (planRawRef.current[draftId] || '') + finalTranscript
+    }
+    rec.onerror = () => { setPlanRecording(null); flushOnce() }
+    rec.onend = () => { setPlanRecording(null); flushOnce() }
+    rec.start()
+    setPlanRecognition(rec)
+    setPlanRecording(draftId)
+  }
+
   const handleEditDraft = (draftId: number, newContent: string, silent = false) => {
+    // 【第75天新增 / 改动2】老师点“保存病历修改”时，把当前「辨证施治方案」存成该老师的新模板。
+    // silent = true 是“追加到病历”等自动保存通道，不写模板；方案为空时 savePlanTemplate 内部会直接跳过。
+    if (!silent) savePlanTemplate(finalPlans[draftId] || '')
     // 【第59天修复】本地占位草案还没有后端 id，先走“落库”流程，不能直接 PUT
     // 【第71天修复】落库成功/失败都给老师明确反馈（原来成功时毫无提示，看起来像“点了没反应”）
     if (draftId < 0) {
@@ -1027,6 +1158,10 @@ export default function App() {
         // 草案 id 由负数变成真实 id：把老师已填的「症状标签 / 辨证施治方案」搬到新 id 下，避免看起来丢了
         setDraftTags(prev => prev[draftId] === undefined ? prev : { ...prev, [id]: prev[draftId] })
         setFinalPlans(prev => prev[draftId] === undefined ? prev : { ...prev, [id]: prev[draftId] })
+        // 【第75天新增 / 改动2】“已套用模板，可修改”标记也跟着搬到真实 id 下，避免落库后提示凭空消失；
+        // 自动套用标记同步搬过去，防止“已清空的方案”在换 id 后又被自动填回模板
+        setPlanTemplateApplied(prev => prev[draftId] === undefined ? prev : { ...prev, [id]: prev[draftId] })
+        if (planTemplateFilledRef.current[draftId]) planTemplateFilledRef.current[id] = true
         if (!silent) alert('病历已保存并落库（现在可以签字）')
       })
       return
@@ -1159,6 +1294,8 @@ export default function App() {
     if (!draft) return
     const plan = finalPlans[draftId] || ''
     if (!plan.trim()) { alert("请先填写施治方案，再预览完整病历"); return }
+    // 【第75天新增 / 改动2】老师点“预览完整病历”时，同样把当前施治方案存成该老师的新模板（POST /api/plan_template）
+    savePlanTemplate(plan)
     const fullContent = draft.content + '\n\n【辨证施治方案】\n' + plan + '\n\n【签字】\n' + selectedTeacher + ' · ' + currentYear + '年' + currentMonth + '月' + currentDay + '日'
     setPreviewDraft({ id: draftId, content: fullContent })
   }
@@ -3348,6 +3485,29 @@ export default function App() {
                 {clinicPatientDrafts.map(d => (
                   <div key={d.id} style={{ marginBottom: '14px' }}>
                     <div style={{ color: '#5a7d5a', fontWeight: 'bold', marginBottom: '8px' }}>📝 给 {d.patient_name} 的辨证施治方案（学生会看到这里的内容）</div>
+                    {/* 【第75天新增 / 改动1】施治方案语音输入按钮：点一下开始录音（zh-CN），再点一下停止 → 智能体清洗后追加到下面文本框末尾 */}
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '10px', flexWrap: 'wrap', marginBottom: '6px' }}>
+                      <button
+                        onClick={() => startPlanRecording(d.id)}
+                        disabled={!speechSupported}
+                        style={{ padding: '6px 16px', borderRadius: '20px', border: 'none', background: !speechSupported ? '#ccc' : (planRecording === d.id ? '#c0392b' : '#8b4513'), color: '#fff', cursor: !speechSupported ? 'not-allowed' : 'pointer', fontSize: '13px', fontFamily: 'serif' }}
+                      >
+                        {planCleaning[d.id] ? '🔄 智能体处理中...' : (planRecording === d.id ? '⏹ 停止录音' : '🎙️ 语音输入')}
+                      </button>
+                      {/* 【第75天新增 / 改动2】自动套用模板后的提示（小灰字） */}
+                      {planTemplateApplied[d.id] && (
+                        <span style={{ fontSize: '11px', color: '#999' }}>已套用模板，可修改</span>
+                      )}
+                    </div>
+                    {!speechSupported && (
+                      <div style={{ fontSize: '12px', color: '#c0392b', marginBottom: '6px' }}>当前浏览器不支持语音识别，请使用 Chrome 或 Edge</div>
+                    )}
+                    {planRecording === d.id && (
+                      <div style={{ fontSize: '12px', color: '#c0392b', marginBottom: '6px' }}>🔴 正在录音，停止后由智能体清洗再追加到下面的文本框</div>
+                    )}
+                    {planCleaning[d.id] && (
+                      <div style={{ fontSize: '12px', color: '#8b4513', marginBottom: '6px' }}>🔄 智能体处理中...（处理完成后自动追加到下面的文本框）</div>
+                    )}
                     <textarea value={finalPlans[d.id] || ''} onChange={(e) => setFinalPlans({ ...finalPlans, [d.id]: e.target.value })} placeholder="例：抓药xxx，三碗水煲成一碗，饭后服；或今日宜喝姜茶，多休息..." style={{ width: '100%', height: '80px', padding: '10px', borderRadius: '8px', border: '1px solid #b8d8c0', background: '#f7fcf9', fontFamily: 'serif', fontSize: '14px', marginBottom: '10px', boxSizing: 'border-box' }} />
                     <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
                       <button onClick={() => handlePreviewFullRecord(d.id)} style={{ padding: '8px 20px', borderRadius: '20px', border: 'none', background: '#5a7d5a', color: '#fff', cursor: 'pointer', fontWeight: 'bold' }}>📄 预览完整病历</button>
