@@ -460,6 +460,21 @@ def clean_transcript(input_data: CleanTranscriptInput):
         cleaned_text = input_data.raw_text
     return {"cleaned_text": cleaned_text}
 
+# 【第76天新增】老师端「辨证施治方案」语音输入专用清洗：
+# 医嘱（剂量/时间/煎法/火候/服法/忌口）没有病历五段式结构，复用 clean_transcript 会被套错结构
+# 甚至被当闲聊删掉，所以单独走本接口——只去噪、不改写、不分节，输出一段连贯医嘱文本。
+class CleanPlanInput(BaseModel):
+    raw_text: str
+
+@app.post("/api/agent/clean_plan")
+def clean_plan(input_data: CleanPlanInput):
+    """清洗施治方案口述转写；清洗失败（异常）时降级返回原文，不阻塞前端。"""
+    try:
+        cleaned_text = agent.clean_plan(input_data.raw_text)
+    except Exception:
+        cleaned_text = input_data.raw_text
+    return {"cleaned_text": cleaned_text}
+
 # 【第75天新增】施治方案模板记忆（老师维度）：
 # 老师在“辨证施治方案”里写的常用内容记一条模板，下次选中的学生施治方案为空时前端自动套用；
 # 老师点“保存病历修改”或“预览完整病历”时，前端把当前内容 POST 回来覆盖这条模板。
