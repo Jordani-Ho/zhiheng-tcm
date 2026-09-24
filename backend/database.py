@@ -151,9 +151,15 @@ def init_db():
         reason TEXT,
         status TEXT DEFAULT 'pending',
         created_at TEXT,
-        confirmed_at TEXT
+        confirmed_at TEXT,
+        is_remote INTEGER DEFAULT 0  -- 【第73天新增】0=当面诊疗 1=远程问诊（视频/线上），与 prescriptions.is_remote 同一套语义
     )
     """)
+    # 【第73天新增】如果表已存在（旧表），尝试补加 is_remote 字段（老库自动迁移，重复执行不报错）
+    try:
+        cursor.execute("ALTER TABLE appointments ADD COLUMN is_remote INTEGER DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass
 
     # 【第46天新增】病历标签表（知识库素材）
     cursor.execute("""
