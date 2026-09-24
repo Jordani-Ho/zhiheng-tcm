@@ -24,6 +24,10 @@ const PULSE_TYPES = ['浮', '沉', '迟', '数', '虚', '实', '滑', '涩']
 const IMAGE_SHARPNESS_THRESHOLD = 100
 // 【第61天新增】首页「今日备忘录」本地存储 key：{ date, keys }，存的数据不是今天就自动清空（前端模拟每日 00:00 重置）
 const MEMO_DONE_STORE_KEY = 'zh_memo_done'
+// 【第71天新增 / 面诊队列整合】🩺 诊室队列「💻 远程问诊」列的判定关键词：
+// appointments 表没有“远程 / 线上”字段，本次后端零改动，所以由前端按「预约原因 reason」里的关键词把已确认预约分成两列：
+// 命中关键词 → 右列「💻 远程问诊」，未命中 → 左列「📅 预约面诊」（老师写原因时带上“远程/线上/视频”等词即可归入远程列）。
+const REMOTE_APPT_KEYWORDS = ['远程', '线上', '网诊', '视频', '电话', '微信']
 
 export default function App() {
   const now = new Date()
@@ -99,6 +103,10 @@ export default function App() {
   const [teacherTab, setTeacherTab] = useState<TeacherTab>('home')
   // 【第57天新增】诊室：老师搜索学生（前端过滤 teacherPatients）
   const [studentSearch, setStudentSearch] = useState('')
+  // 【第71天新增 / 面诊队列整合】🩺 诊室队列：临时加插名单（仅本次会话有效，刷新页面自动清空；不落库、不调后端）
+  const [tempQueue, setTempQueue] = useState<{ name: string; time: string }[]>([])
+  // 临时加插：是否展开「从当前学生列表里选一位没预约的学生」的选择面板
+  const [showTempInsertPicker, setShowTempInsertPicker] = useState(false)
 
   // 【第59天重构】诊室二期：把脉记录（录音 / 拍照 / AI整理 已合并进“现场辅助记录”卡片，复用该卡片自己的 state）
   const [pulseTypes, setPulseTypes] = useState<string[]>([])
@@ -1332,6 +1340,19 @@ export default function App() {
     .filter((a: any) => a.status === 'confirmed' && a.scheduled_date >= todayStr)
     .sort((a: any, b: any) => (a.scheduled_date + a.scheduled_time).localeCompare(b.scheduled_date + b.scheduled_time))
 
+  // 【第71天新增 / 面诊队列整合】🩺 诊室队列双列的筛选逻辑（数据源就是上面的 clinicQueue，不新增接口）：
+  // ① 左列「📅 预约面诊」= clinicQueue 里预约原因未命中远程关键词的；② 右列「💻 远程问诊」= 命中的。
+  // clinicQueue 已按 scheduled_date + scheduled_time 升序排好，filter 保持原顺序，所以两列天然都是“今天及以后、时间升序”。
+  const isRemoteAppointment = (a: any) => REMOTE_APPT_KEYWORDS.some(k => (a.reason || '').includes(k))
+  const clinicInPersonQueue = clinicQueue.filter((a: any) => !isRemoteAppointment(a))
+  const clinicRemoteQueue = clinicQueue.filter((a: any) => isRemoteAppointment(a))
+  // ③ 临时加插候选：当前学生名单里「今天及以后没有任何未取消预约」且「本次会话还没加插过」的学生
+  const bookedPatientNames = appointments
+    .filter((a: any) => a.status !== 'cancelled' && a.scheduled_date >= todayStr)
+    .map((a: any) => a.patient_name)
+  const tempInsertCandidates = teacherPatients.filter((s: any) =>
+    !bookedPatientNames.includes(s.name) && !tempQueue.some(t => t.name === s.name))
+
   // ============== 【第61天新增】📋 今日备忘录（老师端首页）：时间轴 + 未排期事项 ==============
   // 数据全部来自现有 state + 静态模拟（roleData / appointments / teacherPatients / drafts / habitList / holidays / huangli），不新增后端接口
   const tomorrow = new Date(currentYear, currentMonth - 1, currentDay + 1)
@@ -1444,6 +1465,16 @@ export default function App() {
     })
   }
 
+  // 【第71天新增 / 面诊队列整合】🩺 诊室队列：➕ 临时加插
+  // 从「当前学生列表里没预约的学生」中选一位后：① 复用 selectClinicPatient 切到该学生（自动生成本地占位草案，
+  // 录音 / 拍照 / 把脉立刻可用）；② 在左列「📅 预约面诊」顶部插一条「【临时】学生名 · 刚刚」（同一学生重复加插先移除旧的那条，保证只出现一次且置顶）。
+  // 只写 tempQueue 这个独立 state，不落库、不调任何后端接口，刷新页面即清空。
+  const handleTempInsert = (name: string) => {
+    selectClinicPatient(name)
+    setTempQueue(prev => [{ name, time: '刚刚' }, ...prev.filter(t => t.name !== name)])
+    setShowTempInsertPicker(false)
+  }
+
   // （【第59天重构】原 appendToClinicDraft / stopClinicRecording 已随“三卡合一”移除：
   //   把脉、拍照改为先写入“现场辅助记录”文本框，录音复用卡片自带的 startTeacherLiveRecording）
 
@@ -1454,7 +1485,7 @@ export default function App() {
   // 功能3：把脉记录（纯前端，格式化成一段文字追加到“现场辅助记录”上方文本框末尾）
   const handlePulseRecord = () => {
     if (pulseTypes.length === 0 && !pulseRate.trim() && !pulseNote.trim()) { alert('请先选择脉象或填写脉率'); return }
-    if (!clinicTargetDraft) { alert('暂无待处理病历草案，请先在“面诊队列”或“搜索学生”里选一位学生'); return }
+    if (!clinicTargetDraft) { alert('暂无待处理病历草案，请先在“诊室队列”里选一位学生'); return }
     const parts: string[] = ['脉象：' + (pulseTypes.length > 0 ? pulseTypes.join('、') : '未填写')]
     if (pulseRate.trim()) parts.push('脉率：' + pulseRate.trim() + '次/分')
     if (pulseNote.trim()) parts.push('备注：' + pulseNote.trim())
@@ -2707,74 +2738,169 @@ export default function App() {
           </div>
         )}
 
-        {/* 【第57天新增】诊室：面诊队列 */}
-        {(currentRole === '李老师' || currentRole === '李老师智能体') && teacherTab === 'clinic' && (
-          <div style={{ ...boxStyle, background: '#f7fcf9' }}>
-            <div style={{ fontSize: '18px', color: '#5a7d5a', fontWeight: 'bold', marginBottom: '12px' }}>🩺 面诊队列</div>
-            {clinicQueue.length === 0 ? (
-              <div style={{ textAlign: 'center', color: '#999', fontSize: '13px', padding: '10px' }}>暂无已确认预约</div>
-            ) : (
-              clinicQueue.map((a: any) => (
-                <div
-                  key={a.id}
-                  onClick={() => selectClinicPatient(a.patient_name)}
+        {/* 【第71天新增 / 面诊队列整合】🩺 诊室队列：把原「🩺 面诊队列」+「🔍 搜索学生」+「👤 当前就诊学生」三张卡片合并成一张大卡片，
+            内部分三部分（① 队列双列 ② 搜索 + 临时加插 ③ 当前就诊学生），部分之间用虚线分隔。
+            数据全部复用现有 state（appointments / teacherPatients / selectedPatient / clinicQueue），不新增接口、不改后端。 */}
+        {isTeacherRole && teacherTab === 'clinic' && (
+          <div style={{ ...boxStyle, background: '#f7fcf9', width: '100%' }}>
+            <div style={{ fontSize: '20px', color: '#5a7d5a', fontWeight: 'bold', marginBottom: '6px', paddingBottom: '12px', borderBottom: '2px solid #d8e8d8' }}>🩺 诊室队列</div>
+            <div style={{ fontSize: '12px', color: '#999', marginTop: '10px', marginBottom: '16px' }}>
+              队列双列（📅 预约面诊 / 💻 远程问诊）｜ 搜索 + 临时加插 ｜ 当前就诊学生
+            </div>
+
+            {/* ===== 第一部分：队列双列（左 = 预约面诊，右 = 远程问诊；两列都是“今天及以后 + 已确认 + 日期时间升序”） ===== */}
+            <div style={{ display: 'flex', gap: '16px', alignItems: 'flex-start' }}>
+              {/* 左列：📅 预约面诊（本次会话的临时加插条目置顶显示） */}
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ fontSize: '15px', color: '#8b4513', fontWeight: 'bold', marginBottom: '8px' }}>📅 预约面诊</div>
+                <div style={{ maxHeight: '300px', overflowY: 'auto' }}>
+                  {tempQueue.length === 0 && clinicInPersonQueue.length === 0 ? (
+                    <div style={{ textAlign: 'center', color: '#999', fontSize: '13px', padding: '10px' }}>暂无</div>
+                  ) : (
+                    <>
+                      {tempQueue.map(t => (
+                        <div
+                          key={`temp-${t.name}`}
+                          onClick={() => selectClinicPatient(t.name)}
+                          style={{
+                            display: 'flex', alignItems: 'center', padding: '10px', marginBottom: '6px',
+                            background: selectedPatient === t.name ? '#fdeee8' : '#fff8e7',
+                            border: selectedPatient === t.name ? '1px solid #c0392b' : '1px solid #e8d4a8',
+                            borderRadius: '8px', cursor: 'pointer', fontSize: '13px'
+                          }}
+                        >
+                          <div style={{ flex: 1, color: '#c0392b', fontWeight: 'bold' }}>【临时】{t.name} · {t.time}</div>
+                          <div style={{ color: '#8b4513', fontSize: '12px' }}>➕ 已加插</div>
+                        </div>
+                      ))}
+                      {clinicInPersonQueue.map((a: any) => (
+                        <div
+                          key={`appt-${a.id}`}
+                          onClick={() => selectClinicPatient(a.patient_name)}
+                          style={{
+                            display: 'flex', alignItems: 'center', padding: '10px', marginBottom: '6px',
+                            background: selectedPatient === a.patient_name ? '#e8f4e8' : '#fff',
+                            border: selectedPatient === a.patient_name ? '1px solid #5a7d5a' : '1px solid #d4e8d4',
+                            borderRadius: '8px', cursor: 'pointer', fontSize: '13px'
+                          }}
+                        >
+                          <div style={{ flex: 1, color: '#8b4513', fontWeight: 'bold' }}>{a.scheduled_date} · {a.scheduled_time}</div>
+                          <div style={{ flex: 1, color: '#333' }}>👤 {a.patient_name}</div>
+                          <div style={{ color: '#5a7d5a', fontSize: '12px' }}>✅ 已确认</div>
+                        </div>
+                      ))}
+                    </>
+                  )}
+                </div>
+              </div>
+              {/* 右列：💻 远程问诊（同上排序，仅取预约原因命中远程关键词的预约） */}
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ fontSize: '15px', color: '#5a7d5a', fontWeight: 'bold', marginBottom: '8px' }}>💻 远程问诊</div>
+                <div style={{ maxHeight: '300px', overflowY: 'auto' }}>
+                  {clinicRemoteQueue.length === 0 ? (
+                    <div style={{ textAlign: 'center', color: '#999', fontSize: '13px', padding: '10px' }}>暂无</div>
+                  ) : (
+                    clinicRemoteQueue.map((a: any) => (
+                      <div
+                        key={`remote-${a.id}`}
+                        onClick={() => selectClinicPatient(a.patient_name)}
+                        style={{
+                          display: 'flex', alignItems: 'center', padding: '10px', marginBottom: '6px',
+                          background: selectedPatient === a.patient_name ? '#e8eef4' : '#fff',
+                          border: selectedPatient === a.patient_name ? '1px solid #5a7d9a' : '1px solid #d4dde8',
+                          borderRadius: '8px', cursor: 'pointer', fontSize: '13px'
+                        }}
+                      >
+                        <div style={{ flex: 1, color: '#8b4513', fontWeight: 'bold' }}>{a.scheduled_date} · {a.scheduled_time}</div>
+                        <div style={{ flex: 1, color: '#333' }}>👤 {a.patient_name}</div>
+                        <div style={{ color: '#5a7d5a', fontSize: '12px' }}>✅ 已确认</div>
+                      </div>
+                    ))
+                  )}
+                </div>
+              </div>
+            </div>
+            {/* ===== 第二部分：搜索 + 临时加插（搜索沿用旧「🔍 搜索学生」的前端过滤逻辑；临时加插只写 tempQueue 会话 state） ===== */}
+            <div style={{ borderTop: '1px dashed #d4c8a8', margin: '18px 0' }} />
+            <div>
+              <div style={{ display: 'flex', gap: '10px', alignItems: 'flex-start' }}>
+                <div style={{ flex: 1, position: 'relative' }}>
+                  <input
+                    style={{ ...inputStyle, marginBottom: 0 }}
+                    placeholder="输入学生名首字"
+                    value={studentSearch}
+                    onChange={e => setStudentSearch(e.target.value)}
+                  />
+                  {studentSearchResults.length > 0 && (
+                    <div style={{ position: 'absolute', top: '100%', left: 0, right: 0, background: '#fffdf5', border: '1px solid #d4c8a8', borderRadius: '4px', zIndex: 20, maxHeight: '200px', overflowY: 'auto' }}>
+                      {studentSearchResults.map((s: any) => (
+                        <div
+                          key={s.name}
+                          onClick={() => { selectClinicPatient(s.name); setStudentSearch('') }}
+                          style={{ padding: '8px', cursor: 'pointer', fontFamily: 'serif', borderBottom: '1px solid #f0e9d6', fontSize: '14px' }}
+                        >
+                          👤 {s.name}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+                <button
+                  onClick={() => setShowTempInsertPicker(v => !v)}
                   style={{
-                    display: 'flex', alignItems: 'center', padding: '10px', marginBottom: '6px',
-                    background: selectedPatient === a.patient_name ? '#e8f4e8' : '#fff',
-                    border: selectedPatient === a.patient_name ? '1px solid #5a7d5a' : '1px solid #d4e8d4',
-                    borderRadius: '8px', cursor: 'pointer', fontSize: '13px'
+                    padding: '8px 16px', borderRadius: '20px', border: '1px solid #8b4513', cursor: 'pointer',
+                    fontFamily: 'serif', fontSize: '13px', whiteSpace: 'nowrap',
+                    background: showTempInsertPicker ? '#8b4513' : '#fffdf5',
+                    color: showTempInsertPicker ? '#fff' : '#8b4513'
                   }}
                 >
-                  <div style={{ flex: 1, color: '#8b4513', fontWeight: 'bold' }}>{a.scheduled_date} · {a.scheduled_time}</div>
-                  <div style={{ flex: 1, color: '#333' }}>👤 {a.patient_name}</div>
-                  <div style={{ color: '#5a7d5a', fontSize: '12px' }}>✅ 已确认</div>
-                </div>
-              ))
-            )}
-          </div>
-        )}
-
-        {/* 【第57天新增】诊室：老师搜索学生（前端过滤，不做后端接口） */}
-        {(currentRole === '李老师' || currentRole === '李老师智能体') && teacherTab === 'clinic' && (
-          <div style={{ ...boxStyle, background: '#fdf8f0' }}>
-            <div style={{ fontSize: '18px', color: '#8b4513', fontWeight: 'bold', marginBottom: '12px' }}>🔍 搜索学生</div>
-            <div style={{ position: 'relative' }}>
-              <input
-                style={{ ...inputStyle, marginBottom: 0 }}
-                placeholder="输入学生名首字"
-                value={studentSearch}
-                onChange={e => setStudentSearch(e.target.value)}
-              />
-              {studentSearchResults.length > 0 && (
-                <div style={{ position: 'absolute', top: '100%', left: 0, right: 0, background: '#fffdf5', border: '1px solid #d4c8a8', borderRadius: '4px', zIndex: 20, maxHeight: '200px', overflowY: 'auto' }}>
-                  {studentSearchResults.map((s: any) => (
-                    <div
-                      key={s.name}
-                      onClick={() => { selectClinicPatient(s.name); setStudentSearch('') }}
-                      style={{ padding: '8px', cursor: 'pointer', fontFamily: 'serif', borderBottom: '1px solid #f0e9d6', fontSize: '14px' }}
-                    >
-                      👤 {s.name}
+                  ➕ 临时加插
+                </button>
+              </div>
+              {studentSearch.trim() && studentSearchResults.length === 0 && (
+                <div style={{ fontSize: '12px', color: '#999', marginTop: '8px' }}>未找到匹配的学生</div>
+              )}
+              {showTempInsertPicker && (
+                <div style={{ marginTop: '10px', padding: '10px 12px', background: '#fffdf5', border: '1px dashed #d4c8a8', borderRadius: '8px' }}>
+                  <div style={{ fontSize: '12px', color: '#999', marginBottom: '8px' }}>
+                    从当前学生列表里选一位“今天及以后没有预约”的学生加插（仅本次会话有效，不落库、不调后端）：
+                  </div>
+                  {tempInsertCandidates.length === 0 ? (
+                    <div style={{ fontSize: '12px', color: '#999' }}>暂无没预约的学生</div>
+                  ) : (
+                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px' }}>
+                      {tempInsertCandidates.map((s: any) => (
+                        <button
+                          key={s.name}
+                          onClick={() => handleTempInsert(s.name)}
+                          style={{ padding: '6px 14px', borderRadius: '15px', border: '1px solid #8b4513', cursor: 'pointer', fontFamily: 'serif', fontSize: '13px', background: '#fdfcf0', color: '#8b4513' }}
+                        >
+                          👤 {s.name}
+                        </button>
+                      ))}
                     </div>
-                  ))}
+                  )}
+                </div>
+              )}
+              {tempQueue.length > 0 && (
+                <div style={{ fontSize: '12px', color: '#c0392b', marginTop: '8px' }}>
+                  本次已临时加插：{tempQueue.map(t => t.name).join('、')}（刷新页面后自动清空）
                 </div>
               )}
             </div>
-            {studentSearch.trim() && studentSearchResults.length === 0 && (
-              <div style={{ fontSize: '12px', color: '#999', marginTop: '8px' }}>未找到匹配的学生</div>
-            )}
-          </div>
-        )}
-
-        {/* 【第57天新增】诊室：当前就诊学生（纯展示） */}
-        {(currentRole === '李老师' || currentRole === '李老师智能体') && teacherTab === 'clinic' && (
-          <div style={{ ...boxStyle, background: '#fffaf0' }}>
-            <div style={{ fontSize: '18px', color: '#8b4513', fontWeight: 'bold', marginBottom: '12px' }}>👤 当前就诊学生：{selectedPatient}</div>
-            <div style={{ fontSize: '14px', color: '#333', lineHeight: '2' }}>
-              <div>上次就诊：{lastVisitDate}</div>
-              <div>当前状态：{currentStudentInfo ? currentStudentInfo.status_label : '未在您的学生名单中'}</div>
+            {/* ===== 第三部分：当前就诊学生（沿用旧「👤 当前就诊学生」卡片的展示逻辑，纯展示） ===== */}
+            <div style={{ borderTop: '1px dashed #d4c8a8', margin: '18px 0' }} />
+            <div style={{ background: '#fffaf0', border: '1px solid #f0e4cc', borderRadius: '10px', padding: '14px' }}>
+              <div style={{ fontSize: '17px', color: '#8b4513', fontWeight: 'bold', marginBottom: '8px' }}>👤 当前就诊学生：{selectedPatient}</div>
+              <div style={{ fontSize: '14px', color: '#333', lineHeight: '2' }}>
+                <div>上次就诊：{lastVisitDate}</div>
+                <div>当前状态：{currentStudentInfo ? currentStudentInfo.status_label : '未在您的学生名单中'}</div>
+              </div>
             </div>
           </div>
         )}
+
+        {/* 【第71天整合】原「🔍 搜索学生」与「👤 当前就诊学生」两张卡片已合并进上方「🩺 诊室队列」大卡片的第二 / 第三部分，此处不再单独渲染。 */}
 
         {/* 【第69天整合】🩺 诊室工作台：把原「📸 现场辅助记录」卡片与原「📋 诊疗记录区」容器合并成一个撑满宽度的大卡片。
             两个部分共享同一个外边框：上半 = 现场记录区（🎙️录音 / 📷拍照 / 💓把脉 → 先写入文本框，再“追加到病历”），
@@ -2791,7 +2917,7 @@ export default function App() {
             <div style={{ background: '#f0f7f0', border: '1px solid #dde9dd', borderRadius: '10px', padding: '14px' }}>
               <div style={{ fontSize: '17px', color: '#5a7d5a', fontWeight: 'bold', marginBottom: '6px' }}>📸 现场记录区（录音 → AI整理）</div>
               <div style={{ fontSize: '12px', color: '#999', marginBottom: '12px' }}>
-                写入目标：{clinicTargetDraft ? `${clinicTargetDraft.patient_name} 的病历草案` : '（暂无待处理病历草案，请先在“面诊队列”或“搜索学生”里选一位学生）'}
+                写入目标：{clinicTargetDraft ? `${clinicTargetDraft.patient_name} 的病历草案` : '（暂无待处理病历草案，请先在“诊室队列”里选一位学生）'}
               </div>
               {/* a) 文本输入 / 显示区 */}
               <textarea
@@ -2915,7 +3041,7 @@ export default function App() {
             <div style={{ fontSize: '12px', color: '#999', marginBottom: '16px' }}>病历草案 → 症状标签 → 开方 → 辨证施治方案（同一容器，分区之间用内嵌分隔线）</div>
             {/* 【第70天修复 / 数据串台】只渲染“当前就诊学生”的草案，其他学生的草案不再出现在本屏 */}
             {clinicPatientDrafts.length === 0 && (
-              <div style={{ textAlign: 'center', color: '#999', marginBottom: '16px' }}>暂无待处理病历（在“面诊队列”或“搜索学生”里选一位学生即可开始记录）</div>
+              <div style={{ textAlign: 'center', color: '#999', marginBottom: '16px' }}>暂无待处理病历（在“诊室队列”里选一位学生即可开始记录）</div>
             )}
 
             {/* 分区 1/4：病历草案 */}
