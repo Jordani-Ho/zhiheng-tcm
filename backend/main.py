@@ -944,6 +944,54 @@ def api_resolve_agent_task(task_id: int, data: AgentResolveInput):
     if result is None:
         raise HTTPException(status_code=404, detail="任务不存在")
     return {"message": "已处理"}
+
+
+# ============ 【行政化改造】任务表接口（设计文档 4 个接口） ============
+# 说明：上面的 /api/agent/*（scan、tasks、tasks/{id}/resolve）是前端「智能体工作台」在用的老接口，
+# 保持原样不动，避免改前端；这里按设计文档再提供一套更符合 REST 语义的资源路径：
+#   GET  /api/agent_tasks            任务列表（含 request 请示 / report 汇报，可按 status 过滤）
+#   POST /api/agent_tasks/approve    批准（status → approved + resolved_at + 日志）
+#   POST /api/agent_tasks/reject     驳回（status → rejected + resolved_at + 日志）
+#   GET  /api/agent_action_log       行动日志（倒序 + limit）
+# 两套接口读写同一张表（agent_tasks / agent_action_log），不是两套数据。
+
+class AgentTaskIdInput(BaseModel):
+    task_id: int
+
+
+@app.get("/api/agent_tasks")
+def api_list_agent_tasks(teacher_name: str, status: str = ""):
+    """该老师的智能体任务列表；status 不传（或传空串）= 返回全部。
+
+    可选值按设计文档：pending / approved / rejected / done / undone。
+    """
+    return database.get_agent_tasks(teacher_name, status)
+
+
+@app.post("/api/agent_tasks/approve")
+def api_approve_agent_task(data: AgentTaskIdInput):
+    """批准请示：status → approved、写 resolved_at、往 agent_action_log 记一条日志。"""
+    result = database.resolve_agent_task(data.task_id, "approved")
+    if result is None:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    return {"ok": True}
+
+
+@app.post("/api/agent_tasks/reject")
+def api_reject_agent_task(data: AgentTaskIdInput):
+    """驳回请示：status → rejected、写 resolved_at、往 agent_action_log 记一条日志。"""
+    result = database.resolve_agent_task(data.task_id, "rejected")
+    if result is None:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    return {"ok": True}
+
+
+@app.get("/api/agent_action_log")
+def api_get_agent_action_log(teacher_name: str, limit: int = 20):
+    """该老师的智能体行动日志，按 created_at 倒序，默认最多 20 条。"""
+    return database.get_agent_action_log(teacher_name, limit)
+
+
 # ============ Pydantic 模型：财务管理（预存 / 赠送 / 扣费） ============
 
 class FinanceInput(BaseModel):

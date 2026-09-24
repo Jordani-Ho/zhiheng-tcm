@@ -229,6 +229,9 @@ def init_db():
         print("[warn] 药方 role/cooking_method 兼容性升级跳过：", exc)
 
     # 【第56天新增】老师智能体任务表（请示 / 汇报）
+    # 【行政化核对】字段与设计文档一致，无需 ALTER（id / teacher_name / task_type / category /
+    # title / content / action_data / status / created_at / resolved_at 共 10 列，无 CHECK 约束，
+    # 所以 status 可自由使用 pending / approved / rejected / done / undone 五个取值）。
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS agent_tasks (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -238,13 +241,15 @@ def init_db():
         title TEXT,           -- 短标题（如"张三已沉默 35 天"）
         content TEXT,         -- 详细描述
         action_data TEXT,     -- JSON，可执行的行动参数
-        status TEXT DEFAULT 'pending',  -- pending / approved / rejected / done
+        status TEXT DEFAULT 'pending',  -- pending / approved / rejected / done / undone
         created_at TEXT,
         resolved_at TEXT
     )
     """)
 
     # 【第56天新增】智能体行动日志表（闭环留痕）
+    # 【行政化核对】字段与设计文档一致，无需 ALTER（id / teacher_name / task_id / action /
+    # detail / created_at 共 6 列）。
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS agent_action_log (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1300,6 +1305,19 @@ def scan_silent_students(teacher_name, silent_days=30):
         ORDER BY p.name
     """, (teacher_name,)).fetchall()
 
+    # 【行政化改造】先把该老师所有 pending 的「学生」类请示里的 patient_name 收集起来做去重集合。
+    # 不用以前那种 action_data 字符串全等匹配 —— 这样历史旧格式
+    # （{"action": "send_care_notice", ...}）也能命中，action_data 格式升级不会给同一学生重复建单。
+    pending_patient_names = set()
+    for pending in cur.execute(
+        "SELECT action_data FROM agent_tasks WHERE teacher_name = ? AND category = 'student' AND status = 'pending'",
+        (teacher_name,)
+    ).fetchall():
+        try:
+            pending_patient_names.add((json.loads(pending["action_data"]) or {}).get("patient_name"))
+        except Exception:
+            continue
+
     now = datetime.now()
     created = 0
     for student in students:
@@ -1317,22 +1335,29 @@ def scan_silent_students(teacher_name, silent_days=30):
         else:
             days = silent_days  # 从未互动过：按沉默阈值计
 
-        action_data = json.dumps({"action": "send_care_notice", "patient_name": name}, ensure_ascii=False)
-        # 该学生已有 pending 同类请示 → 不重复建（用 action_data 全等匹配，避免同名子串误判）
-        exists = cur.execute(
-            "SELECT id FROM agent_tasks WHERE teacher_name = ? AND category = 'student' AND status = 'pending' AND action_data = ?",
-            (teacher_name, action_data)
-        ).fetchone()
-        if exists:
+        # 该学生已有 pending 同类请示 → 不重复建
+        if name in pending_patient_names:
             continue
 
+        # 【行政化改造】按设计文档固定字段写入 agent_tasks：
+        #   task_type = 'request'、category = 'student'、title = '张三已沉默 35 天'、
+        #   content = '是否发送关怀通知？'、
+        #   action_data = {"action": "send_care_notice", "patient_name": "张三", "template": "care"}、
+        #   status = 'pending'（created_at 由后端补；resolved_at 等老师审批时再写）
+        # 【通知命名规范】action 统一用 send_<类型>_notice 格式，一眼看出通知类型：
+        #   沉默关怀 = send_care_notice、欠费催缴 = send_billing_notice、
+        #   复诊提醒 = send_recall_notice、预约通知 = send_schedule_notice（后续新增按此格式）。
+        action_data = json.dumps(
+            {"action": "send_care_notice", "patient_name": name, "template": "care"},
+            ensure_ascii=False
+        )
         cur.execute("""
             INSERT INTO agent_tasks (teacher_name, task_type, category, title, content, action_data, status, created_at)
             VALUES (?, 'request', 'student', ?, ?, ?, 'pending', ?)
-        """, (teacher_name, f"{name} 已沉默 {days} 天",
-              f"该学生已 {days} 天未打卡或发陈述。是否发送关怀通知？",
+        """, (teacher_name, f"{name}已沉默 {days} 天", "是否发送关怀通知？",
               action_data, now.isoformat()))
         created += 1
+        pending_patient_names.add(name)
 
     conn.commit()
     conn.close()
@@ -1380,7 +1405,8 @@ def resolve_agent_task(task_id, decision):
             action = json.loads(task["action_data"]) if task["action_data"] else {}
         except Exception:
             action = {}
-        if action.get("action") == "send_care_notice":
+        # 标准命名 send_<类型>_notice（沉默关怀 = 'send_care_notice'）；同时容忍中途试写过的 'send_notice'
+        if action.get("action") in ("send_care_notice", "send_notice"):
             cur.execute("""
                 INSERT INTO agent_action_log (teacher_name, task_id, action, detail, created_at)
                 VALUES (?, ?, 'send_notice', ?, ?)
@@ -1389,6 +1415,26 @@ def resolve_agent_task(task_id, decision):
     conn.commit()
     conn.close()
     return {"message": "已处理", "status": new_status}
+
+
+def get_agent_action_log(teacher_name, limit=20):
+    """【行政化改造】返回该老师的智能体行动日志，按 created_at 倒序（同一时间按 id 倒序）。
+
+    limit：最多返回多少条（设计文档接口默认 20）：非正数按默认 20 处理，上限 200，防止一把拉爆。
+    """
+    if not teacher_name:
+        return []
+    if limit is None or limit <= 0:
+        limit = 20
+    limit = min(limit, 200)
+
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT * FROM agent_action_log WHERE teacher_name = ? ORDER BY created_at DESC, id DESC LIMIT ?",
+        (teacher_name, limit)
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
 
 
 # ============ 【第75天新增】施治方案模板（老师维度的模板记忆） ============
