@@ -192,16 +192,31 @@ def init_db():
     )
     """)
 
-    # 10. 【预留】投诉表
+    # 10. 【预留】投诉表 / 学生陈述表
+    # 【第82天启用】学生「十问歌」面诊前准备摘要由 agent.save_intake() 写进本表（status='pending'），
+    # 老师端诊室页「📝 待处理陈述」卡片读本表；点「已处理」后 status → 'processed' 并写 resolved_at。
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS complaints (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         teacher_name TEXT,
         patient_name TEXT,
         content TEXT,
-        created_at TEXT
+        created_at TEXT,
+        status TEXT DEFAULT 'pending',  -- 【第82天新增】pending（待处理）/ processed（已处理）
+        resolved_at TEXT                -- 【第82天新增】处理时间（老师点「已处理」时写入 ISO 时间戳）
     )
     """)
+    # 【第82天新增】老库自动迁移（与 visit_at / is_remote / teacher_settings.holidays 的补列手法完全一致）：
+    # 旧 complaints 表没有 status / resolved_at 列，这里补上；列已存在时 sqlite 抛 OperationalError，直接跳过。
+    # 老记录补 status 后统一为 'pending'（默认值），符合「老陈述还待处理」的语义，不丢数据。
+    try:
+        cursor.execute("ALTER TABLE complaints ADD COLUMN status TEXT DEFAULT 'pending'")
+    except sqlite3.OperationalError:
+        pass  # 字段已存在
+    try:
+        cursor.execute("ALTER TABLE complaints ADD COLUMN resolved_at TEXT")
+    except sqlite3.OperationalError:
+        pass  # 字段已存在
 
     # 【第52天新增】药方表（结构化存储，便于后续按药方自动扣减库存）
     cursor.execute("""
@@ -1474,6 +1489,53 @@ def save_plan_template(teacher_name, content):
     else:
         cur.execute("INSERT INTO plan_templates (teacher_name, content, updated_at) VALUES (?, ?, ?)",
                     (teacher_name, content or "", now))
+    conn.commit()
+    conn.close()
+    return True
+
+
+# ============ 【第82天新增】学生陈述（complaints）：老师端「📝 待处理陈述」 ============
+# 数据链路：学生「十问歌」面诊前准备 → agent.save_intake() 落 complaints（status='pending'）
+#           → 老师端 GET /api/complaints?teacher_name=…&status=pending 看到列表
+#           → 点「已处理」POST /api/complaints/{id}/process → status='processed' + resolved_at。
+
+def get_complaints(teacher_name, status="pending"):
+    """查该老师名下的学生陈述：按 status 过滤，created_at 倒序（同一时间按 id 倒序）。
+
+    status 传空串 / None = 不过滤状态（返回该老师全部陈述）。
+    返回字段：id / patient_name / teacher_name / content / status / created_at。
+    """
+    conn = get_connection()
+    if status:
+        rows = conn.execute(
+            "SELECT id, patient_name, teacher_name, content, status, created_at FROM complaints "
+            "WHERE teacher_name = ? AND status = ? ORDER BY created_at DESC, id DESC",
+            (teacher_name, status)
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT id, patient_name, teacher_name, content, status, created_at FROM complaints "
+            "WHERE teacher_name = ? ORDER BY created_at DESC, id DESC",
+            (teacher_name,)
+        ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def process_complaint(complaint_id):
+    """老师标记「已处理」：status → 'processed' 并写 resolved_at（ISO 时间戳）。
+
+    返回 True；记录不存在返回 False（由接口回 404，不静默成功）。
+    """
+    conn = get_connection()
+    cur = conn.cursor()
+    row = cur.execute("SELECT id FROM complaints WHERE id = ?", (complaint_id,)).fetchone()
+    if row is None:
+        conn.close()
+        return False
+    now = datetime.now().isoformat()
+    cur.execute("UPDATE complaints SET status = 'processed', resolved_at = ? WHERE id = ?",
+                (now, complaint_id))
     conn.commit()
     conn.close()
     return True

@@ -1082,3 +1082,28 @@ def api_finance_deduct(data: FinanceInput):
 def api_finance_accounts():
     """账户列表：role 由 username 是否存在于 teachers 表判断。"""
     return {"accounts": database.get_finance_accounts()}
+
+
+# ============ 接口：学生陈述（complaints）—— 老师端「📝 待处理陈述」 ============
+# 数据来源：学生「十问歌」面诊前准备 → POST /api/agent/save_intake → complaints（status='pending'）。
+# 老师端诊室页「待处理陈述」卡片：GET /api/complaints?teacher_name=…&status=pending 拉列表，
+# 点「已处理」→ POST /api/complaints/{id}/process（status → 'processed' + resolved_at）。
+
+@app.get("/api/complaints")
+def api_get_complaints(teacher_name: str, status: str = "pending"):
+    """按老师 + 状态查学生陈述（status 传空串 = 不过滤状态），created_at 倒序。
+
+    返回：{"complaints": [{id, patient_name, teacher_name, content, status, created_at}, ...]}
+    """
+    return {"complaints": database.get_complaints(teacher_name, status)}
+
+
+@app.post("/api/complaints/{complaint_id}/process")
+def api_process_complaint(complaint_id: int):
+    """老师点「已处理」：该条 status → 'processed' 并写 resolved_at；记录不存在返回 404。
+
+    返回：{"ok": true}
+    """
+    if not database.process_complaint(complaint_id):
+        raise HTTPException(status_code=404, detail="陈述不存在")
+    return {"ok": True}
