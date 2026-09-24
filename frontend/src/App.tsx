@@ -49,6 +49,15 @@ const formatAgentTime = (value?: string | null) => {
   if (s.length < 16) return s
   return `${s.slice(5, 10)} ${s.slice(11, 16)}`
 }
+// 【第82天新增 / 老师端待处理陈述】📝 待处理陈述的「内容摘要」：把换行 / 连续空白折叠成一个空格后，
+// 超过 80 字截断并加 "..."（只影响摘要展示，展开后的完整内容仍是原文，不做任何改写）；
+// 空内容给一个中性占位，避免卡片出现空白块。
+const COMPLAINT_SUMMARY_LIMIT = 80
+const summarizeComplaint = (content?: string | null) => {
+  const text = String(content || '').replace(/\s+/g, ' ').trim()
+  if (!text) return '（无内容）'
+  return text.length > COMPLAINT_SUMMARY_LIMIT ? text.slice(0, COMPLAINT_SUMMARY_LIMIT) + '...' : text
+}
 // 【第74天新增 / 开方九宫格改造】开方「君臣佐使」与「煎法」选项（与后端 database.py 的
 // PRESCRIPTION_ROLES / PRESCRIPTION_COOKING_METHODS 白名单一一对应，改一处要同步另一处）
 const HERB_ROLES = ['君', '臣', '佐', '使']
@@ -172,6 +181,15 @@ export default function App() {
   const [tempQueue, setTempQueue] = useState<{ name: string; time: string }[]>([])
   // 临时加插：是否展开「从当前学生列表里选一位没预约的学生」的选择面板
   const [showTempInsertPicker, setShowTempInsertPicker] = useState(false)
+  // 【第82天新增 / 老师端待处理陈述】📝 待处理陈述（位置：「🩺 诊室队列」下方、「🩺 诊室工作台」上方）：
+  // 学生完成「十问歌」面诊前准备后走 POST /api/agent/save_intake 落库到 complaints 表（status='pending'），
+  // 老师在诊室页这里看到这些陈述，看完点「已处理」把它们移出待办列表。
+  // 数据源：GET /api/complaints?teacher_name=…&status=pending；全部复用现有 fetch 写法，不新增依赖。
+  const [pendingComplaints, setPendingComplaints] = useState<any[]>([])                // 待处理陈述列表
+  const [complaintsLoading, setComplaintsLoading] = useState(false)                    // 正在拉取 / 刷新
+  const [complaintsMissing, setComplaintsMissing] = useState(false)                    // 后端接口缺失（404 / 非 2xx）→ 只给灰字提示，不弹窗
+  const [expandedComplaintIds, setExpandedComplaintIds] = useState<string[]>([])       // 「查看详情」的展开状态（按行 key 记录，可多条同时展开）
+  const [processingComplaintIds, setProcessingComplaintIds] = useState<string[]>([])   // 正在「已处理」的行 key（按钮置灰，防重复点击）
 
   // 【第59天重构】诊室二期：把脉记录（录音 / 拍照 / AI整理 已合并进“现场辅助记录”卡片，复用该卡片自己的 state）
   const [pulseTypes, setPulseTypes] = useState<string[]>([])
@@ -439,6 +457,15 @@ export default function App() {
       fetchAgentWorkbench()
     }
   }, [currentRole, selectedTeacher])
+
+  // 【第82天新增 / 老师端待处理陈述】进入「🩺 诊室」页签 / 切换老师时拉一次「待处理陈述」：
+  // 与上面 plan_template 的依赖写法完全一致（切页签或换老师才重拉，不在诊室里输入时反复请求）。
+  // 后端没这个接口时只会把列表置空 + complaintsMissing=true，不影响诊室其它功能。
+  useEffect(() => {
+    if (currentRole !== '李老师' && currentRole !== '李老师智能体') return
+    if (teacherTab !== 'clinic') return
+    fetchPendingComplaints()
+  }, [currentRole, teacherTab, selectedTeacher])
 
   useEffect(() => {
     fetchRoleData()
@@ -814,6 +841,56 @@ export default function App() {
       .then(res => res.json())
       .then(data => setAgentActionLogs(Array.isArray(data) ? data : []))
       .catch(() => setAgentActionLogs([]))
+  }
+
+  // 【第82天新增 / 老师端待处理陈述】📝 待处理陈述：拉取当前老师名下 status=pending 的学生陈述
+  //   GET /api/complaints?teacher_name=李老师&status=pending
+  // 期望返回：[{ id, teacher_name, patient_name, content, status, created_at }]
+  //   （created_at 是后端 ISO 串，直接交给 formatAgentTime 显示成 MM-DD HH:mm；content 是整理后的「面诊前摘要」全文）
+  // 容错：① 响应不是数组时兼容 { complaints: [...] }（取不到就按空列表处理，绝不 .map 报错）；
+  //       ② 后端还没这个接口（404 / 非 2xx / 连不上）→ complaintsMissing=true，卡片按“暂无”渲染并提示待补接口，
+  //          不弹窗、不影响诊室其它功能；后端补上接口后本卡片无需再改代码。
+  const fetchPendingComplaints = () => {
+    setComplaintsLoading(true)
+    fetch(`/api/complaints?teacher_name=${encodeURIComponent(selectedTeacher)}&status=pending`)
+      .then(res => {
+        if (!res.ok) throw new Error(`complaints ${res.status}`)
+        return res.json()
+      })
+      .then(data => {
+        setComplaintsMissing(false)
+        if (Array.isArray(data)) { setPendingComplaints(data); return }
+        setPendingComplaints(data && Array.isArray(data.complaints) ? data.complaints : [])
+      })
+      .catch(() => { setComplaintsMissing(true); setPendingComplaints([]) })
+      .finally(() => setComplaintsLoading(false))
+  }
+
+  // 【第82天新增 / 老师端待处理陈述】「查看详情」：只切本地的展开状态（不调后端），
+  // 展开后显示完整内容（whiteSpace: pre-wrap 保留后端摘要里的换行）。
+  const toggleComplaintDetail = (rowKey: string) => {
+    setExpandedComplaintIds(prev => prev.includes(rowKey) ? prev.filter(x => x !== rowKey) : [...prev, rowKey])
+  }
+
+  // 【第82天新增 / 老师端待处理陈述】「已处理」：POST /api/complaints/{id}/process
+  // （路径风格与现成的 POST /api/appointments/{id}/confirm、POST /api/drafts/{id}/sign 保持一致），
+  // 后端把这条的 status 改成 processed；成功后本地直接把这条从列表里移除（不必等下一次刷新）。
+  // 后端没这个接口时不静默失败：弹一句明确提示，列表保持原样。
+  const handleProcessComplaint = (id: number, rowKey: string) => {
+    if (!id) { alert('这条陈述缺少 id，无法标记已处理（后端接口字段待确认）。'); return }
+    if (processingComplaintIds.includes(rowKey)) return
+    setProcessingComplaintIds(prev => [...prev, rowKey])
+    fetch(`/api/complaints/${id}/process`, { method: 'POST' })
+      .then(res => {
+        if (!res.ok) throw new Error(`process complaint ${res.status}`)
+        return res.json()
+      })
+      .then(() => {
+        setPendingComplaints(prev => prev.filter(c => String(c && c.id) !== String(id)))
+        setExpandedComplaintIds(prev => prev.filter(x => x !== rowKey))
+      })
+      .catch(() => alert('标记「已处理」失败：后端暂未提供 POST /api/complaints/{id}/process 接口，需要后端新增后再试。'))
+      .finally(() => setProcessingComplaintIds(prev => prev.filter(x => x !== rowKey)))
   }
 
   // 【行政化 B3 / 第56天新增】触发统一扫描：POST /api/agent/scan，请求体 { teacher_name }
@@ -3489,6 +3566,71 @@ export default function App() {
                 <div>当前状态：{currentStudentInfo ? currentStudentInfo.status_label : '未在您的学生名单中'}</div>
               </div>
             </div>
+          </div>
+        )}
+
+        {/* 【第82天新增 / 老师端待处理陈述】📝 待处理陈述：位置在「🩺 诊室队列」下方、「🩺 诊室工作台」上方（只在老师端 🩺 诊室页签显示）。
+            数据来源：GET /api/complaints?teacher_name=…&status=pending —— 即学生完成「十问歌」面诊前准备后
+            由 POST /api/agent/save_intake 写进 complaints 表的记录（status='pending'）。
+            每条：学生名 + 提交时间（MM-DD HH:mm）+ 内容摘要（超 80 字截断加 "..."）→「查看详情」展开全文（expandedComplaintIds 控制展开/收起）
+            →「已处理」POST /api/complaints/{id}/process，后端改 status 后本地移除该条。
+            后端若缺这两个接口：只显示“暂无 + 后端接口待补”灰字提示，不弹窗、不影响诊室的其它功能。 */}
+        {isTeacherRole && teacherTab === 'clinic' && (
+          <div style={{ ...boxStyle, background: '#fffdf6', width: '100%' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '6px', paddingBottom: '12px', borderBottom: '2px solid #efe3c8' }}>
+              <div style={{ fontSize: '20px', color: '#8b4513', fontWeight: 'bold' }}>📝 待处理陈述（{pendingComplaints.length}）</div>
+              <button
+                onClick={fetchPendingComplaints}
+                disabled={complaintsLoading}
+                style={{ padding: '4px 12px', borderRadius: '15px', border: '1px solid #8b4513', background: 'transparent', color: '#8b4513', cursor: complaintsLoading ? 'default' : 'pointer', fontSize: '12px', fontFamily: 'serif', opacity: complaintsLoading ? 0.6 : 1 }}
+              >{complaintsLoading ? '刷新中…' : '🔄 刷新'}</button>
+            </div>
+            <div style={{ fontSize: '12px', color: '#999', marginTop: '10px', marginBottom: '16px' }}>
+              来源：学生「十问歌」面诊前准备（POST /api/agent/save_intake 写入 complaints）｜ 接口：{'GET /api/complaints?teacher_name='}{selectedTeacher}{'&status=pending'}
+            </div>
+
+            {pendingComplaints.length === 0 ? (
+              <div>
+                <div style={{ textAlign: 'center', color: '#999', fontSize: '13px', padding: '8px' }}>暂无待处理陈述，学生完成问诊前准备后会显示在这里</div>
+                {complaintsMissing && (
+                  <div style={{ textAlign: 'center', color: '#c0392b', fontSize: '12px', marginTop: '6px' }}>
+                    （后端接口待补：GET /api/complaints；补上后本卡片无需再改代码）
+                  </div>
+                )}
+              </div>
+            ) : (
+              pendingComplaints.map((c: any, i: number) => {
+                const hasId = c && c.id !== undefined && c.id !== null
+                const rowKey = String(hasId ? c.id : `idx-${i}`)
+                const realId = hasId ? Number(c.id) : null
+                const expanded = expandedComplaintIds.includes(rowKey)
+                const processing = processingComplaintIds.includes(rowKey)
+                return (
+                  <div key={rowKey} style={{ padding: '10px', background: '#fff', border: '1px solid #efe3c8', borderRadius: '8px', marginBottom: '8px' }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '6px' }}>
+                      <div style={{ fontSize: '14px', color: '#8b4513', fontWeight: 'bold' }}>👤 {c && c.patient_name ? c.patient_name : '（未署名）'}</div>
+                      <div style={{ fontSize: '11px', color: '#999', whiteSpace: 'nowrap' }}>🕒 {formatAgentTime(c && c.created_at)}</div>
+                    </div>
+                    {expanded ? (
+                      <div style={{ whiteSpace: 'pre-wrap', fontSize: '13px', color: '#333', lineHeight: '1.7', background: '#fffaf0', border: '1px dashed #e6dcc2', borderRadius: '6px', padding: '8px', marginBottom: '8px' }}>{c && c.content ? c.content : '（无内容）'}</div>
+                    ) : (
+                      <div style={{ fontSize: '13px', color: '#666', lineHeight: '1.6', marginBottom: '8px' }}>{summarizeComplaint(c && c.content)}</div>
+                    )}
+                    <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '8px' }}>
+                      <button
+                        onClick={() => toggleComplaintDetail(rowKey)}
+                        style={{ padding: '4px 12px', borderRadius: '15px', border: '1px solid #8b4513', background: 'transparent', color: '#8b4513', cursor: 'pointer', fontSize: '12px', fontFamily: 'serif' }}
+                      >{expanded ? '收起详情' : '查看详情'}</button>
+                      <button
+                        onClick={() => { if (realId === null) { alert('这条陈述缺少 id，无法标记已处理（后端接口字段待确认）。'); return } handleProcessComplaint(realId, rowKey) }}
+                        disabled={processing}
+                        style={{ padding: '4px 12px', borderRadius: '15px', border: 'none', background: processing ? '#d4c8a8' : '#5a7d5a', color: '#fdfcf0', cursor: processing ? 'default' : 'pointer', fontSize: '12px', fontFamily: 'serif' }}
+                      >{processing ? '处理中…' : '已处理'}</button>
+                    </div>
+                  </div>
+                )
+              })
+            )}
           </div>
         )}
 
