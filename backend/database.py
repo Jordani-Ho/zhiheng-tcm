@@ -104,9 +104,16 @@ def init_db():
         teacher_name TEXT,
         ai_draft TEXT,
         final_plan TEXT,
-        doctor TEXT
+        doctor TEXT,
+        visit_at TEXT  -- 【第77天新增】就诊时间（ISO 时间戳，如 2026-09-23T15:30:00）：老师签字落库时写入，供「复诊提醒」扫描用
     )
     """)
+    # 【第77天新增】如果表已存在（旧库），补加 visit_at 字段：老记录留空串（= 没有就诊时间基准，
+    # agent.check_recall_alerts 会整条跳过），不破坏已有数据；重复执行 / 列已存在时报 OperationalError，跳过即可。
+    try:
+        cursor.execute("ALTER TABLE patient_records ADD COLUMN visit_at TEXT DEFAULT ''")
+    except sqlite3.OperationalError:
+        pass  # 字段已存在
 
     # 9. 积分账户表
     # 【第65天修改】表名冲突处理：accounts 这个名字要让给财务管理的新账户表
@@ -571,7 +578,11 @@ def update_draft_content(draft_id, content):
     conn.close()
 
 def sign_draft(draft_id, final_plan, final_content=None):
-    """【第45天修改】签字时同时保存 AI 原草案与老师最终版（学习轨迹）"""
+    """【第45天修改】签字时同时保存 AI 原草案与老师最终版（学习轨迹）
+
+    【第77天新增】落库时一并写入 visit_at = 当前时间（ISO 时间戳）—— 这是「复诊提醒」唯一可靠的
+    就诊时间基准（以前只能从病历文本的签字行「李老师 · 2026年9月23日」里猜，漏签字行就失效）。
+    """
     conn = get_connection()
     draft = conn.execute("SELECT * FROM drafts WHERE id = ?", (draft_id,)).fetchone()
     if not draft:
@@ -581,9 +592,10 @@ def sign_draft(draft_id, final_plan, final_content=None):
     # 完整病历（如果传了）或退回到最终方案
     patient_record_content = final_content if final_content else final_plan
 
+    # 【第77天新增】visit_at = 签字时刻（本机时间，ISO 格式）：agent.check_recall_alerts 按它判断该生多久没复诊
     conn.execute(
-        "INSERT INTO patient_records (patient_name, teacher_name, ai_draft, final_plan, doctor) VALUES (?, ?, ?, ?, ?)",
-        (draft["patient_name"], draft["teacher_name"], draft["content"], patient_record_content, draft["teacher_name"])
+        "INSERT INTO patient_records (patient_name, teacher_name, ai_draft, final_plan, doctor, visit_at) VALUES (?, ?, ?, ?, ?, ?)",
+        (draft["patient_name"], draft["teacher_name"], draft["content"], patient_record_content, draft["teacher_name"], datetime.now().isoformat())
     )
     conn.execute(
         "INSERT INTO homework (patient_name, teacher_name, task, detail, status, created_at) VALUES (?, ?, ?, ?, ?, ?)",

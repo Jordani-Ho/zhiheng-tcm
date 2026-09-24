@@ -8,7 +8,8 @@ from langgraph.graph import StateGraph, END
 from typing import TypedDict
 
 # 【行政化改造 B3】新增「欠费预存 / 复诊提醒」请示扫描：要读 accounts / patient_records 并写 agent_tasks，
-# 这里复用 database 的连接与表（不新增依赖、不改表结构）。
+# 这里复用 database 的连接与表（不新增依赖）。patient_records.visit_at（就诊时间）由 database.init_db()
+# 自动迁移补列、由 database.sign_draft() 签字落库时写入，本文件只读。
 import database
 
 load_dotenv()
@@ -290,19 +291,16 @@ def clean_plan(raw_text: str) -> str:
 
 
 # ============ 【行政化改造 B3】学生管理请示：欠费预存 + 复诊提醒 ============
-# 复用 B1 的 agent_tasks 表（不改表结构）：老师名下学生的三类请示统一由 agent_tasks 承载 ——
+# 复用 B1 的 agent_tasks 表：老师名下学生的三类请示统一由 agent_tasks 承载 ——
 #   send_care_notice（沉默关怀，B1 已有）/ send_billing_notice（欠费预存）/ send_recall_notice（复诊提醒）。
 # action 命名沿用 database.scan_silent_students 里定下的 send_<类型>_notice 规范。
 
 BILLING_LOW_BALANCE = 100   # 【可配置阈值】学生余额低于该值 → 生成「预存提醒」请示
 RECALL_DAYS = 60            # 【可配置阈值】学生距上次就诊超过该天数 → 生成「复诊提醒」请示
 
-# 病历文本里的日期：签字行由前端生成（App.tsx：「李老师 · 2026年9月23日」），
-# 也兼容「2026-09-23」这类写法；取最后一个匹配（签字行在病历文末）。
-_RECORD_DATE_PATTERNS = (
-    re.compile(r"(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日"),
-    re.compile(r"(\d{4})-(\d{1,2})-(\d{1,2})"),
-)
+# 【第77天新增】「就诊时间」的唯一来源 = patient_records.visit_at（签字落库时写的 datetime.now().isoformat()）。
+# 旧做法是从病历文本的签字行「李老师 · 2026年9月23日」里解析日期：学生没走签字流程、签字行被删、
+# 日期格式一改就整个失效，所以废弃文本解析，改为直接读 visit_at 列；visit_at 为空的旧记录没有就诊基准，不参与扫描。
 
 
 def _teacher_student_names(cur, teacher_name):
@@ -384,34 +382,31 @@ def check_billing_alerts(teacher_name, low_balance=BILLING_LOW_BALANCE):
     return created
 
 
-def _extract_record_date(text):
-    """从病历文本里取「就诊日期」= 文本里最后一个日期（签字行在病历末尾）。
+def _parse_visit_at(value):
+    """【第77天新增】把 patient_records.visit_at 解析成 datetime；为空 / 解析不了 → None。
 
-    取不到（老病历没有签字行 / 日期格式不认识）→ 返回 None，调用方直接跳过：
-    宁可不出复诊提醒，也不拿别的日期（如学生活跃时间）去猜就诊时间。
+    主格式是 database.sign_draft 落的 datetime.now().isoformat()（如 2026-09-23T15:30:00），
+    顺带兼容纯日期「2026-09-23」与空格分隔的「2026-09-23 15:30:00」（手工造数据 / 早期写法）。
+    带时区的值去掉时区后按本地时间参与比较，保证能和 datetime.now()（naive）相减。
     """
+    text = (value or "").strip()
     if not text:
         return None
-    for pattern in _RECORD_DATE_PATTERNS:
-        matches = pattern.findall(text)
-        if not matches:
-            continue
-        year, month, day = matches[-1]
+    for fmt in (None, "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
         try:
-            return datetime(int(year), int(month), int(day))
+            parsed = datetime.fromisoformat(text) if fmt is None else datetime.strptime(text, fmt)
         except ValueError:
             continue
+        return parsed.replace(tzinfo=None)  # 统一成 naive，方便和 now 相减
     return None
 
 
 def check_recall_alerts(teacher_name, recall_days=RECALL_DAYS):
-    """【B3-改动2：复诊提醒请示】按 patient_records 里每个学生最后一次就诊时间，超过 recall_days 天生成请示。
+    """【B3-改动2：复诊提醒请示】按 patient_records.visit_at 里每个学生最后一次就诊时间，超过 recall_days 天生成请示。
 
-    · 「最后一次就诊时间」= 该生最近一条病历（patient_records 里 id 最大的那条，且同一老师）里的就诊日期。
-      说明：patient_records 表没有时间列（只有 id / patient_name / teacher_name / ai_draft / final_plan / doctor），
-      库里可用的就诊日期就是老师签字时写进病历文本的签字行「李老师 · 2026年9月23日」
-      （见 frontend/src/App.tsx 生成、database.sign_draft 落库），所以从 final_plan（为空则退回 ai_draft）文本里取。
-    · 该生没有任何病历、或最近一条病历里取不到日期 → 不生成请示（没有就诊基准就不算「久未复诊」）。
+    · 「最后一次就诊时间」= 该老师在 patient_records 里的 MAX(visit_at)（按 patient_name 分组）：
+      一次 SQL 聚合就拿到每个学生最近一次就诊时间，不再解析病历文本（ISO 字符串字典序 == 时间先后）。
+    · visit_at 为空 / 解析不了的记录（第77天之前的老数据）→ 没有就诊基准，整条跳过，不生成请示。
     · 去重：同 teacher + task_type='request' + category='student' + action='send_recall_notice'
       + patient_name + status='pending' 已存在 → 跳过，不重复建单。
     返回：本次新建的请示条数。
@@ -420,18 +415,20 @@ def check_recall_alerts(teacher_name, recall_days=RECALL_DAYS):
     cur = conn.cursor()
     now = datetime.now()
     created = 0
+
+    # 每个学生的最近一次就诊时间（只取该老师的病历；visit_at 为空的旧记录直接排除）
+    latest_rows = cur.execute("""
+        SELECT patient_name, MAX(visit_at) AS last_visit_at
+        FROM patient_records
+        WHERE teacher_name = ? AND visit_at IS NOT NULL AND visit_at != ''
+        GROUP BY patient_name
+    """, (teacher_name,)).fetchall()
+    last_visit_map = {row["patient_name"]: row["last_visit_at"] for row in latest_rows}
+
     for name in _teacher_student_names(cur, teacher_name):
-        row = cur.execute("""
-            SELECT COALESCE(NULLIF(final_plan, ''), ai_draft) AS record_text
-            FROM patient_records
-            WHERE patient_name = ? AND teacher_name = ?
-            ORDER BY id DESC LIMIT 1
-        """, (name, teacher_name)).fetchone()
-        if row is None:
-            continue
-        last_visit = _extract_record_date(row["record_text"])
+        last_visit = _parse_visit_at(last_visit_map.get(name))
         if last_visit is None:
-            continue
+            continue  # 没有病历 / 旧记录 visit_at 为空 → 没有就诊基准，不算「久未复诊」
         days = (now - last_visit).days
         if days <= recall_days:
             continue
