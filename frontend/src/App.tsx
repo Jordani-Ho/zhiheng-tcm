@@ -105,6 +105,10 @@ export default function App() {
   const [pulseRate, setPulseRate] = useState('')
   const [pulseNote, setPulseNote] = useState('')
 
+  // 【第69天新增】诊室拍照缩略图列表：每上传成功一张图片就记一条 URL（仅当前会话有效，刷新页面即清空）
+  // 点缩略图 → window.open(url, '_blank') 看原图；点右上角 × → 只从本列表移除，不影响已追加到文本框的 URL
+  const [uploadedImages, setUploadedImages] = useState<string[]>([])
+
   // 【第59天重构】拍照清晰度不通过时，弹「重拍 / 继续使用」两个选项（老师自己决定是否仍要使用）
   const [blurryPhoto, setBlurryPhoto] = useState<{ draftId: number; file: File } | null>(null)
   // 诊室拍照 input 引用：选“重拍”时直接再次唤起相机（同一个 input，选完即清空，可重复选同一张图片）
@@ -166,7 +170,8 @@ export default function App() {
   const [financeNote, setFinanceNote] = useState('')
   const [financeSubmitting, setFinanceSubmitting] = useState(false)
   // 【第52天新增】开方（中药材首字联想 + 药方结构化存储）
-  const [prescriptionPatient, setPrescriptionPatient] = useState('')
+  // 【第69天新增】「患者姓名」初值改为当前面诊学生（selectedPatient），之后由下面的 useEffect 跟随 selectedPatient 同步
+  const [prescriptionPatient, setPrescriptionPatient] = useState(selectedPatient)
   // 【第54天新增】amount 改为 string：默认留空，用户不必先删 0（保存时按 0 处理）
   const [prescriptionItems, setPrescriptionItems] = useState<{ herb_name: string; amount: string }[]>([{ herb_name: '', amount: '' }])
   const [herbSuggestions, setHerbSuggestions] = useState<{ [index: number]: any[] }>({})
@@ -174,6 +179,13 @@ export default function App() {
   const [savingPrescription, setSavingPrescription] = useState(false)
   // 【第53天新增】远程诊疗（勾选则不扣库存；默认当面诊疗，扣库存）
   const [prescriptionRemote, setPrescriptionRemote] = useState(false)
+  // 【第69天新增】开方「患者姓名」默认填入当前面诊学生（selectedPatient）：
+  // - selectedPatient 变化（面诊队列 / 搜索学生里换人）→ 输入框内容同步更新
+  // - selectedPatient 不变时本 effect 不会触发，所以老师手动改过的姓名不会被覆盖
+  useEffect(() => {
+    setPrescriptionPatient(selectedPatient)
+  }, [selectedPatient])
+
   // 【第56天新增】智能体工作台（沉默学生请示闭环）
   const [agentTasks, setAgentTasks] = useState<any[]>([])
   const [scanningAgent, setScanningAgent] = useState(false)
@@ -894,7 +906,9 @@ export default function App() {
       .then(r => r.json())
       .then(d => {
         setLiveUploading(prev => ({ ...prev, [draftId]: false }))
+        // 【第69天新增】上传成功 → 同时记入缩略图列表（≠ 写入文本的 URL，移除缩略图不影响文本）
         if (d && d.url) {
+          setUploadedImages(prev => [...prev, d.url])
           setTeacherLiveText(prev => ({ ...prev, [draftId]: (prev[draftId] || '') + '\n\n【上传的图片】' + d.url }))
         } else {
           alert('图片上传失败，请重试')
@@ -2636,125 +2650,143 @@ export default function App() {
           </div>
         )}
 
-        {/* 【第59天重构】📸 现场辅助记录（三卡合一：🎙️录音 + 📷拍照 + 💓把脉 → 先写入文本框，再“追加到病历”） */}
+        {/* 【第69天整合】🩺 诊室工作台：把原「📸 现场辅助记录」卡片与原「📋 诊疗记录区」容器合并成一个撑满宽度的大卡片。
+            两个部分共享同一个外边框：上半 = 现场记录区（🎙️录音 / 📷拍照 / 💓把脉 → 先写入文本框，再“追加到病历”），
+            下半 = 诊疗记录区（病历草案 / 病历标签 / 开方 / 辨证施治方案），两部分之间用内嵌虚线分隔线。
+            所有原有按钮、接口、state 逻辑保持不变，只是重新排列（仅诊室页签显示）。 */}
         {(currentRole === '李老师' || currentRole === '李老师智能体') && teacherTab === 'clinic' && (
-          <div style={{ ...boxStyle, background: '#f0f7f0' }}>
-            <div style={{ fontSize: '18px', color: '#5a7d5a', fontWeight: 'bold', marginBottom: '6px' }}>📸 现场辅助记录（录音 → AI整理）</div>
-            <div style={{ fontSize: '12px', color: '#999', marginBottom: '12px' }}>
-              写入目标：{clinicTargetDraft ? `${clinicTargetDraft.patient_name} 的病历草案` : '（暂无待处理病历草案，请先在“面诊队列”或“搜索学生”里选一位学生）'}
+          <div style={{ ...boxStyle, background: '#fcfdfa', border: '1px solid #d4c8a8', width: '100%' }}>
+            <div style={{ textAlign: 'center', fontSize: '20px', color: '#8b4513', fontWeight: 'bold', marginBottom: '6px', paddingBottom: '12px', borderBottom: '2px solid #e6dcc2' }}>🩺 诊室工作台</div>
+            <div style={{ textAlign: 'center', fontSize: '12px', color: '#999', marginBottom: '16px' }}>
+              现场记录区（录音 / 拍照 / 把脉 → 写入文本框 → 追加到病历）｜ 诊疗记录区（病历草案 → 病历标签 → 开方 → 辨证施治方案）
             </div>
-            {/* a) 文本输入 / 显示区 */}
-            <textarea
-              placeholder="点击下方 🎙️ 开始录音口述望闻问切（停止后由智能体清洗再写入这里），或直接打字；拍照、把脉也会先追加到这里..."
-              value={clinicTargetId !== null ? (teacherLiveText[clinicTargetId] || '') : ''}
-              onChange={e => { if (clinicTargetId !== null) setTeacherLiveText(prev => ({ ...prev, [clinicTargetId]: e.target.value })) }}
-              disabled={clinicTargetId === null}
-              style={{ width: '100%', minHeight: '110px', padding: '10px', borderRadius: '8px', border: '1px solid #b8d8c0', background: '#fff', fontFamily: 'serif', fontSize: '13px', marginBottom: '10px', boxSizing: 'border-box' }}
-            />
-            {/* b) 按钮行：🎙️ 录音 | 🤖 AI整理 | 📷 拍照（诊室页签内唯一拍照入口） */}
-            <div style={{ display: 'flex', gap: '8px', marginBottom: '10px' }}>
-              <button
-                onClick={() => { if (clinicTargetId !== null) startTeacherLiveRecording(clinicTargetId) }}
-                disabled={clinicTargetId === null || !speechSupported}
-                style={{ flex: 1, padding: '8px', borderRadius: '20px', border: 'none', background: (clinicTargetId === null || !speechSupported) ? '#ccc' : (teacherLiveRecording === clinicTargetId ? '#c0392b' : '#8b4513'), color: '#fff', cursor: (clinicTargetId === null || !speechSupported) ? 'not-allowed' : 'pointer', fontSize: '13px' }}
-              >
-                {clinicTargetId !== null && teacherLiveCleaning[clinicTargetId]
-                  ? '🔄 智能体处理中...'
-                  : (clinicTargetId !== null && teacherLiveRecording === clinicTargetId ? '⏹ 停止录音' : '🎙️ 开始录音')}
-              </button>
-              <button
-                onClick={() => { if (clinicTargetId !== null) handleTeacherStructurize(clinicTargetId) }}
-                disabled={clinicTargetId === null || !!teacherLiveStructurizing[clinicTargetId]}
-                style={{ flex: 1, padding: '8px', borderRadius: '20px', border: '1px solid #5a7d5a', background: 'transparent', color: '#5a7d5a', cursor: clinicTargetId === null ? 'not-allowed' : 'pointer', fontSize: '13px' }}
-              >
-                {(clinicTargetId !== null && teacherLiveStructurizing[clinicTargetId]) ? 'AI整理中...' : '🤖 AI整理成病历格式'}
-              </button>
-              <label style={{ flex: 1, padding: '8px', borderRadius: '20px', border: '1px solid #8b4513', background: 'transparent', color: '#8b4513', cursor: clinicTargetId === null ? 'not-allowed' : 'pointer', fontSize: '13px', textAlign: 'center' }}>
-                {(clinicTargetId !== null && liveUploading[clinicTargetId]) ? '上传中...' : '📷 拍照'}
-                <input
-                  ref={clinicPhotoInputRef}
-                  type="file"
-                  accept="image/*"
-                  capture="environment"
-                  disabled={clinicTargetId === null}
-                  onChange={(e) => { if (clinicTargetId !== null) { handleLivePhotoUpload(clinicTargetId, e) } }}
-                  style={{ display: 'none' }}
-                />
-              </label>
-            </div>
-            {!speechSupported && (
-              <div style={{ fontSize: '12px', color: '#c0392b', marginBottom: '8px' }}>当前浏览器不支持语音识别，请使用 Chrome 或 Edge</div>
-            )}
-            {clinicTargetId !== null && teacherLiveRecording === clinicTargetId && (
-              <div style={{ fontSize: '12px', color: '#c0392b', marginBottom: '8px' }}>🔴 正在录音，停止后由智能体清洗（去噪 + 提炼 + 结构化）再写入上面的文本框</div>
-            )}
-            {/* 【第68天新增】清洗进行中的提示：录音已停，正在等 POST /api/agent/clean_transcript 返回 */}
-            {clinicTargetId !== null && teacherLiveCleaning[clinicTargetId] && (
-              <div style={{ fontSize: '12px', color: '#8b4513', marginBottom: '8px' }}>🔄 智能体处理中...（处理完成后自动写入上面的文本框）</div>
-            )}
-            {/* c) 把脉记录子区域：脉象 / 脉率 / 备注 → 追加到上方文本框 */}
-            <div style={{ marginTop: '12px', padding: '12px', background: '#f7f4fd', borderRadius: '8px', border: '1px dashed #c9bde0' }}>
-              <div style={{ fontSize: '14px', color: '#8b4513', fontWeight: 'bold', marginBottom: '10px' }}>💓 把脉记录</div>
-              <div style={{ fontSize: '13px', color: '#333', marginBottom: '6px' }}>脉象（可多选）</div>
-              <div style={{ marginBottom: '10px' }}>
-                {PULSE_TYPES.map(p => {
-                  const active = pulseTypes.includes(p)
-                  return (
-                    <button
-                      key={p}
-                      onClick={() => setPulseTypes(prev => prev.includes(p) ? prev.filter(x => x !== p) : [...prev, p])}
-                      style={{ padding: '6px 16px', borderRadius: '20px', border: active ? '1px solid #8b4513' : '1px solid #d4c8a8', background: active ? '#8b4513' : '#fff', color: active ? '#fff' : '#8b4513', cursor: 'pointer', fontSize: '14px', fontFamily: 'serif', marginRight: '6px', marginBottom: '6px' }}
-                    >
-                      {p}
-                    </button>
-                  )
-                })}
-              </div>
-              <div style={{ display: 'flex', gap: '12px', marginBottom: '10px' }}>
-                <div style={{ flex: 1 }}>
-                  <div style={{ fontSize: '13px', color: '#333', marginBottom: '6px' }}>脉率（次/分钟）</div>
-                  <input type="number" min="0" placeholder="如：78" value={pulseRate} onChange={e => setPulseRate(e.target.value)} style={{ ...inputStyle, marginBottom: 0 }} />
-                </div>
-                <div style={{ flex: 1 }}>
-                  <div style={{ fontSize: '13px', color: '#333', marginBottom: '6px' }}>备注</div>
-                  <input placeholder="如：左关沉细" value={pulseNote} onChange={e => setPulseNote(e.target.value)} style={{ ...inputStyle, marginBottom: 0 }} />
-                </div>
-              </div>
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '10px', flexWrap: 'wrap' }}>
-                <div style={{ fontSize: '12px', color: '#999' }}>
-                  预览：{`【把脉记录】脉象：${pulseTypes.length > 0 ? pulseTypes.join('、') : '未填写'}${pulseRate.trim() ? `；脉率：${pulseRate.trim()}次/分` : ''}${pulseNote.trim() ? `；备注：${pulseNote.trim()}` : ''}`}
-                </div>
-                <button onClick={handlePulseRecord} disabled={clinicTargetId === null} style={{ padding: '6px 18px', borderRadius: '20px', border: 'none', background: clinicTargetId === null ? '#ccc' : '#8b4513', color: '#fff', cursor: clinicTargetId === null ? 'not-allowed' : 'pointer', fontSize: '13px', whiteSpace: 'nowrap' }}>把脉记录追加到上方文本框</button>
-              </div>
-            </div>
-            {/* d) 追加到病历：把文本框内容写入病历草案 */}
-            <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: '12px' }}>
-              <button onClick={() => { if (clinicTargetId !== null) handleAppendTeacherNote(clinicTargetId) }} disabled={clinicTargetId === null} style={{ padding: '8px 24px', borderRadius: '20px', border: 'none', background: clinicTargetId === null ? '#ccc' : '#5a7d5a', color: '#fff', cursor: clinicTargetId === null ? 'not-allowed' : 'pointer', fontSize: '13px', fontWeight: 'bold' }}>追加到病历</button>
-            </div>
-          </div>
-        )}
 
-        {/* 【第59天重构】拍照清晰度不足提示：只提供「重拍 / 继续使用」两个选项（纯前端，无新依赖） */}
-        {blurryPhoto && (
-          <div style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, background: 'rgba(0,0,0,0.5)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 999 }}>
-            <div style={{ background: '#fdfcf0', padding: '24px', borderRadius: '12px', maxWidth: '400px', width: '90%', border: '2px solid #8b4513' }}>
-              <div style={{ fontSize: '18px', color: '#8b4513', fontWeight: 'bold', marginBottom: '10px', textAlign: 'center' }}>📷 清晰度提示</div>
-              <div style={{ fontSize: '14px', color: '#666', marginBottom: '20px', textAlign: 'center', lineHeight: '1.6' }}>
-                图片可能不够清晰，建议重拍。是否仍要使用？
+            {/* ===== 第一部分：现场记录区（原「📸 现场辅助记录」卡片内容，功能 / 按钮 / 接口全部保留） ===== */}
+            <div style={{ background: '#f0f7f0', border: '1px solid #dde9dd', borderRadius: '10px', padding: '14px' }}>
+              <div style={{ fontSize: '17px', color: '#5a7d5a', fontWeight: 'bold', marginBottom: '6px' }}>📸 现场记录区（录音 → AI整理）</div>
+              <div style={{ fontSize: '12px', color: '#999', marginBottom: '12px' }}>
+                写入目标：{clinicTargetDraft ? `${clinicTargetDraft.patient_name} 的病历草案` : '（暂无待处理病历草案，请先在“面诊队列”或“搜索学生”里选一位学生）'}
               </div>
-              <div style={{ display: 'flex', gap: '10px' }}>
-                <button onClick={handleRetakePhoto} style={{ flex: 1, padding: '10px', borderRadius: '20px', border: '1px solid #8b4513', background: 'transparent', color: '#8b4513', cursor: 'pointer' }}>重拍</button>
-                <button onClick={handleUseBlurryPhoto} style={{ flex: 1, padding: '10px', borderRadius: '20px', border: 'none', background: '#5a7d5a', color: '#fff', cursor: 'pointer' }}>继续使用</button>
+              {/* a) 文本输入 / 显示区 */}
+              <textarea
+                placeholder="点击下方 🎙️ 开始录音口述望闻问切（停止后由智能体清洗再写入这里），或直接打字；拍照、把脉也会先追加到这里..."
+                value={clinicTargetId !== null ? (teacherLiveText[clinicTargetId] || '') : ''}
+                onChange={e => { if (clinicTargetId !== null) setTeacherLiveText(prev => ({ ...prev, [clinicTargetId]: e.target.value })) }}
+                disabled={clinicTargetId === null}
+                style={{ width: '100%', minHeight: '110px', padding: '10px', borderRadius: '8px', border: '1px solid #b8d8c0', background: '#fff', fontFamily: 'serif', fontSize: '13px', marginBottom: '10px', boxSizing: 'border-box' }}
+              />
+              {/* b) 按钮行：🎙️ 录音 | 🤖 AI整理 | 📷 拍照（诊室页签内唯一拍照入口） */}
+              <div style={{ display: 'flex', gap: '8px', marginBottom: '10px' }}>
+                <button
+                  onClick={() => { if (clinicTargetId !== null) startTeacherLiveRecording(clinicTargetId) }}
+                  disabled={clinicTargetId === null || !speechSupported}
+                  style={{ flex: 1, padding: '8px', borderRadius: '20px', border: 'none', background: (clinicTargetId === null || !speechSupported) ? '#ccc' : (teacherLiveRecording === clinicTargetId ? '#c0392b' : '#8b4513'), color: '#fff', cursor: (clinicTargetId === null || !speechSupported) ? 'not-allowed' : 'pointer', fontSize: '13px' }}
+                >
+                  {clinicTargetId !== null && teacherLiveCleaning[clinicTargetId]
+                    ? '🔄 智能体处理中...'
+                    : (clinicTargetId !== null && teacherLiveRecording === clinicTargetId ? '⏹ 停止录音' : '🎙️ 开始录音')}
+                </button>
+                <button
+                  onClick={() => { if (clinicTargetId !== null) handleTeacherStructurize(clinicTargetId) }}
+                  disabled={clinicTargetId === null || !!teacherLiveStructurizing[clinicTargetId]}
+                  style={{ flex: 1, padding: '8px', borderRadius: '20px', border: '1px solid #5a7d5a', background: 'transparent', color: '#5a7d5a', cursor: clinicTargetId === null ? 'not-allowed' : 'pointer', fontSize: '13px' }}
+                >
+                  {(clinicTargetId !== null && teacherLiveStructurizing[clinicTargetId]) ? 'AI整理中...' : '🤖 AI整理成病历格式'}
+                </button>
+                <label style={{ flex: 1, padding: '8px', borderRadius: '20px', border: '1px solid #8b4513', background: 'transparent', color: '#8b4513', cursor: clinicTargetId === null ? 'not-allowed' : 'pointer', fontSize: '13px', textAlign: 'center' }}>
+                  {(clinicTargetId !== null && liveUploading[clinicTargetId]) ? '上传中...' : '📷 拍照'}
+                  <input
+                    ref={clinicPhotoInputRef}
+                    type="file"
+                    accept="image/*"
+                    capture="environment"
+                    disabled={clinicTargetId === null}
+                    onChange={(e) => { if (clinicTargetId !== null) { handleLivePhotoUpload(clinicTargetId, e) } }}
+                    style={{ display: 'none' }}
+                  />
+                </label>
+              </div>
+
+              {/* 【第69天新增】📷 拍照缩略图预览区（就位于“📷 拍照”按钮下方）：每上传成功一张图片显示一张 80px 小图 */}
+              {uploadedImages.length > 0 && (
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: '8px', marginBottom: '10px' }}>
+                  {uploadedImages.map((url, i) => (
+                    <div key={`${url}-${i}`} style={{ position: 'relative', width: '80px', height: '80px' }}>
+                      {/* 点缩略图 → 新标签页打开原图 */}
+                      <img
+                        src={url}
+                        alt={`现场图片${i + 1}`}
+                        onClick={() => window.open(url, '_blank')}
+                        title="点击在新标签页查看原图"
+                        style={{ width: '80px', height: '80px', objectFit: 'cover', borderRadius: '8px', border: '1px solid #b8d8c0', cursor: 'zoom-in', display: 'block' }}
+                      />
+                      {/* 右上角 ×：只从缩略图列表移除，已追加到文本框的 URL 不受影响 */}
+                      <button
+                        onClick={() => setUploadedImages(prev => prev.filter((_, idx) => idx !== i))}
+                        title="从预览区移除（已追加到文本框的内容不受影响）"
+                        style={{ position: 'absolute', top: '-6px', right: '-6px', width: '18px', height: '18px', padding: 0, lineHeight: '16px', borderRadius: '50%', border: '1px solid #fff', background: '#c0392b', color: '#fff', fontSize: '12px', cursor: 'pointer' }}
+                      >×</button>
+                    </div>
+                  ))}
+                </div>
+              )}
+              {!speechSupported && (
+                <div style={{ fontSize: '12px', color: '#c0392b', marginBottom: '8px' }}>当前浏览器不支持语音识别，请使用 Chrome 或 Edge</div>
+              )}
+              {clinicTargetId !== null && teacherLiveRecording === clinicTargetId && (
+                <div style={{ fontSize: '12px', color: '#c0392b', marginBottom: '8px' }}>🔴 正在录音，停止后由智能体清洗（去噪 + 提炼 + 结构化）再写入上面的文本框</div>
+              )}
+              {/* 【第68天新增】清洗进行中的提示：录音已停，正在等 POST /api/agent/clean_transcript 返回 */}
+              {clinicTargetId !== null && teacherLiveCleaning[clinicTargetId] && (
+                <div style={{ fontSize: '12px', color: '#8b4513', marginBottom: '8px' }}>🔄 智能体处理中...（处理完成后自动写入上面的文本框）</div>
+              )}
+              {/* c) 把脉记录子区域：脉象 / 脉率 / 备注 → 追加到上方文本框 */}
+              <div style={{ marginTop: '12px', padding: '12px', background: '#f7f4fd', borderRadius: '8px', border: '1px dashed #c9bde0' }}>
+                <div style={{ fontSize: '14px', color: '#8b4513', fontWeight: 'bold', marginBottom: '10px' }}>💓 把脉记录</div>
+                <div style={{ fontSize: '13px', color: '#333', marginBottom: '6px' }}>脉象（可多选）</div>
+                <div style={{ marginBottom: '10px' }}>
+                  {PULSE_TYPES.map(p => {
+                    const active = pulseTypes.includes(p)
+                    return (
+                      <button
+                        key={p}
+                        onClick={() => setPulseTypes(prev => prev.includes(p) ? prev.filter(x => x !== p) : [...prev, p])}
+                        style={{ padding: '6px 16px', borderRadius: '20px', border: active ? '1px solid #8b4513' : '1px solid #d4c8a8', background: active ? '#8b4513' : '#fff', color: active ? '#fff' : '#8b4513', cursor: 'pointer', fontSize: '14px', fontFamily: 'serif', marginRight: '6px', marginBottom: '6px' }}
+                      >
+                        {p}
+                      </button>
+                    )
+                  })}
+                </div>
+                <div style={{ display: 'flex', gap: '12px', marginBottom: '10px' }}>
+                  <div style={{ flex: 1 }}>
+                    <div style={{ fontSize: '13px', color: '#333', marginBottom: '6px' }}>脉率（次/分钟）</div>
+                    <input type="number" min="0" placeholder="如：78" value={pulseRate} onChange={e => setPulseRate(e.target.value)} style={{ ...inputStyle, marginBottom: 0 }} />
+                  </div>
+                  <div style={{ flex: 1 }}>
+                    <div style={{ fontSize: '13px', color: '#333', marginBottom: '6px' }}>备注</div>
+                    <input placeholder="如：左关沉细" value={pulseNote} onChange={e => setPulseNote(e.target.value)} style={{ ...inputStyle, marginBottom: 0 }} />
+                  </div>
+                </div>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '10px', flexWrap: 'wrap' }}>
+                  <div style={{ fontSize: '12px', color: '#999' }}>
+                    预览：{`【把脉记录】脉象：${pulseTypes.length > 0 ? pulseTypes.join('、') : '未填写'}${pulseRate.trim() ? `；脉率：${pulseRate.trim()}次/分` : ''}${pulseNote.trim() ? `；备注：${pulseNote.trim()}` : ''}`}
+                  </div>
+                  <button onClick={handlePulseRecord} disabled={clinicTargetId === null} style={{ padding: '6px 18px', borderRadius: '20px', border: 'none', background: clinicTargetId === null ? '#ccc' : '#8b4513', color: '#fff', cursor: clinicTargetId === null ? 'not-allowed' : 'pointer', fontSize: '13px', whiteSpace: 'nowrap' }}>把脉记录追加到上方文本框</button>
+                </div>
+              </div>
+              {/* d) 追加到病历：把文本框内容写入病历草案 */}
+              <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: '12px' }}>
+                <button onClick={() => { if (clinicTargetId !== null) handleAppendTeacherNote(clinicTargetId) }} disabled={clinicTargetId === null} style={{ padding: '8px 24px', borderRadius: '20px', border: 'none', background: clinicTargetId === null ? '#ccc' : '#5a7d5a', color: '#fff', cursor: clinicTargetId === null ? 'not-allowed' : 'pointer', fontSize: '13px', fontWeight: 'bold' }}>追加到病历</button>
               </div>
             </div>
-          </div>
-        )}
 
-        {/* 【第59天重构】诊疗记录区：病历草案 / 病历标签 / 开方 / 辨证施治方案 同框（仅诊室页签） */}
-        {(currentRole === '李老师' || currentRole === '李老师智能体') && teacherTab === 'clinic' && (
-          <div style={{ ...boxStyle, background: '#fcfdfa', border: '1px solid #d4c8a8' }}>
-            <div style={{ textAlign: 'center', fontSize: '19px', color: '#8b4513', fontWeight: 'bold', marginBottom: '6px', paddingBottom: '12px', borderBottom: '1px solid #e6dcc2' }}>📋 诊疗记录区</div>
-            <div style={{ textAlign: 'center', fontSize: '12px', color: '#999', marginBottom: '16px' }}>病历草案 → 病历标签 → 开方 → 辨证施治方案（同一容器，分区之间用内嵌分隔线）</div>
+            {/* ===== 两部分之间的内嵌分隔线（虚线，浅色）：上半 = 现场记录区，下半 = 诊疗记录区 ===== */}
+            <div style={{ margin: '20px 0', borderTop: '1px dashed #c9bde0' }} />
+
+            {/* ===== 第二部分：诊疗记录区（原「📋 诊疗记录区」容器内容：病历草案 / 病历标签 / 开方 / 辨证施治方案） ===== */}
+            <div style={{ fontSize: '17px', color: '#8b4513', fontWeight: 'bold', marginBottom: '6px' }}>📋 诊疗记录区</div>
+            <div style={{ fontSize: '12px', color: '#999', marginBottom: '16px' }}>病历草案 → 病历标签 → 开方 → 辨证施治方案（同一容器，分区之间用内嵌分隔线）</div>
             {clinicDrafts.length === 0 && (
               <div style={{ textAlign: 'center', color: '#999', marginBottom: '16px' }}>暂无待处理病历（在“面诊队列”或“搜索学生”里选一位学生即可开始记录）</div>
             )}
@@ -2888,6 +2920,23 @@ export default function App() {
                 ))}
               </div>
             )}
+          </div>
+        )}
+
+        {/* 【第69天整合】拍照清晰度不足提示：只提供「重拍 / 继续使用」两个选项（纯前端，无新依赖）
+            fixed 定位的模态框，已从「诊室工作台」卡片内部移到卡片之后，行为不变（重拍 → 再次唤起相机 / 继续使用 → 照常上传） */}
+        {blurryPhoto && (
+          <div style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, background: 'rgba(0,0,0,0.5)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 999 }}>
+            <div style={{ background: '#fdfcf0', padding: '24px', borderRadius: '12px', maxWidth: '400px', width: '90%', border: '2px solid #8b4513' }}>
+              <div style={{ fontSize: '18px', color: '#8b4513', fontWeight: 'bold', marginBottom: '10px', textAlign: 'center' }}>📷 清晰度提示</div>
+              <div style={{ fontSize: '14px', color: '#666', marginBottom: '20px', textAlign: 'center', lineHeight: '1.6' }}>
+                图片可能不够清晰，建议重拍。是否仍要使用？
+              </div>
+              <div style={{ display: 'flex', gap: '10px' }}>
+                <button onClick={handleRetakePhoto} style={{ flex: 1, padding: '10px', borderRadius: '20px', border: '1px solid #8b4513', background: 'transparent', color: '#8b4513', cursor: 'pointer' }}>重拍</button>
+                <button onClick={handleUseBlurryPhoto} style={{ flex: 1, padding: '10px', borderRadius: '20px', border: 'none', background: '#5a7d5a', color: '#fff', cursor: 'pointer' }}>继续使用</button>
+              </div>
+            </div>
           </div>
         )}
 
