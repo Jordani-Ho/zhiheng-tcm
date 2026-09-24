@@ -120,6 +120,8 @@ export default function App() {
   // 【第59天修复】本地占位草案：诊室里选中学生、但该学生还没有“正在编辑的草案”时，
   // 前端本地先生成一条空草案（id 为负数），让录音 / 拍照 / 把脉立刻可用；老师点“保存病历修改”时再落库。
   const [localDrafts, setLocalDrafts] = useState<Draft[]>([])
+  // 【第71天修复 / 签字死锁】本地占位草案落库中：用于置灰“保存病历修改”按钮，避免重复点击造出重复草案
+  const [localDraftSaving, setLocalDraftSaving] = useState(false)
   // 诊室可编辑草案 = 后端草案 + 本地占位草案（同一学生以后端草案为准，避免重复显示）
   const clinicDrafts: Draft[] = [...drafts, ...localDrafts.filter(ld => !drafts.some(d => d.patient_name === ld.patient_name))]
   // 【第70天修复 / 数据串台】诊疗记录区（病历草案 / 症状标签 / 开方 / 辨证施治方案）只取“当前就诊学生”的草案：
@@ -569,11 +571,17 @@ export default function App() {
   }
 
   const handleSavePrescription = () => {
-    const items = prescriptionItems
-      .filter(item => item.herb_name.trim())
-      // 【第54天新增】留空视为 0 克
-      .map(item => ({ herb_name: item.herb_name.trim(), amount: parseFloat(item.amount) || 0, unit: '克' }))
-    if (items.length === 0) { alert('请至少填写一味药材'); return }
+    // 【第71天修复 / 开方校验】保存前先校验，不通过一律不调后端：
+    //  - 完全空白的行（药材名、克数都没填）视为“还没添加的药味”，跳过（默认就有一行空行、点“+ 添加一味药”也会产生空行）；
+    //  - 只要填了内容，就必须“药材名非空 + 克数为大于 0 的数字”，否则弹提示并终止保存。
+    const filled = prescriptionItems.filter(item => item.herb_name.trim() || item.amount.trim())
+    if (filled.length === 0) { alert('请至少填写一味药材'); return }
+    const hasInvalidItem = filled.some(item => {
+      const amount = Number(item.amount)   // 空串 / 非数字 → 0 / NaN，都会被下面拦下
+      return !item.herb_name.trim() || !Number.isFinite(amount) || amount <= 0
+    })
+    if (hasInvalidItem) { alert('请填写完整的药材名和克数'); return }
+    const items = filled.map(item => ({ herb_name: item.herb_name.trim(), amount: Number(item.amount), unit: '克' }))
     setSavingPrescription(true)
     fetch('/api/prescriptions', {
       method: 'POST',
@@ -844,37 +852,88 @@ export default function App() {
       .catch(() => { setTeacherLiveStructurizing(prev => ({ ...prev, [draftId]: false })); alert("AI 整理失败") })
   }
 
-  // 【第59天修复】本地占位草案（id < 0）落库：后端没有“新建草案”接口，因此用已有接口完成三步——
-  // ① 找到该学生最新的一条“学生陈述”→ ② POST /api/generate-draft 生成真实草案 → ③ PUT 写入老师编辑的内容
-  // 如果该学生还没有陈述，则提示老师：内容已暂存在本地草稿。
-  const saveLocalDraftToBackend = (localId: number, newContent: string) => {
+  // 【第71天修复 / 签字死锁】本地占位草案（id < 0）落库：先拿到一个“真实 draft_id”，再把老师编辑的内容 PUT 进去。
+  //
+  // 死锁根因（读后端代码确认，见 backend/database.py + backend/main.py）：
+  // ① GET /api/transcriptions 只返回 processed = 0 的陈述（database.get_transcriptions 写死了条件）；
+  // ② POST /api/generate-draft 也只能从 processed = 0 的陈述里找，找不到就返回 {"error": "找不到该转述"}；
+  // ③ database.insert_draft 会把陈述标记 processed = 1，sign_draft 签字时更会把陈述整行 DELETE 掉。
+  // 因此“第二次就诊 / 学生没发陈述”时永远找不到可用陈述：旧代码只能 keepLocal() 弹
+  // “该学生还没有提交陈述…”，草案永远落不了库；而“确认签字”又提示要先落库 → 保存 ↔ 签字 互相踢皮球 = 死循环。
+  //
+  // 修复：找不到可用陈述时，改用 POST /api/transcribe 造一条“老师现场录入”的陈述
+  // （后端在该接口里会自动生成病历草案），再用 GET /api/drafts 取回这个学生的真实 draft_id，
+  // 最后 PUT 写入老师编辑的内容。这条临时陈述在签字时会被 sign_draft 一并删除，不会留下脏数据。
+  const findDraftIdByPatient = (patientName: string): Promise<number | null> =>
+    fetch(`/api/drafts?teacher_name=${encodeURIComponent(selectedTeacher)}`)
+      .then(r => r.json())
+      .then((list: any[]) => {
+        if (!Array.isArray(list)) return null
+        const mine = list.filter(d => d.patient_name === patientName).sort((a: any, b: any) => b.id - a.id)
+        return mine.length > 0 ? Number(mine[0].id) : null
+      })
+      .catch(() => null)
+
+  const createDraftViaTranscribe = (patientName: string): Promise<number | null> => {
+    const now = new Date()
+    const placeholder = `【老师现场录入】\n学生姓名：${patientName}\n就诊时间：${now.getFullYear()}年${now.getMonth() + 1}月${now.getDate()}日\n（本次由老师在诊室直接录入病历，学生未提交线上陈述）`
+    return fetch('/api/transcribe', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ patient_name: patientName, teacher_name: selectedTeacher, content: placeholder, data_type: 'text' })
+    })
+      .then(() => findDraftIdByPatient(patientName))
+      .catch(() => null)
+  }
+
+  // 返回落库后的真实 draft_id（失败返回 null）
+  const saveLocalDraftToBackend = (localId: number, newContent: string): Promise<number | null> => {
     const local = localDrafts.find(d => d.id === localId)
-    if (!local) return
+    if (!local) return Promise.resolve(null)
+    const patientName = local.patient_name
+    setLocalDraftSaving(true)
     // 先更新本地显示，避免看起来“没保存”
     setLocalDrafts(prev => prev.map(d => d.id === localId ? { ...d, content: newContent } : d))
-    const keepLocal = () => alert('该学生还没有提交陈述，内容已暂存在本地草稿（学生提交陈述后，再点“保存病历修改”即可落库）')
-    fetch(`/api/transcriptions?patient_name=${encodeURIComponent(local.patient_name)}&teacher_name=${encodeURIComponent(selectedTeacher)}`)
+    return fetch(`/api/transcriptions?patient_name=${encodeURIComponent(patientName)}&teacher_name=${encodeURIComponent(selectedTeacher)}`)
       .then(r => r.json())
       .then((list: any[]) => {
         const latest = Array.isArray(list) && list.length > 0 ? list[0] : null
-        if (!latest) { keepLocal(); return }
+        if (!latest) return createDraftViaTranscribe(patientName)   // 没有待处理陈述 → 兜底：造临时陈述 + 让后端自动生成草案
         return fetch(`/api/generate-draft?transcript_id=${latest.id}`, { method: 'POST' })
           .then(r => r.json())
-          .then((res: any) => {
-            if (!res || !res.draft_id) { keepLocal(); return }
-            return fetch(`/api/drafts/${res.draft_id}`, {
-              method: 'PUT',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ content: newContent })
-            }).then(() => fetchDrafts())
-          })
+          .then((res: any) => (res && res.draft_id)
+            ? Number(res.draft_id)
+            : createDraftViaTranscribe(patientName))   // 陈述已被处理过（processed = 1）→ 同样走兜底
       })
-      .catch(() => keepLocal())
+      .catch(() => createDraftViaTranscribe(patientName))
+      .then(draftId => {
+        if (!draftId) return null
+        return fetch(`/api/drafts/${draftId}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ content: newContent })
+        }).then(() => draftId).catch(() => null)
+      })
+      .then(draftId => {
+        setLocalDraftSaving(false)
+        if (draftId) fetchDrafts()   // 拉回后端草案：本地占位草案会被自动清理，编辑框换成真实草案
+        return draftId
+      })
   }
 
-  const handleEditDraft = (draftId: number, newContent: string) => {
+  const handleEditDraft = (draftId: number, newContent: string, silent = false) => {
     // 【第59天修复】本地占位草案还没有后端 id，先走“落库”流程，不能直接 PUT
-    if (draftId < 0) { saveLocalDraftToBackend(draftId, newContent); return }
+    // 【第71天修复】落库成功/失败都给老师明确反馈（原来成功时毫无提示，看起来像“点了没反应”）
+    if (draftId < 0) {
+      saveLocalDraftToBackend(draftId, newContent).then(id => {
+        if (!id) { alert('落库失败：没能生成病历草案，请稍后重试'); return }
+        // 草案 id 由负数变成真实 id：把老师已填的「症状标签 / 辨证施治方案」搬到新 id 下，避免看起来丢了
+        setDraftTags(prev => prev[draftId] === undefined ? prev : { ...prev, [id]: prev[draftId] })
+        setFinalPlans(prev => prev[draftId] === undefined ? prev : { ...prev, [id]: prev[draftId] })
+        if (!silent) alert('病历已保存并落库（现在可以签字）')
+      })
+      return
+    }
     fetch(`/api/drafts/${draftId}`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
@@ -887,7 +946,7 @@ export default function App() {
     if (!text || !text.trim()) { alert("请先录音或输入内容"); return }
     const draft = clinicDrafts.find(x => x.id === draftId)   // 【第59天修复】兼容本地占位草案
     if (draft) {
-      handleEditDraft(draftId, draft.content + '\n\n【现场记录】\n' + text)
+      handleEditDraft(draftId, draft.content + '\n\n【现场记录】\n' + text, true)   // silent：避免每次追加都弹“已落库”
       setTeacherLiveText(prev => ({ ...prev, [draftId]: '' }))
     }
   }
@@ -1009,34 +1068,43 @@ export default function App() {
   const handleFinalSign = () => {
     if (!previewDraft) return
     const currentPreview = previewDraft
-    // 【第59天修复】本地占位草案还没有后端 id，先落库再签字，否则签字会静默失败
-    if (currentPreview.id < 0) { alert('这是本地新建的草案，请先点“保存病历修改”落库，然后再签字'); return }
-    const tagData = draftTags[currentPreview.id]
-    const saveTags = (): Promise<any> => {
-      const tags: any[] = []
-      if (tagData?.area?.trim()) tags.push({ tag_type: '部位', tag_value: tagData.area.trim() })
-      if (tagData?.symptom?.trim()) tags.push({ tag_type: '症状', tag_value: tagData.symptom.trim() })
-      if (tags.length === 0) return Promise.resolve()
-      return fetch('/api/tags', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ record_id: currentPreview.id, teacher_name: selectedTeacher, tags })
-      })
-    }
-    saveTags().then(() => {
-      return fetch(`/api/drafts/${currentPreview.id}/sign`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          final_plan: finalPlans[currentPreview.id] || '',
-          final_content: currentPreview.content
+    // 【第71天修复 / 签字死锁】本地新建草案（id < 0）不再弹“请先点保存病历修改落库”把老师踢回上一步，
+    // 而是当场自动落库拿到真实 draft_id 后再签字：写草案 → 保存 → 签字 → 落库 一步到底。
+    const localDraft = currentPreview.id < 0 ? localDrafts.find(d => d.id === currentPreview.id) : undefined
+    const ensureDraftId: Promise<number | null> = currentPreview.id < 0
+      ? saveLocalDraftToBackend(currentPreview.id, localDraft ? localDraft.content : currentPreview.content)
+      : Promise.resolve(currentPreview.id)
+    const plan = finalPlans[currentPreview.id] || ''
+    ensureDraftId.then(realId => {
+      if (!realId) { alert('落库失败：没能生成病历草案，无法签字，请稍后重试'); return }
+      const tagData = draftTags[realId] || draftTags[currentPreview.id]
+      const saveTags = (): Promise<any> => {
+        const tags: any[] = []
+        if (tagData?.area?.trim()) tags.push({ tag_type: '部位', tag_value: tagData.area.trim() })
+        if (tagData?.symptom?.trim()) tags.push({ tag_type: '症状', tag_value: tagData.symptom.trim() })
+        if (tags.length === 0) return Promise.resolve()
+        return fetch('/api/tags', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ record_id: realId, teacher_name: selectedTeacher, tags })
         })
+      }
+      return saveTags().then(() => {
+        return fetch(`/api/drafts/${realId}/sign`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ final_plan: plan, final_content: currentPreview.content })
+        })
+          .then(r => r.json())
+          .then((res: any) => {
+            // 【第71天修复】签字失败（草案不存在等）不再静默关窗，原样弹出后端报错，方便定位
+            if (res && res.error) { alert('签字失败：' + res.error); return }
+            setPreviewDraft(null)
+            setDraftTags(prev => ({ ...prev, [realId]: { area: '', symptom: '' }, [currentPreview.id]: { area: '', symptom: '' } }))
+            setFinalPlans(prev => ({ ...prev, [realId]: '', [currentPreview.id]: '' }))
+            fetchDrafts(); fetchPatientRecords(); fetchPoints()
+          })
       })
-    }).then(() => {
-      setPreviewDraft(null)
-      setDraftTags(prev => ({ ...prev, [currentPreview.id]: { area: '', symptom: '' } }))
-      fetchDrafts(); fetchPatientRecords(); fetchPoints()
-      setFinalPlans(prev => ({ ...prev, [currentPreview.id]: '' }))
     })
   }
 
@@ -2860,7 +2928,7 @@ export default function App() {
                   </div>
                   <textarea value={d.content} onChange={(e) => { setClinicDraftById(d.id, item => ({ ...item, content: e.target.value })) }} style={{ width: '100%', height: '180px', padding: '10px', borderRadius: '8px', border: '1px solid #d4c8a8', fontFamily: 'serif', fontSize: '13px', marginBottom: '10px', boxSizing: 'border-box', whiteSpace: 'pre-wrap' }} />
                   <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: '10px' }}>
-                    <button onClick={() => handleEditDraft(d.id, d.content)} style={{ padding: '6px 16px', borderRadius: '20px', border: '1px solid #8b4513', background: 'transparent', color: '#8b4513', cursor: 'pointer' }}>保存病历修改</button>
+                    <button onClick={() => handleEditDraft(d.id, d.content)} disabled={localDraftSaving && d.id < 0} style={{ padding: '6px 16px', borderRadius: '20px', border: '1px solid #8b4513', background: 'transparent', color: '#8b4513', cursor: 'pointer' }}>{localDraftSaving && d.id < 0 ? '落库中...' : '保存病历修改'}</button>
                   </div>
 
                   {extractImageUrls(d.content).length > 0 && (
