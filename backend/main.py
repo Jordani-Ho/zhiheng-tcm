@@ -877,3 +877,41 @@ def api_resolve_agent_task(task_id: int, data: AgentResolveInput):
     if result is None:
         raise HTTPException(status_code=404, detail="任务不存在")
     return {"message": "已处理"}
+# ============ Pydantic 模型：财务管理（预存 / 赠送 / 扣费） ============
+
+class FinanceInput(BaseModel):
+    username: str
+    amount: int
+    note: str = ""
+
+
+# ============ 接口：财务管理（第65天新增，接前端"💰 财务管理"面板三个按钮） ============
+
+@app.post("/api/finance/recharge")
+def api_finance_recharge(data: FinanceInput):
+    """预存（充值）：账户余额 +amount，记一条 type='recharge' 流水。"""
+    if data.amount <= 0:
+        raise HTTPException(status_code=400, detail="金额必须大于 0")
+    return database.recharge_account(data.username, data.amount, data.note)
+
+
+@app.post("/api/finance/gift")
+def api_finance_gift(data: FinanceInput):
+    """赠送：账户余额 +amount，记一条 type='gift' 流水。"""
+    if data.amount <= 0:
+        raise HTTPException(status_code=400, detail="金额必须大于 0")
+    return database.gift_account(data.username, data.amount, data.note)
+
+
+@app.post("/api/finance/deduct")
+def api_finance_deduct(data: FinanceInput):
+    """扣费：账户余额 -amount；余额不足返回 {ok: false, error: '余额不足'} 且不扣款。"""
+    if data.amount <= 0:
+        raise HTTPException(status_code=400, detail="金额必须大于 0")
+    return database.deduct_account(data.username, data.amount, data.note)
+
+
+@app.get("/api/finance/accounts")
+def api_finance_accounts():
+    """账户列表：role 由 username 是否存在于 teachers 表判断。"""
+    return {"accounts": database.get_finance_accounts()}

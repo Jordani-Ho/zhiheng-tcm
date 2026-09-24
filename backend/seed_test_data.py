@@ -3,11 +3,15 @@
 用法：cd /workspaces/zhiheng-tcm/backend && python seed_test_data.py
 作用：为李老师生成 8 个虚拟学生，各自有不同的活跃度和积分，用于测试状态标签
 注意：这是测试脚本，正式上线前可以删除
+【第65天】顺带补齐财务账户种子数据：张三 100、李老师 500（账户不存在才创建）
 """
 import sqlite3
 import os
 import sys
 from datetime import datetime, timedelta
+
+# 【第65天新增】复用后端的建表 / 迁移逻辑，保证财务表定义只有一处
+import database
 
 # 【第59天修复】Windows 控制台默认 GBK，直接 print 带 emoji 的提示会 UnicodeEncodeError，
 # 这里把标准输出统一切成 UTF-8（不支持时静默跳过，不影响逻辑）。
@@ -16,7 +20,8 @@ try:
 except Exception:
     pass
 
-DB_PATH = os.path.join(os.path.dirname(__file__), "zhiheng.db")
+# 【第65天修改】直接复用 database 模块解析出的库路径，保证脚本和 uvicorn 读写同一个库
+DB_PATH = database.DB_PATH
 
 # 8 个虚拟学生，每个学生用不同的活跃时间和积分
 TEST_STUDENTS = [
@@ -62,6 +67,12 @@ TEST_TRANSCRIPTIONS = [
     ("张三", "主诉：近一周入睡困难、多梦易醒。\n现病史：白天精神差，饭后腹胀。\n舌象：舌淡红、苔薄白。\n脉象：脉弦细。"),
 ]
 
+# 【第65天新增】财务账户种子数据：(用户名, 角色, 初始余额)——只在账户不存在时创建
+TEST_FINANCE_ACCOUNTS = [
+    ("张三", "student", 100),
+    ("李老师", "teacher", 500),
+]
+
 # 老师名字统一常量（后面新增的种子数据都挂在李老师名下）
 TEACHER_NAME = "李老师"
 
@@ -96,7 +107,7 @@ def seed_herbs(cursor):
 
 
 def seed_points(cursor):
-    """【第59天新增】充值 / 消耗流水，并按流水累加出最终余额写回 accounts（保证余额与流水一致）。"""
+    """【第59天新增】充值 / 消耗流水，并按流水累加出最终余额写回 points_accounts（保证余额与流水一致）。"""
     balance = {}
     for patient_name, change_type, points, note, days_ago in TEST_POINT_FLOWS:
         balance[patient_name] = balance.get(patient_name, 0) + points
@@ -107,9 +118,26 @@ def seed_points(cursor):
             (patient_name, TEACHER_NAME, change_type, points, balance[patient_name], note, created_at)
         )
     for patient_name, final_balance in balance.items():
-        cursor.execute("UPDATE accounts SET points = ? WHERE role_name = ?", (final_balance, patient_name))
+        cursor.execute("UPDATE points_accounts SET points = ? WHERE role_name = ?", (final_balance, patient_name))
     detail = "、".join(["%s(%d积分)" % (k, v) for k, v in balance.items()])
     print("✅ 已生成 %d 条余额流水，覆盖 %d 名学生：%s" % (len(TEST_POINT_FLOWS), len(balance), detail))
+
+
+def seed_finance_accounts(cursor):
+    """【第65天新增】财务账户：张三 100、李老师 500；账户已存在则保持原样不动。"""
+    created = []
+    for username, role, balance in TEST_FINANCE_ACCOUNTS:
+        cursor.execute("SELECT balance FROM accounts WHERE username = ?", (username,))
+        if cursor.fetchone() is None:
+            cursor.execute(
+                "INSERT INTO accounts (username, role, balance, updated_at) VALUES (?, ?, ?, ?)",
+                (username, role, balance, datetime.now().isoformat())
+            )
+            created.append("%s(%d)" % (username, balance))
+    if created:
+        print("✅ 已创建 %d 个财务账户：%s" % (len(created), "、".join(created)))
+    else:
+        print("✅ 财务账户已存在（张三 / 李老师），余额未改动")
 
 
 def seed_appointments(cursor):
@@ -142,6 +170,10 @@ def seed_transcriptions(cursor):
 
 
 def seed():
+    # 【第65天新增】先把财务两张表建好（内含老积分表 accounts → points_accounts 的自动迁移）。
+    # 必须在写库之前调用：它用自己的连接做 DDL，避免和本脚本的事务抢锁。
+    database.init_finance_tables()
+
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
@@ -153,7 +185,7 @@ def seed():
         cursor.execute("DELETE FROM patients WHERE name = ?", (name,))
         cursor.execute("DELETE FROM patient_profiles WHERE patient_name = ?", (name,))
         cursor.execute("DELETE FROM patient_teachers WHERE patient_name = ?", (name,))
-        cursor.execute("DELETE FROM accounts WHERE role_name = ?", (name,))
+        cursor.execute("DELETE FROM points_accounts WHERE role_name = ?", (name,))
 
     for name, relation, gender, birth_date, birth_time, birth_place, location, days_ago, points in TEST_STUDENTS:
         # 1. 患者表
@@ -181,7 +213,7 @@ def seed():
 
         # 4. 积分账户
         cursor.execute(
-            "INSERT INTO accounts (role_name, points) VALUES (?, ?)",
+            "INSERT INTO points_accounts (role_name, points) VALUES (?, ?)",
             (name, points)
         )
 
@@ -189,6 +221,7 @@ def seed():
     ensure_extra_tables(cursor)   # 中药材库存表 + 余额流水表
     seed_herbs(cursor)            # 中药材库存（黄芪/当归/枸杞/甘草/陈皮）
     seed_points(cursor)           # 余额 + 充值/消耗流水
+    seed_finance_accounts(cursor) # 【第65天新增】财务账户：张三 100、李老师 500
     seed_appointments(cursor)     # 今天/明天的已确认预约（面诊队列）
     seed_transcriptions(cursor)   # 学生陈述（未处理）
 
@@ -200,6 +233,7 @@ def seed():
     print("  1) 老师端 → 🩺 诊室 → 面诊队列：今天有 李四 10:00、张三 15:00 两场已确认预约")
     print("  2) 点队列里的学生 / 搜索学生选中后，若没有病历草案会自动生成本地草案，录音、拍照、把脉立即可用")
     print("  3) 张三已有一条学生陈述，补完病历点“保存病历修改”即可落库")
+    print("  4) 财务账户已就绪：张三余额 100、李老师余额 500（GET /api/finance/accounts 可查）")
 
 
 if __name__ == "__main__":

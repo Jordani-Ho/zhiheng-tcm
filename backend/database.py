@@ -109,8 +109,12 @@ def init_db():
     """)
 
     # 9. 积分账户表
+    # 【第65天修改】表名冲突处理：accounts 这个名字要让给财务管理的新账户表
+    # （id / username / role / balance / updated_at），所以老的"积分账户表"统一改名成
+    # points_accounts。老库（accounts 里存 role_name/points）的数据由
+    # init_finance_tables() 里的自动迁移原样搬过来，不会丢数据。
     cursor.execute("""
-    CREATE TABLE IF NOT EXISTS accounts (
+    CREATE TABLE IF NOT EXISTS points_accounts (
         role_name TEXT PRIMARY KEY,
         points INTEGER DEFAULT 0
     )
@@ -264,16 +268,18 @@ def init_db():
     except sqlite3.OperationalError:
         pass  # 字段已存在
     
-    cursor.execute("SELECT COUNT(*) as count FROM accounts")
+    cursor.execute("SELECT COUNT(*) as count FROM points_accounts")
     if cursor.fetchone()["count"] == 0:
-        cursor.execute("INSERT INTO accounts (role_name, points) VALUES (?, ?)", ("张三", 100))
-        cursor.execute("INSERT INTO accounts (role_name, points) VALUES (?, ?)", ("李四", 100))
-        cursor.execute("INSERT INTO accounts (role_name, points) VALUES (?, ?)", ("李老师", 500))
+        cursor.execute("INSERT INTO points_accounts (role_name, points) VALUES (?, ?)", ("张三", 100))
+        cursor.execute("INSERT INTO points_accounts (role_name, points) VALUES (?, ?)", ("李四", 100))
+        cursor.execute("INSERT INTO points_accounts (role_name, points) VALUES (?, ?)", ("李老师", 500))
         conn.commit()
 
     conn.close()
     # 【第51天新增】中药材库存表
     init_herb_table()
+    # 【第65天新增】财务管理：账户表 accounts + 流水表 transactions（含老积分表自动迁移）
+    init_finance_tables()
 
 # ---------- 老师相关操作 ----------
 def get_teachers():
@@ -296,7 +302,7 @@ def get_teacher_patients(teacher_name):
                COALESCE(a.points, 0) as points
         FROM patients p
         INNER JOIN patient_teachers pt ON p.name = pt.patient_name
-        LEFT JOIN accounts a ON p.name = a.role_name
+        LEFT JOIN points_accounts a ON p.name = a.role_name
         WHERE pt.teacher_name = ? AND pt.status = 'active'
         ORDER BY p.name
     """, (teacher_name,)).fetchall()
@@ -307,7 +313,7 @@ def get_student_status(patient_name):
     """【第44天新增】根据最后活跃时间 + 积分，返回学生状态"""
     conn = get_connection()
     row = conn.execute("SELECT last_active_at FROM patients WHERE name = ?", (patient_name,)).fetchone()
-    pts_row = conn.execute("SELECT points FROM accounts WHERE role_name = ?", (patient_name,)).fetchone()
+    pts_row = conn.execute("SELECT points FROM points_accounts WHERE role_name = ?", (patient_name,)).fetchone()
     conn.close()
 
     points = pts_row["points"] if pts_row else 0
@@ -363,7 +369,7 @@ def teacher_add_student(teacher_name, student_name):
     except sqlite3.IntegrityError:
         pass  # 关系已存在
     # 3. 给新学生一个初始积分（如果账户不存在）
-    conn.execute("INSERT OR IGNORE INTO accounts (role_name, points) VALUES (?, 100)", (student_name,))
+    conn.execute("INSERT OR IGNORE INTO points_accounts (role_name, points) VALUES (?, 100)", (student_name,))
     conn.commit()
     conn.close()
     return {"message": "学生添加成功"}    
@@ -404,8 +410,8 @@ def add_patient(name, guardian_name, relation, gender, birth_date, birth_time, b
 
 def delete_patient(name):
     conn = get_connection()
-    for table in ["patients", "patient_teachers", "patient_profiles", "homework", "transcriptions", "drafts", "patient_records", "accounts"]:
-        col = "role_name" if table == "accounts" else ("patient_name" if table != "patients" else "name")
+    for table in ["patients", "patient_teachers", "patient_profiles", "homework", "transcriptions", "drafts", "patient_records", "points_accounts"]:
+        col = "role_name" if table == "points_accounts" else ("patient_name" if table != "patients" else "name")
         conn.execute(f"DELETE FROM {table} WHERE {col} = ?", (name,))
     conn.commit()
     conn.close()
@@ -620,7 +626,7 @@ def accept_invite(code, student_name):
     except sqlite3.IntegrityError:
         pass
     # 初始积分
-    conn.execute("INSERT OR IGNORE INTO accounts (role_name, points) VALUES (?, 100)", (student_name,))
+    conn.execute("INSERT OR IGNORE INTO points_accounts (role_name, points) VALUES (?, 100)", (student_name,))
     # 标记邀请码已使用
     conn.execute("UPDATE invites SET used_by = ?, used_at = ? WHERE code = ?",
                  (student_name, datetime.now().strftime('%Y-%m-%d %H:%M:%S'), code))
@@ -823,25 +829,150 @@ def get_teacher_tags_summary(teacher_name):
     return [dict(r) for r in rows]
 
 # ---------- 积分相关操作 ----------
+# 【第65天说明】积分与财务余额是两套数：积分仍在 points_accounts 表，接口 /api/points 行为不变。
 def get_points(role_name):
     conn = get_connection()
-    row = conn.execute("SELECT points FROM accounts WHERE role_name = ?", (role_name,)).fetchone()
+    row = conn.execute("SELECT points FROM points_accounts WHERE role_name = ?", (role_name,)).fetchone()
     conn.close()
     return row["points"] if row else 0
 
 def add_points(role_name, amount):
     conn = get_connection()
-    conn.execute("UPDATE accounts SET points = points + ? WHERE role_name = ?", (amount, role_name))
+    conn.execute("UPDATE points_accounts SET points = points + ? WHERE role_name = ?", (amount, role_name))
     conn.commit()
     conn.close()
 
 def transfer_points(from_role, to_role, amount):
     conn = get_connection()
-    conn.execute("UPDATE accounts SET points = points - ? WHERE role_name = ?", (amount, from_role))
-    conn.execute("UPDATE accounts SET points = points + ? WHERE role_name = ?", (amount, to_role))
+    conn.execute("UPDATE points_accounts SET points = points - ? WHERE role_name = ?", (amount, from_role))
+    conn.execute("UPDATE points_accounts SET points = points + ? WHERE role_name = ?", (amount, to_role))
     conn.commit()
     conn.close()
-    # ============ 中药材库存管理 ============
+
+# ============ 【第65天新增】财务管理：账户表 + 流水表 ============
+
+def init_finance_tables():
+    """财务两张表的建表语句，由 init_db() 在启动时调用，保证自动建表。
+
+    accounts     财务账户表：id / username(唯一) / role / balance / updated_at
+    transactions 财务流水表：id / username / type(recharge|gift|deduct) / amount
+                             / balance_after / note / created_at
+
+    兼容处理：老版本的 accounts 是"积分账户表"（role_name/points），
+    这里若检测到老结构，先改名成 points_accounts 把数据原样搬走，再建新的 accounts。
+    """
+    conn = get_connection()
+    cur = conn.cursor()
+    _migrate_legacy_points_accounts(cur)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS accounts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT UNIQUE,
+        role TEXT DEFAULT 'student',
+        balance INTEGER DEFAULT 0,
+        updated_at TEXT
+    )
+    """)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS transactions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT,
+        type TEXT,
+        amount INTEGER,
+        balance_after INTEGER,
+        note TEXT,
+        created_at TEXT
+    )
+    """)
+    conn.commit()
+    conn.close()
+
+
+def _migrate_legacy_points_accounts(cursor):
+    """把老库里的"积分账户表 accounts(role_name, points)"改名成 points_accounts（数据原样保留）。"""
+    existed = cursor.execute("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'accounts'").fetchone()
+    if existed is None:
+        return False  # 全新库，没有老表
+    columns = [row["name"] for row in cursor.execute("PRAGMA table_info(accounts)").fetchall()]
+    if "balance" in columns:
+        return False  # 已经是新的财务账户表结构
+    if "points" not in columns:
+        return False  # 不认识的表结构，不擅自动它
+    cursor.execute("CREATE TABLE IF NOT EXISTS points_accounts (role_name TEXT PRIMARY KEY, points INTEGER DEFAULT 0)")
+    cursor.execute("INSERT OR REPLACE INTO points_accounts (role_name, points) SELECT role_name, points FROM accounts")
+    cursor.execute("DROP TABLE accounts")
+    return True
+
+
+def _finance_role(conn, username):
+    """role 规则：username 存在于 teachers 表就是 teacher，否则 student。"""
+    row = conn.execute("SELECT 1 FROM teachers WHERE name = ?", (username,)).fetchone()
+    return "teacher" if row else "student"
+
+
+def _ensure_finance_account(conn, username):
+    """账户不存在就自动创建（余额 0），返回当前余额。"""
+    row = conn.execute("SELECT balance FROM accounts WHERE username = ?", (username,)).fetchone()
+    if row is None:
+        conn.execute(
+            "INSERT OR IGNORE INTO accounts (username, role, balance, updated_at) VALUES (?, ?, 0, ?)",
+            (username, _finance_role(conn, username), datetime.now().isoformat())
+        )
+        row = conn.execute("SELECT balance FROM accounts WHERE username = ?", (username,)).fetchone()
+    return row["balance"] if row else 0
+
+
+def _change_finance_balance(username, amount, change_type, note=""):
+    """统一入账入口：余额不足（余额 + amount < 0）时整体回滚，不扣款也不记流水。"""
+    conn = get_connection()
+    try:
+        balance = _ensure_finance_account(conn, username)
+        if balance + amount < 0:
+            conn.rollback()  # 撤销上面可能刚建的账户，保证"余额不足不扣款"
+            return {"ok": False, "error": "余额不足"}
+        new_balance = balance + amount
+        now = datetime.now().isoformat()
+        conn.execute("UPDATE accounts SET balance = ?, updated_at = ? WHERE username = ?", (new_balance, now, username))
+        conn.execute(
+            "INSERT INTO transactions (username, type, amount, balance_after, note, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (username, change_type, amount, new_balance, note or "", now)
+        )
+        conn.commit()
+        return {"ok": True, "balance": new_balance}
+    finally:
+        conn.close()
+
+
+def recharge_account(username, amount, note=""):
+    """预存（充值）：余额 +amount，流水 amount 记正数。"""
+    return _change_finance_balance(username, amount, "recharge", note)
+
+
+def gift_account(username, amount, note=""):
+    """赠送：余额 +amount，流水 amount 记正数。"""
+    return _change_finance_balance(username, amount, "gift", note)
+
+
+def deduct_account(username, amount, note=""):
+    """扣费：余额 -amount，流水 type='deduct' 且 amount 记负数。"""
+    return _change_finance_balance(username, -amount, "deduct", note)
+
+
+def get_finance_accounts():
+    """账户列表：role 由 username 是否存在于 teachers 表实时判断。"""
+    conn = get_connection()
+    rows = conn.execute("""
+        SELECT a.username,
+               CASE WHEN t.name IS NULL THEN 'student' ELSE 'teacher' END as role,
+               a.balance
+        FROM accounts a
+        LEFT JOIN teachers t ON a.username = t.name
+        ORDER BY a.username
+    """).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+# ============ 中药材库存管理 ============
 
 def init_herb_table():
     """建表语句，需要在现有的建表初始化流程里调用一次（和其他15张表的建表放在一起）。"""
