@@ -460,6 +460,24 @@ def clean_transcript(input_data: CleanTranscriptInput):
         cleaned_text = input_data.raw_text
     return {"cleaned_text": cleaned_text}
 
+# 【第75天新增】施治方案模板记忆（老师维度）：
+# 老师在“辨证施治方案”里写的常用内容记一条模板，下次选中的学生施治方案为空时前端自动套用；
+# 老师点“保存病历修改”或“预览完整病历”时，前端把当前内容 POST 回来覆盖这条模板。
+class PlanTemplateInput(BaseModel):
+    teacher_name: str
+    content: str
+
+@app.get("/api/plan_template")
+def get_plan_template(teacher_name: str):
+    """取该老师的施治方案模板；没有记录（或内容为空）时返回空串。"""
+    return {"content": database.get_plan_template(teacher_name)}
+
+@app.post("/api/plan_template")
+def save_plan_template(input_data: PlanTemplateInput):
+    """保存 / 覆盖该老师的施治方案模板（teacher_name 唯一），返回 {\"ok\": true}。"""
+    database.save_plan_template(input_data.teacher_name, input_data.content)
+    return {"ok": True}
+
 @app.post("/api/transcribe")
 def transcribe(input_data: TranscriptionInput):
     database.insert_transcription(input_data.patient_name, input_data.teacher_name, input_data.content, input_data.data_type)

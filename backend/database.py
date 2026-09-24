@@ -258,6 +258,18 @@ def init_db():
 
     conn.commit()
 
+    # 【第75天新增】施治方案模板表（老师个人的“施治方案”常用模板记忆）
+    # 一位老师一条（teacher_name UNIQUE）：选中的学生“施治方案”为空时，前端自动套用这条模板；
+    # 老师点“保存病历修改”或“预览完整病历”时，把当前内容覆盖写回这里（越用越贴合老师的习惯写法）。
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS plan_templates (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        teacher_name TEXT UNIQUE,
+        content TEXT DEFAULT '',
+        updated_at TEXT
+    )
+    """)
+
     # 初始化默认数据
     cursor.execute("SELECT COUNT(*) as count FROM teachers")
     if cursor.fetchone()["count"] == 0:
@@ -1377,3 +1389,33 @@ def resolve_agent_task(task_id, decision):
     conn.commit()
     conn.close()
     return {"message": "已处理", "status": new_status}
+
+
+# ============ 【第75天新增】施治方案模板（老师维度的模板记忆） ============
+
+def get_plan_template(teacher_name):
+    """取该老师的“施治方案”模板：没有记录（或内容为空）时统一返回空串，前端好判断。"""
+    conn = get_connection()
+    row = conn.execute("SELECT content FROM plan_templates WHERE teacher_name = ?", (teacher_name,)).fetchone()
+    conn.close()
+    if row is None:
+        return ""
+    return row["content"] or ""
+
+
+def save_plan_template(teacher_name, content):
+    """保存 / 覆盖该老师的“施治方案”模板（teacher_name 唯一：有则 UPDATE，无则 INSERT）。"""
+    conn = get_connection()
+    cur = conn.cursor()
+    now = datetime.now().isoformat()
+    cur.execute("SELECT id FROM plan_templates WHERE teacher_name = ?", (teacher_name,))
+    existing = cur.fetchone()
+    if existing:
+        cur.execute("UPDATE plan_templates SET content = ?, updated_at = ? WHERE id = ?",
+                    (content or "", now, existing["id"]))
+    else:
+        cur.execute("INSERT INTO plan_templates (teacher_name, content, updated_at) VALUES (?, ?, ?)",
+                    (teacher_name, content or "", now))
+    conn.commit()
+    conn.close()
+    return True
