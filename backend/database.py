@@ -214,6 +214,20 @@ def init_db():
     except sqlite3.OperationalError:
         pass
 
+    # 【第74天新增 / 开方九宫格改造】药材的「君臣佐使(role)」与「煎法(cooking_method)」不加表列：
+    # prescriptions 的药材是以 JSON 字符串存在 items_json 里的，一条药方有多味药、这两个字段是
+    # 「每条药材」的属性，加表列会放错层级，所以直接加在每条药材记录的 JSON 里：
+    #   {herb_name, amount, unit, role: '君'/'臣'/'佐'/'使'/'', cooking_method: '常规'/'先煎'/'后下'/'包煎'/'烊化'/'另煎'/'冲服'/''}
+    # 等价于 ALTER TABLE 的兼容方案：历史药方由下面的函数补上这两个 key（默认 ''，只添 key、不改原值、可重复执行）。
+    # 另外：该函数与相关常量定义在本文件的「药方」小节（模块加载时已定义，init_db() 调用时一定可用）。
+    # 【注意】必须先 commit：该函数会另开一个连接去读 prescriptions，不先落盘的话新库会报
+    # “no such table: prescriptions”（上面的建表语句还在当前事务里）；同时兜住异常，兼容性升级失败也不能挡住启动。
+    conn.commit()
+    try:
+        migrate_prescription_items_role_cooking()
+    except sqlite3.Error as exc:
+        print("[warn] 药方 role/cooking_method 兼容性升级跳过：", exc)
+
     # 【第56天新增】老师智能体任务表（请示 / 汇报）
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS agent_tasks (
@@ -1096,6 +1110,86 @@ def batch_deduct_herbs(teacher_name, items):
 
 # ============ 药方（开方：中药首字联想 + 结构化存储） ============
 
+# 【第74天新增 / 开方九宫格改造】君臣佐使（role）与煎法（cooking_method）的合法取值白名单，
+# 与前端 App.tsx 的 HERB_ROLES / COOKING_METHODS 保持一致（不合法 / 空值一律落成空串 ''）。
+PRESCRIPTION_ROLES = ("君", "臣", "佐", "使")
+PRESCRIPTION_COOKING_METHODS = ("常规", "先煎", "后下", "包煎", "烊化", "另煎", "冲服")
+
+
+def clean_prescription_role(value):
+    """君臣佐使：只认 君/臣/佐/使，其它（含 None / 未标注 / 拼写错误）一律落成 ''。"""
+    if not isinstance(value, str):
+        return ""
+    value = value.strip()
+    return value if value in PRESCRIPTION_ROLES else ""
+
+
+def clean_prescription_cooking_method(value):
+    """煎法：只认 常规/先煎/后下/包煎/烊化/另煎/冲服，其它一律落成 ''。"""
+    if not isinstance(value, str):
+        return ""
+    value = value.strip()
+    return value if value in PRESCRIPTION_COOKING_METHODS else ""
+
+
+def sanitize_prescription_items(items):
+    """【第74天新增】落库前清洗药方里的每条药材：
+    - 只清洗客户端真正传了的 role / cooking_method（老客户端不传这两个字段时，存进去的 JSON 与改造前完全一致，
+      保证历史数据格式与既有测试不被破坏）；
+    - 传了但值不合法 → 落成 ''（既不报错也不把脏值写进库）。
+    返回新的 list，不改动入参。
+    """
+    cleaned = []
+    for item in (items or []):
+        entry = dict(item)
+        if "role" in entry:
+            entry["role"] = clean_prescription_role(entry.get("role"))
+        if "cooking_method" in entry:
+            entry["cooking_method"] = clean_prescription_cooking_method(entry.get("cooking_method"))
+        cleaned.append(entry)
+    return cleaned
+
+
+def migrate_prescription_items_role_cooking():
+    """【第74天新增 / 等效于 ALTER TABLE 的兼容方案】
+    给历史药方的每条药材补上 role / cooking_method 两个 key（默认 ''）：
+    - 只添加缺失的 key，已有的值原样保留，药材名 / 克数 / 单位完全不动 → 不破坏已有数据；
+    - items_json 为空或不是合法 JSON 的脏数据直接跳过；
+    - 可重复执行（补过一次的行下次会因 key 已存在而被跳过）。
+    返回本次补过 key 的药方条数。
+    """
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        rows = cur.execute("SELECT id, items_json FROM prescriptions").fetchall()
+        migrated = 0
+        for row in rows:
+            raw = row["items_json"]
+            if not raw:
+                continue
+            try:
+                items = json.loads(raw)
+            except Exception:
+                continue  # 脏数据不动它
+            if not isinstance(items, list):
+                continue
+            changed = False
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                if "role" not in item or "cooking_method" not in item:
+                    item.setdefault("role", "")
+                    item.setdefault("cooking_method", "")
+                    changed = True
+            if changed:
+                cur.execute("UPDATE prescriptions SET items_json = ? WHERE id = ?", (json.dumps(items, ensure_ascii=False), row["id"]))
+                migrated += 1
+        conn.commit()
+        return migrated
+    finally:
+        conn.close()   # 出错也要关连接：否则 Windows 上会锁住 db 文件（测试里表现为 PermissionError）
+
+
 def search_herbs_by_prefix(teacher_name, prefix):
     """首字联想：只看药材名首字。输入「甘」匹配「甘草」，不匹配「炙甘草」。prefix 为空返回 []。"""
     if not prefix:
@@ -1113,7 +1207,12 @@ def search_herbs_by_prefix(teacher_name, prefix):
 
 def create_prescription(teacher_name, patient_name, items, note="", is_remote=0):
     """保存药方：当面诊疗（is_remote=0）先原子扣减库存，扣成功才保存药方；
-    远程诊疗（is_remote=1）只保存药方、不动库存。"""
+    远程诊疗（is_remote=1）只保存药方、不动库存。
+
+    【第74天新增 / 开方九宫格改造】items 里每条药材可额外带 role（君臣佐使）与 cooking_method（煎法），
+    落库前统一走 sanitize_prescription_items() 清洗；扣库存逻辑完全不变（仍然只用到 herb_name / amount）。
+    """
+    items = sanitize_prescription_items(items)
     # 1. 当面诊疗：先扣库存
     if not is_remote:
         deducted = batch_deduct_herbs(teacher_name, items)
@@ -1134,9 +1233,19 @@ def create_prescription(teacher_name, patient_name, items, note="", is_remote=0)
 
 
 def _prescription_row_to_dict(row):
-    """内部工具函数：一行 prescriptions 转 dict，并顺带把 items_json 解析成 items 列表。"""
+    """内部工具函数：一行 prescriptions 转 dict，并顺带把 items_json 解析成 items 列表。
+
+    【第74天新增】解析出来的每条药材补上 role / cooking_method 默认值（''）：
+    历史药方（改造前存的）也能被前端当成「未标注 + 常规」正常渲染，前端不必再做兼容判断。
+    """
     d = dict(row)
-    d["items"] = json.loads(d["items_json"]) if d["items_json"] else []
+    items = json.loads(d["items_json"]) if d["items_json"] else []
+    if isinstance(items, list):
+        for item in items:
+            if isinstance(item, dict):
+                item.setdefault("role", "")
+                item.setdefault("cooking_method", "")
+    d["items"] = items
     return d
 
 

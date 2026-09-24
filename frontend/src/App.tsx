@@ -34,6 +34,17 @@ const MEMO_DONE_STORE_KEY = 'zh_memo_done'
 // appointments 表没有“远程 / 线上”字段，本次后端零改动，所以由前端按「预约原因 reason」里的关键词把已确认预约分成两列：
 // 命中关键词 → 右列「💻 远程问诊」，未命中 → 左列「📅 预约面诊」（老师写原因时带上“远程/线上/视频”等词即可归入远程列）。
 const REMOTE_APPT_KEYWORDS = ['远程', '线上', '网诊', '视频', '电话', '微信']
+// 【第74天新增 / 开方九宫格改造】开方「君臣佐使」与「煎法」选项（与后端 database.py 的
+// PRESCRIPTION_ROLES / PRESCRIPTION_COOKING_METHODS 白名单一一对应，改一处要同步另一处）
+const HERB_ROLES = ['君', '臣', '佐', '使']
+const ROLE_UNMARKED_LABEL = '未标注'          // role 为空串时下拉里显示的文字
+const COOKING_METHODS = ['常规', '先煎', '后下', '包煎', '烊化', '另煎', '冲服']
+const DEFAULT_COOKING_METHOD = '常规'          // 新选入的药材默认煎法
+// 【第74天新增】九宫格主色（与全站主色 #8b4513 一致）：未选中灰白底 / 已选中棕底白字
+const HERB_GRID_CELL_BASE: React.CSSProperties = {
+  padding: '8px 4px', borderRadius: '6px', cursor: 'pointer', fontFamily: 'serif',
+  fontSize: '13px', lineHeight: 1.4, boxSizing: 'border-box', textAlign: 'center'
+}
 
 export default function App() {
   const now = new Date()
@@ -197,10 +208,15 @@ export default function App() {
   // 【第52天新增】开方（中药材首字联想 + 药方结构化存储）
   // 【第69天新增】「患者姓名」初值改为当前面诊学生（selectedPatient），之后由下面的 useEffect 跟随 selectedPatient 同步
   const [prescriptionPatient, setPrescriptionPatient] = useState(selectedPatient)
-  // 【第54天新增】amount 改为 string：默认留空，用户不必先删 0（保存时按 0 处理）
-  const [prescriptionItems, setPrescriptionItems] = useState<{ herb_name: string; amount: string }[]>([{ herb_name: '', amount: '' }])
-  const [herbSuggestions, setHerbSuggestions] = useState<{ [index: number]: any[] }>({})
-  const herbSearchTimers = useRef<{ [index: number]: any }>({})
+  // 【第74天新增 / 开方九宫格改造】药材不再逐行手敲：由「九宫格点选」产生，初始为空。
+  // 每条含 药材名 / 克数(string，默认留空) / role 君臣佐使(空串=未标注) / cooking_method 煎法(默认常规)
+  const [prescriptionItems, setPrescriptionItems] = useState<{ herb_name: string; amount: string; role: string; cooking_method: string }[]>([])
+  // 【第74天新增】九宫格顶部搜索框：输入药材名首字过滤九宫格（空 = 显示该老师全部药材）
+  const [herbGridKeyword, setHerbGridKeyword] = useState('')
+  // 【第74天新增】输入习惯 b：单味药点击后直接填分量 —— 用 ref 记下「点选后要聚焦到哪一行的克数框」
+  // （用 ref 而不是 state：聚焦是纯 DOM 副作用，不需要触发额外渲染）
+  const pendingFocusAmountHerb = useRef('')
+  const prescriptionAmountRefs = useRef<{ [herbName: string]: HTMLInputElement | null }>({})
   const [savingPrescription, setSavingPrescription] = useState(false)
   // 【第53天新增】远程诊疗（勾选则不扣库存；默认当面诊疗，扣库存）
   const [prescriptionRemote, setPrescriptionRemote] = useState(false)
@@ -210,6 +226,16 @@ export default function App() {
   useEffect(() => {
     setPrescriptionPatient(selectedPatient)
   }, [selectedPatient])
+
+  // 【第74天新增】九宫格点选加药后，把光标自动送到新那一行的「克数」输入框（单味药点击即可直接填分量）；
+  // 依赖里带上 prescriptionItems，保证那一行已经渲染出来、ref 已经挂上（这里只操作 DOM，不 setState）。
+  useEffect(() => {
+    const herbName = pendingFocusAmountHerb.current
+    if (!herbName) return
+    pendingFocusAmountHerb.current = ''
+    const el = prescriptionAmountRefs.current[herbName]
+    if (el) el.focus()
+  }, [prescriptionItems])
 
   // 【第56天新增】智能体工作台（沉默学生请示闭环）
   const [agentTasks, setAgentTasks] = useState<any[]>([])
@@ -388,12 +414,10 @@ export default function App() {
     setPulseTypes([])
     setPulseRate('')
     setPulseNote('')
-    // ⑤ 开方：患者姓名对齐新学生，药材列表 / 首字联想 / 远程诊疗勾选全部清空
+    // ⑤ 开方：患者姓名对齐新学生，已选药材 / 九宫格搜索词 / 远程诊疗勾选全部清空
     setPrescriptionPatient(selectedPatient)
-    setPrescriptionItems([{ herb_name: '', amount: '' }])
-    setHerbSuggestions({})
-    Object.values(herbSearchTimers.current).forEach(t => clearTimeout(t))   // 清掉还在 debounce 中的联想请求，避免返回后填到下一位学生
-    herbSearchTimers.current = {}
+    setPrescriptionItems([])
+    setHerbGridKeyword('')
     setPrescriptionRemote(false)
     // ⑥ 历史病历展开状态
     setShowHistory(false)
@@ -592,52 +616,65 @@ export default function App() {
       .then(() => fetchHerbs())
   }
 
-  // 【第52天新增】开方：药材名首字联想（debounce 300ms）
-  const searchHerbSuggestions = (index: number, prefix: string) => {
-    if (herbSearchTimers.current[index]) clearTimeout(herbSearchTimers.current[index])
-    const keyword = prefix.trim()
-    if (!keyword) {
-      setHerbSuggestions(prev => ({ ...prev, [index]: [] }))
+  // 【第74天新增 / 开方九宫格改造】九宫格点选：已选中的格子再点一次 = 取消；未选中 = 加入下方「已选药材」列表。
+  // 兼容两种输入习惯：a) 先连续点选多味药，再逐条填分量 / 选君臣佐使 / 选煎法；
+  //                  b) 只点一味药，光标自动落到它那一行的克数输入框，直接填分量。
+  const togglePrescriptionHerb = (herb: any) => {
+    const herbName = herb.herb_name
+    if (prescriptionItems.some(item => item.herb_name === herbName)) {
+      setPrescriptionItems(prev => prev.filter(item => item.herb_name !== herbName))
       return
     }
-    herbSearchTimers.current[index] = setTimeout(() => {
-      fetch(`/api/herbs/search?teacher_name=${encodeURIComponent(selectedTeacher)}&prefix=${encodeURIComponent(keyword)}`)
-        .then(res => res.json())
-        .then(data => setHerbSuggestions(prev => ({ ...prev, [index]: data })))
-        .catch(() => setHerbSuggestions(prev => ({ ...prev, [index]: [] })))
-    }, 300)
+    setPrescriptionItems(prev => [...prev, { herb_name: herbName, amount: '', role: '', cooking_method: DEFAULT_COOKING_METHOD }])
+    pendingFocusAmountHerb.current = herbName   // 渲染完由上面的 effect 把光标送到这一行的克数框
   }
 
-  const changePrescriptionItem = (index: number, field: 'herb_name' | 'amount', value: string) => {
+  // 【第74天新增】九宫格格子的选中态：以「已选药材列表」为准（点选 / 删除都即时反映到格子颜色上）
+  const isPrescriptionHerbSelected = (herbName: string) => prescriptionItems.some(item => item.herb_name === herbName)
+
+  // 【第74天新增】修改已选药材的某一列（克数 / 君臣佐使 / 煎法）；药材名不可编辑（由九宫格决定）
+  const changePrescriptionItem = (index: number, field: 'amount' | 'role' | 'cooking_method', value: string) => {
     setPrescriptionItems(prev => prev.map((item, i) => {
       if (i !== index) return item
-      // 【第54天新增】数量按原始字符串存，允许空值
-      return field === 'amount' ? { ...item, amount: value } : { ...item, herb_name: value }
+      if (field === 'amount') return { ...item, amount: value }
+      if (field === 'role') return { ...item, role: value }
+      return { ...item, cooking_method: value }
     }))
-    if (field === 'herb_name') searchHerbSuggestions(index, value)
   }
 
-  const pickHerbSuggestion = (index: number, herb: any) => {
-    setPrescriptionItems(prev => prev.map((item, i) => (i === index ? { ...item, herb_name: herb.herb_name } : item)))
-    setHerbSuggestions(prev => ({ ...prev, [index]: [] }))
+  // 【第74天新增】删除已选药材（同时会让九宫格对应格子回到未选中状态）
+  const removePrescriptionItem = (index: number) => {
+    setPrescriptionItems(prev => prev.filter((_, i) => i !== index))
   }
 
-  const addPrescriptionItem = () => {
-    setPrescriptionItems(prev => [...prev, { herb_name: '', amount: '' }])
-  }
+  // 【第74天新增】九宫格里要展示的药材：按「药材名首字」过滤（与后端 /api/herbs/search 语义一致：只看首字），
+  // 搜索框为空时展示该老师全部药材库存（herbs 由 fetchHerbs 从 /api/herbs 拉取）。
+  const herbGridKeywordText = herbGridKeyword.trim()
+  const herbGridList = herbGridKeywordText
+    ? herbs.filter(h => String(h.herb_name || '').startsWith(herbGridKeywordText))
+    : herbs
 
   const handleSavePrescription = () => {
-    // 【第71天修复 / 开方校验】保存前先校验，不通过一律不调后端：
-    //  - 完全空白的行（药材名、克数都没填）视为“还没添加的药味”，跳过（默认就有一行空行、点“+ 添加一味药”也会产生空行）；
-    //  - 只要填了内容，就必须“药材名非空 + 克数为大于 0 的数字”，否则弹提示并终止保存。
-    const filled = prescriptionItems.filter(item => item.herb_name.trim() || item.amount.trim())
-    if (filled.length === 0) { alert('请至少填写一味药材'); return }
-    const hasInvalidItem = filled.some(item => {
+    // 【第71天修复 / 开方校验】【第74天调整】九宫格改造后不再有空白行：
+    //  - 一味药都没选 → 提示先选药；
+    //  - 任一药材的克数不是大于 0 的数字 → 提示「请填写完整的分量」；
+    //  - 药材名为空（理论上不会出现，作为兜底）→ 提示补全。
+    // 以上任一条不通过都不调后端、不落库。
+    if (prescriptionItems.length === 0) { alert('请至少选择一味药材'); return }
+    const hasInvalidAmount = prescriptionItems.some(item => {
       const amount = Number(item.amount)   // 空串 / 非数字 → 0 / NaN，都会被下面拦下
-      return !item.herb_name.trim() || !Number.isFinite(amount) || amount <= 0
+      return !Number.isFinite(amount) || amount <= 0
     })
-    if (hasInvalidItem) { alert('请填写完整的药材名和克数'); return }
-    const items = filled.map(item => ({ herb_name: item.herb_name.trim(), amount: Number(item.amount), unit: '克' }))
+    if (hasInvalidAmount) { alert('请填写完整的分量'); return }
+    if (prescriptionItems.some(item => !item.herb_name.trim())) { alert('请填写完整的药材名'); return }
+    // 【第74天新增】每条药材把君臣佐使（role，空串=未标注）与煎法（cooking_method）一起提交给后端
+    const items = prescriptionItems.map(item => ({
+      herb_name: item.herb_name.trim(),
+      amount: Number(item.amount),
+      unit: '克',
+      role: item.role || '',
+      cooking_method: item.cooking_method || DEFAULT_COOKING_METHOD
+    }))
     setSavingPrescription(true)
     fetch('/api/prescriptions', {
       method: 'POST',
@@ -651,13 +688,13 @@ export default function App() {
         // 当面诊疗扣库存失败 → 弹窗提示，不保存（表单保留，方便老师改数量）
         if (data.error) { alert(data.error); return }
         setPrescriptionPatient('')
-        setPrescriptionItems([{ herb_name: '', amount: '' }])
-        setHerbSuggestions({})
+        setPrescriptionItems([])
+        setHerbGridKeyword('')
         setPrescriptionRemote(false)
+        fetchHerbs()   // 【第74天新增】刷新九宫格里的库存数字（当面诊疗会扣减）
         if (prescriptionRemote) {
           alert('药方已保存（远程诊疗，库存未变）')
         } else {
-          fetchHerbs()
           alert('药方已保存，库存已扣减')
         }
       })
@@ -3212,45 +3249,90 @@ export default function App() {
                 />
                 远程诊疗（学生自采，不扣库存）
               </label>
-              {prescriptionItems.map((item, index) => (
-                <div key={index} style={{ display: 'flex', gap: '8px', marginBottom: '8px' }}>
-                  <div style={{ flex: 2, position: 'relative' }}>
-                    <input
-                      style={{ ...inputStyle, marginBottom: 0 }}
-                      placeholder="药材名（输入首字联想）"
-                      value={item.herb_name}
-                      onChange={e => changePrescriptionItem(index, 'herb_name', e.target.value)}
-                    />
-                    {(herbSuggestions[index] || []).length > 0 && (
-                      <div style={{ position: 'absolute', top: '100%', left: 0, right: 0, background: '#fffdf5', border: '1px solid #d4c8a8', borderRadius: '4px', zIndex: 20, maxHeight: '160px', overflowY: 'auto' }}>
-                        {(herbSuggestions[index] || []).map(h => (
-                          <div
-                            key={h.id}
-                            onClick={() => pickHerbSuggestion(index, h)}
-                            style={{ padding: '6px 8px', cursor: 'pointer', fontFamily: 'serif', borderBottom: '1px solid #f0e9d6' }}
-                          >
-                            {h.herb_name}（库存 {h.stock_amount}{h.unit}）
-                          </div>
-                        ))}
-                      </div>
-                    )}
-                  </div>
-                  <input
-                    style={{ ...inputStyle, marginBottom: 0, width: '90px' }}
-                    type="number"
-                    placeholder="克数"
-                    value={item.amount}
-                    onChange={e => changePrescriptionItem(index, 'amount', e.target.value)}
-                  />
-                  {/* 【第54天新增】固定单位标签（暂不支持切换单位） */}
-                  <span style={{ alignSelf: 'center', color: '#999', fontSize: '13px', fontFamily: 'serif' }}>克</span>
+              {/* 【第74天新增 / 开方九宫格改造】九宫格选药：顶部搜索框（输入药材名首字）+ 3 列 × N 行格子（超高滚动）。
+                  未选中 = 灰白底 + 浅色边框；已选中 = 棕色底（主色 #8b4513）白字。点格子切换选中状态。 */}
+              <input
+                style={{ ...inputStyle, marginBottom: '8px' }}
+                placeholder="输入药材名首字"
+                value={herbGridKeyword}
+                onChange={e => setHerbGridKeyword(e.target.value)}
+              />
+              {herbGridList.length === 0 ? (
+                <div style={{ fontFamily: 'serif', fontSize: '13px', color: '#999', marginBottom: '12px' }}>
+                  {herbs.length === 0 ? '暂时没有药材库存记录，请先到「库存」页添加药材' : '没有匹配的药材，换个首字试试'}
                 </div>
-              ))}
+              ) : (
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '8px', maxHeight: '240px', overflowY: 'auto', padding: '2px', marginBottom: '12px' }}>
+                  {herbGridList.map(h => {
+                    const selected = isPrescriptionHerbSelected(h.herb_name)
+                    return (
+                      <button
+                        key={h.id}
+                        onClick={() => togglePrescriptionHerb(h)}
+                        title={`${h.herb_name} 库存 ${h.stock_amount}${h.unit}`}
+                        style={{
+                          ...HERB_GRID_CELL_BASE,
+                          background: selected ? '#8b4513' : '#f7f5ef',
+                          color: selected ? '#fdfcf0' : '#5a4a3a',
+                          border: selected ? '1px solid #8b4513' : '1px solid #d4c8a8'
+                        }}
+                      >
+                        <div style={{ fontWeight: 'bold' }}>{h.herb_name}</div>
+                        <div style={{ fontSize: '12px', opacity: 0.85 }}>{h.stock_amount}{h.unit}</div>
+                      </button>
+                    )
+                  })}
+                </div>
+              )}
+
+              {/* 【第74天新增】已选药材列表：药材名 | 克数输入框 | 君臣佐使下拉 | 煎法下拉 | 删除按钮 */}
+              {prescriptionItems.length === 0 ? (
+                <div style={{ fontFamily: 'serif', fontSize: '13px', color: '#999', marginBottom: '12px' }}>点上面的九宫格选药（可先连点几味，再逐条填分量和标注）</div>
+              ) : (
+                <div style={{ marginBottom: '8px' }}>
+                  {prescriptionItems.map((item, index) => (
+                    <div key={item.herb_name} style={{ display: 'flex', gap: '8px', alignItems: 'center', marginBottom: '8px' }}>
+                      <span style={{ flex: '0 0 72px', fontFamily: 'serif', fontWeight: 'bold', color: '#8b4513' }}>{item.herb_name}</span>
+                      <input
+                        ref={el => { prescriptionAmountRefs.current[item.herb_name] = el }}
+                        style={{ ...inputStyle, marginBottom: 0, flex: '0 0 84px' }}
+                        type="number"
+                        placeholder="克数"
+                        value={item.amount}
+                        onChange={e => changePrescriptionItem(index, 'amount', e.target.value)}
+                      />
+                      {/* 【第54天新增】固定单位标签（暂不支持切换单位） */}
+                      <span style={{ color: '#999', fontSize: '13px', fontFamily: 'serif' }}>克</span>
+                      {/* 【第74天新增】君臣佐使：君 / 臣 / 佐 / 使 / 未标注（'' 落库为未标注） */}
+                      <select
+                        style={{ ...inputStyle, marginBottom: 0, flex: '0 0 92px' }}
+                        title="君臣佐使"
+                        value={item.role}
+                        onChange={e => changePrescriptionItem(index, 'role', e.target.value)}
+                      >
+                        <option value="">{ROLE_UNMARKED_LABEL}</option>
+                        {HERB_ROLES.map(role => <option key={role} value={role}>{role}</option>)}
+                      </select>
+                      {/* 【第74天新增】煎法：常规 / 先煎 / 后下 / 包煎 / 烊化 / 另煎 / 冲服 */}
+                      <select
+                        style={{ ...inputStyle, marginBottom: 0, flex: '0 0 92px' }}
+                        title="煎法"
+                        value={COOKING_METHODS.includes(item.cooking_method) ? item.cooking_method : DEFAULT_COOKING_METHOD}
+                        onChange={e => changePrescriptionItem(index, 'cooking_method', e.target.value)}
+                      >
+                        {COOKING_METHODS.map(method => <option key={method} value={method}>{method}</option>)}
+                      </select>
+                      <button
+                        onClick={() => removePrescriptionItem(index)}
+                        style={{ flex: '0 0 auto', background: '#d4c8a8', border: 'none', padding: '6px 10px', borderRadius: '4px', cursor: 'pointer', fontFamily: 'serif' }}
+                      >删除</button>
+                    </div>
+                  ))}
+                </div>
+              )}
+
               <div style={{ marginTop: '12px' }}>
-                <button
-                  onClick={addPrescriptionItem}
-                  style={{ marginRight: '8px', background: '#5a7d5a', color: '#fdfcf0', border: 'none', padding: '6px 12px', borderRadius: '4px', cursor: 'pointer', fontFamily: 'serif' }}
-                >+ 添加一味药</button>
+                {/* 【第74天修改】原有「+ 添加一味药」按钮去掉：选药能力已由上面的九宫格承担 */}
                 <button
                   onClick={handleSavePrescription}
                   disabled={savingPrescription}

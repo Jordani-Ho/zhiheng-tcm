@@ -835,10 +835,24 @@ def api_delete_herb(herb_id: int):
 
 # ============ Pydantic 模型：开方 ============
 
+class PrescriptionItem(BaseModel):
+    """【第74天新增 / 开方九宫格改造】一味药材：药材名 + 克数 + 君臣佐使 + 煎法。
+
+    - role：君 / 臣 / 佐 / 使，空串 '' = 未标注；
+    - cooking_method：常规 / 先煎 / 后下 / 包煎 / 烊化 / 另煎 / 冲服，空串 '' = 未指定；
+    - 两个字段都有默认值，老调用方（只传 herb_name / amount / unit）无需改动。
+    """
+    herb_name: str
+    amount: float
+    unit: str = "克"
+    role: str = ""              # 【第74天新增】君臣佐使
+    cooking_method: str = ""    # 【第74天新增】煎法
+
+
 class PrescriptionInput(BaseModel):
     teacher_name: str
     patient_name: str = ""
-    items: list  # [{herb_name: str, amount: float, unit: str}]
+    items: list[PrescriptionItem]  # [{herb_name: str, amount: float, unit: str, role: str, cooking_method: str}]
     note: str = ""
     is_remote: bool = False  # 【第53天新增】True=远程诊疗（学生自采，不扣库存）；默认当面诊疗（扣库存）
 
@@ -853,8 +867,14 @@ def api_search_herbs(teacher_name: str, prefix: str = ""):
 
 @app.post("/api/prescriptions")
 def api_create_prescription(data: PrescriptionInput):
-    """【第53天新增】当面诊疗（默认）先扣库存，扣失败返回 {"error": ...} 且不保存；远程诊疗只存药方。"""
-    return database.create_prescription(data.teacher_name, data.patient_name, data.items, data.note, data.is_remote)
+    """【第53天新增】当面诊疗（默认）先扣库存，扣失败返回 {"error": ...} 且不保存；远程诊疗只存药方。
+
+    【第74天新增 / 开方九宫格改造】每条药材额外接收 role（君臣佐使）与 cooking_method（煎法）：
+    exclude_unset=True 只把「客户端真正传了的字段」交给数据库 —— 不传这两个字段的老调用方
+    （以及历史数据格式）行为完全不变，传了就按白名单清洗后落进 items_json。
+    """
+    items = [item.model_dump(exclude_unset=True) for item in data.items]
+    return database.create_prescription(data.teacher_name, data.patient_name, items, data.note, data.is_remote)
 
 
 @app.get("/api/prescriptions")
