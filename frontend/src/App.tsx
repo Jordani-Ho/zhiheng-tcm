@@ -150,6 +150,13 @@ export default function App() {
   const [showLowOnly, setShowLowOnly] = useState(false)
   const [adjustingHerb, setAdjustingHerb] = useState<any>(null)
   const [adjustDelta, setAdjustDelta] = useState(0)
+  // 【第66天新增】💰 财务管理接真实接口：账户数据（GET /api/finance/accounts）+ 三个按钮的内联小表单状态
+  const [financeAccounts, setFinanceAccounts] = useState<{ username: string; role: string; balance: number }[]>([])
+  const [financeForm, setFinanceForm] = useState<'recharge' | 'gift' | 'deduct' | null>(null)
+  const [financeUsername, setFinanceUsername] = useState('')
+  const [financeAmount, setFinanceAmount] = useState('')
+  const [financeNote, setFinanceNote] = useState('')
+  const [financeSubmitting, setFinanceSubmitting] = useState(false)
   // 【第52天新增】开方（中药材首字联想 + 药方结构化存储）
   const [prescriptionPatient, setPrescriptionPatient] = useState('')
   // 【第54天新增】amount 改为 string：默认留空，用户不必先删 0（保存时按 0 处理）
@@ -293,6 +300,18 @@ export default function App() {
   const fetchPoints = () => {
     fetch(`/api/points?patient_name=${selectedPatient}`).then(r => r.json()).then(d => setPoints(d)).catch(() => setPoints(null))
   }
+  // 【第66天新增】💰 财务管理：账户列表（顶部两个数字 + 充值/赠送/扣费表单的“学生姓名”下拉框都取自这里）
+  const fetchFinanceAccounts = () => {
+    fetch('/api/finance/accounts')
+      .then(r => r.json())
+      .then(d => setFinanceAccounts(d && Array.isArray(d.accounts) ? d.accounts : []))
+      .catch(() => setFinanceAccounts([]))
+  }
+
+  // 【第66天新增】💰 财务管理：页面加载时自动拉取一次真实账户数据（老师端「管理」页顶部两个数字的数据来源）
+  useEffect(() => {
+    fetchFinanceAccounts()
+  }, [])
   const fetchProfile = () => {
     fetch(`/api/patient-profile?patient_name=${selectedPatient}`).then(r => r.json()).then(d => setProfile(d)).catch(() => setProfile(null))
   }
@@ -1107,6 +1126,11 @@ export default function App() {
 
   // 【第57天新增 / 第62天调整】老师端页签定义：首页 / 诊室 / 管理（原「学生」+「库存」合并为 1 个页签） / 设置
   const isTeacherRole = currentRole === '李老师' || currentRole === '李老师智能体'
+  // 【第66天新增】💰 财务管理：账户数据派生值（后端按 username 排序，取第一个 role='student' / 'teacher' 的账户，如 张三 / 李老师）
+  const financeStudentAccount = financeAccounts.find(a => a.role === 'student') || null
+  const financeTeacherAccount = financeAccounts.find(a => a.role === 'teacher') || null
+  // 充值 / 赠送 / 扣费 表单的“学生姓名”下拉框只列学生账户
+  const financeStudentOptions = financeAccounts.filter(a => a.role === 'student')
   const teacherTabs: { key: TeacherTab; label: string }[] = [
     { key: 'home', label: '🏠 首页' },
     { key: 'clinic', label: '🩺 诊室' },
@@ -1357,11 +1381,82 @@ export default function App() {
     return { done, total, rate, summary }
   })()
 
-  // ============== 【第64天新增】💰 财务管理面板（最小版）：预存 / 赠送 / 扣费 三个按钮 ==============
-  // 目前只做前端提示（纯 UI 占位），不调用任何后端接口、不改数据库，后续版本再接入真实逻辑
-  const handleFinanceRecharge = () => { alert('预存功能开发中') }
-  const handleFinanceGift = () => { alert('赠送功能开发中') }
-  const handleFinanceDeduct = () => { alert('扣费功能开发中') }
+  // ============== 【第66天接入真实接口】💰 财务管理面板：预存 / 赠送 / 扣费 ==============
+  // 数据来源：顶部两个数字 = GET /api/finance/accounts；三个按钮提交 = POST /api/finance/recharge | gift | deduct
+  const financeLabels: { recharge: string; gift: string; deduct: string } = { recharge: '充值', gift: '赠送', deduct: '扣费' }
+
+  // 点按钮展开内联小表单（再点同一个按钮则收起）；默认选中第一个学生账户
+  const openFinanceForm = (mode: 'recharge' | 'gift' | 'deduct') => {
+    if (financeForm === mode) { closeFinanceForm(); return }
+    setFinanceForm(mode)
+    setFinanceUsername(financeStudentOptions.length > 0 ? financeStudentOptions[0].username : '')
+    setFinanceAmount('')
+    setFinanceNote('')
+  }
+
+  const closeFinanceForm = () => {
+    setFinanceForm(null)
+    setFinanceUsername('')
+    setFinanceAmount('')
+    setFinanceNote('')
+  }
+
+  // 提交：成功后关闭表单 → 重新拉取账户数据 → 弹成功提示（如“充值成功，当前余额 150”）
+  const submitFinance = () => {
+    if (!financeForm || financeSubmitting) return
+    const mode = financeForm
+    const label = financeLabels[mode]
+    const amount = parseInt(financeAmount, 10)
+    if (!financeUsername) { alert('请选择学生。'); return }
+    if (!Number.isFinite(amount) || amount <= 0) { alert('请输入大于 0 的整数金额。'); return }
+    setFinanceSubmitting(true)
+    fetch(`/api/finance/${mode}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: financeUsername, amount, note: financeNote.trim() })
+    })
+      .then(res => res.json().then(body => ({ ok: res.ok, body })).catch(() => ({ ok: res.ok, body: {} as any })))
+      .then(({ ok, body }) => {
+        if (!ok) throw new Error(body.detail || `${label}失败`)
+        if (body.ok === false) throw new Error(body.error || `${label}失败`)
+        setFinanceSubmitting(false)
+        closeFinanceForm()
+        fetchFinanceAccounts()
+        alert(`${label}成功，当前余额 ${body.balance}`)
+      })
+      .catch(err => {
+        setFinanceSubmitting(false)
+        const msg = err && err.message ? err.message : `${label}失败`
+        // 扣费时后端返回 { ok: false, error: '余额不足' } 且不扣款，这里单独提示
+        alert(msg === '余额不足' ? '余额不足，未扣款' : msg)
+      })
+  }
+
+  // 【第66天新增】三个按钮共用的内联小表单：学生姓名（下拉，只列 role='student'）+ 金额 + 备注（可空）+ 确认 / 取消
+  const renderFinanceForm = (mode: 'recharge' | 'gift' | 'deduct') => {
+    if (financeForm !== mode) return null
+    const label = financeLabels[mode]
+    return (
+      <div style={{ background: '#f7f3e8', border: '1px dashed #d4c8a8', borderRadius: '8px', padding: '12px', marginBottom: '10px' }}>
+        <div style={{ fontSize: '14px', color: '#8b4513', fontWeight: 'bold', marginBottom: '8px' }}>{label}</div>
+        <label style={{ fontSize: '12px', color: '#888' }}>学生姓名</label>
+        <select value={financeUsername} onChange={e => setFinanceUsername(e.target.value)} style={inputStyle}>
+          <option value="">{financeStudentOptions.length === 0 ? '暂无学生账户' : '请选择学生'}</option>
+          {financeStudentOptions.map(a => (
+            <option key={a.username} value={a.username}>{a.username}（当前余额 {a.balance}）</option>
+          ))}
+        </select>
+        <label style={{ fontSize: '12px', color: '#888' }}>金额</label>
+        <input type="number" min="1" value={financeAmount} onChange={e => setFinanceAmount(e.target.value)} placeholder="请输入金额（大于 0 的整数）" style={inputStyle} />
+        <label style={{ fontSize: '12px', color: '#888' }}>备注（可空）</label>
+        <input value={financeNote} onChange={e => setFinanceNote(e.target.value)} placeholder="备注（可空）" style={inputStyle} />
+        <div style={{ display: 'flex', gap: '10px' }}>
+          <button onClick={submitFinance} disabled={financeSubmitting} style={{ flex: 1, padding: '8px', borderRadius: '20px', border: 'none', background: financeSubmitting ? '#c9b79a' : '#8b4513', color: '#fff', cursor: financeSubmitting ? 'default' : 'pointer', fontFamily: 'serif', fontSize: '14px' }}>{financeSubmitting ? '提交中…' : `确认${label}`}</button>
+          <button onClick={closeFinanceForm} style={{ flex: 1, padding: '8px', borderRadius: '20px', border: '1px solid #999', background: 'transparent', color: '#666', cursor: 'pointer', fontFamily: 'serif', fontSize: '14px' }}>取消</button>
+        </div>
+      </div>
+    )
+  }
 
   // ============== 渲染 ==============
   return (
@@ -2188,43 +2283,46 @@ export default function App() {
 
         {/* 【第63天调整】🧑‍⚕️ 角色切换卡片（调试模块）：已从页面顶部附近迁至整页最底部（所有页签内容的最下方），代码见本 return 末尾 */}
 
-        {/* 【第64天新增】💰 财务管理面板（最小版）：老师端只在「🗂️管理」页签显示（🏠首页 / 🩺诊室 / ⚙️设置 均不显示）。
-            说明：两个核心数字沿用原有积分数据（points.patient_points / points.teacher_points），数据来源未做任何改动；
-                  三个功能区目前只弹前端提示（handleFinanceRecharge / handleFinanceGift / handleFinanceDeduct），未接后端。 */}
-        {points && isTeacherRole && teacherTab === 'manage' && (
+        {/* 【第66天接入真实接口】💰 财务管理面板：老师端只在「🗂️管理」页签显示（🏠首页 / 🩺诊室 / ⚙️设置 均不显示）。
+            数据来源：顶部两个数字取自 GET /api/finance/accounts（学生取第一个 role='student' 的账户，老师取第一个 role='teacher' 的账户）；
+                  三个按钮各自展开内联小表单，分别 POST /api/finance/recharge | gift | deduct，成功后重新拉取账户数据。 */}
+        {isTeacherRole && teacherTab === 'manage' && (
           <div style={{ ...boxStyle, background: '#fffdf5' }}>
             {/* 卡片标题 */}
             <div style={{ fontSize: '18px', color: '#8b4513', fontWeight: 'bold', marginBottom: '15px' }}>💰 财务管理</div>
 
-            {/* 顶部一行：两个核心数字（学生账户总额 / 老师账户总额） */}
+            {/* 顶部一行：两个核心数字（学生账户总额 / 老师账户总额），数据来自 /api/finance/accounts 的真实余额 */}
             <div style={{ display: 'flex', justifyContent: 'space-around', textAlign: 'center', paddingBottom: '15px', borderBottom: '1px solid #e6dcc2', marginBottom: '15px' }}>
               <div>
-                <div style={{ fontSize: '12px', color: '#999' }}>学生账户总额（{selectedPatient}）</div>
-                <div style={{ fontSize: '24px', fontWeight: 'bold', color: '#8b4513' }}>{points.patient_points}</div>
+                <div style={{ fontSize: '12px', color: '#999' }}>学生账户总额（{financeStudentAccount ? financeStudentAccount.username : '—'}）</div>
+                <div style={{ fontSize: '24px', fontWeight: 'bold', color: '#8b4513' }}>{financeStudentAccount ? financeStudentAccount.balance : '—'}</div>
               </div>
               <div>
-                <div style={{ fontSize: '12px', color: '#999' }}>老师账户总额（{selectedTeacher}）</div>
-                <div style={{ fontSize: '24px', fontWeight: 'bold', color: '#5a7d5a' }}>{points.teacher_points}</div>
+                <div style={{ fontSize: '12px', color: '#999' }}>老师账户总额（{financeTeacherAccount ? financeTeacherAccount.username : '—'}）</div>
+                <div style={{ fontSize: '24px', fontWeight: 'bold', color: '#5a7d5a' }}>{financeTeacherAccount ? financeTeacherAccount.balance : '—'}</div>
               </div>
             </div>
 
-            {/* 功能区 a：预存（充值） */}
+            {/* 功能区 a：预存（充值）→ 内联表单 */}
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '8px 0' }}>
-              <button onClick={handleFinanceRecharge} style={{ padding: '8px 20px', borderRadius: '20px', border: 'none', background: '#8b4513', color: '#fff', cursor: 'pointer', fontFamily: 'serif', fontSize: '14px' }}>💵 预存（充值）</button>
+              <button onClick={() => openFinanceForm('recharge')} style={{ padding: '8px 20px', borderRadius: '20px', border: 'none', background: '#8b4513', color: '#fff', cursor: 'pointer', fontFamily: 'serif', fontSize: '14px' }}>💵 预存（充值）</button>
               <div style={{ fontSize: '13px', color: '#666', textAlign: 'right' }}>学生预交学费充进账户，余额可跨次就诊使用</div>
             </div>
+            {renderFinanceForm('recharge')}
 
-            {/* 功能区 b：赠送 */}
+            {/* 功能区 b：赠送 → 内联表单 */}
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '8px 0' }}>
-              <button onClick={handleFinanceGift} style={{ padding: '8px 20px', borderRadius: '20px', border: 'none', background: '#5a7d5a', color: '#fff', cursor: 'pointer', fontFamily: 'serif', fontSize: '14px' }}>🎁 赠送</button>
-              <div style={{ fontSize: '13px', color: '#666', textAlign: 'right' }}>活动或答谢时，额外赠送积分到学生账户</div>
+              <button onClick={() => openFinanceForm('gift')} style={{ padding: '8px 20px', borderRadius: '20px', border: 'none', background: '#5a7d5a', color: '#fff', cursor: 'pointer', fontFamily: 'serif', fontSize: '14px' }}>🎁 赠送</button>
+              <div style={{ fontSize: '13px', color: '#666', textAlign: 'right' }}>活动或答谢时，额外赠送金额到学生账户</div>
             </div>
+            {renderFinanceForm('gift')}
 
-            {/* 功能区 c：扣费 */}
+            {/* 功能区 c：扣费 → 内联表单（余额不足时后端不扣款，前端弹提示） */}
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '8px 0' }}>
-              <button onClick={handleFinanceDeduct} style={{ padding: '8px 20px', borderRadius: '20px', border: 'none', background: '#c0392b', color: '#fff', cursor: 'pointer', fontFamily: 'serif', fontSize: '14px' }}>💸 扣费</button>
-              <div style={{ fontSize: '13px', color: '#666', textAlign: 'right' }}>面诊 / 开方后，从学生账户扣除对应积分</div>
+              <button onClick={() => openFinanceForm('deduct')} style={{ padding: '8px 20px', borderRadius: '20px', border: 'none', background: '#c0392b', color: '#fff', cursor: 'pointer', fontFamily: 'serif', fontSize: '14px' }}>💸 扣费</button>
+              <div style={{ fontSize: '13px', color: '#666', textAlign: 'right' }}>面诊 / 开方后，从学生账户扣除对应金额</div>
             </div>
+            {renderFinanceForm('deduct')}
 
             {/* 底部灰色小字：后续版本功能预告 */}
             <div style={{ fontSize: '12px', color: '#999', textAlign: 'center', marginTop: '15px' }}>催缴、统计、报表将在后续版本上线</div>
