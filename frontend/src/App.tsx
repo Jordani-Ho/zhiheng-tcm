@@ -22,6 +22,12 @@ const PULSE_TYPES = ['浮', '沉', '迟', '数', '虚', '实', '滑', '涩']
 // 【第59天重构】拍照清晰度检测阈值：Canvas 取灰度 → 3x3 拉普拉斯卷积 → 求灰度方差，< 100 视为“可能不够清晰”，
 // 弹「重拍 / 继续使用」让老师自己决定是否仍要使用
 const IMAGE_SHARPNESS_THRESHOLD = 100
+// 【第73天新增 / 改动2 + 改动3】诊室拍照归类：舌苔照 / 患处照 / 其他（默认「患处照」）
+// 轻量版智能体判断：当前版本先由老师在下拉里手动确认归类，不做后端识别
+const PHOTO_CATEGORIES = ['舌苔照', '患处照', '其他']
+const DEFAULT_PHOTO_CATEGORY = '患处照'
+// 【第73天新增 / 改动1】后端静态资源挂在 8000 端口：/uploads/xxx.jpg 要拼成完整地址才能显示 / 打开原图
+const IMAGE_ORIGIN = 'http://localhost:8000'
 // 【第61天新增】首页「今日备忘录」本地存储 key：{ date, keys }，存的数据不是今天就自动清空（前端模拟每日 00:00 重置）
 const MEMO_DONE_STORE_KEY = 'zh_memo_done'
 // 【第71天新增 / 面诊队列整合】🩺 诊室队列「💻 远程问诊」列的判定关键词：
@@ -113,9 +119,12 @@ export default function App() {
   const [pulseRate, setPulseRate] = useState('')
   const [pulseNote, setPulseNote] = useState('')
 
-  // 【第69天新增】诊室拍照缩略图列表：每上传成功一张图片就记一条 URL（仅当前会话有效，刷新页面即清空）
+  // 【第69天新增】诊室拍照缩略图列表：每上传成功一张图片就记一条（仅当前会话有效，刷新页面即清空）
   // 点缩略图 → window.open(url, '_blank') 看原图；点右上角 × → 只从本列表移除，不影响已追加到文本框的 URL
-  const [uploadedImages, setUploadedImages] = useState<string[]>([])
+  // 【第73天改动3】结构由 string[] 改成对象数组 { url, category }：
+  //   · url      → 图片地址（/uploads/xxx.jpg，与追加进文本框的 URL 完全一致）
+  //   · category → 归类的智能体标签（轻量版：默认「患处照」，老师在缩略图下方下拉里手动确认 / 切换）
+  const [uploadedImages, setUploadedImages] = useState<{ url: string; category: string }[]>([])
 
   // 【第59天重构】拍照清晰度不通过时，弹「重拍 / 继续使用」两个选项（老师自己决定是否仍要使用）
   const [blurryPhoto, setBlurryPhoto] = useState<{ draftId: number; file: File } | null>(null)
@@ -252,6 +261,45 @@ export default function App() {
     const regex = /\/uploads\/audio_[a-zA-Z0-9._-]+/g
     const matches = content.match(regex)
     return matches ? Array.from(new Set(matches)) : []
+  }
+
+  // ============== 【第73天新增】改动1：签字预览页渲染照片 / 改动2：标题动态化 / 改动3：归类下拉 ==============
+  // 改动1：病历文本里出现 /uploads/xxx.jpg（例如【上传的图片】/uploads/xxx.jpg）时，在文本下方额外渲染缩略图。
+  // 后端静态资源挂在 8000 端口，所以 <img src> 要拼成完整地址；页面本身仍保留 URL 文本（textarea 内容不动）。
+  const toFullImageUrl = (url: string): string => (url.startsWith('http') ? url : IMAGE_ORIGIN + url)
+
+  // 改动2：这张图是不是「本次会话老师现场拍的」？
+  // uploadedImages 只在 📷 拍照 按钮上传成功时写入 → 命中即老师现场拍摄；
+  // 未命中（如学生端提交陈述时上传的图片 / 刷新页面后的历史图片）保持原样，仍按「学生上传的图片」显示。
+  const isTeacherLivePhoto = (url: string): boolean => uploadedImages.some(x => x.url === url)
+
+  // 改动2：病历草案图片区的标题——老师现场拍的照片不再被误标成「学生上传的图片」
+  const imageStripTitle = (content: string): string => {
+    const urls = extractImageUrls(content)
+    const teacherCount = urls.filter(u => isTeacherLivePhoto(u)).length
+    if (teacherCount === 0) return '📷 学生上传的图片：'            // 全是学生端上传的 → 标题保持原样
+    if (teacherCount === urls.length) return '📷 舌苔照 / 患处照'   // 全是老师现场拍的
+    return '📷 图片（舌苔照 / 患处照 / 学生上传）'                   // 两种混在一起
+  }
+
+  // 改动3：缩略图下方的归类下拉（舌苔照 / 患处照 / 其他）。
+  // 轻量版智能体判断 = 默认「患处照」，由老师在下拉里确认；状态只存在 uploadedImages 的每一条里，
+  // 所以「📸 现场辅助记录的拍照区」与「📋 病历草案的图片区」两处共用同一份归类（改一处两处同步）。
+  // url 不在本次会话拍照列表里（纯学生上传）→ 返回 null，不显示下拉，学生端零改动。
+  const renderPhotoCategorySelect = (url: string, keySuffix: string) => {
+    const idx = uploadedImages.findIndex(x => x.url === url)
+    if (idx < 0) return null
+    return (
+      <select
+        key={`photo-cat-${keySuffix}`}
+        value={uploadedImages[idx].category}
+        onChange={e => setUploadedImages(prev => prev.map((x, i) => (i === idx ? { ...x, category: e.target.value } : x)))}
+        title="智能体判断归类（当前版本暂由老师确认）"
+        style={{ width: '100%', marginTop: '4px', padding: '1px 2px', borderRadius: '6px', border: '1px solid #b8d8c0', background: '#fff', color: '#5a7d5a', fontSize: '11px', fontFamily: 'serif', cursor: 'pointer' }}
+      >
+        {PHOTO_CATEGORIES.map(c => <option key={c} value={c}>{c}</option>)}
+      </select>
+    )
   }
 
   // ============== 初始化 ==============
@@ -1036,7 +1084,8 @@ export default function App() {
         // 【第69天新增】上传成功 → 同时记入缩略图列表（≠ 写入文本的 URL，移除缩略图不影响文本）
         if (d && d.url) {
           if (clinicPatientRef.current !== uploadOwner) return   // 【第70天修复】学生已切换 → 不写进缩略图列表，也不追加到文本框
-          setUploadedImages(prev => [...prev, d.url])
+          // 【第73天改动3】结构改为 { url, category }，默认归类「患处照」（老师可在缩略图下方下拉里切换）
+          setUploadedImages(prev => [...prev, { url: d.url, category: DEFAULT_PHOTO_CATEGORY }])
           setTeacherLiveText(prev => ({ ...prev, [draftId]: (prev[draftId] || '') + '\n\n【上传的图片】' + d.url }))
         } else {
           alert('图片上传失败，请重试')
@@ -1704,6 +1753,31 @@ export default function App() {
                 <span style={{ color: '#c0392b', fontWeight: 'bold' }}>确认签字后，AI 原草案将销毁，音频文件将删除。</span>
               </div>
               <textarea value={previewDraft.content} onChange={e => setPreviewDraft({ ...previewDraft, content: e.target.value })} style={{ width: '100%', minHeight: '400px', padding: '12px', borderRadius: '8px', border: '1px solid #d4c8a8', fontFamily: 'serif', fontSize: '14px', marginBottom: '15px', boxSizing: 'border-box', whiteSpace: 'pre-wrap', lineHeight: '1.6' }} />
+              {/* 【第73天改动1】签字预览页渲染照片：病历文本里出现 /uploads/xxx.jpg（如【上传的图片】/uploads/xxx.jpg）时，
+                  在文本框下方额外渲染缩略图（宽度 120px、圆角）；URL 文本本身仍保留在文本框里（不删、不改）。
+                  src 用 http://localhost:8000 + URL 拼完整地址；点缩略图 → window.open(完整URL, '_blank') 看原图。 */}
+              {extractImageUrls(previewDraft.content).length > 0 && (
+                <div style={{ marginBottom: '15px', padding: '10px', background: '#fff', borderRadius: '8px', border: '1px dashed #d4c8a8' }}>
+                  <div style={{ fontSize: '12px', color: '#8b4513', fontWeight: 'bold', marginBottom: '8px' }}>📷 病历内附照片（点击缩略图看原图）</div>
+                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: '10px' }}>
+                    {extractImageUrls(previewDraft.content).map((url, i) => {
+                      const fullUrl = toFullImageUrl(url)
+                      return (
+                        <div key={`${url}-${i}`} style={{ textAlign: 'center', width: '120px' }}>
+                          <img
+                            src={fullUrl}
+                            alt={`病历照片${i + 1}`}
+                            onClick={() => window.open(fullUrl, '_blank')}
+                            title="点击查看原图"
+                            style={{ width: '120px', height: '120px', objectFit: 'cover', borderRadius: '8px', border: '1px solid #d4c8a8', display: 'block', cursor: 'zoom-in' }}
+                          />
+                          <div style={{ fontSize: '11px', color: '#999', marginTop: '4px' }}>点击查看原图</div>
+                        </div>
+                      )
+                    })}
+                  </div>
+                </div>
+              )}
               <div style={{ display: 'flex', gap: '10px', justifyContent: 'flex-end' }}>
                 <button onClick={() => setPreviewDraft(null)} style={{ padding: '8px 20px', borderRadius: '20px', border: '1px solid #999', background: 'transparent', color: '#666', cursor: 'pointer' }}>取消（返回修改）</button>
                 <button onClick={handleFinalSign} style={{ padding: '8px 24px', borderRadius: '20px', border: 'none', background: '#5a7d5a', color: '#fff', cursor: 'pointer', fontWeight: 'bold' }}>✅ 确认签字</button>
@@ -3014,27 +3088,35 @@ export default function App() {
                   <button onClick={handlePulseRecord} disabled={clinicTargetId === null} style={{ padding: '6px 18px', borderRadius: '20px', border: 'none', background: clinicTargetId === null ? '#ccc' : '#8b4513', color: '#fff', cursor: clinicTargetId === null ? 'not-allowed' : 'pointer', fontSize: '13px', whiteSpace: 'nowrap' }}>把脉记录追加到上方文本框</button>
                 </div>
               </div>
-              {/* d) 拍照缩略图区（本部分末：每上传成功一张图片显示一张 80px 小图） */}
+              {/* d) 拍照缩略图区（每上传成功一张图片显示一张 80px 小图 + 缩略图下方归类下拉） */}
+              {/* 【第73天改动2】uploadedImages 只由「📷 拍照」按钮上传成功时写入 → 本区图片必然都是老师现场拍的，
+                  所以标题从“学生上传的图片：”改成“📷 舌苔照 / 患处照”，并在标题下加一行小灰字说明归类规则。 */}
               {uploadedImages.length > 0 && (
-                <div style={{ display: 'flex', flexWrap: 'wrap', gap: '8px', marginTop: '10px', marginBottom: '10px' }}>
-                  {uploadedImages.map((url, i) => (
-                    <div key={`${url}-${i}`} style={{ position: 'relative', width: '80px', height: '80px' }}>
-                      {/* 点缩略图 → 新标签页打开原图 */}
-                      <img
-                        src={url}
-                        alt={`现场图片${i + 1}`}
-                        onClick={() => window.open(url, '_blank')}
-                        title="点击在新标签页查看原图"
-                        style={{ width: '80px', height: '80px', objectFit: 'cover', borderRadius: '8px', border: '1px solid #b8d8c0', cursor: 'zoom-in', display: 'block' }}
-                      />
-                      {/* 右上角 ×：只从缩略图列表移除，已追加到文本框的 URL 不受影响 */}
-                      <button
-                        onClick={() => setUploadedImages(prev => prev.filter((_, idx) => idx !== i))}
-                        title="从预览区移除（已追加到文本框的内容不受影响）"
-                        style={{ position: 'absolute', top: '-6px', right: '-6px', width: '18px', height: '18px', padding: 0, lineHeight: '16px', borderRadius: '50%', border: '1px solid #fff', background: '#c0392b', color: '#fff', fontSize: '12px', cursor: 'pointer' }}
-                      >×</button>
-                    </div>
-                  ))}
+                <div style={{ marginTop: '10px', marginBottom: '10px', padding: '10px', background: '#f7fcf9', borderRadius: '8px', border: '1px dashed #b8d8c0' }}>
+                  <div style={{ fontSize: '12px', color: '#5a7d5a', fontWeight: 'bold', marginBottom: '4px' }}>📷 舌苔照 / 患处照</div>
+                  <div style={{ fontSize: '11px', color: '#999', marginBottom: '8px' }}>老师拍照后由智能体判断归类（当前版本暂由老师确认）</div>
+                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: '8px' }}>
+                    {uploadedImages.map((item, i) => (
+                      <div key={`${item.url}-${i}`} style={{ position: 'relative', width: '80px' }}>
+                        {/* 点缩略图 → 新标签页打开原图 */}
+                        <img
+                          src={item.url}
+                          alt={`现场图片${i + 1}`}
+                          onClick={() => window.open(item.url, '_blank')}
+                          title="点击在新标签页查看原图"
+                          style={{ width: '80px', height: '80px', objectFit: 'cover', borderRadius: '8px', border: '1px solid #b8d8c0', cursor: 'zoom-in', display: 'block' }}
+                        />
+                        {/* 右上角 ×：只从缩略图列表移除，已追加到文本框的 URL 不受影响 */}
+                        <button
+                          onClick={() => setUploadedImages(prev => prev.filter((_, idx) => idx !== i))}
+                          title="从预览区移除（已追加到文本框的内容不受影响）"
+                          style={{ position: 'absolute', top: '-6px', right: '-6px', width: '18px', height: '18px', padding: 0, lineHeight: '16px', borderRadius: '50%', border: '1px solid #fff', background: '#c0392b', color: '#fff', fontSize: '12px', cursor: 'pointer' }}
+                        >×</button>
+                        {/* 【第73天改动3】缩略图下方归类下拉：舌苔照 / 患处照 / 其他（默认「患处照」，老师可手动切换） */}
+                        {renderPhotoCategorySelect(item.url, `live-${i}`)}
+                      </div>
+                    ))}
+                  </div>
                 </div>
               )}
               {/* e) 追加到病历：把文本框内容写入病历草案（手工打字时的备用通道；AI整理走上面的 🤖 按钮） */}
@@ -3067,10 +3149,20 @@ export default function App() {
 
                   {extractImageUrls(d.content).length > 0 && (
                     <div style={{ marginBottom: '15px', padding: '10px', background: '#f7fcf9', borderRadius: '8px', border: '1px dashed #b8d8c0' }}>
-                      <div style={{ fontSize: '12px', color: '#5a7d5a', fontWeight: 'bold', marginBottom: '8px' }}>📷 学生上传的图片：</div>
-                      <div style={{ display: 'flex', flexWrap: 'wrap' }}>
+                      {/* 【第73天改动2】标题动态化：本次会话老师现场拍的照片（出现在 uploadedImages 里）不再被误标成
+                          “📷 学生上传的图片：”；纯学生端上传时标题保持原样（学生端零改动）。 */}
+                      <div style={{ fontSize: '12px', color: '#5a7d5a', fontWeight: 'bold', marginBottom: '8px' }}>{imageStripTitle(d.content)}</div>
+                      {/* 【第73天改动2】小灰字：仅当本区含老师现场拍的照片时才提示归类规则 */}
+                      {extractImageUrls(d.content).some(u => isTeacherLivePhoto(u)) && (
+                        <div style={{ fontSize: '11px', color: '#999', marginBottom: '8px' }}>老师拍照后由智能体判断归类（当前版本暂由老师确认）</div>
+                      )}
+                      <div style={{ display: 'flex', flexWrap: 'wrap', gap: '8px' }}>
                         {extractImageUrls(d.content).map((url, i) => (
-                          <img key={i} src={url} alt={`学生图片${i + 1}`} style={{ maxWidth: '150px', maxHeight: '150px', objectFit: 'cover', borderRadius: '8px', margin: '4px', border: '1px solid #b8d8c0' }} />
+                          <div key={`${url}-${i}`} style={{ width: '150px' }}>
+                            <img src={url} alt={`病历图片${i + 1}`} style={{ maxWidth: '150px', maxHeight: '150px', objectFit: 'cover', borderRadius: '8px', border: '1px solid #b8d8c0', display: 'block' }} />
+                            {/* 【第73天改动3】老师现场拍的照片 → 缩略图下方归类下拉（与拍照区共用 uploadedImages 里同一份归类） */}
+                            {renderPhotoCategorySelect(url, `draft-${d.id}-${i}`)}
+                          </div>
                         ))}
                       </div>
                     </div>
