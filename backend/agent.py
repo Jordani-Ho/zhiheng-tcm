@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import sqlite3
 from datetime import datetime
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
@@ -288,6 +289,225 @@ def clean_plan(raw_text: str) -> str:
     if not cleaned:
         raise ValueError("clean_plan: 智能体返回内容为空")
     return cleaned
+
+
+# ============ 【第80天新增】学生智能体「十问歌」主动追问（面诊前准备） ============
+# 场景：学生约好老师、面诊之前，学生智能体主动把还没说清的症状一项一项问出来，
+# 面诊时老师直接读到一份「问诊前摘要」，不用再从头问一遍。
+# 十问歌：一问寒热二问汗，三问头身四问便，五问饮食六问胸，七聋八渴俱当辨，九问旧病十问因。
+#
+# TEN_QUESTIONS 一份数据两处用（都在下面）：
+#   ① 喂给 LLM 当「固定十项清单」——LLM 逐项对照学生已回答内容，挑第一个没明确回答的问；
+#   ② LLM 调用失败时的静态兜底——直接按已答轮次取第 N 问（第（N+1）项），保证前端永远拿得到问题。
+# 顺序 = 十问歌原顺序，不能改（改了会和老师的阅读习惯错位）。
+TEN_QUESTIONS = [
+    ("寒热", "你最近是怕冷多一点，还是怕热多一点？"),
+    ("汗", "你平时出汗多不多，是白天容易出汗，还是睡着了出汗？"),
+    ("头身", "头或者身体有没有哪里不舒服，比如头晕、头痛、身上发酸发沉？"),
+    ("二便", "大小便情况怎么样，有没有干结、稀软或者次数变多？"),
+    ("饮食", "最近胃口和口味怎么样，吃东西香不香？"),
+    ("胸腹", "胸口或者肚子有没有发闷、发胀、隐隐作痛？"),
+    ("耳", "耳朵有没有响，或者听东西不太清楚？"),
+    ("口渴", "会觉得口渴吗，平时更想喝热水还是凉水？"),
+    ("旧病", "以前得过什么病，有没有长期在吃的药？"),
+    ("病因", "这次不舒服大概是从什么时候开始的，你觉得可能和什么有关？"),
+]
+
+# 十项里「学生明确说没有」也算已经问到（不重复问）；十项都覆盖 → 返回 done。
+ASK_NEXT_QUESTION_PROMPT = (
+    "你是一名中医学生智能体的【问诊前追问员】。这位学生已经约好了老师的面诊，"
+    "在面诊之前，你要按中医「十问歌」把还没问到的症状一项一项问清楚，"
+    "帮老师把学生的零散说法攒成一份面诊时能快速读懂的「问诊前摘要」。\n\n"
+    "【十问歌 · 固定十项（顺序不能变，也不许增删）】\n"
+    "{checklist}\n\n"
+    "【你要做的】\n"
+    "1. 先通读下面的「学生已经回答过的内容」，逐项判断这十项里哪些已经明确回答"
+    "（学生说到了、或明确说「没有 / 还好」，都算已回答）\n"
+    "2. 【严格按顺序扫描】从第 1 项开始逐项往下看：已经明确回答的 → 跳过看下一项；"
+    "遇到第一项没明确回答的，就问它，绝对不要先问后面的项"
+    "（例如第 9 项「旧病」还没问到，就不许先问第 10 项「病因」）\n"
+    "3. 措辞口语化，像关心的同学在聊天：不要出现「寒热」「二便」「问汗」这类学术说法，"
+    "可以结合学生前面回答里提到的症状把问题问得更贴人（例如学生说头晕，就问「头晕的时候是一阵一阵还是一直晕」）\n"
+    "4. 一次只问一个问题，一两句话说完就行，不要列清单、不要带序号\n\n"
+    "【绝对禁止】\n"
+    "1. 不能诊断、辨证、开方，不能推荐药、食疗、穴位、养生方法\n"
+    "2. 不能评价或安慰学生的回答（如「这很常见」「别担心」）\n"
+    "3. 不能一次抛出多个问题，不能要求学生拍照、上传资料或去做检查\n"
+    "4. 不能重复学生已经明确回答过的项\n\n"
+    "【输出格式】\n"
+    "· 还有没问到的项：只输出这一个问题本身（一句口语化的问句），"
+    "不要序号、不要「问题：」这类前缀、不要引号、不要解释、不要 markdown。\n"
+    "· 十项都已经明确回答（或学生已明确表示没有更多可说的）：只输出 {done} 三个字，不要别的内容。\n\n"
+    "【学生姓名】{patient_name}\n"
+    "【学生已经回答过的内容】\n"
+    "{current_answers}"
+)
+
+# 「十问已问全」的固定输出标记（LLM 按约定输出这三个字；解析时原样识别）
+ASK_DONE_MARK = "已问全"
+
+# 十问歌 → 结构化摘要的固定十行（供 save_intake 的 prompt 用，与 TEN_QUESTIONS 同序同名）
+INTAKE_SUMMARY_LINES = "\n".join(f"{label}：..." for label, _ in TEN_QUESTIONS)
+
+# 保存前的整理 prompt：只做格式化（补标点 / 归类 / 删语气词），不许推理、不许补充、不许给建议。
+SAVE_INTAKE_PROMPT = (
+    "你是一名中医问诊的【记录整理员】。学生已经在面诊前按「十问歌」回答完了一轮问题，"
+    "你的任务只有一个：把这些零散的回答整理成一份老师面诊时 10 秒钟能读完的「问诊前摘要」。\n\n"
+    "【绝对禁止】\n"
+    "1. 不能做任何诊断、辨证、开方、推理判断\n"
+    "2. 不能添加学生没说过的内容，也不能替学生「推测」或「补全」\n"
+    "3. 不能给出任何建议（吃药、食疗、作息、穴位、复诊都一个字都不要提）\n\n"
+    "【必须做的】\n"
+    "1. 只做格式化：给学生的原话补标点、删掉语气词、按下面固定十项归类\n"
+    "2. 学生原话照抄（如「手脚冰凉」「大便两天一次」「夜里两点醒」），不要改写成术语\n"
+    "3. 学生某项完全没提到 → 该项写「未提及」，绝对不能填补\n"
+    "4. 一项里说了多件事就保留在同一行，用逗号或分号隔开，不要自己分小节、加小标题\n\n"
+    "【输出格式】严格按下面第一行的标题 + 固定十行，顺序不增不减，不要任何别的内容"
+    "（不要前言、不要总结、不要 markdown 标记）\n"
+    "【面诊前摘要】\n"
+    "{summary_lines}\n\n"
+    "【学生姓名】{patient_name}\n"
+    "【学生的问答记录】\n"
+    "{answers}"
+)
+
+
+def _parse_next_question(raw_text):
+    """解析 LLM 的追问输出。
+
+    · 返回 None：LLM 没给可用内容（空串 / 全是标点）→ 调用方走静态兜底，避免把「追问」变成「无话可说」；
+    · 返回 {"question": "", "done": True}：命中「已问全」标记 → 十问已覆盖；
+    · 返回 {"question": "…", "done": False}：拿到下一个问题（已做轻量清洗：去序号 / 去「问题：」前缀 / 只留第一句）。
+    """
+    text = (raw_text or "").strip().strip("`*# \t\r\n")
+    if not text:
+        return None
+    if ASK_DONE_MARK in text:
+        return {"question": "", "done": True}
+    text = re.sub(r"^\s*(?:[-*•·]\s*|\d+\s*[.、)）:：]\s*)", "", text)   # 去列表符号 / 序号
+    text = re.sub(r"^(?:问题|下一个问题|追问|问)\s*[:：]\s*", "", text)      # 去常见前缀
+    first_q = re.search(r"[？?]", text)
+    if first_q:
+        text = text[:first_q.end()]     # 问号后还有内容 = LLM 一次多问了 → 只留第一句
+    text = text.strip().strip('"“”\'‘’')
+    if not text:
+        return None
+    if ASK_DONE_MARK in text:
+        return {"question": "", "done": True}
+    return {"question": text, "done": False}
+
+
+def _fallback_next_question(answered_rounds):
+    """LLM 调用失败 / 输出无法解析时的静态兜底：按已答轮次取十问歌里的下一项。
+
+    前端按「问：…\\n答：…」累积 current_answers，所以「答：」出现几次就是已经答了几轮；
+    轮次超出十项 → 视为十问已覆盖（done）。
+    """
+    if answered_rounds >= len(TEN_QUESTIONS):
+        return {"question": "", "done": True}
+    return {"question": TEN_QUESTIONS[answered_rounds][1], "done": False}
+
+
+def ask_next_question(patient_name: str, current_answers: str) -> dict:
+    """【改动1】学生智能体「十问歌」主动追问入口。
+
+    入参：patient_name（学生姓名，只用于让提问更贴人）、current_answers（学生已回答的内容，第一次为空串）。
+    返回：{"question": str, "done": bool}
+      · done=False → question 是下一个问题（一句话、口语化，不带诊断/开方/建议）；
+      · done=True  → 十问已覆盖，question 为空串。
+
+    越界防护：这里只产出「问什么」，不产出任何诊断、辨证、开方或建议；
+    即使 LLM 不听话多问了，_parse_next_question 也只会留下第一句话，保证「一次只问一个」。
+    """
+    answers_text = (current_answers or "").strip()
+    # 确定性上限：十项都答过就不再问（同时兜住「LLM 万一绕圈」导致前端永远问不完的情况）
+    answered_rounds = answers_text.count("答：")
+    if answered_rounds >= len(TEN_QUESTIONS):
+        return {"question": "", "done": True}
+
+    checklist = "\n".join(f"{i}. 问{label}：{example}" for i, (label, example) in enumerate(TEN_QUESTIONS, 1))
+    prompt = (ASK_NEXT_QUESTION_PROMPT
+              .replace("{checklist}", checklist)
+              .replace("{done}", ASK_DONE_MARK)
+              .replace("{patient_name}", patient_name or "这位学生")
+              .replace("{current_answers}", answers_text or "（学生还没有回答过任何内容，请从第 1 项开始问）"))
+    try:
+        response = llm.invoke(prompt)
+    except Exception:
+        return _fallback_next_question(answered_rounds)   # LLM 挂了也不能让学生卡在这里
+
+    parsed = _parse_next_question(response.content)
+    if parsed is None:
+        return _fallback_next_question(answered_rounds)
+    if parsed["done"]:
+        return {"question": "", "done": True}
+    return parsed
+
+
+def _ensure_complaints_status_column():
+    """保证 complaints 有 status 列（改动2 要求落 status='pending'）。
+
+    【为什么写在这里】complaints 表定义在 database.py（本次改动范围之外，不动它），
+    老库里没有 status 列，所以这里做一次幂等补列（与 database.py 里 visit_at / is_remote 的
+    ALTER TABLE 补列手法完全一致：列已存在时 sqlite 抛 OperationalError，直接跳过）。
+    """
+    conn = database.get_connection()
+    try:
+        conn.execute("ALTER TABLE complaints ADD COLUMN status TEXT DEFAULT 'pending'")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass   # 列已存在（重复调用）
+    finally:
+        conn.close()
+
+
+def _format_intake(patient_name: str, answers: str) -> str:
+    """把学生的问答记录整理成「问诊前摘要」（LLM 只做格式化；失败就降级成原文，绝不丢内容）。"""
+    raw = (answers or "").strip()
+    if not raw:
+        return "【面诊前摘要】\n（学生未填写内容）"
+    prompt = (SAVE_INTAKE_PROMPT
+              .replace("{summary_lines}", INTAKE_SUMMARY_LINES)
+              .replace("{patient_name}", patient_name or "这位学生")
+              .replace("{answers}", raw))
+    try:
+        response = llm.invoke(prompt)
+        text = (response.content or "").strip()
+        if text:
+            return text
+    except Exception:
+        pass
+    return "【面诊前摘要】\n" + raw   # 降级：原样保留学生问答记录，老师照样能读
+
+
+def save_intake(patient_name: str, teacher_name: str, answers: str) -> dict:
+    """【改动2】保存「面诊前准备」结果：整理成结构化文本 → 写入 complaints（学生陈述表）。
+
+    · status 固定 'pending'（老师尚未在面诊中处理）；
+    · created_at 用 datetime.now().isoformat()，与库内其它 created_at 写法一致；
+    · 只管格式化，不做任何推理 / 补充（见 SAVE_INTAKE_PROMPT）。
+    返回：{"ok": True, "id": 新记录 id}
+    """
+    content = _format_intake(patient_name, answers)
+    _ensure_complaints_status_column()
+    conn = database.get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "INSERT INTO complaints (teacher_name, patient_name, content, status, created_at) "
+            "VALUES (?, ?, ?, 'pending', ?)",
+            (teacher_name, patient_name, content, datetime.now().isoformat())
+        )
+    except sqlite3.OperationalError:
+        # 兜底：补列失败（权限 / 锁 / 极旧库）时也不让学生白准备，先按老字段写进去
+        cur.execute(
+            "INSERT INTO complaints (teacher_name, patient_name, content, created_at) VALUES (?, ?, ?, ?)",
+            (teacher_name, patient_name, content, datetime.now().isoformat())
+        )
+    new_id = cur.lastrowid
+    conn.commit()
+    conn.close()
+    return {"ok": True, "id": new_id}
 
 
 # ============ 【行政化改造 B3】学生管理请示：欠费预存 + 复诊提醒 ============

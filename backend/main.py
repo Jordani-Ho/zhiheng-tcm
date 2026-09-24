@@ -437,6 +437,43 @@ def patient_structurize(input_data: PatientStructurizeInput):
     result = agent.structurize_patient_input(input_data.raw_text)
     return {"structured": result}
 
+# ============ 【第80天新增】学生智能体「十问歌」主动追问（面诊前准备） ============
+# 两个接口是配套的一问一答：ask_next_question 只负责「下一问是什么」，save_intake 负责「问完之后落库」。
+# 两者都只走 agent.py 里现成的 LLM（deepseek-chat），不新增任何依赖、不改数据库表定义。
+
+class AskNextQuestionInput(BaseModel):
+    patient_name: str
+    current_answers: str = ""   # 学生已回答的内容；第一次为空字符串（不传也当空串，前端首次调用更省事）
+
+
+class SaveIntakeInput(BaseModel):
+    patient_name: str
+    teacher_name: str
+    answers: str
+
+
+@app.post("/api/agent/ask_next_question")
+def api_ask_next_question(input_data: AskNextQuestionInput):
+    """【改动1】按「十问歌」返回下一个该问的问题。
+
+    请求体：{"patient_name": "张三", "current_answers": "问：…\\n答：…"}（第一次 current_answers 为空串）
+    响应体：{"question": "一句口语化的问句", "done": false}；十问都覆盖时 {"question": "", "done": true}
+    越界防护：问题里不会出现诊断、辨证、开方、建议；一次只返回一个问题。
+    """
+    return agent.ask_next_question(input_data.patient_name, input_data.current_answers)
+
+
+@app.post("/api/agent/save_intake")
+def api_save_intake(input_data: SaveIntakeInput):
+    """【改动2】把「面诊前准备」的问答记录整理成结构化文本，写进 complaints（学生陈述表）。
+
+    请求体：{"patient_name": "张三", "teacher_name": "李老师", "answers": "问：…\\n答：…"}
+    响应体：{"ok": true}；整理只做格式化（不推理、不补充），status 固定 'pending'。
+    """
+    agent.save_intake(input_data.patient_name, input_data.teacher_name, input_data.answers)
+    return {"ok": True}
+
+
 # 【第42天新增】老师端现场口述整理
 class TeacherStructurizeInput(BaseModel):
     raw_text: str

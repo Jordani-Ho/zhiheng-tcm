@@ -34,6 +34,13 @@ const MEMO_DONE_STORE_KEY = 'zh_memo_done'
 // appointments 表没有“远程 / 线上”字段，本次后端零改动，所以由前端按「预约原因 reason」里的关键词把已确认预约分成两列：
 // 命中关键词 → 右列「💻 远程问诊」，未命中 → 左列「📅 预约面诊」（老师写原因时带上“远程/线上/视频”等词即可归入远程列）。
 const REMOTE_APPT_KEYWORDS = ['远程', '线上', '网诊', '视频', '电话', '微信']
+// 【第80天新增 / 改动3】🩺 面诊前准备：问答记录的固定拼接格式（问：…⏎答：…）——
+// 后端 agent.ask_next_question 按「答：」的条数判断学生已经答了几轮（LLM 失败时的兜底也靠它算轮次），
+// 所以前端只在这一处拼串，改格式要同步改后端。
+const INTAKE_QA_SEP = '\n'
+// 【第80天新增 / 改动3】兜底轮数上限：正常情况下「十问是否问全」以后端 done 为准，
+// 这里防的是“后端异常 / LLM 绕圈”导致前端一直问不完（最多 12 轮就收起并进入发送确认）。
+const MAX_INTAKE_ROUNDS = 12
 // 【第56天重构 / 智能体工作台】时间显示：后端返回 ISO 串（如 2026-09-24T10:30:00.123456）→ 显示成 "09-24 10:30"；
 // 空值显示 "—"，格式异常（长度不足）则原样返回，绝不抛错影响卡片渲染。
 const formatAgentTime = (value?: string | null) => {
@@ -136,6 +143,19 @@ export default function App() {
 
   const [previewDraft, setPreviewDraft] = useState<{ id: number; content: string } | null>(null)
   const [draftTags, setDraftTags] = useState<{ [draftId: number]: { area: string; symptom: string } }>({})
+
+  // 【第80天新增 / 改动3】🩺 面诊前准备（学生端首页 · 黄历卡片下方）：十问歌主动追问的问答状态
+  const [showIntake, setShowIntake] = useState(false)             // 是否展开问答界面（点「开始面诊前准备」后展开）
+  const [intakeQuestion, setIntakeQuestion] = useState('')         // 当前这一问（POST /api/agent/ask_next_question 返回）
+  const [intakeAnswer, setIntakeAnswer] = useState('')             // 当前这一问的输入框内容（🎙️ 语音输入也写这里）
+  const [intakeAnswers, setIntakeAnswers] = useState('')           // 累积的问答记录，格式：问：…⏎答：…（首次为空串）
+  const [intakeRounds, setIntakeRounds] = useState(0)              // 本地已答轮数（仅用于进度显示与上限兜底）
+  const [intakeDone, setIntakeDone] = useState(false)              // 十问是否已问全（后端 done=true）
+  const [intakeLoading, setIntakeLoading] = useState(false)        // 正在拉下一问
+  const [intakeSending, setIntakeSending] = useState(false)        // 正在发送给老师
+  const [intakeSent, setIntakeSent] = useState(false)              // 已发送成功
+  const [intakeRecording, setIntakeRecording] = useState(false)    // 🎙️ 语音输入是否在录音
+  const [intakeRecognition, setIntakeRecognition] = useState<any>(null)
 
   // 【第57天新增 / 第62天调整】老师端页签（首页/诊室/管理/设置），切换时不清空 selectedPatient
   const [teacherTab, setTeacherTab] = useState<TeacherTab>('home')
@@ -971,6 +991,99 @@ export default function App() {
     setPendingImages(prev => prev.filter(u => u !== url))
   }
 
+  // ============== 【第80天新增 / 改动3】🩺 面诊前准备：十问歌主动追问（学生端） ==============
+  // 与后端的约定：current_answers 用「问：…⏎答：…」累积（见 INTAKE_QA_SEP 注释），第一次传空串。
+  const intakeAskNext = (answers: string) => {
+    setIntakeLoading(true)
+    fetch('/api/agent/ask_next_question', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ patient_name: selectedPatient, current_answers: answers })
+    })
+      .then(r => { if (!r.ok) throw new Error('ask_next_question failed'); return r.json() })
+      .then(d => {
+        setIntakeLoading(false)
+        const next = d && typeof d.question === 'string' ? d.question.trim() : ''
+        if (!d || d.done || !next) { setIntakeQuestion(''); setIntakeDone(true); return }
+        setIntakeQuestion(next)
+        setIntakeDone(false)
+      })
+      .catch(() => { setIntakeLoading(false); alert('智能体追问失败，请稍后再试。') })
+  }
+
+  const handleStartIntake = () => {
+    setShowIntake(true)
+    setIntakeQuestion(''); setIntakeAnswer(''); setIntakeAnswers('')
+    setIntakeRounds(0); setIntakeDone(false); setIntakeSent(false)
+    intakeAskNext('')   // 第一次调用：current_answers 为空字符串（后端从十问歌第 1 项开始）
+  }
+
+  const handleNextIntakeQuestion = () => {
+    const answer = intakeAnswer.trim()
+    if (!answer) { alert('先写一句回答（或点 🎙️ 语音输入）再点“下一个问题”。'); return }
+    const merged = (intakeAnswers ? intakeAnswers + INTAKE_QA_SEP : '')
+      + '问：' + intakeQuestion + INTAKE_QA_SEP + '答：' + answer
+    setIntakeAnswers(merged)
+    setIntakeAnswer('')
+    const rounds = intakeRounds + 1
+    setIntakeRounds(rounds)
+    if (rounds >= MAX_INTAKE_ROUNDS) {   // 兜底：拉满上限就直接进入「发送确认」，不让学生被卡住
+      setIntakeQuestion(''); setIntakeDone(true); return
+    }
+    intakeAskNext(merged)                // 带着累积的回答去拉下一问
+  }
+
+  const handleSendIntake = () => {
+    if (intakeSending) return
+    setIntakeSending(true)
+    fetch('/api/agent/save_intake', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        patient_name: selectedPatient,
+        teacher_name: (intakeAppointment && intakeAppointment.teacher_name) || selectedTeacher,
+        answers: intakeAnswers
+      })
+    })
+      .then(r => { if (!r.ok) throw new Error('save_intake failed'); return r.json() })
+      .then(() => { setIntakeSending(false); setIntakeSent(true) })
+      .catch(() => { setIntakeSending(false); alert('发送失败，请稍后再试。') })
+  }
+
+  // 【复用现有录音逻辑】🎙️ 语音输入：与「🗣️ 学生智能体」卡片的 startStudentRecording 同一套
+  // Web Speech API（zh-CN、边听边出最终结果、点第二次停止、拿不到麦克风就提示权限）——
+  // 原有录音函数一行没动，这里只做两处裁剪：① 转写结果写进追问回答框；② 不上传音频（追问的答案是文本，
+  // 图片 / 录音附件仍走「🗣️ 学生智能体」卡片原有流程）。
+  const startIntakeRecording = () => {
+    if (intakeRecording) {
+      intakeRecognition?.stop()
+      setIntakeRecording(false)
+      return
+    }
+    try {
+      const SR = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition
+      if (!SR) { alert('当前浏览器不支持语音识别，请直接输入文字。'); return }
+      const rec = new SR()
+      rec.continuous = true
+      rec.interimResults = false
+      rec.lang = 'zh-CN'
+      rec.onresult = (event: any) => {
+        let finalTranscript = ''
+        for (let i = event.resultIndex; i < event.results.length; i++) {
+          if (event.results[i].isFinal) finalTranscript += event.results[i][0].transcript
+        }
+        if (finalTranscript) setIntakeAnswer(prev => prev + finalTranscript)
+      }
+      rec.onerror = (e: any) => console.error('追问语音识别错误:', e)
+      rec.onend = () => setIntakeRecording(false)
+      rec.start()
+      setIntakeRecognition(rec)
+      setIntakeRecording(true)
+    } catch (e) {
+      alert("无法访问麦克风，请检查浏览器权限。")
+    }
+  }
+
   // ============== 老师端行为 ==============
   // 【第68天新增】录音停止后：原始转写先送智能体清洗（去噪 / 提炼 / 结构化），再把 cleaned_text 追加到文本框。
   // 追加目标仍是“现场辅助记录”文本框（teachersLiveText），老师点“追加到病历”才进病历草案，原有流程不变。
@@ -1631,6 +1744,30 @@ export default function App() {
   const tempInsertCandidates = teacherPatients.filter((s: any) =>
     !bookedPatientNames.includes(s.name) && !tempQueue.some(t => t.name === s.name))
 
+  // ============== 【第80天新增 / 改动3】🩺 面诊前准备：卡片状态派生值（学生端首页） ==============
+  // 数据只复用现有 state（appointments / selectedTeacher），不新增接口、老师端不涉及。
+  // 「有预约」判定：该学生未取消的预约里优先取今天及以后最近的一条；都在过去就取最近的一条历史预约（仍算有预约）。
+  const intakeActiveAppointments = appointments.filter((a: any) => a.status !== 'cancelled')
+  const intakeAppointment = intakeActiveAppointments
+    .filter((a: any) => a.scheduled_date >= todayStr)
+    .sort((a: any, b: any) => (a.scheduled_date + a.scheduled_time).localeCompare(b.scheduled_date + b.scheduled_time))[0]
+    || intakeActiveAppointments
+      .sort((a: any, b: any) => (b.scheduled_date + b.scheduled_time).localeCompare(a.scheduled_date + a.scheduled_time))[0]
+    || null
+  // 状态文案：无预约「暂无预约，可以照镜子或打卡」；有预约「您有预约：X月X日 X点 与 李老师」
+  const intakeApptText = (() => {
+    if (!intakeAppointment) return '暂无预约，可以照镜子或打卡'
+    const dateParts = String(intakeAppointment.scheduled_date || '').split('-')
+    const dateText = dateParts.length >= 3
+      ? `${Number(dateParts[1])}月${Number(dateParts[2])}日`
+      : String(intakeAppointment.scheduled_date || '')
+    const timeParts = String(intakeAppointment.scheduled_time || '').split(':')
+    const timeText = timeParts[0]
+      ? `${Number(timeParts[0])}点${Number(timeParts[1] || 0) > 0 ? `${Number(timeParts[1])}分` : ''}`
+      : ''
+    return `您有预约：${dateText} ${timeText} 与 ${intakeAppointment.teacher_name || selectedTeacher}`.replace(/\s+/g, ' ').trim()
+  })()
+
   // ============== 【第61天新增】📋 今日备忘录（老师端首页）：时间轴 + 未排期事项 ==============
   // 数据全部来自现有 state + 静态模拟（roleData / appointments / teacherPatients / drafts / habitList / holidays / huangli），不新增后端接口
   const tomorrow = new Date(currentYear, currentMonth - 1, currentDay + 1)
@@ -2033,6 +2170,58 @@ export default function App() {
             )}
             <div style={{ textAlign: 'center', color: '#5a7d5a', fontSize: '16px', marginBottom: '10px' }}>🌿 {huangli.solar_term}：{huangli.health_trend}</div>
             <div style={{ textAlign: 'center', background: '#fff8e7', padding: '15px', borderRadius: '8px', color: '#8b4513' }}>📝 今日作业：{huangli.homework}</div>
+          </div>
+        )}
+
+        {/* 【第80天新增 / 改动3】🩺 面诊前准备（学生端首页 · 黄历卡片下方；老师端不渲染，页签结构不变）
+            流程：开始 → POST /api/agent/ask_next_question（首次 current_answers 传空串）拿到一个问题
+                 → 学生回答（可点 🎙️ 语音输入，复用现有录音逻辑）→「下一个问题」把问答累积进 current_answers 再拉下一问
+                 → 后端 done=true 后提示「已收集完整，是否发送给老师？」→ POST /api/agent/save_intake 落库。 */}
+        {(currentRole === '学生' || currentRole === '学生智能体') && (
+          <div style={{ ...boxStyle, background: '#f3f8ff' }}>
+            <div style={{ fontSize: '18px', color: '#3b6ea5', fontWeight: 'bold', marginBottom: '12px' }}>🩺 面诊前准备</div>
+            <div style={{ padding: '12px', background: '#fff', borderRadius: '8px', border: '1px dashed #b9cde4', fontSize: '14px', color: '#333', lineHeight: '1.7', marginBottom: '12px' }}>
+              {intakeAppointment ? '📅 ' : '🪞 '}{intakeApptText}
+            </div>
+            {intakeAppointment && !showIntake && (
+              <button onClick={handleStartIntake} style={{ padding: '8px 24px', borderRadius: '20px', border: 'none', background: '#3b6ea5', color: '#fff', cursor: 'pointer', fontSize: '14px', fontFamily: 'serif' }}>开始面诊前准备</button>
+            )}
+            {intakeAppointment && showIntake && intakeSent && (
+              <div style={{ textAlign: 'center', padding: '16px', background: '#fff', borderRadius: '8px', border: '1px solid #b9cde4', color: '#3b6ea5', fontSize: '15px' }}>
+                ✅ 已发送，老师面诊时会看到
+                <div style={{ marginTop: '10px' }}>
+                  <button onClick={() => setShowIntake(false)} style={{ padding: '6px 16px', borderRadius: '20px', border: '1px solid #999', background: 'transparent', color: '#666', cursor: 'pointer', fontSize: '13px' }}>收起</button>
+                </div>
+              </div>
+            )}
+            {intakeAppointment && showIntake && !intakeSent && intakeDone && (
+              <div>
+                <div style={{ fontSize: '15px', color: '#3b6ea5', fontWeight: 'bold', marginBottom: '8px' }}>已收集完整，是否发送给老师？</div>
+                <textarea value={intakeAnswers} readOnly style={{ width: '100%', height: '150px', padding: '10px', borderRadius: '8px', border: '1px solid #b9cde4', background: '#fff', fontFamily: 'serif', fontSize: '13px', marginBottom: '10px', boxSizing: 'border-box' }} />
+                <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '10px' }}>
+                  <button onClick={() => setShowIntake(false)} style={{ padding: '6px 16px', borderRadius: '20px', border: '1px solid #999', background: 'transparent', color: '#666', cursor: 'pointer', fontSize: '13px' }}>先不发送</button>
+                  <button onClick={handleSendIntake} disabled={intakeSending} style={{ padding: '6px 20px', borderRadius: '20px', border: 'none', background: intakeSending ? '#8aa2bb' : '#3b6ea5', color: '#fff', cursor: intakeSending ? 'default' : 'pointer', fontSize: '13px' }}>{intakeSending ? '发送中...' : '发送'}</button>
+                </div>
+              </div>
+            )}
+            {intakeAppointment && showIntake && !intakeSent && !intakeDone && (
+              <div>
+                <div style={{ fontSize: '12px', color: '#8aa2bb', marginBottom: '6px' }}>十问歌 · 已答 {intakeRounds} 问（共十问）</div>
+                <div style={{ padding: '12px', background: '#fff', borderRadius: '8px', border: '1px solid #b9cde4', fontSize: '16px', color: '#333', lineHeight: '1.7', marginBottom: '10px', minHeight: '26px' }}>
+                  {intakeLoading ? '智能体正在想下一个问题...' : intakeQuestion}
+                </div>
+                <textarea value={intakeAnswer} onChange={e => setIntakeAnswer(e.target.value)} placeholder="用您自己的话说说，或点下方 🎙️ 语音输入..." style={{ width: '100%', height: '80px', padding: '10px', borderRadius: '8px', border: '1px solid #b9cde4', fontFamily: 'serif', marginBottom: '10px', boxSizing: 'border-box' }} />
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '10px' }}>
+                  <button onClick={startIntakeRecording} style={{ padding: '8px 20px', borderRadius: '30px', border: 'none', background: intakeRecording ? '#c0392b' : '#5a7d5a', color: '#fff', cursor: 'pointer', fontSize: '14px', fontFamily: 'serif' }}>
+                    {intakeRecording ? '⏹ 停止录音（点击结束）' : '🎙️ 语音输入'}
+                  </button>
+                  <button onClick={handleNextIntakeQuestion} disabled={intakeLoading} style={{ padding: '8px 24px', borderRadius: '30px', border: 'none', background: intakeLoading ? '#8aa2bb' : '#3b6ea5', color: '#fff', cursor: intakeLoading ? 'default' : 'pointer', fontSize: '14px', fontFamily: 'serif' }}>
+                    {intakeLoading ? '处理中...' : '下一个问题'}
+                  </button>
+                </div>
+                {intakeRecording && (<div style={{ fontSize: '12px', color: '#c0392b', marginTop: '5px' }}>● 正在录音，请说话...（说完再点一次停止）</div>)}
+              </div>
+            )}
           </div>
         )}
 
