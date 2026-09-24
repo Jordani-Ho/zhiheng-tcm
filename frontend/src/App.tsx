@@ -113,12 +113,18 @@ export default function App() {
   const [blurryPhoto, setBlurryPhoto] = useState<{ draftId: number; file: File } | null>(null)
   // 诊室拍照 input 引用：选“重拍”时直接再次唤起相机（同一个 input，选完即清空，可重复选同一张图片）
   const clinicPhotoInputRef = useRef<HTMLInputElement>(null)
+  // 【第70天修复 / 数据串台】当前就诊学生 ref：拍照上传属于异步回调，返回时用它判断“学生是否已经被切换过”，
+  // 避免上一个学生的上传结果（缩略图 / 图片 URL）落到下一位学生身上（ref 不受闭包快照影响）
+  const clinicPatientRef = useRef(selectedPatient)
 
   // 【第59天修复】本地占位草案：诊室里选中学生、但该学生还没有“正在编辑的草案”时，
   // 前端本地先生成一条空草案（id 为负数），让录音 / 拍照 / 把脉立刻可用；老师点“保存病历修改”时再落库。
   const [localDrafts, setLocalDrafts] = useState<Draft[]>([])
   // 诊室可编辑草案 = 后端草案 + 本地占位草案（同一学生以后端草案为准，避免重复显示）
   const clinicDrafts: Draft[] = [...drafts, ...localDrafts.filter(ld => !drafts.some(d => d.patient_name === ld.patient_name))]
+  // 【第70天修复 / 数据串台】诊疗记录区（病历草案 / 症状标签 / 开方 / 辨证施治方案）只取“当前就诊学生”的草案：
+  // 后端 GET /api/drafts 是“按老师”返回全部学生的草案，若直接渲染 clinicDrafts，一屏上就会同时出现多位学生的内容
+  const clinicPatientDrafts: Draft[] = clinicDrafts.filter(d => d.patient_name === selectedPatient)
 
   // 本地占位草案一旦被后端草案取代（落库成功 / 学生提交陈述），就清理掉，避免签字后又“复活”
   useEffect(() => {
@@ -297,6 +303,54 @@ export default function App() {
     fetchCalendar()
     setShowHistory(false)
   }, [currentRole, selectedPatient, selectedTeacher])
+
+  // 【第70天修复 / 数据串台】切换当前就诊学生（selectedPatient）时，把所有“跟上一个学生绑定”的诊室 state 一次性清空，
+  // 再按新学生重新从后端拉取病历草案；否则上一个学生的病历草案 / 施治方案 / 症状标签 / 开方 / 现场记录会串到下一位学生身上。
+  // 依赖只有 selectedPatient：老师没切人时（例如只是手动改了开方患者姓名）不会被清掉。
+  useEffect(() => {
+    clinicPatientRef.current = selectedPatient   // 先让异步回调知道“现在是谁”（拍照上传播后返回时用它比对）
+    // ① 现场记录区：文本框内容 / 录音状态 / 原始转写缓冲 / 智能体清洗与整理标记 / 上传中标记
+    //    先清缓冲区再停录音：stop() 会触发 onend → flush，缓冲区已空就不会把上一位学生的口述写回文本框
+    teacherLiveRawRef.current = {}
+    teacherLiveRecognition?.stop()
+    setTeacherLiveRecognition(null)
+    setTeacherLiveRecording(null)
+    setTeacherLiveText({})
+    setTeacherLiveCleaning({})
+    setTeacherLiveStructurizing({})
+    setLiveUploading({})
+    // ② 诊疗记录区：症状标签（原「病历标签」）/ 辨证施治方案 / 完整病历预览弹窗
+    setDraftTags({})
+    setFinalPlans({})
+    setPreviewDraft(null)
+    // ③ 拍照：缩略图列表 / 「图片不够清晰」提示
+    setUploadedImages([])
+    setBlurryPhoto(null)
+    // ④ 把脉记录输入（脉象 / 脉率 / 备注）
+    setPulseTypes([])
+    setPulseRate('')
+    setPulseNote('')
+    // ⑤ 开方：患者姓名对齐新学生，药材列表 / 首字联想 / 远程诊疗勾选全部清空
+    setPrescriptionPatient(selectedPatient)
+    setPrescriptionItems([{ herb_name: '', amount: '' }])
+    setHerbSuggestions({})
+    Object.values(herbSearchTimers.current).forEach(t => clearTimeout(t))   // 清掉还在 debounce 中的联想请求，避免返回后填到下一位学生
+    herbSearchTimers.current = {}
+    setPrescriptionRemote(false)
+    // ⑥ 历史病历展开状态
+    setShowHistory(false)
+    // ⑦ 本地占位草案：新学生既没有后端草案、也没有本地占位草案时，补一条空的本地草案（让录音 / 拍照 / 把脉立刻可用）；
+    //    其他学生未落库的本地草案保留（各自按 patient_name 存放，只在渲染自己的学生时才出现，互不串台）
+    setLocalDrafts(prev => {
+      if (prev.some(d => d.patient_name === selectedPatient)) return prev
+      if (drafts.some(d => d.patient_name === selectedPatient)) return prev
+      return [...prev, { id: -Date.now(), transcript_id: 0, patient_name: selectedPatient, content: '', signed: false }]
+    })
+    // ⑧ 病历草案重新从后端拉取（GET /api/drafts?teacher_name=...）。
+    //    施治方案 / 症状标签 / 开方 / 上传图片 / 现场文本框在后端没有“未签字草稿”接口，因此只做清空；
+    //    学生档案 / 积分 / 历史病历已由上面 [currentRole, selectedPatient, selectedTeacher] 的 effect 重新拉取（未改动）
+    fetchDrafts()
+  }, [selectedPatient])
 
   // ============== 数据获取 ==============
   const fetchPatients = (guardian: string) => {
@@ -900,6 +954,8 @@ export default function App() {
   // 【第59天重构】清晰度检测通过（或老师点“继续使用”）后：上传 /api/upload-temp → URL 追加到文本框末尾
   const uploadLivePhoto = (draftId: number, file: File) => {
     setLiveUploading(prev => ({ ...prev, [draftId]: true }))
+    // 【第70天修复 / 数据串台】记下这张照片属于哪个学生：上传返回时若老师已切到别的学生，就丢弃这次结果
+    const uploadOwner = clinicDrafts.find(x => x.id === draftId)?.patient_name
     const formData = new FormData()
     formData.append('file', file)
     fetch('/api/upload-temp', { method: 'POST', body: formData })
@@ -908,6 +964,7 @@ export default function App() {
         setLiveUploading(prev => ({ ...prev, [draftId]: false }))
         // 【第69天新增】上传成功 → 同时记入缩略图列表（≠ 写入文本的 URL，移除缩略图不影响文本）
         if (d && d.url) {
+          if (clinicPatientRef.current !== uploadOwner) return   // 【第70天修复】学生已切换 → 不写进缩略图列表，也不追加到文本框
           setUploadedImages(prev => [...prev, d.url])
           setTeacherLiveText(prev => ({ ...prev, [draftId]: (prev[draftId] || '') + '\n\n【上传的图片】' + d.url }))
         } else {
@@ -1295,8 +1352,9 @@ export default function App() {
   const lastVisitDate = patientRecords.length > 0 ? `第 ${patientRecords[0].id} 号病历` : '首次就诊'
 
   // ============== 【第59天新增】诊室二期：老师工作状态（录音转文字 / 拍照上传 / 把脉记录） ==============
-  // 目标病历草案：优先“当前就诊学生”，其次第一条可编辑草案（含本地占位草案；老师点“保存病历修改”才落库）
-  const clinicTargetDraft = clinicDrafts.find(x => x.patient_name === selectedPatient) || clinicDrafts[0] || null
+  // 【第70天修复 / 数据串台】目标病历草案只看“当前就诊学生”的草案（含本地占位草案）：
+  // 该学生没有草案时返回 null（控件置灰），绝不再回退到 clinicDrafts[0]——那会把现场记录写进别的学生的病历里
+  const clinicTargetDraft = clinicPatientDrafts[0] || null
   // 【第59天重构】“现场辅助记录”卡片统一用这个 id 作为读写目标（null = 暂无草案，控件置灰）
   const clinicTargetId: number | null = clinicTargetDraft ? clinicTargetDraft.id : null
   const speechSupported = !!((window as any).SpeechRecognition || (window as any).webkitSpeechRecognition)
@@ -2652,13 +2710,13 @@ export default function App() {
 
         {/* 【第69天整合】🩺 诊室工作台：把原「📸 现场辅助记录」卡片与原「📋 诊疗记录区」容器合并成一个撑满宽度的大卡片。
             两个部分共享同一个外边框：上半 = 现场记录区（🎙️录音 / 📷拍照 / 💓把脉 → 先写入文本框，再“追加到病历”），
-            下半 = 诊疗记录区（病历草案 / 病历标签 / 开方 / 辨证施治方案），两部分之间用内嵌虚线分隔线。
+            下半 = 诊疗记录区（病历草案 / 症状标签 / 开方 / 辨证施治方案），两部分之间用内嵌虚线分隔线。
             所有原有按钮、接口、state 逻辑保持不变，只是重新排列（仅诊室页签显示）。 */}
         {(currentRole === '李老师' || currentRole === '李老师智能体') && teacherTab === 'clinic' && (
           <div style={{ ...boxStyle, background: '#fcfdfa', border: '1px solid #d4c8a8', width: '100%' }}>
             <div style={{ textAlign: 'center', fontSize: '20px', color: '#8b4513', fontWeight: 'bold', marginBottom: '6px', paddingBottom: '12px', borderBottom: '2px solid #e6dcc2' }}>🩺 诊室工作台</div>
             <div style={{ textAlign: 'center', fontSize: '12px', color: '#999', marginBottom: '16px' }}>
-              现场记录区（录音 / 拍照 / 把脉 → 写入文本框 → 追加到病历）｜ 诊疗记录区（病历草案 → 病历标签 → 开方 → 辨证施治方案）
+              现场记录区（录音 / 拍照 / 把脉 → 写入文本框 → 追加到病历）｜ 诊疗记录区（病历草案 → 症状标签 → 开方 → 辨证施治方案）
             </div>
 
             {/* ===== 第一部分：现场记录区（原「📸 现场辅助记录」卡片内容，功能 / 按钮 / 接口全部保留） ===== */}
@@ -2784,16 +2842,17 @@ export default function App() {
             {/* ===== 两部分之间的内嵌分隔线（虚线，浅色）：上半 = 现场记录区，下半 = 诊疗记录区 ===== */}
             <div style={{ margin: '20px 0', borderTop: '1px dashed #c9bde0' }} />
 
-            {/* ===== 第二部分：诊疗记录区（原「📋 诊疗记录区」容器内容：病历草案 / 病历标签 / 开方 / 辨证施治方案） ===== */}
+            {/* ===== 第二部分：诊疗记录区（原「📋 诊疗记录区」容器内容：病历草案 / 症状标签 / 开方 / 辨证施治方案） ===== */}
             <div style={{ fontSize: '17px', color: '#8b4513', fontWeight: 'bold', marginBottom: '6px' }}>📋 诊疗记录区</div>
-            <div style={{ fontSize: '12px', color: '#999', marginBottom: '16px' }}>病历草案 → 病历标签 → 开方 → 辨证施治方案（同一容器，分区之间用内嵌分隔线）</div>
-            {clinicDrafts.length === 0 && (
+            <div style={{ fontSize: '12px', color: '#999', marginBottom: '16px' }}>病历草案 → 症状标签 → 开方 → 辨证施治方案（同一容器，分区之间用内嵌分隔线）</div>
+            {/* 【第70天修复 / 数据串台】只渲染“当前就诊学生”的草案，其他学生的草案不再出现在本屏 */}
+            {clinicPatientDrafts.length === 0 && (
               <div style={{ textAlign: 'center', color: '#999', marginBottom: '16px' }}>暂无待处理病历（在“面诊队列”或“搜索学生”里选一位学生即可开始记录）</div>
             )}
 
             {/* 分区 1/4：病历草案 */}
             <div style={{ fontSize: '16px', color: '#8b4513', fontWeight: 'bold', marginBottom: '10px' }}>📄 病历草案（老师智能体生成，待老师补充）</div>
-            {clinicDrafts.map(d => (
+            {clinicPatientDrafts.map(d => (
                 <div key={d.id} style={{ paddingBottom: '12px', marginBottom: '12px', borderBottom: '1px dashed #ece3cd' }}>
                   <div style={{ color: '#8b4513', fontWeight: 'bold', marginBottom: '5px' }}>
                     学生：{d.patient_name}
@@ -2826,11 +2885,11 @@ export default function App() {
                 </div>
               ))}
 
-            {/* 分区 2/4：病历标签 */}
-            {clinicDrafts.length > 0 && (
+            {/* 分区 2/4：症状标签（原「病历标签」，仅改名） */}
+            {clinicPatientDrafts.length > 0 && (
               <div style={{ borderTop: '1px solid #e6dcc2', paddingTop: '15px', marginBottom: '16px' }}>
-                <div style={{ fontSize: '16px', color: '#8b4513', fontWeight: 'bold', marginBottom: '10px' }}>🏷️ 病历标签（用于知识库归类）</div>
-                {clinicDrafts.map(d => (
+                <div style={{ fontSize: '16px', color: '#8b4513', fontWeight: 'bold', marginBottom: '10px' }}>🏷️ 症状标签（用于知识库归类）</div>
+                {clinicPatientDrafts.map(d => (
                   <div key={d.id} style={{ display: 'flex', gap: '8px', marginBottom: '8px' }}>
                     <span style={{ alignSelf: 'center', minWidth: '60px', fontSize: '13px', fontWeight: 'bold', color: '#8b4513' }}>{d.patient_name}</span>
                     <input placeholder="部位（如：舌苔/皮肤/面色）" value={draftTags[d.id]?.area || ''} onChange={e => setDraftTags(prev => ({ ...prev, [d.id]: { area: e.target.value, symptom: prev[d.id]?.symptom || '' } }))} style={{ flex: 1, padding: '6px', borderRadius: '6px', border: '1px solid #d4c8a8', fontSize: '13px', fontFamily: 'serif' }} />
@@ -2907,9 +2966,9 @@ export default function App() {
             </div>
 
             {/* 分区 4/4：辨证施治方案 */}
-            {clinicDrafts.length > 0 && (
+            {clinicPatientDrafts.length > 0 && (
               <div style={{ borderTop: '1px solid #e6dcc2', paddingTop: '15px' }}>
-                {clinicDrafts.map(d => (
+                {clinicPatientDrafts.map(d => (
                   <div key={d.id} style={{ marginBottom: '14px' }}>
                     <div style={{ color: '#5a7d5a', fontWeight: 'bold', marginBottom: '8px' }}>📝 给 {d.patient_name} 的辨证施治方案（学生会看到这里的内容）</div>
                     <textarea value={finalPlans[d.id] || ''} onChange={(e) => setFinalPlans({ ...finalPlans, [d.id]: e.target.value })} placeholder="例：抓药xxx，三碗水煲成一碗，饭后服；或今日宜喝姜茶，多休息..." style={{ width: '100%', height: '80px', padding: '10px', borderRadius: '8px', border: '1px solid #b8d8c0', background: '#f7fcf9', fontFamily: 'serif', fontSize: '14px', marginBottom: '10px', boxSizing: 'border-box' }} />
