@@ -41,6 +41,50 @@ const INTAKE_QA_SEP = '\n'
 // 【第80天新增 / 改动3】兜底轮数上限：正常情况下「十问是否问全」以后端 done 为准，
 // 这里防的是“后端异常 / LLM 绕圈”导致前端一直问不完（最多 12 轮就收起并进入发送确认）。
 const MAX_INTAKE_ROUNDS = 12
+// 【第83天新增 / 十问歌会话持久化】学生端「面诊前准备」进行中会话的状态结构（存 localStorage）：
+// { currentQuestion: 当前这一问, answers: 已累积的「问：…⏎答：…」, questionIndex: 已答轮数, updatedAt: ISO 时间串 }
+interface IntakeSession { currentQuestion: string; answers: string; questionIndex: number; updatedAt: string }
+// localStorage key：intake_session_{patient_name}_{teacher_name}（一个学生对一个老师只保留一份进行中会话）
+const INTAKE_SESSION_KEY_PREFIX = 'intake_session_'
+// 会话有效期：updatedAt 距今超过 24 小时视为过期 → 清空重来
+const INTAKE_SESSION_TTL_MS = 24 * 60 * 60 * 1000
+const intakeSessionKey = (patientName: string, teacherName: string) =>
+  `${INTAKE_SESSION_KEY_PREFIX}${patientName || ''}_${teacherName || ''}`
+// 读会话：没有 / JSON 坏了 / 已过期（> 24 小时）/ 一条答案都没有 → 一律返回 null，并顺手删掉脏数据（下次从第一问开始）
+const loadIntakeSession = (patientName: string, teacherName: string): IntakeSession | null => {
+  const key = intakeSessionKey(patientName, teacherName)
+  try {
+    const raw = localStorage.getItem(key)
+    if (!raw) return null
+    const parsed = JSON.parse(raw)
+    const answers = parsed && typeof parsed.answers === 'string' ? parsed.answers : ''
+    const updatedMs = Date.parse(String((parsed && parsed.updatedAt) || ''))
+    if (!answers.trim() || !updatedMs || Date.now() - updatedMs > INTAKE_SESSION_TTL_MS) {
+      localStorage.removeItem(key)
+      return null
+    }
+    return {
+      currentQuestion: String(parsed.currentQuestion || ''),
+      answers,
+      questionIndex: Number(parsed.questionIndex) || 0,
+      updatedAt: String(parsed.updatedAt || '')
+    }
+  } catch {
+    return null   // 解析失败不抛错，按“没有进行中会话”处理
+  }
+}
+// 写会话：每答完一题、拿到下一问后调用一次（updatedAt 每次都刷新，用于 24 小时过期判定）
+const saveIntakeSession = (patientName: string, teacherName: string, session: IntakeSession) => {
+  try {
+    localStorage.setItem(intakeSessionKey(patientName, teacherName), JSON.stringify(session))
+  } catch { /* 忽略写入失败（隐私模式 / 空间不足），不影响问答流程 */ }
+}
+// 清会话：发送成功后 / 学生点「放弃本次」时调用
+const clearIntakeSession = (patientName: string, teacherName: string) => {
+  try {
+    localStorage.removeItem(intakeSessionKey(patientName, teacherName))
+  } catch { /* 忽略删除失败 */ }
+}
 // 【第56天重构 / 智能体工作台】时间显示：后端返回 ISO 串（如 2026-09-24T10:30:00.123456）→ 显示成 "09-24 10:30"；
 // 空值显示 "—"，格式异常（长度不足）则原样返回，绝不抛错影响卡片渲染。
 const formatAgentTime = (value?: string | null) => {
@@ -172,6 +216,8 @@ export default function App() {
   const [intakeSent, setIntakeSent] = useState(false)              // 已发送成功
   const [intakeRecording, setIntakeRecording] = useState(false)    // 🎙️ 语音输入是否在录音
   const [intakeRecognition, setIntakeRecognition] = useState<any>(null)
+  // 【第83天新增 / 十问歌会话持久化】本次是否是从 localStorage 恢复的进行中会话（true 才显示「继续上次…」那行灰字）
+  const [intakeResumed, setIntakeResumed] = useState(false)
 
   // 【第57天新增 / 第62天调整】老师端页签（首页/诊室/管理/设置），切换时不清空 selectedPatient
   const [teacherTab, setTeacherTab] = useState<TeacherTab>('home')
@@ -1090,8 +1136,13 @@ export default function App() {
   }
 
   // ============== 【第80天新增 / 改动3】🩺 面诊前准备：十问歌主动追问（学生端） ==============
+  // 【第83天新增 / 十问歌会话持久化】在上面这套问答之上加一层 localStorage 会话（key / 结构见文件顶部 IntakeSession 注释）：
+  // 答过的内容不再丢 —— 学生重开卡片能接着上次问，避免每次从第一问重来、短时间内往 complaints 表灌多条孤立摘要。
   // 与后端的约定：current_answers 用「问：…⏎答：…」累积（见 INTAKE_QA_SEP 注释），第一次传空串。
-  const intakeAskNext = (answers: string) => {
+  const intakeAskNext = (answers: string, rounds?: number) => {
+    // 【第83天新增】本次会话归属的老师：与落库（handleSendIntake）取值完全一致，保证 key 与 complaints 对应同一个老师
+    const teacherName = intakeTeacherName
+    const answeredRounds = typeof rounds === 'number' ? rounds : intakeRounds
     setIntakeLoading(true)
     fetch('/api/agent/ask_next_question', {
       method: 'POST',
@@ -1102,18 +1153,45 @@ export default function App() {
       .then(d => {
         setIntakeLoading(false)
         const next = d && typeof d.question === 'string' ? d.question.trim() : ''
-        if (!d || d.done || !next) { setIntakeQuestion(''); setIntakeDone(true); return }
+        if (!d || d.done || !next) {
+          setIntakeQuestion(''); setIntakeDone(true)
+          // 【第83天新增】已问全：会话仍保留（currentQuestion 为空）→ 下次进来自动回到「发送确认」，可以补发
+          if (answers.trim()) saveIntakeSession(selectedPatient, teacherName, { currentQuestion: '', answers, questionIndex: answeredRounds, updatedAt: new Date().toISOString() })
+          return
+        }
         setIntakeQuestion(next)
         setIntakeDone(false)
+        // 【第83天新增】拿到下一问 → 立刻持久化「当前问题 + 累积回答 + 已答轮数」，这就是会话恢复的依据
+        if (answers.trim()) saveIntakeSession(selectedPatient, teacherName, { currentQuestion: next, answers, questionIndex: answeredRounds, updatedAt: new Date().toISOString() })
       })
       .catch(() => { setIntakeLoading(false); alert('智能体追问失败，请稍后再试。') })
   }
 
   const handleStartIntake = () => {
+    const teacherName = intakeTeacherName
+    // 【第83天新增】打开「面诊前准备」先查 localStorage：有进行中会话就恢复，没有就从第一问开始
+    // （过期 > 24 小时 / 一条答案都没有的会话会被 loadIntakeSession 当成无效并清掉）
+    const session = loadIntakeSession(selectedPatient, teacherName)
     setShowIntake(true)
-    setIntakeQuestion(''); setIntakeAnswer(''); setIntakeAnswers('')
-    setIntakeRounds(0); setIntakeDone(false); setIntakeSent(false)
-    intakeAskNext('')   // 第一次调用：current_answers 为空字符串（后端从十问歌第 1 项开始）
+    setIntakeAnswer('')
+    setIntakeSent(false)
+    if (session) {
+      setIntakeAnswers(session.answers)      // 恢复已答内容
+      setIntakeRounds(session.questionIndex) // 恢复已答轮数（UI 里的「已答 N 问」）
+      setIntakeResumed(true)                 // 标记“这是接着上次问”，渲染那行小灰字
+      if (session.currentQuestion) {
+        setIntakeQuestion(session.currentQuestion)   // 恢复上次停在的那一问，接着问
+        setIntakeDone(false)
+      } else {
+        // 上次已经问全（currentQuestion 为空）→ 带着完整回答再问一次拿后端的 done，直接回到「发送确认」
+        setIntakeQuestion(''); setIntakeDone(false)
+        intakeAskNext(session.answers, session.questionIndex)
+      }
+      return
+    }
+    setIntakeQuestion(''); setIntakeAnswers('')
+    setIntakeRounds(0); setIntakeDone(false); setIntakeResumed(false)
+    intakeAskNext('', 0)   // 第一次调用：current_answers 为空字符串（后端从十问歌第 1 项开始）
   }
 
   const handleNextIntakeQuestion = () => {
@@ -1126,25 +1204,42 @@ export default function App() {
     const rounds = intakeRounds + 1
     setIntakeRounds(rounds)
     if (rounds >= MAX_INTAKE_ROUNDS) {   // 兜底：拉满上限就直接进入「发送确认」，不让学生被卡住
-      setIntakeQuestion(''); setIntakeDone(true); return
+      setIntakeQuestion(''); setIntakeDone(true)
+      // 【第83天新增】兜底收尾也存会话（currentQuestion 为空 → 下次进来直接回到「发送确认」）
+      saveIntakeSession(selectedPatient, intakeTeacherName, { currentQuestion: '', answers: merged, questionIndex: rounds, updatedAt: new Date().toISOString() })
+      return
     }
-    intakeAskNext(merged)                // 带着累积的回答去拉下一问
+    intakeAskNext(merged, rounds)        // 带着累积的回答去拉下一问（成功后由 intakeAskNext 写入 localStorage）
+  }
+
+  // 【第83天新增 / 十问歌会话持久化】「放弃本次」：清空该学生对该老师的进行中会话（已答内容不再保留）
+  const handleAbandonIntake = () => {
+    clearIntakeSession(selectedPatient, intakeTeacherName)
+    setIntakeQuestion(''); setIntakeAnswer(''); setIntakeAnswers('')
+    setIntakeRounds(0); setIntakeDone(false); setIntakeResumed(false)
+    setShowIntake(false)
   }
 
   const handleSendIntake = () => {
     if (intakeSending) return
     setIntakeSending(true)
+    const teacherName = intakeTeacherName   // 【第83天新增】与 localStorage key 用同一个老师名，清会话才清得对
     fetch('/api/agent/save_intake', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         patient_name: selectedPatient,
-        teacher_name: (intakeAppointment && intakeAppointment.teacher_name) || selectedTeacher,
+        teacher_name: teacherName,
         answers: intakeAnswers
       })
     })
       .then(r => { if (!r.ok) throw new Error('save_intake failed'); return r.json() })
-      .then(() => { setIntakeSending(false); setIntakeSent(true) })
+      .then(() => {
+        setIntakeSending(false); setIntakeSent(true)
+        // 【第83天新增 / 十问歌会话持久化】已提交给老师 → 清空该学生对该老师的进行中会话，
+        // 下次打开从第一问重新开始，不会再重复提交同一份摘要（老师端「待处理陈述」不再被孤立摘要污染）。
+        clearIntakeSession(selectedPatient, teacherName)
+      })
       .catch(() => { setIntakeSending(false); alert('发送失败，请稍后再试。') })
   }
 
@@ -1903,6 +1998,15 @@ export default function App() {
     return `您有预约：${dateText} ${timeText} 与 ${intakeAppointment.teacher_name || selectedTeacher}`.replace(/\s+/g, ' ').trim()
   })()
 
+  // 【第83天新增 / 十问歌会话持久化】本次会话归属的老师：与落库（handleSendIntake）用的取值完全一致
+  // （优先取预约上的老师，没有预约就取学生当前选中的老师）—— localStorage key 用它拼，保证与 complaints 里的是同一个老师。
+  const intakeTeacherName = (intakeAppointment && intakeAppointment.teacher_name) || selectedTeacher
+
+  // 【第83天新增 / 十问歌会话持久化】打开「🩺 面诊前准备」卡片时先查一次 localStorage：
+  // 有进行中会话 → 按钮显示「继续面诊前准备（已答 N 问）」；没有（含已过 24 小时被清掉的）→ 保持「开始面诊前准备」。
+  // 这里只读（渲染期派生，不额外存 state / 不用 effect），真正的恢复在 handleStartIntake 里做。
+  const intakeSavedRounds = loadIntakeSession(selectedPatient, intakeTeacherName)?.questionIndex || 0
+
   // ============== 【第61天新增】📋 今日备忘录（老师端首页）：时间轴 + 未排期事项 ==============
   // 数据全部来自现有 state + 静态模拟（roleData / appointments / teacherPatients / drafts / habitList / holidays / huangli），不新增后端接口
   const tomorrow = new Date(currentYear, currentMonth - 1, currentDay + 1)
@@ -2311,7 +2415,9 @@ export default function App() {
         {/* 【第80天新增 / 改动3】🩺 面诊前准备（学生端首页 · 黄历卡片下方；老师端不渲染，页签结构不变）
             流程：开始 → POST /api/agent/ask_next_question（首次 current_answers 传空串）拿到一个问题
                  → 学生回答（可点 🎙️ 语音输入，复用现有录音逻辑）→「下一个问题」把问答累积进 current_answers 再拉下一问
-                 → 后端 done=true 后提示「已收集完整，是否发送给老师？」→ POST /api/agent/save_intake 落库。 */}
+                 → 后端 done=true 后提示「已收集完整，是否发送给老师？」→ POST /api/agent/save_intake 落库。
+            【第83天新增 / 十问歌会话持久化】每答完一题把会话写进 localStorage（key = intake_session_{学生}_{老师}），
+            重开卡片能接着上次问（超过 24 小时视为过期）；发送成功或点「放弃本次」才清空该会话。 */}
         {(currentRole === '学生' || currentRole === '学生智能体') && (
           <div style={{ ...boxStyle, background: '#f3f8ff' }}>
             <div style={{ fontSize: '18px', color: '#3b6ea5', fontWeight: 'bold', marginBottom: '12px' }}>🩺 面诊前准备</div>
@@ -2319,7 +2425,10 @@ export default function App() {
               {intakeAppointment ? '📅 ' : '🪞 '}{intakeApptText}
             </div>
             {intakeAppointment && !showIntake && (
-              <button onClick={handleStartIntake} style={{ padding: '8px 24px', borderRadius: '20px', border: 'none', background: '#3b6ea5', color: '#fff', cursor: 'pointer', fontSize: '14px', fontFamily: 'serif' }}>开始面诊前准备</button>
+              <button onClick={handleStartIntake} style={{ padding: '8px 24px', borderRadius: '20px', border: 'none', background: '#3b6ea5', color: '#fff', cursor: 'pointer', fontSize: '14px', fontFamily: 'serif' }}>
+                {/* 【第83天新增】有进行中会话 → 按钮提示可以接着答，避免学生以为要重新开始 */}
+                {intakeSavedRounds > 0 ? `继续面诊前准备（已答 ${intakeSavedRounds} 问）` : '开始面诊前准备'}
+              </button>
             )}
             {intakeAppointment && showIntake && intakeSent && (
               <div style={{ textAlign: 'center', padding: '16px', background: '#fff', borderRadius: '8px', border: '1px solid #b9cde4', color: '#3b6ea5', fontSize: '15px' }}>
@@ -2334,6 +2443,9 @@ export default function App() {
                 <div style={{ fontSize: '15px', color: '#3b6ea5', fontWeight: 'bold', marginBottom: '8px' }}>已收集完整，是否发送给老师？</div>
                 <textarea value={intakeAnswers} readOnly style={{ width: '100%', height: '150px', padding: '10px', borderRadius: '8px', border: '1px solid #b9cde4', background: '#fff', fontFamily: 'serif', fontSize: '13px', marginBottom: '10px', boxSizing: 'border-box' }} />
                 <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '10px' }}>
+                  {/* 【第83天新增 / 十问歌会话持久化】「放弃本次」= 真正丢弃：清空 localStorage 会话并收起界面 */}
+                  <button onClick={handleAbandonIntake} style={{ marginRight: 'auto', padding: '6px 16px', borderRadius: '20px', border: '1px solid #999', background: 'transparent', color: '#666', cursor: 'pointer', fontSize: '13px' }}>放弃本次</button>
+                  {/* 「先不发送」只是先收起来（localStorage 会话保留），下次打开还能接着发送，不算放弃 */}
                   <button onClick={() => setShowIntake(false)} style={{ padding: '6px 16px', borderRadius: '20px', border: '1px solid #999', background: 'transparent', color: '#666', cursor: 'pointer', fontSize: '13px' }}>先不发送</button>
                   <button onClick={handleSendIntake} disabled={intakeSending} style={{ padding: '6px 20px', borderRadius: '20px', border: 'none', background: intakeSending ? '#8aa2bb' : '#3b6ea5', color: '#fff', cursor: intakeSending ? 'default' : 'pointer', fontSize: '13px' }}>{intakeSending ? '发送中...' : '发送'}</button>
                 </div>
@@ -2341,6 +2453,10 @@ export default function App() {
             )}
             {intakeAppointment && showIntake && !intakeSent && !intakeDone && (
               <div>
+                {/* 【第83天新增 / 十问歌会话持久化】只有“接着上次问”时才显示这行小灰字；从第一问开始时完全不显示 */}
+                {intakeResumed && intakeRounds > 0 && (
+                  <div style={{ fontSize: '12px', color: '#999', marginBottom: '6px' }}>继续上次未完成的面诊前准备（已答 {intakeRounds} 问）</div>
+                )}
                 <div style={{ fontSize: '12px', color: '#8aa2bb', marginBottom: '6px' }}>十问歌 · 已答 {intakeRounds} 问（共十问）</div>
                 <div style={{ padding: '12px', background: '#fff', borderRadius: '8px', border: '1px solid #b9cde4', fontSize: '16px', color: '#333', lineHeight: '1.7', marginBottom: '10px', minHeight: '26px' }}>
                   {intakeLoading ? '智能体正在想下一个问题...' : intakeQuestion}
@@ -2350,9 +2466,13 @@ export default function App() {
                   <button onClick={startIntakeRecording} style={{ padding: '8px 20px', borderRadius: '30px', border: 'none', background: intakeRecording ? '#c0392b' : '#5a7d5a', color: '#fff', cursor: 'pointer', fontSize: '14px', fontFamily: 'serif' }}>
                     {intakeRecording ? '⏹ 停止录音（点击结束）' : '🎙️ 语音输入'}
                   </button>
-                  <button onClick={handleNextIntakeQuestion} disabled={intakeLoading} style={{ padding: '8px 24px', borderRadius: '30px', border: 'none', background: intakeLoading ? '#8aa2bb' : '#3b6ea5', color: '#fff', cursor: intakeLoading ? 'default' : 'pointer', fontSize: '14px', fontFamily: 'serif' }}>
-                    {intakeLoading ? '处理中...' : '下一个问题'}
-                  </button>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                    {/* 【第83天新增 / 十问歌会话持久化】放弃按钮：清空该学生的 localStorage 会话后收起界面 */}
+                    <button onClick={handleAbandonIntake} style={{ padding: '8px 18px', borderRadius: '30px', border: '1px solid #999', background: 'transparent', color: '#666', cursor: 'pointer', fontSize: '13px', fontFamily: 'serif' }}>放弃本次</button>
+                    <button onClick={handleNextIntakeQuestion} disabled={intakeLoading} style={{ padding: '8px 24px', borderRadius: '30px', border: 'none', background: intakeLoading ? '#8aa2bb' : '#3b6ea5', color: '#fff', cursor: intakeLoading ? 'default' : 'pointer', fontSize: '14px', fontFamily: 'serif' }}>
+                      {intakeLoading ? '处理中...' : '下一个问题'}
+                    </button>
+                  </div>
                 </div>
                 {intakeRecording && (<div style={{ fontSize: '12px', color: '#c0392b', marginTop: '5px' }}>● 正在录音，请说话...（说完再点一次停止）</div>)}
               </div>
