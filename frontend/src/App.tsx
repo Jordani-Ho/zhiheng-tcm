@@ -787,15 +787,23 @@ export default function App() {
       .catch(() => setAgentActionLogs([]))
   }
 
-  // 【第56天新增 / 保留】触发沉默学生扫描（老接口，与上面三个接口读写同一张表：扫出新的 pending 请示）
+  // 【行政化 B3 / 第56天新增】触发统一扫描：POST /api/agent/scan，请求体 { teacher_name }
+  // 一次扫出三类学生请示（后端依次跑）：沉默关怀 send_care_notice + 欠费预存 send_billing_notice + 复诊提醒 send_recall_notice，
+  // 都写进同一张 agent_tasks（status=pending，与上面三个接口读的是同一张表），所以扫完直接重拉工作台三区块。
+  // 后端返回 { ok, created }；created 兼容老字段 new_tasks（都取不到时按 0 处理，避免 undefined 弹窗）。
   const handleAgentScan = () => {
     setScanningAgent(true)
-    fetch(`/api/agent/scan?teacher_name=${encodeURIComponent(selectedTeacher)}`, { method: 'POST' })
+    fetch('/api/agent/scan', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ teacher_name: selectedTeacher })
+    })
       .then(res => res.json())
       .then(data => {
         setScanningAgent(false)
         fetchAgentWorkbench()
-        alert(data.new_tasks > 0 ? `智能体发现 ${data.new_tasks} 条新请示` : '没有发现新的待办')
+        const created = data.created ?? data.new_tasks ?? 0
+        alert(created > 0 ? `智能体发现 ${created} 条新请示` : '没有发现新的待办')
       })
       .catch(() => { setScanningAgent(false); alert('扫描失败，请重试') })
   }
@@ -2030,7 +2038,8 @@ export default function App() {
 
         {/* 【第56天重构】🤖 智能体工作台（老师端 🏠 首页，位置：黄历卡片下方、今日备忘录卡片上方）
             三个区块：⏳ 待你确认（浅黄底强调） / ✅ 已办汇报（最近 5 条） / 📜 行动日志（最近 10 条）；
-            「立即扫描」沿用老接口 POST /api/agent/scan，保留原有沉默学生扫描能力。 */}
+            「立即扫描」走统一扫描接口 POST /api/agent/scan（请求体 { teacher_name }），一次扫出三类学生请示：
+            沉默关怀 send_care_notice + 欠费预存 send_billing_notice + 复诊提醒 send_recall_notice。 */}
         {(currentRole === '李老师' || currentRole === '李老师智能体') && teacherTab === 'home' && (
           <div style={boxStyle}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>

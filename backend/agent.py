@@ -1,8 +1,15 @@
+import json
 import os
+import re
+from datetime import datetime
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from langgraph.graph import StateGraph, END
 from typing import TypedDict
+
+# 【行政化改造 B3】新增「欠费预存 / 复诊提醒」请示扫描：要读 accounts / patient_records 并写 agent_tasks，
+# 这里复用 database 的连接与表（不新增依赖、不改表结构）。
+import database
 
 load_dotenv()
 
@@ -280,5 +287,180 @@ def clean_plan(raw_text: str) -> str:
     if not cleaned:
         raise ValueError("clean_plan: 智能体返回内容为空")
     return cleaned
+
+
+# ============ 【行政化改造 B3】学生管理请示：欠费预存 + 复诊提醒 ============
+# 复用 B1 的 agent_tasks 表（不改表结构）：老师名下学生的三类请示统一由 agent_tasks 承载 ——
+#   send_care_notice（沉默关怀，B1 已有）/ send_billing_notice（欠费预存）/ send_recall_notice（复诊提醒）。
+# action 命名沿用 database.scan_silent_students 里定下的 send_<类型>_notice 规范。
+
+BILLING_LOW_BALANCE = 100   # 【可配置阈值】学生余额低于该值 → 生成「预存提醒」请示
+RECALL_DAYS = 60            # 【可配置阈值】学生距上次就诊超过该天数 → 生成「复诊提醒」请示
+
+# 病历文本里的日期：签字行由前端生成（App.tsx：「李老师 · 2026年9月23日」），
+# 也兼容「2026-09-23」这类写法；取最后一个匹配（签字行在病历文末）。
+_RECORD_DATE_PATTERNS = (
+    re.compile(r"(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日"),
+    re.compile(r"(\d{4})-(\d{1,2})-(\d{1,2})"),
+)
+
+
+def _teacher_student_names(cur, teacher_name):
+    """该老师名下所有在读学生姓名（升序），学生口径与 database.scan_silent_students 保持一致。"""
+    rows = cur.execute("""
+        SELECT p.name AS name
+        FROM patients p
+        INNER JOIN patient_teachers pt ON p.name = pt.patient_name
+        WHERE pt.teacher_name = ? AND pt.status = 'active'
+        ORDER BY p.name
+    """, (teacher_name,)).fetchall()
+    return [row["name"] for row in rows]
+
+
+def _pending_task_exists(cur, teacher_name, task_type, category, action, patient_name):
+    """去重判断：【task_type + category + action_data.action + patient_name + status='pending'】
+    五个条件全中才算「已有同类请示」，否则可以再建一条。
+
+    做法：SQL 先按 teacher_name / task_type / category / status 过滤（条件明确、不扫全表），
+    再在 Python 侧解析 action_data 比对 action + patient_name —— 这样 action_data 里以后
+    增减字段（如 amount / days）也不会漏判，同一学生的不同类型请示（关怀 / 欠费 / 复诊）互不影响。
+    """
+    rows = cur.execute("""
+        SELECT action_data FROM agent_tasks
+        WHERE teacher_name = ? AND task_type = ? AND category = ? AND status = 'pending'
+    """, (teacher_name, task_type, category)).fetchall()
+    for row in rows:
+        try:
+            data = json.loads(row["action_data"]) if row["action_data"] else {}
+        except Exception:
+            continue
+        if data.get("action") == action and data.get("patient_name") == patient_name:
+            return True
+    return False
+
+
+def _insert_student_request(cur, teacher_name, title, content, action_data, created_at):
+    """往 agent_tasks 写一条待审批请示（字段与 B1 一致：task_type='request'、category='student'、status='pending'）。"""
+    cur.execute("""
+        INSERT INTO agent_tasks (teacher_name, task_type, category, title, content, action_data, status, created_at)
+        VALUES (?, 'request', 'student', ?, ?, ?, 'pending', ?)
+    """, (teacher_name, title, content, json.dumps(action_data, ensure_ascii=False), created_at))
+
+
+def check_billing_alerts(teacher_name, low_balance=BILLING_LOW_BALANCE):
+    """【B3-改动1：欠费请示】扫描该老师名下学生的余额（accounts.balance），余额 < low_balance 的生成请示。
+
+    · 余额来源：accounts 表（username = 学生姓名）。
+    · 只有「在 accounts 里开过户」的学生（= 预存制学生）才参与欠费扫描：没有账户的学生从未预存过，
+      不属于「余额告急」场景，不生成请示（否则每个没充过钱的学生都会刷一条「余额仅剩 0 分」，把
+      待你确认区刷爆）。老师真要给他建账户，走「💰 财务管理 → 预存」。余额被扣到 0 的已开户学生照常提醒。
+    · 去重：同 teacher + task_type='request' + category='student' + action='send_billing_notice'
+      + patient_name + status='pending' 已存在 → 跳过，不重复建单。
+    返回：本次新建的请示条数。
+    """
+    conn = database.get_connection()
+    cur = conn.cursor()
+    now = datetime.now()
+    created = 0
+    for name in _teacher_student_names(cur, teacher_name):
+        row = cur.execute("SELECT balance FROM accounts WHERE username = ?", (name,)).fetchone()
+        if row is None or row["balance"] is None:
+            continue  # 没开过户 → 不是预存制学生，不进欠费扫描
+        balance = row["balance"]
+        if balance >= low_balance:
+            continue
+        if _pending_task_exists(cur, teacher_name, "request", "student", "send_billing_notice", name):
+            continue
+        _insert_student_request(
+            cur, teacher_name,
+            f"{name}余额仅剩 {balance} 分",
+            "是否发送预存提醒？",
+            {"action": "send_billing_notice", "patient_name": name, "amount": balance},
+            now.isoformat()
+        )
+        created += 1
+    conn.commit()
+    conn.close()
+    return created
+
+
+def _extract_record_date(text):
+    """从病历文本里取「就诊日期」= 文本里最后一个日期（签字行在病历末尾）。
+
+    取不到（老病历没有签字行 / 日期格式不认识）→ 返回 None，调用方直接跳过：
+    宁可不出复诊提醒，也不拿别的日期（如学生活跃时间）去猜就诊时间。
+    """
+    if not text:
+        return None
+    for pattern in _RECORD_DATE_PATTERNS:
+        matches = pattern.findall(text)
+        if not matches:
+            continue
+        year, month, day = matches[-1]
+        try:
+            return datetime(int(year), int(month), int(day))
+        except ValueError:
+            continue
+    return None
+
+
+def check_recall_alerts(teacher_name, recall_days=RECALL_DAYS):
+    """【B3-改动2：复诊提醒请示】按 patient_records 里每个学生最后一次就诊时间，超过 recall_days 天生成请示。
+
+    · 「最后一次就诊时间」= 该生最近一条病历（patient_records 里 id 最大的那条，且同一老师）里的就诊日期。
+      说明：patient_records 表没有时间列（只有 id / patient_name / teacher_name / ai_draft / final_plan / doctor），
+      库里可用的就诊日期就是老师签字时写进病历文本的签字行「李老师 · 2026年9月23日」
+      （见 frontend/src/App.tsx 生成、database.sign_draft 落库），所以从 final_plan（为空则退回 ai_draft）文本里取。
+    · 该生没有任何病历、或最近一条病历里取不到日期 → 不生成请示（没有就诊基准就不算「久未复诊」）。
+    · 去重：同 teacher + task_type='request' + category='student' + action='send_recall_notice'
+      + patient_name + status='pending' 已存在 → 跳过，不重复建单。
+    返回：本次新建的请示条数。
+    """
+    conn = database.get_connection()
+    cur = conn.cursor()
+    now = datetime.now()
+    created = 0
+    for name in _teacher_student_names(cur, teacher_name):
+        row = cur.execute("""
+            SELECT COALESCE(NULLIF(final_plan, ''), ai_draft) AS record_text
+            FROM patient_records
+            WHERE patient_name = ? AND teacher_name = ?
+            ORDER BY id DESC LIMIT 1
+        """, (name, teacher_name)).fetchone()
+        if row is None:
+            continue
+        last_visit = _extract_record_date(row["record_text"])
+        if last_visit is None:
+            continue
+        days = (now - last_visit).days
+        if days <= recall_days:
+            continue
+        if _pending_task_exists(cur, teacher_name, "request", "student", "send_recall_notice", name):
+            continue
+        _insert_student_request(
+            cur, teacher_name,
+            f"{name}距上次就诊已 {days} 天",
+            "是否发送复诊提醒？",
+            {"action": "send_recall_notice", "patient_name": name, "days": days},
+            now.isoformat()
+        )
+        created += 1
+    conn.commit()
+    conn.close()
+    return created
+
+
+def scan_student_requests(teacher_name):
+    """【B3-改动3：统一扫描入口】把该老师名下学生的三类请示一次扫完，返回本次新建任务总数。
+
+    顺序与设计文档一致：沉默关怀（B1 已有的 database.scan_silent_students）→ 欠费预存 → 复诊提醒。
+    三类都写进同一张 agent_tasks（category='student'），各自按 action 独立去重，互不干扰。
+    """
+    if not teacher_name:
+        return 0
+    created = database.scan_silent_students(teacher_name)
+    created += check_billing_alerts(teacher_name)
+    created += check_recall_alerts(teacher_name)
+    return created
 
     

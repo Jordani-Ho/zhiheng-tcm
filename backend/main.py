@@ -923,10 +923,25 @@ class AgentResolveInput(BaseModel):
 
 # ============ 接口：老师智能体（一期：沉默学生请示闭环） ============
 
+class AgentScanInput(BaseModel):
+    teacher_name: str = ""
+
+
 @app.post("/api/agent/scan")
-def api_agent_scan(teacher_name: str):
-    """扫描沉默学生，生成请示任务。"""
-    return {"new_tasks": database.scan_silent_students(teacher_name)}
+def api_agent_scan(data: AgentScanInput | None = None, teacher_name: str = ""):
+    """【行政化 B3】统一扫描入口：一次扫完该老师名下学生的三类请示 ——
+    沉默关怀（send_care_notice，B1 已有）+ 欠费预存（send_billing_notice）+ 复诊提醒（send_recall_notice），
+    都写进同一张 agent_tasks（category='student'、task_type='request'、status='pending'）。
+
+    请求体：{"teacher_name": "李老师"}；返回：{"ok": true, "created": N}（N = 本次新创建的任务数）。
+    兼容旧调用：不接受请求体时仍认查询参数 ?teacher_name=，响应里保留 new_tasks（与 created 同值），
+    这样前端「智能体工作台」和已有测试的老调用方式都不用改。
+    """
+    name = (data.teacher_name if data else "") or teacher_name
+    if not name:
+        raise HTTPException(status_code=400, detail="teacher_name 不能为空")
+    created = agent.scan_student_requests(name)
+    return {"ok": True, "created": created, "new_tasks": created}
 
 
 @app.get("/api/agent/tasks")
