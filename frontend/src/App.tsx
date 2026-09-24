@@ -34,6 +34,14 @@ const MEMO_DONE_STORE_KEY = 'zh_memo_done'
 // appointments 表没有“远程 / 线上”字段，本次后端零改动，所以由前端按「预约原因 reason」里的关键词把已确认预约分成两列：
 // 命中关键词 → 右列「💻 远程问诊」，未命中 → 左列「📅 预约面诊」（老师写原因时带上“远程/线上/视频”等词即可归入远程列）。
 const REMOTE_APPT_KEYWORDS = ['远程', '线上', '网诊', '视频', '电话', '微信']
+// 【第56天重构 / 智能体工作台】时间显示：后端返回 ISO 串（如 2026-09-24T10:30:00.123456）→ 显示成 "09-24 10:30"；
+// 空值显示 "—"，格式异常（长度不足）则原样返回，绝不抛错影响卡片渲染。
+const formatAgentTime = (value?: string | null) => {
+  if (!value) return '—'
+  const s = String(value)
+  if (s.length < 16) return s
+  return `${s.slice(5, 10)} ${s.slice(11, 16)}`
+}
 // 【第74天新增 / 开方九宫格改造】开方「君臣佐使」与「煎法」选项（与后端 database.py 的
 // PRESCRIPTION_ROLES / PRESCRIPTION_COOKING_METHODS 白名单一一对应，改一处要同步另一处）
 const HERB_ROLES = ['君', '臣', '佐', '使']
@@ -250,8 +258,13 @@ export default function App() {
     if (el) el.focus()
   }, [prescriptionItems])
 
-  // 【第56天新增】智能体工作台（沉默学生请示闭环）
-  const [agentTasks, setAgentTasks] = useState<any[]>([])
+  // 【第56天重构】智能体工作台三区块数据（老师端首页）：
+  //   ① agentPendingTasks  ⏳ 待你确认（GET /api/agent_tasks?status=pending）
+  //   ② agentDoneTasks     ✅ 已办汇报（GET /api/agent_tasks?status=approved，最近 5 条，按 created_at 倒序）
+  //   ③ agentActionLogs    📜 行动日志（GET /api/agent_action_log?limit=10）
+  const [agentPendingTasks, setAgentPendingTasks] = useState<any[]>([])
+  const [agentDoneTasks, setAgentDoneTasks] = useState<any[]>([])
+  const [agentActionLogs, setAgentActionLogs] = useState<any[]>([])
   const [scanningAgent, setScanningAgent] = useState(false)
   // 【第61天新增】首页「今日备忘录」时间轴：已完成事项（key 列表；点“完成”后从列表移除）+ 当前时间 + 本地记录日期
   const [memoDoneKeys, setMemoDoneKeys] = useState<string[]>([])
@@ -393,10 +406,10 @@ export default function App() {
       .catch(() => setPlanTemplate(''))
   }, [currentRole, teacherTab, selectedTeacher])
 
-  // 【第56天新增】智能体工作台：进入老师端时拉取待办请示
+  // 【第56天重构】智能体工作台：进入老师端（含切换老师）时一次性拉取三个接口
   useEffect(() => {
     if (currentRole === '李老师' || currentRole === '李老师智能体') {
-      fetchAgentTasks()
+      fetchAgentWorkbench()
     }
   }, [currentRole, selectedTeacher])
 
@@ -753,35 +766,65 @@ export default function App() {
       .catch(() => { setSavingPrescription(false); alert('保存失败，请重试') })
   }
 
-  // 【第56天新增】智能体工作台：拉取待办 / 触发扫描 / 处理请示（确认执行或忽略）
-  const fetchAgentTasks = () => {
-    fetch(`/api/agent/tasks?teacher_name=${encodeURIComponent(selectedTeacher)}&status=pending`)
+  // 【第56天重构】智能体工作台：一次拉取三个接口，填满三个区块
+  //   ① 待你确认 → GET /api/agent_tasks?teacher_name=当前老师&status=pending
+  //   ② 已办汇报 → GET /api/agent_tasks?teacher_name=当前老师&status=approved（后端按 created_at 倒序，前端取最近 5 条）
+  //   ③ 行动日志 → GET /api/agent_action_log?teacher_name=当前老师&limit=10
+  // 任一接口失败只把对应区块置空，不影响其它区块；响应不是数组时同样按空处理（防止 .map 报错）。
+  const fetchAgentWorkbench = () => {
+    const teacher = encodeURIComponent(selectedTeacher)
+    fetch(`/api/agent_tasks?teacher_name=${teacher}&status=pending`)
       .then(res => res.json())
-      .then(data => setAgentTasks(data))
-      .catch(() => setAgentTasks([]))
+      .then(data => setAgentPendingTasks(Array.isArray(data) ? data : []))
+      .catch(() => setAgentPendingTasks([]))
+    fetch(`/api/agent_tasks?teacher_name=${teacher}&status=approved`)
+      .then(res => res.json())
+      .then(data => setAgentDoneTasks(Array.isArray(data) ? data.slice(0, 5) : []))
+      .catch(() => setAgentDoneTasks([]))
+    fetch(`/api/agent_action_log?teacher_name=${teacher}&limit=10`)
+      .then(res => res.json())
+      .then(data => setAgentActionLogs(Array.isArray(data) ? data : []))
+      .catch(() => setAgentActionLogs([]))
   }
 
+  // 【第56天新增 / 保留】触发沉默学生扫描（老接口，与上面三个接口读写同一张表：扫出新的 pending 请示）
   const handleAgentScan = () => {
     setScanningAgent(true)
     fetch(`/api/agent/scan?teacher_name=${encodeURIComponent(selectedTeacher)}`, { method: 'POST' })
       .then(res => res.json())
       .then(data => {
         setScanningAgent(false)
-        fetchAgentTasks()
+        fetchAgentWorkbench()
         alert(data.new_tasks > 0 ? `智能体发现 ${data.new_tasks} 条新请示` : '没有发现新的待办')
       })
       .catch(() => { setScanningAgent(false); alert('扫描失败，请重试') })
   }
 
-  const handleResolveAgentTask = (taskId: number, decision: 'approved' | 'rejected') => {
-    fetch(`/api/agent/tasks/${taskId}/resolve`, {
+  // 【第56天重构】待确认区块 / ✅ 确认：POST /api/agent_tasks/approve  body { task_id }
+  // 先本地移除（按钮立即消失、不卡）→ 无论成败都重拉三个接口，保证三个区块数据一致。
+  const handleApproveAgentTask = (taskId: number) => {
+    setAgentPendingTasks(prev => prev.filter(t => t.id !== taskId))
+    fetch('/api/agent_tasks/approve', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ decision })
+      body: JSON.stringify({ task_id: taskId })
     })
       .then(res => res.json())
-      .then(() => fetchAgentTasks())
-      .catch(() => alert('处理失败，请重试'))
+      .then(() => fetchAgentWorkbench())
+      .catch(() => { alert('处理失败，请重试'); fetchAgentWorkbench() })
+  }
+
+  // 【第56天重构】待确认区块 / ❌ 忽略：POST /api/agent_tasks/reject  body { task_id }（行为同上）
+  const handleRejectAgentTask = (taskId: number) => {
+    setAgentPendingTasks(prev => prev.filter(t => t.id !== taskId))
+    fetch('/api/agent_tasks/reject', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ task_id: taskId })
+    })
+      .then(res => res.json())
+      .then(() => fetchAgentWorkbench())
+      .catch(() => { alert('处理失败，请重试'); fetchAgentWorkbench() })
   }
     // 【第50天新增】拉取可视化排班数据
   const fetchCalendar = () => {
@@ -1985,6 +2028,75 @@ export default function App() {
           </div>
         )}
 
+        {/* 【第56天重构】🤖 智能体工作台（老师端 🏠 首页，位置：黄历卡片下方、今日备忘录卡片上方）
+            三个区块：⏳ 待你确认（浅黄底强调） / ✅ 已办汇报（最近 5 条） / 📜 行动日志（最近 10 条）；
+            「立即扫描」沿用老接口 POST /api/agent/scan，保留原有沉默学生扫描能力。 */}
+        {(currentRole === '李老师' || currentRole === '李老师智能体') && teacherTab === 'home' && (
+          <div style={boxStyle}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
+              <div style={{ fontSize: '18px', color: '#8b4513', fontWeight: 'bold' }}>🤖 智能体工作台</div>
+              <button
+                onClick={handleAgentScan}
+                disabled={scanningAgent}
+                style={{ padding: '4px 12px', borderRadius: '15px', border: '1px solid #8b4513', background: 'transparent', color: '#8b4513', cursor: 'pointer', fontSize: '12px', fontFamily: 'serif' }}
+              >{scanningAgent ? '扫描中…' : '🔍 立即扫描'}</button>
+            </div>
+
+            {/* 区块1：⏳ 待你确认（浅黄底强调） */}
+            <div style={{ background: '#fffbe8', border: '1px solid #f0e2b6', borderRadius: '8px', padding: '12px' }}>
+              <div style={{ fontSize: '14px', color: '#8b4513', fontWeight: 'bold', marginBottom: '8px' }}>⏳ 待你确认（{agentPendingTasks.length}）</div>
+              {agentPendingTasks.length === 0 ? (
+                <div style={{ textAlign: 'center', color: '#999', fontSize: '13px', padding: '6px' }}>暂无待办</div>
+              ) : (
+                agentPendingTasks.map(task => (
+                  <div key={task.id} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '10px', background: '#fff', border: '1px solid #f0e2b6', borderRadius: '8px', marginBottom: '8px' }}>
+                    <div style={{ flex: 1, marginRight: '10px' }}>
+                      <div style={{ fontSize: '14px', color: '#8b4513', fontWeight: 'bold', marginBottom: '4px' }}>{task.title}</div>
+                      <div style={{ fontSize: '12px', color: '#666', lineHeight: '1.5' }}>{task.content}</div>
+                    </div>
+                    <div style={{ whiteSpace: 'nowrap' }}>
+                      <button onClick={() => handleApproveAgentTask(task.id)} style={{ marginRight: '6px', padding: '4px 10px', borderRadius: '4px', border: 'none', background: '#5a7d5a', color: '#fdfcf0', cursor: 'pointer', fontSize: '12px', fontFamily: 'serif' }}>✅ 确认</button>
+                      <button onClick={() => handleRejectAgentTask(task.id)} style={{ padding: '4px 10px', borderRadius: '4px', border: 'none', background: '#d4c8a8', color: '#333', cursor: 'pointer', fontSize: '12px', fontFamily: 'serif' }}>❌ 忽略</button>
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
+
+            {/* 区块2：✅ 已办汇报（最近 5 条：标题 + 处理时间 resolved_at） */}
+            <div style={{ borderTop: '1px solid #f0e9d6', marginTop: '12px', paddingTop: '12px' }}>
+              <div style={{ fontSize: '14px', color: '#8b4513', fontWeight: 'bold', marginBottom: '8px' }}>✅ 已办汇报（最近 5 条）</div>
+              {agentDoneTasks.length === 0 ? (
+                <div style={{ textAlign: 'center', color: '#999', fontSize: '13px', padding: '6px' }}>暂无</div>
+              ) : (
+                agentDoneTasks.map(task => (
+                  <div key={task.id} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '6px 0', borderBottom: '1px dashed #f0e9d6' }}>
+                    <div style={{ flex: 1, fontSize: '13px', color: '#333', marginRight: '8px' }}>· {task.title}</div>
+                    <div style={{ fontSize: '11px', color: '#999', whiteSpace: 'nowrap' }}>{formatAgentTime(task.resolved_at)}</div>
+                  </div>
+                ))
+              )}
+            </div>
+
+            {/* 区块3：📜 行动日志（最近 10 条：[action] + detail + created_at） */}
+            <div style={{ borderTop: '1px solid #f0e9d6', marginTop: '12px', paddingTop: '12px' }}>
+              <div style={{ fontSize: '14px', color: '#8b4513', fontWeight: 'bold', marginBottom: '8px' }}>📜 行动日志（最近 10 条）</div>
+              {agentActionLogs.length === 0 ? (
+                <div style={{ textAlign: 'center', color: '#999', fontSize: '13px', padding: '6px' }}>暂无</div>
+              ) : (
+                agentActionLogs.map(log => (
+                  <div key={log.id} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', padding: '6px 0', borderBottom: '1px dashed #f0e9d6' }}>
+                    <div style={{ flex: 1, fontSize: '13px', color: '#333', marginRight: '8px', lineHeight: '1.6' }}>
+                      <span style={{ color: '#5a7d5a', fontWeight: 'bold', marginRight: '6px' }}>[{log.action}]</span>{log.detail}
+                    </div>
+                    <div style={{ fontSize: '11px', color: '#999', whiteSpace: 'nowrap' }}>{formatAgentTime(log.created_at)}</div>
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
+        )}
+
         {/* 【第61天新增】老师端：📋 今日备忘录（动态时间轴 + 未排期事项列；已完成移除、逾期变灰、跨天自动清空） */}
         {(currentRole === '李老师' || currentRole === '李老师智能体') && teacherTab === 'home' && (
           <div style={{ ...boxStyle, background: '#fffdf5' }}>
@@ -2119,35 +2231,7 @@ export default function App() {
           </div>
         )}
 
-        {/* 【第56天新增】智能体工作台（老师端：沉默学生请示闭环） */}
-        {(currentRole === '李老师' || currentRole === '李老师智能体') && teacherTab === 'home' && (
-          <div style={boxStyle}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '10px' }}>
-              <div style={{ fontSize: '18px', color: '#8b4513', fontWeight: 'bold' }}>🤖 智能体工作台</div>
-              <button
-                onClick={handleAgentScan}
-                disabled={scanningAgent}
-                style={{ padding: '4px 12px', borderRadius: '15px', border: '1px solid #8b4513', background: 'transparent', color: '#8b4513', cursor: 'pointer', fontSize: '12px', fontFamily: 'serif' }}
-              >{scanningAgent ? '扫描中…' : '🔍 立即扫描'}</button>
-            </div>
-            {agentTasks.length === 0 ? (
-              <div style={{ textAlign: 'center', color: '#999', fontSize: '13px', padding: '8px' }}>暂无待办</div>
-            ) : (
-              agentTasks.map(task => (
-                <div key={task.id} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '10px', background: '#fffdf5', border: '1px solid #f0e9d6', borderRadius: '8px', marginBottom: '8px' }}>
-                  <div style={{ flex: 1, marginRight: '10px' }}>
-                    <div style={{ fontSize: '14px', color: '#8b4513', fontWeight: 'bold', marginBottom: '4px' }}>{task.title}</div>
-                    <div style={{ fontSize: '12px', color: '#666', lineHeight: '1.5' }}>{task.content}</div>
-                  </div>
-                  <div style={{ whiteSpace: 'nowrap' }}>
-                    <button onClick={() => handleResolveAgentTask(task.id, 'approved')} style={{ marginRight: '6px', padding: '4px 10px', borderRadius: '4px', border: 'none', background: '#5a7d5a', color: '#fdfcf0', cursor: 'pointer', fontSize: '12px', fontFamily: 'serif' }}>确认执行</button>
-                    <button onClick={() => handleResolveAgentTask(task.id, 'rejected')} style={{ padding: '4px 10px', borderRadius: '4px', border: 'none', background: '#d4c8a8', color: '#333', cursor: 'pointer', fontSize: '12px', fontFamily: 'serif' }}>忽略</button>
-                  </div>
-                </div>
-              ))
-            )}
-          </div>
-        )}
+        {/* 【第56天重构】原「智能体工作台」卡片已上移到黄历卡片下方（三区块：待你确认 / 已办汇报 / 行动日志），此处不再重复渲染 */}
 
         {(currentRole === '学生' || currentRole === '学生智能体') && healthTrend && (
           <div style={boxStyle}>
