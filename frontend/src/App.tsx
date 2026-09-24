@@ -13,6 +13,10 @@ type TeacherTab = 'home' | 'clinic' | 'manage' | 'settings'
 const boxStyle: React.CSSProperties = { background: '#fdfcf0', border: '1px solid #d4c8a8', borderRadius: '12px', padding: '24px', marginBottom: '20px', boxShadow: '0 4px 12px rgba(0,0,0,0.06)' }
 const inputStyle: React.CSSProperties = { width: '100%', padding: '8px', borderRadius: '6px', border: '1px solid #d4c8a8', fontFamily: 'serif', marginBottom: '8px', boxSizing: 'border-box' }
 const dateSelectStyle: React.CSSProperties = { padding: '8px', borderRadius: '6px', border: '1px solid #d4c8a8', fontFamily: 'serif', marginRight: '6px', marginBottom: '8px' }
+// 【第67天新增】⚙️ 设置页签：四个分区的「大标题 + 分隔线」样式（纯前端 UI 组织，不涉及任何数据/接口）
+const sectionTitleStyle: React.CSSProperties = { fontSize: '20px', fontWeight: 'bold', color: '#8b4513', borderBottom: '2px solid #d4c8a8', paddingBottom: '6px', marginBottom: '12px', letterSpacing: '1px' }
+// 【第67天新增】设置页签内分区小卡片样式（复用 boxStyle，内边距略收窄，视觉上从属于所属分区）
+const sectionCardStyle: React.CSSProperties = { ...boxStyle, padding: '16px 24px' }
 // 【第59天新增】诊室二期：把脉可选的脉象（可多选）
 const PULSE_TYPES = ['浮', '沉', '迟', '数', '虚', '实', '滑', '涩']
 // 【第59天重构】拍照清晰度检测阈值：Canvas 取灰度 → 3x3 拉普拉斯卷积 → 求灰度方差，< 100 视为“可能不够清晰”，
@@ -1991,13 +1995,39 @@ export default function App() {
           </div>
         )}
 
-        {/* 预约卡片（可视化网格） */}
-        {(currentRole === '学生' || currentRole === '学生智能体' || ((currentRole === '李老师' || currentRole === '李老师智能体') && teacherTab === 'settings')) && (
-          <div style={boxStyle}>
-            <div style={{ fontSize: '18px', color: '#8b4513', fontWeight: 'bold', marginBottom: '12px' }}>
-              📅 {currentRole.includes('老师') ? '排班与预约管理' : `预约 ${selectedTeacher}`}
-            </div>
+        {/* 【第67天重构】⚙️ 设置页签：老师端四大分区（① 💊 药材入库 / ② 🕐 作息与节假日 / ③ 📅 预约与通知 / ④ 💰 财务规则）
+            组织方式：每个分区用「大标题 + 分隔线」，自上而下依次排列
+            - ② ③ 中的「我的工作时间 / 节假日设置 / 排班与预约日历 / 待处理预约」全部是原有卡片，state 与接口逻辑一字未改，只是重新归入分区
+            - ① ③ ④ 中的规则类内容为纯前端只读占位（未接后端，后续版本开发）
+            - 学生端：仍是原来的「预约」卡片（标题、日历、我的预约记录、预约表单均保持不变） */}
+        {(currentRole === '学生' || currentRole === '学生智能体' || (isTeacherRole && teacherTab === 'settings')) && (
+          <div style={isTeacherRole ? { marginBottom: '20px' } : boxStyle}>
+            {/* 原卡片标题：仅学生端显示（老师端改为四大分区的分区标题，「排班与预约管理」标题移到分区③内） */}
+            {!isTeacherRole && (
+              <div style={{ fontSize: '18px', color: '#8b4513', fontWeight: 'bold', marginBottom: '12px' }}>
+                📅 预约 {selectedTeacher}
+              </div>
+            )}
 
+            {/* ============ 分区 ① 💊 药材入库（老师端设置页签） ============ */}
+            {isTeacherRole && (
+              <>
+                <div style={sectionTitleStyle}>💊 药材入库</div>
+                <div style={sectionCardStyle}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '12px', flexWrap: 'wrap' }}>
+                    <button onClick={() => alert('药材入库功能开发中')} style={{ padding: '8px 26px', borderRadius: '20px', border: 'none', background: '#5a7d5a', color: '#fff', cursor: 'pointer', fontSize: '14px', fontFamily: 'serif' }}>💊 入库</button>
+                    <div style={{ fontSize: '13px', color: '#666' }}>老师或智能体录入新到药材</div>
+                  </div>
+                </div>
+
+                {/* ============ 分区 ② 🕐 作息与节假日（老师端设置页签） ============ */}
+                <div style={sectionTitleStyle}>🕐 作息与节假日</div>
+              </>
+            )}
+
+            {/* ===== 分区 ② 内容：以下两张为原有卡片（我的工作时间 / 节假日设置），功能不变 ===== */}
+            {isTeacherRole ? (
+              <div style={sectionCardStyle}>
             {/* 老师工作时间设置 */}
             {currentRole.includes('老师') && schedule && (
               <div style={{ marginBottom: '12px', padding: '10px', background: '#f0f7f0', borderRadius: '8px', border: '1px dashed #5a7d5a' }}>
@@ -2064,7 +2094,45 @@ export default function App() {
                 )}
               </div>
             )}
+              </div>
+            ) : null}
 
+            {/* ============ 分区 ③ 📅 预约与通知（老师端设置页签） ============ */}
+            {isTeacherRole && (
+              <>
+                <div style={sectionTitleStyle}>📅 预约与通知</div>
+
+                {/* 预约规则（只读占位，后续开发） */}
+                <div style={sectionCardStyle}>
+                  <div style={{ fontSize: '15px', color: '#8b4513', fontWeight: 'bold', marginBottom: '8px' }}>📋 预约规则</div>
+                  <div style={{ fontSize: '13px', color: '#666', lineHeight: '2' }}>
+                    <div>· 可预约提前时间：学生最多提前 7 天发起预约（只读占位）</div>
+                    <div>· 最长预约时长：单次面诊默认 30 分钟（只读占位）</div>
+                    <div>· 取消 / 改期：面诊开始前 2 小时可自行取消（只读占位）</div>
+                    <div>· 号源粒度：与分区②「我的工作时间」的 30 分钟时段保持一致</div>
+                  </div>
+                  <div style={{ fontSize: '11px', color: '#999', marginTop: '6px' }}>（后续开发：以上规则暂为只读占位，未接后端）</div>
+                </div>
+
+                {/* 通知条件（只读占位，后续开发） */}
+                <div style={sectionCardStyle}>
+                  <div style={{ fontSize: '15px', color: '#5a7d5a', fontWeight: 'bold', marginBottom: '8px' }}>🔔 通知条件</div>
+                  <div style={{ fontSize: '13px', color: '#666', lineHeight: '2' }}>
+                    <div>· 沉默学生提醒阈值：连续 7 天无打卡 / 无记录 → 提醒老师（占位）</div>
+                    <div>· 余额预警阈值：账户余额低于 100 元 → 提醒学生与老师（占位）</div>
+                    <div>· 提醒频率：A 每天 / B 隔天 / C 每周（已在【🗂️ 管理 → 学生管理】中按学生设置）</div>
+                    <div>· 提醒方式：站内卡片 + 智能体工作台请示（占位）</div>
+                  </div>
+                  <div style={{ fontSize: '11px', color: '#999', marginTop: '6px' }}>（后续开发：以上阈值暂为只读占位，未接后端）</div>
+                </div>
+
+                {/* 原有卡片：排班与预约日历（功能不变，仅归入本分区） */}
+                <div style={{ fontSize: '15px', color: '#8b4513', fontWeight: 'bold', margin: '4px 0 10px' }}>🗓 排班与预约管理</div>
+              </>
+            )}
+
+            {/* ===== 分区 ③ 内容：以下为原有卡片（排班日历 / 待处理预约 / 我的预约记录 / 预约表单），功能不变 ===== */}
+            <div style={isTeacherRole ? boxStyle : undefined}>
             {/* 7 天 tab 切换 */}
             {calendarData && calendarData.days && (
               <div>
@@ -2187,6 +2255,31 @@ export default function App() {
                   <button onClick={handleCreateAppointment} style={{ padding: '6px 20px', borderRadius: '20px', border: 'none', background: '#8b4513', color: '#fff', cursor: 'pointer', fontSize: '12px' }}>提交预约</button>
                 </div>
               </div>
+            )}
+            </div>
+
+            {/* ============ 分区 ④ 💰 财务规则（老师端设置页签） ============ */}
+            {isTeacherRole && (
+              <>
+                <div style={sectionTitleStyle}>💰 财务规则</div>
+                <div style={sectionCardStyle}>
+                  <div style={{ fontSize: '14px', color: '#8b4513', fontWeight: 'bold', marginBottom: '6px' }}>💳 余额门限设置</div>
+                  <div style={{ fontSize: '13px', color: '#666', lineHeight: '2', marginBottom: '14px' }}>
+                    <div>· 余额下限：账户余额低于 100 元时，暂停新增预约（占位）</div>
+                    <div>· 单次扣费上限：单次面诊扣费不超过 500 元（占位）</div>
+                  </div>
+                  <div style={{ fontSize: '14px', color: '#5a7d5a', fontWeight: 'bold', marginBottom: '6px' }}>🎁 积分赠送规则</div>
+                  <div style={{ fontSize: '13px', color: '#666', lineHeight: '2', marginBottom: '14px' }}>
+                    <div>· 打卡赠送：连续打卡 7 天赠送 10 积分（占位）</div>
+                    <div>· 预存赠送：预存满 1000 元赠送 100 积分（占位）</div>
+                    <div>· 邀请赠送：新学生首次面诊完成后赠送 20 积分（占位）</div>
+                  </div>
+                  <div style={{ padding: '10px', background: '#fff8e7', borderRadius: '8px', border: '1px dashed #d4c8a8', fontSize: '13px', color: '#8b4513', lineHeight: '1.8' }}>
+                    ℹ️ 余额门限与积分赠送目前仅为规则占位（后续开发）。实际的钱款操作（充值 / 赠送 / 扣费 / 账户余额）在【🗂️ 管理】页签的「💰 财务管理」面板，本分区只放规则。
+                  </div>
+                  <div style={{ fontSize: '11px', color: '#999', marginTop: '6px' }}>（后续开发：以上规则暂为只读占位，未接后端）</div>
+                </div>
+              </>
             )}
           </div>
         )}
