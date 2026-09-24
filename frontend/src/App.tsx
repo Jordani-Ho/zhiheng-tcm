@@ -1357,6 +1357,12 @@ export default function App() {
     return { done, total, rate, summary }
   })()
 
+  // ============== 【第64天新增】💰 财务管理面板（最小版）：预存 / 赠送 / 扣费 三个按钮 ==============
+  // 目前只做前端提示（纯 UI 占位），不调用任何后端接口、不改数据库，后续版本再接入真实逻辑
+  const handleFinanceRecharge = () => { alert('预存功能开发中') }
+  const handleFinanceGift = () => { alert('赠送功能开发中') }
+  const handleFinanceDeduct = () => { alert('扣费功能开发中') }
+
   // ============== 渲染 ==============
   return (
     <div style={{ minHeight: '100vh', background: '#f5f1e6', padding: '40px 20px', fontFamily: 'serif' }}>
@@ -2182,8 +2188,51 @@ export default function App() {
 
         {/* 【第63天调整】🧑‍⚕️ 角色切换卡片（调试模块）：已从页面顶部附近迁至整页最底部（所有页签内容的最下方），代码见本 return 末尾 */}
 
-        {/* 【第63天调整】积分卡片：老师端只在「⚙️管理」页签显示（🏠首页 / 🩺诊室 / ⚙️设置 均不显示）；学生端无页签，保持原样 */}
-        {points && (!isTeacherRole || teacherTab === 'manage') && (
+        {/* 【第64天新增】💰 财务管理面板（最小版）：老师端只在「🗂️管理」页签显示（🏠首页 / 🩺诊室 / ⚙️设置 均不显示）。
+            说明：两个核心数字沿用原有积分数据（points.patient_points / points.teacher_points），数据来源未做任何改动；
+                  三个功能区目前只弹前端提示（handleFinanceRecharge / handleFinanceGift / handleFinanceDeduct），未接后端。 */}
+        {points && isTeacherRole && teacherTab === 'manage' && (
+          <div style={{ ...boxStyle, background: '#fffdf5' }}>
+            {/* 卡片标题 */}
+            <div style={{ fontSize: '18px', color: '#8b4513', fontWeight: 'bold', marginBottom: '15px' }}>💰 财务管理</div>
+
+            {/* 顶部一行：两个核心数字（学生账户总额 / 老师账户总额） */}
+            <div style={{ display: 'flex', justifyContent: 'space-around', textAlign: 'center', paddingBottom: '15px', borderBottom: '1px solid #e6dcc2', marginBottom: '15px' }}>
+              <div>
+                <div style={{ fontSize: '12px', color: '#999' }}>学生账户总额（{selectedPatient}）</div>
+                <div style={{ fontSize: '24px', fontWeight: 'bold', color: '#8b4513' }}>{points.patient_points}</div>
+              </div>
+              <div>
+                <div style={{ fontSize: '12px', color: '#999' }}>老师账户总额（{selectedTeacher}）</div>
+                <div style={{ fontSize: '24px', fontWeight: 'bold', color: '#5a7d5a' }}>{points.teacher_points}</div>
+              </div>
+            </div>
+
+            {/* 功能区 a：预存（充值） */}
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '8px 0' }}>
+              <button onClick={handleFinanceRecharge} style={{ padding: '8px 20px', borderRadius: '20px', border: 'none', background: '#8b4513', color: '#fff', cursor: 'pointer', fontFamily: 'serif', fontSize: '14px' }}>💵 预存（充值）</button>
+              <div style={{ fontSize: '13px', color: '#666', textAlign: 'right' }}>学生预交学费充进账户，余额可跨次就诊使用</div>
+            </div>
+
+            {/* 功能区 b：赠送 */}
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '8px 0' }}>
+              <button onClick={handleFinanceGift} style={{ padding: '8px 20px', borderRadius: '20px', border: 'none', background: '#5a7d5a', color: '#fff', cursor: 'pointer', fontFamily: 'serif', fontSize: '14px' }}>🎁 赠送</button>
+              <div style={{ fontSize: '13px', color: '#666', textAlign: 'right' }}>活动或答谢时，额外赠送积分到学生账户</div>
+            </div>
+
+            {/* 功能区 c：扣费 */}
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '8px 0' }}>
+              <button onClick={handleFinanceDeduct} style={{ padding: '8px 20px', borderRadius: '20px', border: 'none', background: '#c0392b', color: '#fff', cursor: 'pointer', fontFamily: 'serif', fontSize: '14px' }}>💸 扣费</button>
+              <div style={{ fontSize: '13px', color: '#666', textAlign: 'right' }}>面诊 / 开方后，从学生账户扣除对应积分</div>
+            </div>
+
+            {/* 底部灰色小字：后续版本功能预告 */}
+            <div style={{ fontSize: '12px', color: '#999', textAlign: 'center', marginTop: '15px' }}>催缴、统计、报表将在后续版本上线</div>
+          </div>
+        )}
+
+        {/* 【第63天调整】积分卡片：学生端保持原样（老师端已升级为上方「💰 财务管理」面板，不再重复显示） */}
+        {points && !isTeacherRole && (
           <div style={{ ...boxStyle, display: 'flex', justifyContent: 'space-around', textAlign: 'center', background: '#fffdf5' }}>
             <div>
               <div style={{ fontSize: '12px', color: '#999' }}>{selectedPatient} 积分</div>
