@@ -937,11 +937,6 @@ def get_active_record_template(teacher_name):
             "[warn] 取生效病歷模板失敗（生成側回落今天路徑）：%s: %s" % (type(exc).__name__, exc)
         )
         return None
-    except sqlite3.Error as exc:
-        print(
-            "[warn] 取生效病歷模板失敗（生成側回落今天路徑）：%s: %s" % (type(exc).__name__, exc)
-        )
-        return None
 
 
 def record_section_skeleton(template_row):
