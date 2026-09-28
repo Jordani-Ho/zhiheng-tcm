@@ -11,11 +11,22 @@ import subprocess
 import sys
 
 import pytest
+from alembic.config import Config
+from alembic.script import ScriptDirectory
 
 BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BACKEND_DIR)
 
 import migrations_runner
+
+# 【CTO 批复 2026-09-28 · design §5.5 修正句】head 不再硬编码：
+# 原先两处断言写字面量 "0002_add_draft_template_refs"，任何新增 revision（如 0003）都会失败；
+# 改为从 alembic 脚本目录动态取当前 head —— 只读脚本目录，不连库、不写 alembic_version。
+# 用 backend/alembic.ini（其 script_location 由 %(here)s 锚定），故与 cwd 无关
+# （从仓库根或 backend/ 跑结果一致）。
+ALEMBIC_HEAD = ScriptDirectory.from_config(
+    Config(os.path.join(BACKEND_DIR, "alembic.ini"))
+).get_current_head()
 
 LEGACY_NAME = "施治模板（存量迁移）"
 LEGACY_SOURCE = "plan_templates"
@@ -114,7 +125,7 @@ def test_upgrade_creates_table_and_indexes(tmp_path):
     assert "UNIQUE INDEX" in partial.upper()
     assert "WHERE status = 'active'" in partial
 
-    assert _one(str(db), "SELECT version_num FROM alembic_version")["version_num"] == "0002_add_draft_template_refs"
+    assert _one(str(db), "SELECT version_num FROM alembic_version")["version_num"] == ALEMBIC_HEAD
 
 
 def test_migration_backfills_plan_template(tmp_path):
@@ -315,7 +326,7 @@ def test_migration_0002_adds_draft_template_refs(tmp_path):
     old_row = _one(str(db), "SELECT * FROM drafts WHERE patient_name = '张三'")
     assert old_row["template_id"] == 0 and old_row["template_version"] == 0   # 老数据 = 未记录
     assert old_row["content"] == "老草案"                                    # 老行内容一字不动
-    assert _one(str(db), "SELECT version_num FROM alembic_version")["version_num"] == "0002_add_draft_template_refs"
+    assert _one(str(db), "SELECT version_num FROM alembic_version")["version_num"] == ALEMBIC_HEAD
 
     # 可重跑：已在 head 再 upgrade 一次仍是 no-op（不重复加列、不报错）
     assert migrations_runner.run_upgrade(db_file=str(db)) is True

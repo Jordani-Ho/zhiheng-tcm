@@ -621,6 +621,8 @@ POST /api/transcribe / /api/upload / /api/generate-draft
 | 灰度顺序 | ① 迁移先上（flag off，零行为变化）→ ② 代码上（flag off，仍零行为变化）→ ③ 单老师 lab 打开 `AGENT_STAGE_ENABLED=on`（该老师已在 `learning`）→ ④ 观察指标卡 → ⑤ 全量 |
 | 回退顺序 | ① flag 置 off（新接口立即 404、阶段评估停止、既有链路不变）→ ② 如需回收：`alembic downgrade 0002`（删 3 张新表，保留两个快照列）→ ③ 无需回滚病历 / 模板数据（全程未触碰） |
 
+修正（2026-09-28 CTO 批复）：§5.5「test_migrations.py 零改动」的语义是「不改测试断言」。为配合 Alembic head 演进，允许将硬编码的 head 字面量改为动态查询（ScriptDirectory.from_config），属必要的健壮性打磨，不违反本节。
+
 ---
 
 ## 6. 验收与测试清单（`backend/test_agent_stage.py`，约 34 条）
