@@ -5,6 +5,9 @@ import pytest
 
 # 【关键】在导入 database/main 之前，把数据库指向 test.db
 os.environ["ZHIENG_DB"] = "test.db"
+# 【Epic 1 新增】模板接口默认关闭（设计 §5.2 第 5 条：`TEMPLATE_API_ENABLED` 默认 off、分批放量）；
+# 测试统一打开，需要验「关闭态」的用例自行 monkeypatch 成 off（test_templates.py 覆盖）。
+os.environ["TEMPLATE_API_ENABLED"] = "on"
 sys.path.insert(0, os.path.dirname(__file__))
 
 from fastapi.testclient import TestClient

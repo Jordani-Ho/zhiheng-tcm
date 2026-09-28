@@ -7,6 +7,7 @@ import lunardate
 import cnlunar
 import database
 import agent
+import template_api
 import os
 import shutil
 import uuid
@@ -39,6 +40,13 @@ except Exception as exc:  # noqa: BLE001 —— 迁移框架不可用（例如�
         "[warn] 模板迁移运行器不可用（不阻塞启动，旧链路照常）：%s: %s"
         % (type(exc).__name__, exc)
     )
+
+# 【Epic 1 新增】四類模板接口（設計 §9–§11）：`/api/templates*`（GET/POST/PUT + publish/archive/
+# activate/derive）。與舊 `/api/plan_template` 並存，舊接口一行不改（§12.4）。
+# feature flag `TEMPLATE_API_ENABLED` **默认 off**（§5.2 第 5 条）→ 全部 404，前端不渲染入口；
+# 启用：$env:TEMPLATE_API_ENABLED = "on"（PowerShell 示例）。
+app.include_router(template_api.router)
+app.add_exception_handler(database.TemplateError, template_api.template_error_handler)
 
 class TranscriptionInput(BaseModel):
     patient_name: str
