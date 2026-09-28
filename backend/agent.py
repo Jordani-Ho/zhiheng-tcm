@@ -102,8 +102,16 @@ DOCTOR_PROMPT = (
 )
 
 
-def generate_medical_draft(patient_name: str, visit_date: str, student_complaint: str, past_records: str) -> str:
-    """医生智能体入口：把学生主诉和过往病历整理成病历草案。"""
+def generate_medical_draft(patient_name: str, visit_date: str, student_complaint: str, past_records: str,
+                           section_template: str = None) -> str:
+    """医生智能体入口：把学生主诉和过往病历整理成病历草案。
+
+    【Epic 1 §12.2 新增可选参数】`section_template` = 老师生效「病历」模板的段落骨架提示
+    （`database.record_section_skeleton()` 产出的多行文本；缺省 None → 提示词与今天逐字节一致）。
+    只决定「按老师的段落顺序与标题写」，**不放宽任何禁区**：标「留待老师」的段（舌象 / 脉象 /
+    辨证 / 施治方案）智能体永不填内容（§12.2 第 4 条）。
+    LLM 调用失败时的本地兜底文本不含模板骨架（降级路径保持与今天一致）。
+    """
     import re
 
     # 【第41天修复】把图片/录音 URL 从学生内容里抽出来，Python 直接拼接，不让 LLM 处理
@@ -123,6 +131,13 @@ def generate_medical_draft(patient_name: str, visit_date: str, student_complaint
                   .replace("{visit_date}", visit_date)
                   .replace("{student_complaint}", text_only)
                   .replace("{past_records}", past_records))
+        if section_template:
+            # 【Epic 1 §12.2】老師生效「病歷」模板的段落骨架：只規定「按什麼段落順序與標題寫」，
+            # 一個字都不放寬禁區 —— 「（留待老師）」的段必須只留標題、內容留空。
+            prompt = prompt + (
+                "\n【本診室病歷段落骨架（依老師模板，段落順序照寫）】\n" + section_template +
+                "\n凡標記「（留待老師）」的段落只保留標題，內容一律留空，不要替老師補寫。\n"
+            )
         response = llm.invoke(prompt)
         llm_output = response.content
     except Exception:

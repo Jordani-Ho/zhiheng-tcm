@@ -86,6 +86,11 @@ from template_service import (  # noqa: F401  (向後兼容：模板服務層舊
     archive_template,
     derive_template_from,
     template_herb_warnings,
+    TEMPLATE_API_ENABLED_VALUES,
+    template_api_enabled,
+    get_active_record_template,
+    record_section_skeleton,
+    sync_legacy_plan_template,
 )
 
 
@@ -632,10 +637,35 @@ def get_transcriptions(patient_name=None, teacher_name=None):
     return [dict(r) for r in rows]
 
 # ---------- 病历草案相关操作 ----------
-def insert_draft(transcript_id, patient_name, teacher_name, content):
+# 【Epic 1 §12.1 / §12.2】`drafts` 的模板引用两列由迁移 0002 添加（DDL 单一真相源，init_db() 不写）；
+# 下面的探测让「迁移未跑的老库」依旧走五列 INSERT —— 旧链路行为一字不变（§12.2 第 2 条回归红线）。
+_DRAFT_TEMPLATE_REF_COLUMNS = ("template_id", "template_version")
+
+
+def _drafts_supports_template_refs(conn):
+    """`drafts.template_id / template_version` 是否就位（迁移 0002 未跑 / drafts 未建 → False）。"""
+    try:
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info('drafts')")}
+    except sqlite3.Error:
+        return False
+    return set(_DRAFT_TEMPLATE_REF_COLUMNS) <= columns
+
+
+def insert_draft(transcript_id, patient_name, teacher_name, content, template_id=0, template_version=0):
+    """新增病历草案，返回 draft_id。
+
+    【Epic 1 §12.2 第 1 条】前四个位置参数**不变**：老调用方（`seed_test_data.py` 等）原样可跑，
+    新增的 `template_id` / `template_version` 缺省 0 = 未记录（老数据 / 无模板生成）。
+    """
     conn = get_connection()
-    cursor = conn.execute("INSERT INTO drafts (transcript_id, patient_name, teacher_name, content, signed) VALUES (?, ?, ?, ?, ?)",
-                          (transcript_id, patient_name, teacher_name, content, 0))
+    if _drafts_supports_template_refs(conn):
+        cursor = conn.execute(
+            "INSERT INTO drafts (transcript_id, patient_name, teacher_name, content, signed, "
+            "template_id, template_version) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (transcript_id, patient_name, teacher_name, content, 0, template_id or 0, template_version or 0))
+    else:
+        cursor = conn.execute("INSERT INTO drafts (transcript_id, patient_name, teacher_name, content, signed) VALUES (?, ?, ?, ?, ?)",
+                              (transcript_id, patient_name, teacher_name, content, 0))
     conn.execute("UPDATE transcriptions SET processed = 1 WHERE id = ?", (transcript_id,))
     conn.commit()
     draft_id = cursor.lastrowid
@@ -1556,7 +1586,14 @@ def get_plan_template(teacher_name):
 
 
 def save_plan_template(teacher_name, content):
-    """保存 / 覆盖该老师的“施治方案”模板（teacher_name 唯一：有则 UPDATE，无则 INSERT）。"""
+    """保存 / 覆盖该老师的“施治方案”模板（teacher_name 唯一：有则 UPDATE，无则 INSERT）。
+
+    【Epic 1 §5.2 第 4 条 / §12.4】本通道自此是「遗留写入通道」，采用 best-effort 两段式：
+    ① 先写 `plan_templates` 并 COMMIT —— 旧接口的成功 100% 不依赖模板表，行为与今天一字不差；
+    ② 再调 `template_service.sync_legacy_plan_template()` 单向双写 `templates`
+       （同 scope 无 draft → 派生 v2 草稿，不原地改 active；永不反向回写 `plan_templates`）；
+    ③ 双写失败（例如 `templates` 表缺失 / 库被锁）**只打日志**，绝不改变本函数的返回值。
+    """
     conn = get_connection()
     cur = conn.cursor()
     now = datetime.now().isoformat()
@@ -1570,6 +1607,17 @@ def save_plan_template(teacher_name, content):
                     (teacher_name, content or "", now))
     conn.commit()
     conn.close()
+
+    # 第二段：best-effort 双写（flag off 时 sync 内部直接返回 None，不做任何读写）
+    try:
+        import template_service  # 函数内延迟导入：与文件顶部的 re-export 同源，不新增 import 期依赖
+
+        template_service.sync_legacy_plan_template(teacher_name, content)
+    except Exception as exc:  # noqa: BLE001 —— legacy 通道必须容忍模板侧任何异常（§12.4）
+        print(
+            "[warn] 施治模板双写 templates 失败（不影响旧接口返回）：%s: %s"
+            % (type(exc).__name__, exc)
+        )
     return True
 
 

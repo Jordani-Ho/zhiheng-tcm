@@ -1,16 +1,19 @@
-"""【Epic 1】四類模板 CRUD / 校驗層 / 狀態機 守護測試
+"""【Epic 1】四類模板 CRUD / 校驗層 / 狀態機 / 生成接入 / 舊接口雙寫 守護測試
 
-覆蓋設計 §9（四類 schema_json 字段級契約）、§10（CRUD 接口）、§11（發佈 / 歸檔 / 派生），
-以及 §14.1 測試清單的 B / C / D / E 組與 F 組中屬於本子任務的三條（兼容 / 零回溯 / flag off）。
+覆蓋設計 §9（四類 schema_json 字段級契約）、§10（CRUD 接口）、§11（發佈 / 歸檔 / 派生）、
+§12.2（生成接入：`drafts.template_id/template_version`）、§12.4（legacy 兼容 + 單向雙寫），
+以及 §14.1 測試清單的 B / C / D / E / G 組與 F 組。
 
 運行方式：
     cd backend
     ..\\venv\\Scripts\\python.exe -m pytest test_templates.py -v
 
 前置：`conftest.py` 已把 `TEMPLATE_API_ENABLED` 置為 `on`（默認 off 的分支由
-`test_templates_flag_off_returns_404` 自行 monkeypatch 覆蓋）。
+`test_templates_flag_off_returns_404` / `test_legacy_write_does_not_touch_templates_when_flag_off`
+自行 monkeypatch 覆蓋）。
 """
 import json
+import re
 
 import agent
 import database
@@ -434,6 +437,108 @@ def test_legacy_plan_template_api_unchanged(client):
     assert row["content"] == "疏肝理氣，健脾和胃。"
 
 
+def _insert_legacy_active_template(teacher=TEACHER, content="存量施治模板內容"):
+    """造一條「遷移 0001 回填行」形狀的 active（`meta.legacy_source='plan_templates'`、v1），
+    給雙寫用例一個真實起點（回填形狀本身由 `test_migrations.py` 守護）。"""
+    conn = database.get_connection()
+    now = "2026-09-01T10:00:00"
+    conn.execute(
+        "INSERT INTO templates (type, lineage_id, teacher_id, name, schema_json, version, "
+        "parent_template_id, status, created_at, updated_at) "
+        "VALUES ('treatment', '', ?, ?, ?, 1, NULL, 'active', ?, ?)",
+        (teacher, "施治模板（存量迁移）",
+         json.dumps({"version": 1, "format": "text", "content": content, "placeholders": [],
+                     "meta": {"legacy_source": "plan_templates"}}, ensure_ascii=False), now, now),
+    )
+    conn.commit()
+    row = dict(conn.execute(
+        "SELECT * FROM templates WHERE teacher_id = ? AND type = 'treatment'", (teacher,)).fetchone())
+    conn.close()
+    return row
+
+
+def _scope_rows(teacher=TEACHER, template_type="treatment", status=None):
+    conn = database.get_connection()
+    sql = "SELECT * FROM templates WHERE teacher_id = ? AND type = ?"
+    params = [teacher, template_type]
+    if status:
+        sql += " AND status = ?"
+        params.append(status)
+    rows = [dict(r) for r in conn.execute(sql + " ORDER BY version", params)]
+    conn.close()
+    return rows
+
+
+def test_legacy_write_dual_write_creates_draft_v2(client):
+    """§5.2 第 4 條 / §12.4：flag on 時舊接口寫庫 → 同 scope 出現 `draft` v2，`active` 一字不改。"""
+    active = _insert_legacy_active_template()
+
+    r = client.post("/api/plan_template", json={"teacher_name": TEACHER, "content": "新口徑：疏肝理氣，佐以健脾。"})
+    assert r.status_code == 200 and r.json() == {"ok": True}
+
+    drafts = _scope_rows(status="draft")
+    active_now = _scope_rows(status="active")
+    assert len(drafts) == 1
+    draft = drafts[0]
+    assert draft["version"] == 2
+    assert draft["parent_template_id"] == active["id"]
+    assert draft["status"] == "draft"
+    assert json.loads(draft["schema_json"])["content"] == "新口徑：疏肝理氣，佐以健脾。"
+    # 「存量遷移」標籤只屬於回填行：派生草稿的內容是老師寫的，不算遷移行
+    assert "legacy_source" not in json.loads(draft["schema_json"])["meta"]
+
+    # active 是凍結快照（§3.3）：內容 / 版本 / updated_at 全不動
+    assert len(active_now) == 1
+    assert active_now[0]["id"] == active["id"]
+    assert active_now[0]["schema_json"] == active["schema_json"]
+    assert active_now[0]["updated_at"] == active["updated_at"]
+
+    # 再寫一次 → 複用同一份草稿原地更新（不派生 v3），active 仍不動
+    r = client.post("/api/plan_template", json={"teacher_name": TEACHER, "content": "第三次口徑。"})
+    assert r.status_code == 200 and r.json() == {"ok": True}
+    drafts = _scope_rows(status="draft")
+    assert len(drafts) == 1 and drafts[0]["version"] == 2
+    assert json.loads(drafts[0]["schema_json"])["content"] == "第三次口徑。"
+    assert _scope_rows(status="active")[0]["schema_json"] == active["schema_json"]
+
+    # 單向：舊接口只讀 plan_templates（永不反向），新接口能讀到同步後的草稿
+    assert client.get("/api/plan_template", params={"teacher_name": TEACHER}).json() == {"content": "第三次口徑。"}
+    assert client.get("/api/templates/active", params=_auth(type="treatment")).json()["template"]["schema_json"]["content"] \
+        == "存量施治模板內容"
+
+
+def test_legacy_write_does_not_touch_templates_when_flag_off(client, monkeypatch):
+    """§5.2 第 5 條：flag off → 舊接口行為與今天 1:1，`templates` 一行都不寫、一個字都不讀。"""
+    monkeypatch.setenv("TEMPLATE_API_ENABLED", "off")
+    _insert_legacy_active_template()
+
+    r = client.post("/api/plan_template", json={"teacher_name": TEACHER, "content": "flag off 寫入。"})
+    assert r.status_code == 200 and r.json() == {"ok": True}
+
+    assert database.get_plan_template(TEACHER) == "flag off 寫入。"
+    rows = _scope_rows()
+    assert [row["status"] for row in rows] == ["active"]      # 沒有新草稿
+    assert len(rows) == 1 and json.loads(rows[0]["schema_json"])["content"] == "存量施治模板內容"
+
+
+def test_legacy_write_succeeds_when_templates_broken(client, capsys):
+    """§12.4：`templates` 不可用（例如遷移未跑 / 表被動過）→ 舊接口仍 200，僅日誌告警。"""
+    conn = database.get_connection()
+    conn.execute("ALTER TABLE templates RENAME TO templates_hidden")
+    conn.commit()
+    conn.close()
+
+    r = client.post("/api/plan_template", json={"teacher_name": TEACHER, "content": "舊接口照常寫入。"})
+    assert r.status_code == 200 and r.json() == {"ok": True}
+
+    # 舊表照寫、照讀（舊接口行為 100% 不變）
+    assert database.get_plan_template(TEACHER) == "舊接口照常寫入。"
+    assert client.get("/api/plan_template", params={"teacher_name": TEACHER}).json() == {"content": "舊接口照常寫入。"}
+
+    out = capsys.readouterr().out
+    assert "[warn]" in out and "双写" in out        # 只有日誌告警，沒有拋出、沒有 500
+
+
 def test_template_archive_does_not_touch_history(client):
     """§4.4 / §14.1 F：發布 v2、v1 轉歸檔後，引用 v1 的草案與已簽病歷逐字節不變。"""
     v1_id, v1_payload = _published(client, "treatment")
@@ -484,6 +589,126 @@ def test_templates_flag_off_returns_404(client, monkeypatch):
         r = getattr(client, method)(url, json=_auth(type="inquiry"))
         assert r.status_code == 404, (url, r.text)
         assert r.json()["detail"]["error"] == "templates_disabled"
+
+
+# ============ G. 生成接入（§12.2：drafts.template_id / template_version）============
+
+def _link_transcript(patient_name="张三", teacher_name=TEACHER, content="主诉：头痛三天，夜寐不安。"):
+    """直接落一條轉述（繞過會調 LLM 的 `/api/transcribe`），只為給 `/api/generate-draft` 一個 id。"""
+    database.insert_transcription(patient_name, teacher_name, content, "text")
+    return database.get_transcriptions(patient_name, teacher_name)[0]["id"]
+
+
+def _draft_row(draft_id):
+    conn = database.get_connection()
+    row = dict(conn.execute("SELECT * FROM drafts WHERE id = ?", (draft_id,)).fetchone())
+    conn.close()
+    return row
+
+
+def test_generate_draft_records_template_ref(client):
+    """有 active `record` 模板 → 草案兩列 = 模板行列值；`GET /api/drafts` 只增不改（§12.2）。"""
+    template_id, published = _published(client, "record")
+    assert published["template"]["version"] == 1
+    assert published["template"]["status"] == "active"
+
+    transcript_id = _link_transcript()
+    r = client.post("/api/generate-draft", params={"transcript_id": transcript_id})
+    assert r.status_code == 200, r.text
+    draft_id = r.json()["draft_id"]
+
+    row = _draft_row(draft_id)
+    assert (row["template_id"], row["template_version"]) == (template_id, 1)
+
+    listed = client.get("/api/drafts", params={"teacher_name": TEACHER}).json()
+    assert [d["id"] for d in listed] == [draft_id]
+    assert listed[0]["template_id"] == template_id
+    assert listed[0]["template_version"] == 1
+    # 只增不改：老前端讀的老鍵一個不少
+    assert {"id", "transcript_id", "patient_name", "teacher_name", "content", "signed"} <= set(listed[0].keys())
+
+
+def test_generate_draft_without_template_unchanged(client):
+    """無 active 模板 → 輸出與改動前的 `build_draft_template` 黃金文本逐字節一致，兩列落 0。"""
+    _published(client, "treatment")        # 別類型的模板不算：生成接入只認 `record`（§12.2）
+    transcript_id = _link_transcript()
+
+    r = client.post("/api/generate-draft", params={"transcript_id": transcript_id})
+    assert r.status_code == 200, r.text
+    row = _draft_row(r.json()["draft_id"])
+
+    date_str = re.search(r"就诊时间：(\d{4}年\d{1,2}月\d{1,2}日)", row["content"]).group(1)
+    golden = "\n".join([
+        "【中医病历草案】",
+        "学生姓名：张三",
+        "就诊时间：" + date_str,
+        "",
+        "【主诉（学生原话）】",
+        "主诉：头痛三天，夜寐不安。",
+        "",
+        "【既往病历参考】",
+        "暂无过往病历",
+        "",
+        "【待老师补充】",
+        "- 舌象：",
+        "- 脉象：",
+        "- 辨证：",
+        "- 施治方案：",
+    ])
+    assert row["content"] == golden
+    assert (row["template_id"], row["template_version"]) == (0, 0)
+
+    # §12.2 第 2 條：schema 版本不支持（手改庫的髒數據）→ 同樣回落今天路徑、兩列落 0
+    broken_id, _ = _published(client, "record")
+    broken_schema = database.get_active_template(TEACHER, "record")["schema_json"]
+    broken_schema["version"] = database.TEMPLATE_SCHEMA_VERSION + 98
+    conn = database.get_connection()
+    conn.execute("UPDATE templates SET schema_json = ? WHERE id = ?",
+                 (json.dumps(broken_schema, ensure_ascii=False), broken_id))
+    conn.commit()
+    conn.close()
+
+    transcript_id = _link_transcript(content="主诉：咳嗽一周，痰白。")
+    r = client.post("/api/generate-draft", params={"transcript_id": transcript_id})
+    assert r.status_code == 200, r.text
+    row = _draft_row(r.json()["draft_id"])
+    assert "主诉：咳嗽一周，痰白。" in row["content"]
+    assert (row["template_id"], row["template_version"]) == (0, 0)
+
+
+def test_insert_draft_backward_compatible(client):
+    """§12.2 第 1 條：老調用方簽名（4 個位置參數）照跑，兩列落 0，簽字鏈路不受影響。"""
+    draft_id = database.insert_draft(0, "张三", TEACHER, "老調用方寫入的草案")
+    row = _draft_row(draft_id)
+    assert row["content"] == "老調用方寫入的草案"
+    assert (row["template_id"], row["template_version"]) == (0, 0)
+
+    database.sign_draft(draft_id, "依原樣落庫")
+    assert database.get_patient_records("张三", TEACHER)[0]["final_plan"] == "依原樣落庫"
+
+
+def test_inquiry_template_not_wired_in_epic1(client, monkeypatch):
+    """§15 第 4 條：Epic 1 的 `inquiry` 模板只存不用 —— 學生端追問輸出不受影響。"""
+    class _NoLLM:
+        """本用例不允許真實 LLM 調用：只能暴露「十問歌靜態兜底」（證明追問鏈路沒讀模板）。"""
+
+        def invoke(self, prompt):
+            raise RuntimeError("Epic 1 不接管學生端追問")
+
+    monkeypatch.setattr(agent, "llm", _NoLLM())
+    body = {"patient_name": "张三", "current_answers": ""}
+
+    before = client.post("/api/agent/ask_next_question", json=body)
+    assert before.status_code == 200, before.text
+    assert before.json() == {"question": agent.TEN_QUESTIONS[0][1], "done": False}
+
+    schema = _publishable("inquiry")
+    schema["fields"][0]["ask"] = "（模板口徑）你最近怕冷多一點還是怕熱多一點？"
+    _published(client, "inquiry", schema)
+
+    after = client.post("/api/agent/ask_next_question", json=body)
+    assert after.status_code == 200, after.text
+    assert after.json() == before.json() == {"question": agent.TEN_QUESTIONS[0][1], "done": False}
 
 
 # ============ I. 校驗層（§9：只攔截、絕不清洗）============

@@ -12,6 +12,7 @@
        與前端 `HERB_ROLES` / `COOKING_METHODS` 同步），本模組只讀不寫、且**不清洗**（§9.4）。
 """
 import json
+import os
 import re
 import sqlite3
 from datetime import datetime
@@ -889,3 +890,151 @@ def template_herb_warnings(teacher_name, schema_obj):
         seen.add(herb_name)
         warnings.append({"code": "herb_not_in_inventory", "herb_name": herb_name})
     return warnings
+
+
+# ---------- 生成接入與 legacy 雙寫（§12.2 / §12.4）----------
+
+# feature flag 取值語義（與 template_api.py 的 `_enabled()` 同一套；默認 off，§5.2 第 5 條）
+TEMPLATE_API_ENABLED_VALUES = ("on", "1", "true", "yes")
+
+
+def template_api_enabled():
+    """`TEMPLATE_API_ENABLED` 每次調用現讀（便於灰度切換 / 測試，不必重啟）。**默認 off。**
+
+    這是兩條「非接口」路徑的唯一閘門（與 `/api/templates*` 的 404 同一語義，§5.2 第 5 條）：
+      · 舊寫入通道的單向雙寫（`sync_legacy_plan_template`，§12.4）；
+      · 生成接入取生效 `record` 模板（`get_active_record_template`，§12.2）。
+    flag off = 與今天 1:1：不讀 `templates`、不寫 `templates`、生成輸出一字不改。
+    """
+    return os.environ.get("TEMPLATE_API_ENABLED", "off").strip().lower() in TEMPLATE_API_ENABLED_VALUES
+
+
+def get_active_record_template(teacher_name):
+    """§12.2：生成前取該老師生效的 `record` 模板（`None` = **走今天的既有路徑**，§3.4）。
+
+    降級口徑（任一命中即返回 None，不拋異常、不打斷生成）：
+      flag off / `templates` 表未就緒（遷移未跑）/ 該 scope 無 `active` / 讀庫異常（表被改名、庫被鎖）/
+      `schema_json.version` 非本版本支持的 `TEMPLATE_SCHEMA_VERSION`（§12.2 第 2 條：版本不支持也走今天路徑）。
+    """
+    if not template_api_enabled():
+        return None
+    try:
+        if not template_store_ready():
+            return None
+        row = get_active_template(teacher_name, "record")
+        if row is None:
+            return None
+        schema_obj = row.get("schema_json")
+        if not isinstance(schema_obj, dict) or schema_obj.get("version") != TEMPLATE_SCHEMA_VERSION:
+            print(
+                "[warn] 病歷模板 schema 版本不受支持（生成側回落今天路徑）：template_id=%s"
+                % row.get("id")
+            )
+            return None
+        return row
+    except sqlite3.Error as exc:
+        print(
+            "[warn] 取生效病歷模板失敗（生成側回落今天路徑）：%s: %s" % (type(exc).__name__, exc)
+        )
+        return None
+    except sqlite3.Error as exc:
+        print(
+            "[warn] 取生效病歷模板失敗（生成側回落今天路徑）：%s: %s" % (type(exc).__name__, exc)
+        )
+        return None
+
+
+def record_section_skeleton(template_row):
+    """§12.2：active `record` 模板 → 交給生成智能體的「段落骨架提示」文本（多行）。
+
+    `writable_by='teacher'` 的段一律標註「（留待老師）」：AI 永不填舌象 / 脈象 / 辨證 / 施治方案
+    （憲法硬約束，§12.2 第 4 條）。`template_row` 形狀不對 / 無有效段落 → 空串（＝生成側一個字都不加）。
+    """
+    schema_obj = (template_row or {}).get("schema_json")
+    if not isinstance(schema_obj, dict):
+        return ""
+    lines = []
+    for section in schema_obj.get("sections") or []:
+        if not isinstance(section, dict):
+            continue
+        title = section.get("title") or section.get("key") or ""
+        if not title:
+            continue
+        lines.append("- %s%s" % (title, "（留待老師）" if section.get("writable_by") == "teacher" else ""))
+    return "\n".join(lines)
+
+
+def sync_legacy_plan_template(teacher_name, content):
+    """§5.2 第 4 條 / §12.4：legacy 通道（`plan_templates`）→ 新表（`templates`）單向雙寫，**永不反向**。
+
+    調用前提：`plan_templates` 已寫入並 `COMMIT`（舊接口的成功已 100% 落地）。本函數的異常
+    **由調用方 catch 成日誌告警**（§12.4：`templates` 壞掉不能連帶舊接口 500）。返回 dict 或 None：
+
+    · flag off → None（今天行為 1:1，一個字都不寫）；
+    · 同 scope 已有 `draft` → **原地更新**該草稿的 `schema_json.content`（草稿可變，§3.3），
+      其餘鍵（placeholders / 未知鍵）原樣保留；
+    · 同 scope 無 `draft` → **派生新草稿**（`active` 是凍結快照，永不原地改，§3.3）：
+      父 = 同 scope 的 `active`（若有，含存量回填行），`version = max(父+1, 鏈內 max+1)`；
+      無 `active` 則為該 scope 首版（`name` = 類型顯示名「施治」）；
+    · `content` 為空且無 `draft` → None（與 `get_plan_template` 的空語義一致：空 = 沒有模板；
+      但**已有草稿**時仍同步為空 —— 老師清空後，新接口看到的也是空草稿）。
+
+    派生行的 `meta.legacy_source` 會被移除：「存量遷移」標籤只屬於遷移 0001 的回填行，
+    這條草稿的內容是老師在舊鏈路上寫的，不該被標成遷移行。
+    """
+    if not template_api_enabled():
+        return None
+
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        now = datetime.now().isoformat()
+
+        draft = _find_scope_draft(cur, teacher_name, "treatment")
+        if draft is not None:
+            schema_obj = parse_template_schema(draft["schema_json"])
+            schema_obj["content"] = content or ""
+            cur.execute(
+                "UPDATE templates SET schema_json = ?, updated_at = ? WHERE id = ?",
+                (serialize_template_schema(schema_obj), now, draft["id"]),
+            )
+            conn.commit()
+            return {"draft_id": draft["id"], "version": draft["version"], "derived": False}
+
+        if not (content or "").strip():
+            return None
+
+        active = cur.execute(
+            "SELECT * FROM templates WHERE " + _SCOPE_WHERE + " AND status = 'active' "
+            "ORDER BY version DESC, id DESC LIMIT 1",
+            ("", teacher_name, "treatment"),
+        ).fetchone()
+        if active is not None:
+            schema_obj = parse_template_schema(active["schema_json"])
+            parent_id = active["id"]
+            version = max(active["version"] + 1, _scope_max_version(cur, teacher_name, "treatment") + 1)
+            name = active["name"]
+        else:
+            schema_obj = default_template_schema("treatment")
+            parent_id = None
+            version = _scope_max_version(cur, teacher_name, "treatment") + 1
+            name = TEMPLATE_TYPE_LABELS["treatment"]
+
+        meta = schema_obj.get("meta")
+        if isinstance(meta, dict):
+            # 「存量遷移」標籤的判定鍵是 `meta.legacy_source`（見 `_template_row_to_dict()` 的 is_legacy）：
+            # 派生草稿的內容是老師在舊鏈路寫的，去掉這個鍵才不會被標成回填行。
+            meta.pop("legacy_source", None)
+        schema_obj["content"] = content
+
+        cur.execute(
+            "INSERT INTO templates (type, lineage_id, teacher_id, name, schema_json, version, "
+            "parent_template_id, status, created_at, updated_at) "
+            "VALUES ('treatment', '', ?, ?, ?, ?, ?, 'draft', ?, ?)",
+            (teacher_name, name, serialize_template_schema(schema_obj), version, parent_id, now, now),
+        )
+        new_id = cur.lastrowid
+        conn.commit()
+        return {"draft_id": new_id, "version": version, "derived": True}
+    finally:
+        conn.close()

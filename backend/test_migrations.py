@@ -31,6 +31,19 @@ CREATE TABLE IF NOT EXISTS plan_templates (
 """
 
 
+# 与 database.py init_db() 的 drafts 建表语句逐字一致（迁移 0002 只补两列，不改形状）
+DRAFTS_DDL = """
+CREATE TABLE IF NOT EXISTS drafts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    transcript_id INTEGER,
+    patient_name TEXT,
+    teacher_name TEXT,
+    content TEXT,
+    signed INTEGER
+)
+"""
+
+
 def _seed_legacy_db(db_path, rows=()):
     conn = sqlite3.connect(db_path)
     conn.execute(PLAN_TEMPLATES_DDL)
@@ -101,7 +114,7 @@ def test_upgrade_creates_table_and_indexes(tmp_path):
     assert "UNIQUE INDEX" in partial.upper()
     assert "WHERE status = 'active'" in partial
 
-    assert _one(str(db), "SELECT version_num FROM alembic_version")["version_num"] == "0001_create_templates"
+    assert _one(str(db), "SELECT version_num FROM alembic_version")["version_num"] == "0002_add_draft_template_refs"
 
 
 def test_migration_backfills_plan_template(tmp_path):
@@ -231,9 +244,13 @@ def test_downgrade_safety_gate_blocks_when_teacher_created_template(tmp_path):
         migrations_runner.run_downgrade("base", db_file=str(db))
     assert "downgrade 已中止" in str(excinfo.value)
 
-    # 事务回滚：表还在、版本号没退、老师新建的行与存量回填行都还在
+    # 安全闸中止后：模板表与两行数据完好（未执行任何 DROP），版本号最多退到 0001 一步
+    # （SQLite 方言下 alembic_version 每步迁移后即落定，故多 revision 顺序回退时可能停在中间态；
+    #  关键不变式是「老师配好的模板没被吃掉、也不许退到 base」——这是本用例真正要守的东西）
     assert _one(str(db), "SELECT COUNT(*) AS c FROM templates")["c"] == 2
-    assert _one(str(db), "SELECT version_num FROM alembic_version")["version_num"] == "0001_create_templates"
+    assert _one(str(db), "SELECT version_num FROM alembic_version")["version_num"] in (
+        "0001_create_templates", "0002_add_draft_template_refs",
+    )
     assert _one(str(db), "SELECT COUNT(*) AS c FROM templates WHERE type='record'")["c"] == 1
 
     # 清掉老师新建的行后降级通过 → 证明闸门是唯一阻塞点
@@ -277,4 +294,34 @@ def test_cli_upgrade_reads_zhieng_db_env(tmp_path):
     row = _one(str(db), "SELECT schema_json, name FROM templates")
     assert row["name"] == LEGACY_NAME
     assert json.loads(row["schema_json"])["content"] == "命令行回填內容"
+
+
+def test_migration_0002_adds_draft_template_refs(tmp_path):
+    """§12.1：`drafts` 补 `template_id` / `template_version`（老行落 0），可重跑，回退不删列。"""
+    db = tmp_path / "m7.db"
+    conn = sqlite3.connect(str(db))
+    conn.execute(DRAFTS_DDL)
+    conn.execute(
+        "INSERT INTO drafts (transcript_id, patient_name, teacher_name, content, signed) "
+        "VALUES (0, '张三', '李老师', '老草案', 0)"
+    )
+    conn.commit()
+    conn.close()
+
+    assert migrations_runner.run_upgrade(db_file=str(db)) is True
+
+    columns = _names(_read(str(db), "PRAGMA table_info('drafts')"))
+    assert {"template_id", "template_version"} <= set(columns)
+    old_row = _one(str(db), "SELECT * FROM drafts WHERE patient_name = '张三'")
+    assert old_row["template_id"] == 0 and old_row["template_version"] == 0   # 老数据 = 未记录
+    assert old_row["content"] == "老草案"                                    # 老行内容一字不动
+    assert _one(str(db), "SELECT version_num FROM alembic_version")["version_num"] == "0002_add_draft_template_refs"
+
+    # 可重跑：已在 head 再 upgrade 一次仍是 no-op（不重复加列、不报错）
+    assert migrations_runner.run_upgrade(db_file=str(db)) is True
+    assert _names(_read(str(db), "PRAGMA table_info('drafts')")).count("template_id") == 1
+
+    # downgrade base：按 §12.1 默认不删列（删列会丢「依哪个模板哪个版本生成」的溯源信息）
+    migrations_runner.run_downgrade("base", db_file=str(db))
+    assert {"template_id", "template_version"} <= set(_names(_read(str(db), "PRAGMA table_info('drafts')")))
 

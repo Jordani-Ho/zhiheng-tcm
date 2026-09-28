@@ -547,9 +547,45 @@ def get_plan_template(teacher_name: str):
 
 @app.post("/api/plan_template")
 def save_plan_template(input_data: PlanTemplateInput):
-    """保存 / 覆盖该老师的施治方案模板（teacher_name 唯一），返回 {\"ok\": true}。"""
+    """保存 / 覆盖该老师的施治方案模板（teacher_name 唯一），返回 {\"ok\": true}。
+
+    【Epic 1 §12.4】本接口自身一行未改；新增的「单向双写 templates（派生 v2 草稿）」在
+    `database.save_plan_template()` 内部 best-effort 完成（失败只打日志，旧接口照常 200）。
+    """
     database.save_plan_template(input_data.teacher_name, input_data.content)
     return {"ok": True}
+
+
+# ============ 【Epic 1 §12.2】草案生成接入 `template_id + template_version` ============
+# 铁律：flag off / `templates` 表未就绪 / 无 active `record` 模板 / 任何读库异常 →
+#       `database.get_active_record_template()` 返回 None，三条生成路径**输出与今天逐字节一致**
+#       （§12.2 第 2 条回归红线），`insert_draft` 两列落 0。
+
+def _record_template_ref(record_template):
+    """active 模板行 → `(template_id, template_version)`；无模板 / 形状异常 → `(0, 0)`。"""
+    if not isinstance(record_template, dict):
+        return 0, 0
+    return int(record_template.get("id") or 0), int(record_template.get("version") or 0)
+
+
+def _generate_and_store_llm_draft(transcript_id, patient_name, teacher_name, content_desc, past_content):
+    """LLM 路径的生成接入（`/api/transcribe` 与 `/api/upload` 图片分支共用，§12.2）。
+
+    有生效 `record` 模板 → 把段落骨架提示交给智能体（`agent` 的可选参数）；
+    无模板 → **与今天逐字节相同的四参调用**（`test_api.py` 的四参猴补丁不受影响，§12.2 第 2 条）。
+    最后把 `(template_id, template_version)` 一起落进 `drafts`。返回 draft_id。
+    """
+    visit_date = datetime.now().strftime('%Y年%m月%d日')
+    record_template = database.get_active_record_template(teacher_name)
+    if record_template is not None:
+        template = agent.generate_medical_draft(
+            patient_name, visit_date, content_desc, past_content,
+            section_template=database.record_section_skeleton(record_template))
+    else:
+        template = agent.generate_medical_draft(patient_name, visit_date, content_desc, past_content)
+    template_id, template_version = _record_template_ref(record_template)
+    return database.insert_draft(transcript_id, patient_name, teacher_name, template.strip(),
+                                 template_id, template_version)
 
 @app.post("/api/transcribe")
 def transcribe(input_data: TranscriptionInput):
@@ -568,9 +604,8 @@ def transcribe(input_data: TranscriptionInput):
     # 【第41天修复】学生端已做过结构化，后端不再调 structurize，直接交给老师智能体
     content_desc = str(latest['content'])
 
-    visit_date = datetime.now().strftime('%Y年%m月%d日')
-    template = agent.generate_medical_draft(patient_name, visit_date, content_desc, past_content)
-    database.insert_draft(latest['id'], patient_name, teacher_name, template.strip())
+    # 【Epic 1 §12.2】生成接入：有生效「病歷」模板 → 段落骨架提示 + 记 (template_id, version)
+    _generate_and_store_llm_draft(latest['id'], patient_name, teacher_name, content_desc, past_content)
 
     return {"message": "转述成功，病历草案已自动生成"}
 
@@ -590,9 +625,8 @@ async def upload_image(patient_name: str = "张三", teacher_name: str = "李老
         past_records = database.get_patient_records(patient_name, teacher_name)
         past_content = "\n".join([f"- {r['final_plan']}" for r in past_records]) if past_records else "暂无过往病历"
         content_desc = "[学生上传了图片：" + file_url + "]"
-        visit_date = datetime.now().strftime('%Y年%m月%d日')
-        template = agent.generate_medical_draft(patient_name, visit_date, content_desc, past_content)
-        database.insert_draft(latest['id'], patient_name, teacher_name, template.strip())
+        # 【Epic 1 §12.2】与上传音路径同一套生成接入（段落骨架 + template_id/version）
+        _generate_and_store_llm_draft(latest['id'], patient_name, teacher_name, content_desc, past_content)
 
     return {"message": "图片转述成功", "url": file_url}
 
@@ -634,7 +668,12 @@ def generate_draft(transcript_id: int):
     else:
         content_desc = str(transcript['content'])
     template = build_draft_template(patient_name, content_desc, past_content)
-    draft_id = database.insert_draft(transcript_id, patient_name, teacher_name, template.strip())
+    # 【Epic 1 §12.2】此路径是纯本地骨架（无 LLM）→ **输出与今天逐字节一致**，只额外记生成引用；
+    # 模板骨架提示只作用于 LLM 路径（`section_template` 是给智能体的，不是本地骨架的替换）。
+    record_template = database.get_active_record_template(teacher_name)
+    template_id, template_version = _record_template_ref(record_template)
+    draft_id = database.insert_draft(transcript_id, patient_name, teacher_name, template.strip(),
+                                    template_id, template_version)
     return {"message": "病历草案生成成功", "draft_id": draft_id}
 
 @app.get("/api/drafts")
