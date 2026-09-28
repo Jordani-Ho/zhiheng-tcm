@@ -1,0 +1,14 @@
+﻿banner 0-based line = 1545 | 1-based = 1546
+   1543 | 
+   1544 | 
+   1545 | # ============================================================================
+   1546 | # 【Epic 1 新增】四類模板（templates）：白名單 / 默認骨架 / 校驗層 / 存取與狀態機
+   1547 | # ============================================================================
+   1548 | # 對齊：docs/epic1-template-design-v1.md §3（狀態機）、§4（版本規則）、§9（四類 schema_json
+block_start(1-based) = 1545 | total lines = 2392
+
+[需從 database.py 取得] : ['PRESCRIPTION_COOKING_METHODS', 'PRESCRIPTION_ROLES', 'get_connection', 'items', 'name']
+
+[既非本區塊、也非前置定義] : ['amount_key', 'base', 'code', 'datetime', 'exc', 'exclude_id', 'include_schema', 'json', 'lineage_id', 'max_items', 'max_len', 'min_items', 'min_len', 'msg', 'node', 'parent_template_id', 're', 'required', 'self', 'source_id', 'sqlite3', 'status', 'teacher_id', 'teacher_name', 'template_id', 'template_type', 'unique_fields', 'validator']
+
+[前置定義清單中含 herbs / role 常量者] : ['PRESCRIPTION_COOKING_METHODS', 'PRESCRIPTION_ROLES']
