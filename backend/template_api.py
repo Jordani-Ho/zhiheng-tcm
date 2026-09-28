@@ -20,13 +20,18 @@
     $env:TEMPLATE_API_ENABLED = "on"    # 不設或 off = 全部 404，走舊鏈路
 """
 import os
-from typing import Any, Optional
+from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict, Field
 
 import database
+from models import (
+    TemplateActionInput,
+    TemplateCreateInput,
+    TemplateDeriveInput,
+    TemplateUpdateInput,
+)
 
 router = APIRouter(prefix="/api/templates", tags=["templates"])
 
@@ -122,41 +127,7 @@ def _warnings_for(row):
 
 
 # ---------- 請求體（POST/PUT 走 body 帶 teacher_name / teacher_id，§10.1）----------
-
-class TemplateCreateInput(BaseModel):
-    # 欄位名故意不叫 `schema_json`：那會遮蔽 `BaseModel.schema_json`（pydantic 會發 UserWarning）。
-    # 對外仍用別名 `schema_json`，請求體結構與設計 §10.1 一字不差。
-    model_config = ConfigDict(populate_by_name=True)
-
-    teacher_name: str
-    teacher_id: str
-    type: str
-    name: str = ""
-    # 故意用 Any：結構不合法由校驗層回 400 schema_invalid（而不是 FastAPI 的 422）
-    template_schema: Any = Field(default=None, alias="schema_json")
-    lineage_id: str = ""
-
-
-class TemplateUpdateInput(BaseModel):
-    model_config = ConfigDict(populate_by_name=True)
-
-    teacher_name: str
-    teacher_id: str
-    # None = 「本次不改」。只允許改這兩個鍵（§10.1：不提供改 type / teacher_id / … 的通用 PUT）
-    name: Optional[str] = None
-    template_schema: Any = Field(default=None, alias="schema_json")
-
-
-class TemplateActionInput(BaseModel):
-    teacher_name: str
-    teacher_id: str
-
-
-class TemplateDeriveInput(TemplateActionInput):
-    name: Optional[str] = None
-    parent_template_id: Optional[int] = None
-    lineage_id: str = ""
-
+# 已抽至 backend/models.py（純結構重構，請求體一字不改；舊入口 `database.Template*Input` 亦保留）
 
 # ---------- 1. 列表 ----------
 
