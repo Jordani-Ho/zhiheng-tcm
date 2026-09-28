@@ -10,6 +10,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 from fastapi.testclient import TestClient
 import database
 import main
+import migrations_runner
 
 TEST_DB = os.path.join(os.path.dirname(__file__), "test.db")
 
@@ -20,4 +21,7 @@ def client():
     if os.path.exists(TEST_DB):
         os.remove(TEST_DB)
     database.init_db()
+    # 【Epic 1 新增】templates 表由 alembic 迁移创建（init_db() 不再建它），
+    # 让 pytest 与生产走同一条迁移路径；失败只打日志、不阻塞存量用例（批复 1）。
+    migrations_runner.run_upgrade()
     return TestClient(main.app)

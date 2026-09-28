@@ -27,6 +27,19 @@ app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 
 database.init_db()
 
+# 【Epic 1 新增】模板表（templates）由 alembic 迁移创建（init_db() 不再重复写 DDL，见
+# docs/epic1-template-design-v1.md §1.1 / §6.2）。与 init_db() 共用这条启动路径：
+# 迁移失败只打日志、不阻塞启动（批复 1）——旧链路（病历 / 签字 / 九宫格开方）必须照常可用。
+try:
+    import migrations_runner
+
+    migrations_runner.run_upgrade()
+except Exception as exc:  # noqa: BLE001 —— 迁移框架不可用（例如依赖未装）也不能挡住启动
+    print(
+        "[warn] 模板迁移运行器不可用（不阻塞启动，旧链路照常）：%s: %s"
+        % (type(exc).__name__, exc)
+    )
+
 class TranscriptionInput(BaseModel):
     patient_name: str
     teacher_name: str
