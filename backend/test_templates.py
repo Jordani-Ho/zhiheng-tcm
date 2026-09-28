@@ -17,6 +17,7 @@ import re
 
 import agent
 import database
+import template_service
 
 TEACHER = "李老师"
 OTHER_TEACHER = "王老师"
@@ -265,6 +266,62 @@ def test_publish_idempotent(client):
     assert r.status_code == 200
     assert r.json()["changed"] is False
     assert r.json()["archived_ids"] == []
+
+
+def test_publish_concurrent_active_conflict_returns_409(client, monkeypatch):
+    """§14.1 A4 後半 / §11.1 併發兜底：**接口側**收到 409 `template_active_conflict`（不暴露原始 SQLite 錯誤）。
+
+    兩分支都在 `POST /api/templates/{id}/publish` 上斷言：
+      ① 併發窗口：服務層讀到的 stale 快照為空（等價於併發寫入者已提交、本請求隨後才寫入）→
+         本行 `UPDATE ... status='active'` 撞上部分唯一索引 `uq_templates_active_one` →
+         `sqlite3.IntegrityError` → 翻譯成 409，且**整體回滾**：本行仍 `draft`、原 `active` 仍
+         `active`（既不雙 active，也不會出現「scope 無 active」的空窗）；
+      ② 防禦分支（`template_service.py` 第 743–748 行）：本行已是 `active` 而 scope 內仍有其它
+         active（髒數據 / 極端併發）→ 直接 409，不悄悄改數據、也不誤報 `changed=True`。
+
+    兩分支都只 monkeypatch「服務層讀到的 stale 列表」，**不動任何行的數據**：部分唯一索引讓 ②
+    無法從接口寫出，故以「stale 非空」這一等價輸入覆蓋該分支。
+    """
+    v1_id, _ = _published(client, "treatment")
+    created = _create(client, "treatment", _publishable("treatment"))
+    assert created.status_code == 201, created.text
+    v2 = created.json()["template"]
+    v2_id = v2["id"]
+    assert v2["version"] == 2 and v2["status"] == "draft"
+
+    # ---------- ① 併發窗口：stale 為空 → UPDATE 撞部分唯一索引 ----------
+    monkeypatch.setattr(template_service, "_scope_active_ids", lambda *args, **kwargs: [])
+    r = client.post("/api/templates/%d/publish" % v2_id, json=_auth())
+    assert r.status_code == 409, r.text
+    detail = r.json()["detail"]
+    assert detail["error"] == "template_active_conflict"
+    assert "請重試" in detail["msg"]
+    assert detail["errors"] == [] and detail["warnings"] == []
+    serialized = json.dumps(r.json(), ensure_ascii=False)
+    assert "IntegrityError" not in serialized and "UNIQUE" not in serialized
+    assert "Traceback" not in serialized
+
+    # 整體回滾：v2 沒被發佈（status / updated_at / 內容一字未動），v1 也沒被歸檔
+    after_v2 = _GET(client, v2_id).json()["template"]
+    assert after_v2["status"] == "draft"
+    assert after_v2["updated_at"] == v2["updated_at"]
+    assert after_v2["schema_json"] == v2["schema_json"]
+    assert _GET(client, v1_id).json()["template"]["status"] == "active"
+    actives = [
+        t for t in client.get("/api/templates", params=_auth(type="treatment")).json()["templates"]
+        if t["status"] == "active"
+    ]
+    assert [t["id"] for t in actives] == [v1_id]
+
+    # ---------- ② 防禦分支：本行已 active 且 stale 非空 → 直接 409 ----------
+    monkeypatch.setattr(template_service, "_scope_active_ids", lambda *args, **kwargs: [999999])
+    before = _GET(client, v1_id).json()["template"]
+    r = client.post("/api/templates/%d/publish" % v1_id, json=_auth())
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"]["error"] == "template_active_conflict"
+    after = _GET(client, v1_id).json()["template"]
+    assert after["status"] == "active"
+    assert after["updated_at"] == before["updated_at"]
 
 
 def test_update_active_returns_409(client):
