@@ -1,8 +1,11 @@
 import { useEffect, useState, useRef } from 'react'
+// 【Epic 1 子任務 4】老師端模板配置卡片（📜 模板傳承（四類））：新檔 components 風格獨立，App.tsx 只做 import + 掛載
+import TemplateStudio from './TemplateStudio'
 
 interface HuangliData { date: string; lunar: string; solar_term: string; solar_term_tip: string; health_trend: string; homework: string; }
 interface RoleData { role_type: string; name: string; task: string; detail: string; }
-interface Draft { id: number; transcript_id: number; patient_name: string; content: string; signed: boolean; doctor?: string; }
+// 【Epic 1 子任務 3】草案溯源：template_id / template_version（0 或缺失 = 未記錄：本地新建草案 / 無模板生成）
+interface Draft { id: number; transcript_id: number; patient_name: string; content: string; signed: boolean; doctor?: string; template_id?: number; template_version?: number; }
 interface Patient { name: string; teacher_name: string; guardian_name: string; relation: string; }
 interface PatientRecord { id: number; patient_name: string; ai_draft: string; final_plan: string; doctor: string; }
 interface PatientProfile { patient_name: string; gender: string; birth_date: string; birth_time: string; birth_place: string; location: string; bazi?: string; wuxing?: string; }
@@ -3299,6 +3302,13 @@ export default function App() {
           </div>
         )}
 
+        {/* 【Epic 1 子任務 4】管理頁籤 · 模板傳承（四類）：插在「學生管理」之後、「中藥材庫存」之前。
+            卡片自帶 flag 探測（TEMPLATE_API_ENABLED=off → 整體不渲染；503 → 卡內紅字），
+            App.tsx 不參與任何模板邏輯，原有頁面結構與其它頁籤不受影響。 */}
+        {isTeacherRole && teacherTab === 'manage' && (
+          <TemplateStudio teacherName={selectedTeacher} teacherId={selectedTeacher} />
+        )}
+
         {/* 【第51天新增 / 第62天调整】中药材库存（合并进「管理」页签，排在学生卡片下方） */}
         {(currentRole === '李老师' || currentRole === '李老师智能体') && teacherTab === 'manage' && (
           <div style={boxStyle}>
@@ -3922,6 +3932,14 @@ export default function App() {
                   <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: '10px' }}>
                     <button onClick={() => handleEditDraft(d.id, d.content)} disabled={localDraftSaving && d.id < 0} style={{ padding: '6px 16px', borderRadius: '20px', border: '1px solid #8b4513', background: 'transparent', color: '#8b4513', cursor: 'pointer' }}>{localDraftSaving && d.id < 0 ? '落库中...' : '保存病历修改'}</button>
                   </div>
+
+                  {/* 【Epic 1 子任務 3】草案溯源：顯示生成時引用的模板 id 與版本。
+                      template_id = 0 / 缺失（本地新建草案、無模板生成的老數據）→ 不顯示這一條。 */}
+                  {(d.template_id || 0) > 0 && (
+                    <div style={{ fontSize: '11px', color: '#999', marginBottom: '10px' }}>
+                      依 病歷模板 v{d.template_version || 0} 生成（模板編號 #{d.template_id}）
+                    </div>
+                  )}
 
                   {extractImageUrls(d.content).length > 0 && (
                     <div style={{ marginBottom: '15px', padding: '10px', background: '#f7fcf9', borderRadius: '8px', border: '1px dashed #b8d8c0' }}>
