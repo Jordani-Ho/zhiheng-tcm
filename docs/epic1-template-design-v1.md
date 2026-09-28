@@ -345,5 +345,481 @@
 
 ---
 
-第一部分 完。后续部分输出并获批后追加至本文件。
+第一部分 完。
+
+---
+
+# Epic 1 设计方案 · 第二部分：接口契约 + 前端结构
+
+版本：v0.1（第二部分）
+承接：第一部分（本文件 §1–§8）；本部分所有接口/字段命名与第一部分一致。
+已落实的批复：① `run_upgrade()` 接入（§6.2）；② 发布 = 同事务自动归档旧 `active` + 返回 `archived_ids`（不报 409）；③ `active` 不可原地改，409 + 「基於此版本修訂」；④ 回填名「施治模板（存量迁移）」+ `legacy_source='plan_templates'`。
+
+---
+
+## 9. 四类 `schema_json` 字段级契约
+
+### 9.0 通用约定（四类共用）
+
+| 项 | 约定 |
+| :---- | :---- |
+| 序列化 | `json.dumps(obj, ensure_ascii=False)` 存 `TEXT`（沿用 `database.py` 现有惯例：`teacher_settings` 的 `work_schedule` / `prescriptions.items_json`） |
+| 外层结构 | 一律含 `version`（契约版本，Epic 1 恒为 `1`）、`meta`（自由对象，不参与校验）、以及一个类型专属的主键数组 |
+| 未知键 | **忽略且原样保留**（前向兼容：Epic 2/3 新增字段时旧代码不报错） |
+| 未知 `schema_json.version` | 大于当前支持版本 → 允许保存，但生成时**降级为不用模板**并记日志（不报错、不影响出稿） |
+| 校验入口 | `database.py` 新增常量 `TEMPLATE_TYPES` / `TEMPLATE_STATUSES` 与 `validate_template_schema(type, schema_obj)` → 返回 `(ok, errors)`；`errors` 为 `[{path, msg}]`（`path` 用 JS 风格，如 `fields[2].label`） |
+| 校验时机 | `POST /api/templates`（创建）、`PUT /api/templates/{id}`（改草稿）→ **格式校验**；`publish` → **发布级校验**（草稿允许半成品，发布必须完整） |
+| `meta` 保留键 | `meta.legacy_source`（存量迁移标记）、`meta.note`（老师备注）、`meta.updated_hint`（前端未保存提示用，可清空） |
+| 中文文案 | `label` / `title` / `hint` / `ask` 一律繁体古字；**炁 / 氣 按语义区分**，禁止全局简繁替换（例：`先天之炁`、`後天之氣`、`調理氣機`） |
+| 长度上限 | 单个字符串 ≤ 2000 字；`schema_json` 序列化后 ≤ 64 KB（超限 400 `schema_too_large`，防前端误塞大文本） |
+
+---
+
+### 9.1 `inquiry`（問診）
+
+外层：`{"version":1,"fields":[…],"meta":{}}`
+
+| 字段 | 类型 | 必填 | 默认 | 约束 | 语义 |
+| :---- | :---- | :---- | :---- | :---- | :---- |
+| `fields[].key` | string | 是 | — | `^[a-z][a-z0-9_]{0,31}$`，同模板内唯一 | 机器键（**建议沿用十问歌英文键**，见下表） |
+| `fields[].label` | string | 是 | — | 1–16 字，繁体 | 显示名（`寒熱` / `汗` / `頭身`…） |
+| `fields[].ask` | string | 否 | `''` | ≤ 120 字 | 老师口径的问法（覆盖默认问法） |
+| `fields[].order` | int | 是 | — | ≥ 1，同模板内唯一 | 提问顺序 |
+| `fields[].required` | bool | 否 | `false` | — | 是否必问（未答不允许「已問全」） |
+| `fields[].answer_type` | string | 否 | `text` | `text` / `number` / `choice` | 学生端作答控件类型 |
+| `fields[].choices` | string[] | 条件 | `[]` | `answer_type='choice'` 时必填，2–12 项、去重 | 选项 |
+| `fields[].follow_up` | string | 否 | `''` | ≤ 120 字 | 追问触发条件（自然语言描述，Epic 1 只存不执行） |
+
+**数量约束**：`3 ≤ len(fields) ≤ 20`；发布时至少 1 条 `required=true`。
+
+**默认骨架（新建时预填，来自 `agent.TEN_QUESTIONS`，`agent.py:303-314`，顺序不可变）**
+
+| `key` | `label` | 默认 `ask`（可改为老师口径） |
+| :---- | :---- | :---- |
+| `cold_heat` | 寒熱 | 你最近是怕冷多一點，還是怕熱多一點？ |
+| `sweat` | 汗 | 平時出汗多不多？是白天易汗，還是睡著了出汗？ |
+| `head_body` | 頭身 | 頭或身體有哪裏不舒服？頭暈、頭痛、身重痠沉？ |
+| `urine_stool` | 二便 | 大小便如何？有無乾結、稀軟、次數變多？ |
+| `diet` | 飲食 | 近來胃口與口味如何？吃東西香不香？ |
+| `chest_abdomen` | 胸腹 | 胸口或腹部有無發悶、發脹、隱隱作痛？ |
+| `ear` | 耳 | 耳朵有沒有響，或聽東西不太清楚？ |
+| `thirst` | 口渴 | 會覺得口渴嗎？想喝熱水還是涼水？ |
+| `old_illness` | 舊病 | 以前得過什麼病？有無長期服藥？ |
+| `cause` | 病因 | 這次不適大約從何時起？你覺得與什麼有關？ |
+
+**与现有链路**：`agent.TEN_QUESTIONS` 常量**不动**（存量原则）；模板存在且 flag 打开时，Epic 2 的追问链路改读模板（Epic 1 只做「配置 + 存储 + 读接口」，不接管生成，见 §12 的口径与 §15 待确认 4）。
+
+### 9.2 `record`（病歷）
+
+外层：`{"version":1,"sections":[…],"tone":{…},"meta":{}}`
+
+| 字段 | 类型 | 必填 | 默认 | 约束 | 语义 |
+| :---- | :---- | :---- | :---- | :---- | :---- |
+| `sections[].key` | string | 是 | — | 同上正则，唯一 | 机器键 |
+| `sections[].title` | string | 是 | — | 1–20 字，繁体 | 段落标题（如 `主訴（學生原話）`） |
+| `sections[].hint` | string | 否 | `''` | ≤ 120 字 | 给智能体的填充提示（缺失留空，禁止编造） |
+| `sections[].order` | int | 是 | — | ≥ 1，唯一 | 段落顺序 |
+| `sections[].required` | bool | 否 | `false` | — | 必须出现的段 |
+| `sections[].writable_by` | string | 否 | `ai` | `ai`（可填）/ `teacher`（仅老师填，留空） | 硬约束：`teacher` 段**智能体永不留内容**，只留 `标题：` |
+| `tone.style` | string | 否 | `''` | ≤ 120 字 | 措辞偏好（口语 / 文言） |
+| `tone.forbidden` | string[] | 否 | `[]` | ≤ 20 项 | 禁止替换/删除的词（默认含中医术语铁律） |
+
+**数量约束**：`2 ≤ len(sections) ≤ 12`；发布时至少 1 条 `writable_by='teacher'`（保证「待老师补充」语义不被抹掉）。
+
+**默认骨架（对齐 `agent.DOCTOR_PROMPT` 输出模板 `agent.py:89-101` 与 `main.build_draft_template` `main.py:72-89`）**
+
+| `key` | `title` | `order` | `writable_by` | 备注 |
+| :---- | :---- | :---- | :---- | :---- |
+| `chief_complaint` | 主訴（學生原話） | 1 | `ai` | 学生原话，禁止改写（`agent.py` 铁律） |
+| `past_records` | 既往病歷參考 | 2 | `ai` | 取该学生同老师的历史 `final_plan` 摘要 |
+| `tongue` | 舌象 | 3 | `teacher` | 智能体只留空 |
+| `pulse` | 脈象 | 4 | `teacher` | 智能体只留空 |
+| `pattern` | 辨證 | 5 | `teacher` | **AI 永不辨证**（宪法硬约束） |
+| `treatment_plan` | 施治方案 | 6 | `teacher` | 由 `treatment` 模板套用后由老师确认 |
+
+`tone.forbidden` 默认值 = 术语铁律词表：`脈象` / `舌象` / `主訴` / `現病史` / `伴隨症狀` / `辨證`（对应 `agent.py:189-192` 的「原文保留、不许换近义词」）。
+
+**无模板时的黄金断言**：生成结果必须与今天 `build_draft_template` 的输出**逐字节一致**（回归测试写死）。
+
+---
+
+### 9.3 `treatment`（施治）
+
+外层：`{"version":1,"format":"text","content":"","placeholders":[],"meta":{}}`
+
+| 字段 | 类型 | 必填 | 默认 | 约束 | 语义 |
+| :---- | :---- | :---- | :---- | :---- | :---- |
+| `format` | string | 否 | `text` | Epic 1 仅 `text`（预留 `blocks`） | 内容形态 |
+| `content` | string | 是 | `''` | ≤ 2000 字；**发布时 `trim()` 非空** | 施治方案模板正文（= 旧 `plan_templates.content`） |
+| `placeholders` | string[] | 否 | `[]` | ≤ 8 项，每项 ≤ 60 字 | 生成时提醒老师补的空位（Epic 1 只存不执行） |
+| `meta.legacy_source` | string | 否 | — | 仅迁移写入 `plan_templates` | 回填幂等标记（第一部分 §5.2(3)） |
+
+**与现有链路映射（逐字段）**
+
+| 旧通道 | 新契约 | 关系 |
+| :---- | :---- | :---- |
+| `plan_templates.content`（`database.py:291-298`） | `schema_json.content` | 回填时 1:1 复制，永不反向写 |
+| `GET /api/plan_template`（`main.py:522-525`） | `GET /api/templates/active?type=treatment` | 新旧并存；前端 flag on 时优先新接口，旧接口做兜底 |
+| `POST /api/plan_template`（`main.py:527-531`） | `POST/PUT /api/templates*` | 旧通道保留为「遗留写入通道」（单向双写，见 §12.4） |
+| 前端「已套用模板，可修改」提示（`App.tsx:4100`） | 不变 | 显示文案不动（存量 UI 不动），仅数据来源切换 |
+
+---
+
+### 9.4 `prescription`（開方）
+
+外层：`{"version":1,"herbs":[…],"formulas":[…],"defaults":{…},"meta":{}}`
+
+| 字段 | 类型 | 必填 | 默认 | 约束 | 语义 |
+| :---- | :---- | :---- | :---- | :---- | :---- |
+| `herbs[].herb_name` | string | 是 | — | 1–20 字，同模板内唯一 | 药材名（与 `herb_inventory.herb_name` 同名） |
+| `herbs[].default_amount` | number | 否 | `0` | `0` 或 `(0,1000]`；`0` = 未预填 | 预填克数 |
+| `herbs[].role` | string | 否 | `''` | 白名单 `PRESCRIPTION_ROLES` = 君臣佐使（`database.py:1159`） | 默认君臣佐使 |
+| `herbs[].cooking_method` | string | 否 | `常规` | 白名单 `PRESCRIPTION_COOKING_METHODS`（`database.py:1160`） | 默认煎法 |
+| `herbs[].order` | int | 否 | 数组下标+1 | 唯一 | 九宫格预选顺序 |
+| `formulas[]` | object[] | 否 | `[]` | ≤ 10；`{name(≤20字), composition:[{herb_name, amount, role, cooking_method}]≤20}` | 常用方剂组合（见 §15 待确认 3） |
+| `defaults.cooking_method` | string | 否 | `常规` | 同上白名单 | 新选药材的默认煎法 |
+| `defaults.remote` | bool | 否 | `false` | — | 是否默认勾「遠程診療（學生自採，不扣庫存）」 |
+
+**数量约束**：`len(herbs) ≤ 40`。
+
+**校验的两级策略（不阻断老师）**
+
+| 情形 | 处理 |
+| :---- | :---- |
+| `role` / `cooking_method` 不在白名单 | 400 `schema_invalid`（沿用 `clean_prescription_role` 的清洗语义，但**模板侧直接拒**，避免悄悄变成 `''` 让老师误解） |
+| `herb_name` 不在该老师 `herb_inventory` 中 | **200 通过 + `warnings: [{code:'herb_not_in_inventory', herb_name}]`**，前端黄字提示「未入庫，開方時將無法扣減庫存」；理由：老师可能先配模板、后补库存（`herb_inventory` 有 `UNIQUE(teacher_name, herb_name)`，`database.py:1045`） |
+
+**硬边界（对齐宪法与存量）**：模板只产出「**九宫格预选 + 预填分量**」；`prescriptions` 落库仍必须老师点「保存藥方」（`handleSavePrescription`），**AI 永不自动开方、永不自动发送**。
+
+---
+
+## 10. 模板 CRUD 接口定义
+
+### 10.1 公共约定
+
+| 项 | 约定 |
+| :---- | :---- |
+| 前缀 | `/api/templates`（新命名空间，与旧 `/api/plan_template` 并存） |
+| 鉴权 | 每个接口都必须带 `teacher_name` 与 `teacher_id`（GET 走 query，POST/PUT 走 body），**两者不等 → 403 `teacher_mismatch`**；只允许操作 `teacher_id` 自己的行 |
+| `lineage_id` | Epic 1 一律 `''`；请求若传非空值 → 400 `lineage_not_supported`（防止前端提前误用留白字段） |
+| 成功响应 | 200/201 + `{"template": {…}}` 或 `{"templates": […]}`（`schema_json` 返回**解析后的对象**，不给前端 JSON 字符串） |
+| 错误响应 | 真实 HTTP 状态码；body 沿用 FastAPI 的 `HTTPException(detail=…)` 包装：`{"detail": {"error": "<code>", "msg": "<繁中說明>", "errors":[…],"warnings":[…]}}`（前端读 `res.detail.error`） |
+| flag/就绪 | `TEMPLATE_API_ENABLED=off` → 全部 **404 `templates_disabled`**；`templates` 表缺失（迁移未跑）→ **503 `template_store_unavailable`**（第一部分 §7） |
+| 不做的事 | **不提供 DELETE**；不提供改 `type` / `teacher_id` / `lineage_id` / `parent_template_id` / `version` 的通用 PUT |
+
+**模板对象（所有模板类响应共用）**
+
+| 键 | 类型 | 说明 |
+| :---- | :---- | :---- |
+| `id` / `type` / `teacher_id` / `lineage_id` | — | 直出 |
+| `name` | string | 模板名 |
+| `schema_json` | object | 解析后的骨架对象 |
+| `version` / `parent_template_id` | int / int\|null | 版本信息 |
+| `status` | string | `draft` / `active` / `archived` |
+| `created_at` / `updated_at` | string | ISO |
+| `is_legacy` | bool | 是否存量回填而来（`meta.legacy_source == 'plan_templates'`），前端用于显示「存量遷移」标签 |
+
+### 10.2 接口清单
+
+| # | 方法 | 路径 | 请求 | 成功响应 | 主要错误 |
+| :---- | :---- | :---- | :---- | :---- | :---- |
+| 1 | GET | `/api/templates` | query：`teacher_name`、`teacher_id`、`type?`（缺省=四类全返）、`status?`（缺省=全部）、`include_schema?`（默认 `1`；列表页可传 `0` 省流量） | `{"templates":[…], "counts":{"inquiry":3,…}}`，排序：`type asc, version desc` | 403 / 400 `invalid_type` |
+| 2 | GET | `/api/templates/{id}` | query：`teacher_name`、`teacher_id` | `{"template":{…}, "chain":[{"id","version","status","updated_at"}], "generated_count": <引用该 link 的草案数（可选，Epic3 细化）>}` | 404 `template_not_found` / 403 |
+| 3 | GET | `/api/templates/active` | query：`teacher_name`、`teacher_id`、**`type`（必填）** | `{"template": {…}\|null}`（`null` = 无生效模板 → 生成侧走旧路径） | 403 / 400 |
+| 4 | POST | `/api/templates` | body：`teacher_name`、`teacher_id`、`type`、`name?`（缺省 = 该类型显示名，如 `施治`）、`schema_json?`（缺省 = 该类型默认骨架） | **201** `{"template":{…}, "reused": false}`；若同 scope 已有 `draft` → **200** `{"template":<既有草稿>, "reused": true}`（幂等，不产生第二份草稿） | 400 `invalid_type` / `schema_invalid` / `schema_too_large` |
+| 5 | PUT | `/api/templates/{id}` | body：`teacher_name`、`teacher_id`、`name?`、`schema_json?`（**只能改这些**） | 200 `{"template":{…}}` | **409 `template_published_immutable`**（`status != 'draft'`，批复 3）/ 400 `schema_invalid` |
+| 6 | POST | `/api/templates/{id}/publish` | body：`teacher_name`、`teacher_id` | 200 `{"template":{…}, "archived_ids":[…], "changed": true, "event":"template_configured"}` | 400 `schema_invalid`（发布级校验）/ 409 `template_active_conflict`（并发兜底） |
+| 7 | POST | `/api/templates/{id}/archive` | body：`teacher_name`、`teacher_id` | 200 `{"template":{…}, "changed": <bool>}` | 403 / 404 |
+| 8 | POST | `/api/templates/{id}/activate` | body：`teacher_name`、`teacher_id` | 200 `{"template":{…}, "archived_ids":[…], "changed": <bool>}` | 409 `template_active_conflict` |
+| 9 | POST | `/api/templates/{id}/derive` | body：`teacher_name`、`teacher_id`、`name?` | **201** `{"template":<新草稿>, "reused_draft": false}`；同链已有 `draft` → 200 + `reused_draft: true`（复用） | 400 `template_parent_*`（§4.3 五条）/ 403 |
+| 10 | GET | `/api/plan_template` | 不变（存量） | 不变 | 不变 |
+| 11 | POST | `/api/plan_template` | 不变（存量） | 不变（flag on 时附 `derived_template_id?`，前端不解析也不影响） | 不变 |
+
+**示例（`POST /api/templates/{id}/publish` 响应，展示批复 2 的返回形状）**
+
+| 键 | 值示例 |
+| :---- | :---- |
+| `template.id` / `version` / `status` | `12` / `2` / `"active"` |
+| `archived_ids` | `[7]`（同 scope 被顶替的旧 `active`，同事务归档；前端据此提示「舊版本 v1 已歸檔」） |
+| `event` | `"template_configured"`（Epic 3 哈希链接口预留，§3.5） |
+| `changed` | `true`（重复点发布 → `false`，200 幂等） |
+
+---
+
+## 11. 状态机接口（发布 / 归档 / 派生）
+
+### 11.1 `publish`（草稿 → 生效，同事务自动归档旧 active）
+
+**前置**：`status='draft'`；`teacher_name == teacher_id`；行属本人；发布级 schema 校验通过。
+
+**执行顺序（同一 SQLite 事务，顺序不可换 —— 否则瞬时违反 `uq_templates_active_one`）**
+
+1. `SELECT` 该 scope 现有 `status='active'` 行（`WHERE lineage_id=? AND teacher_id=? AND type=? AND status='active' AND id != ?`）。
+2. `UPDATE` 这些行 → `status='archived'`, `updated_at=now`；把 id 收进 `archived_ids`。
+3. `UPDATE` 本行 → `status='active'`, `updated_at=now`。
+4. `COMMIT`；失败则整体回滚（旧 `active` 仍是 `active`，不会出现「scope 无 active」的空窗）。
+
+**幂等**：本行已是 `active` 且 scope 无其它 `active` → 200 `{"changed": false, "archived_ids": []}`。
+**并发兜底**：捕获 SQLite 唯一约束异常（`sqlite3.IntegrityError`）→ 翻译成 409 `template_active_conflict`（附提示「請重試」），不暴露原始错误。
+**响应**：见 §10.2 #6。
+**副作用**：无其它表写操作（不碰 `drafts` / `patient_records`）。
+
+### 11.2 `archive`（生效/草稿 → 已歸檔）
+
+- `active → archived`：该 scope 变为「无生效模板」→ 后续生成回落内置骨架（§3.4，不报错）。
+- `draft → archived`：弃用草稿。
+- `archived → archived`：200 `changed:false`（幂等）。
+- 二次确认文案见 §13.6。
+
+### 11.3 `activate`（已歸檔 → 生效，内容不可改）
+
+- 与 `publish` 完全相同的「同事务归档旧 active」规则；**不校验 schema_json**（它当初已通过发布校验且此后 `archived` 不可改 → 天然合法）。
+- 若该行 `is_legacy=true`（存量回填）同样允许激活。
+
+### 11.4 `derive`（派生新版本 = 前端「基於此版本修訂」）
+
+**前置**：源行可为 `active` 或 `archived`（`draft` 不必派生 —— 直接 `PUT` 编辑）。
+**版本计算**：`new_version = max(source.version + 1, 同链现有 max(version) + 1)`（第一部分 §4.2）。
+**强制继承（不可由请求覆盖）**：`type` / `teacher_id` / `lineage_id` / `name`（默认继承，请求可改名）。
+**复用规则**：同链已存在 `draft` → 返回既有草稿（`reused_draft: true`），不新建第二份草稿（§4.3 第 4 条）。
+**校验**：§4.3 五条（父不存在 / scope 不符 / 自引用 / 未来版本 / 非法父）。
+**响应**：201 + 新草稿（`status='draft'`, `parent_template_id=source.id`）。
+**与 409 的联动（批复 3）**：前端捕获 `template_published_immutable` 后**自动改走本接口**并在 UI 上把按钮显示为「基於此版本修訂」，不向老师弹原始错误。
+
+---
+
+## 12. 草案生成接入 `template_id + version`
+
+### 12.1 schema 变更（revision `0002_add_draft_template_refs`）
+
+| 表 | 变更 | 说明 |
+| :---- | :---- | :---- |
+| `drafts` | `ADD COLUMN template_id INTEGER DEFAULT 0`、`ADD COLUMN template_version INTEGER DEFAULT 0` | `0` = 未记录（老数据 / 无模板生成）；DDL 单一来源仍为迁移（第一部分 §1.1），`init_db()` 不重复写 |
+
+- `patient_records` **不改**：`sign_draft()`（`database.py:595+`）已同时落 `ai_draft`（AI 原草案）与 `final_plan`（老师最终版），生成时的文本快照已存在 → 「历史病历零回溯」无需再动该表（防范围蔓延）。
+- 迁移可重跑：`PRAGMA table_info('drafts')` 探测后再 `ADD COLUMN`。
+- `downgrade`：SQLite 3.49 支持 `DROP COLUMN`，但**默认不删列**（删列会丢引用信息）→ downgrade 只把版本号回退，列保留（文档标注）。
+
+### 12.2 后端接线点（三条生成路径，全部「取不到模板即走旧逻辑」）
+
+| 现有入口 | 现状 | 接线方式 |
+| :---- | :---- | :---- |
+| `POST /api/transcribe`（`main.py:533-554`） | `agent.generate_medical_draft(...)` → `insert_draft(...)` | 生成前取 `active` 的 `record` 模板；有模板 → 把模板骨架作为段落骨架提示交给生成（`agent` 侧新增可选参数，缺省行为不变）；`insert_draft` 带 `template_id/template_version` |
+| `POST /api/upload-image`（`main.py:556-586` 内图片分支，574 行） | 同上传音路径 | 同上 |
+| `POST /api/generate-draft`（`main.py:601-617`） | `build_draft_template(...)` | 同上（此路径是纯本地骨架，无 LLM） |
+
+**关键约定**
+1. **不改 `insert_draft` 既有位置参数**：扩展为 `insert_draft(transcript_id, patient_name, teacher_name, content, template_id=0, template_version=0)`，老调用方（含 `seed_test_data.py`）不改也能跑。
+2. **flag off / 无 active 模板 / schema 版本不支持** → 三条路径输出与今天**逐字节一致**（回归红线）。
+3. `GET /api/drafts` 返回体新增 `template_id` / `template_version` 两键（**只增不改**，旧前端忽略即可）；老师端可在草案卡显示小灰字「依 施治模板 v2 生成」（繁体）。
+4. **AI 权限边界**：模板只决定「骨架与措辞参考」，`record` 中 `writable_by='teacher'` 的段（舌象/脉象/辨证/施治方案）智能体永不填内容。
+
+### 12.3 施治方案套用路径的切换（前端）
+
+| flag | 数据来源 | 行为 |
+| :---- | :---- | :---- |
+| `off` | `GET /api/plan_template` | 与今天 1:1（含「已套用模板，可修改」标记、`planTemplateFilledRef` 只套一次语义） |
+| `on` | `GET /api/templates/active?type=treatment` → `schema_json.content`；**失败/为空则回退旧接口** | 套用逻辑（`App.tsx:591-602`）与标记逻辑不改，仅换取值来源 |
+
+### 12.4 对第一部分 §5.2(4) 的细化修正（请一并确认）
+
+第一部分写「`save_plan_template()` 内部在同一事务里同步写 `templates`」。落地时更安全的做法是 **best-effort 两段式**：
+
+1. 先写 `plan_templates` 并 `COMMIT` → 保证旧接口行为 100% 不变（旧前端无论如何都能成功）。
+2. 再写 `templates`（同 scope 无 `draft` 则更新该草稿的 `schema_json.content`；该 scope 的 `active` 是回填行 → 走派生 v2 草稿）；**失败只打日志**，不影响旧接口返回。
+
+理由：flag 打开但 `templates` 表异常（例如迁移失败 → 503）时，不能让旧通道连带失败。新接口侧仍是严格事务（§11.1），只有 legacy 兼容通道放宽。
+
+---
+
+## 13. 前端：老师端模板配置页
+
+### 13.1 挂载点与开关
+
+| 项 | 决定 |
+| :---- | :---- |
+| 位置 | 老师端 **「管理」页签**（`teacherTab === 'manage'`，`App.tsx:2775/3287/3303/3381` 已有多张卡片）新增一张卡片，插在「學生管理」之后、「中藥材庫存」之前 |
+| 卡片标题（繁体） | `📜 模板傳承（四類）` |
+| flag off 行为 | 卡片**不渲染**（启动时用一次探测请求判定：`GET /api/templates?type=inquiry&include_schema=0` → 404/503 即视为关闭；结果缓存在 state，不重复探测） |
+| `App.tsx` 改动量 | 仅两处：① `import TemplateStudio` + 在 manage 页签渲染 `<TemplateStudio teacherName={selectedTeacher} teacherId={selectedTeacher} />`；② 施治方案取值来源切换（§12.3） |
+| 依赖 | 不新增任何 npm 依赖（沿用内联 style + `serif` 字体 + 主色 `#8b4513`，与存量视觉一致） |
+
+### 13.2 组件结构（新文件 `frontend/src/TemplateStudio.tsx`，内部子组件同文件导出）
+
+| 组件 | 职责 | 调用的接口 |
+| :---- | :---- | :---- |
+| `TemplateStudio`（外层） | 加载三态（載入中 / 載入失敗 / 就緒）、全局错误条、`warnings` 展示、保存后刷新 | 列表 + 默认探测 |
+| `TemplateTypeTabs` | 四類切换：`問診` / `病歷` / `施治` / `開方`；徽章显示各类型 `active` 的版本号 | 无（数据来自列表） |
+| `TemplateList` | 该类型全部版本：`v{n}`、状態徽章（`草稿` / `生效中` / `已歸檔`）、更新時間、操作按钮（`檢視` / `編輯草稿` / `發佈` / `歸檔` / `重新啟用` / `基於此版本修訂`） | `GET /api/templates?type=` |
+| `TemplateEditor` | 按 `type` 分派到四个表单；统一「儲存草稿 / 發佈 / 取消」 | `POST /api/templates`、`PUT /api/templates/{id}`、`POST …/publish` |
+| `InquiryForm` | 十問项列表：拖排序（上下移按钮，不引拖拽库）、`label` / `ask` / `required` / `answer_type` / `choices` 编辑、增删项（3–20） | 同上 |
+| `RecordForm` | 段落列表：`title` / `hint` / `order` / `writable_by`（`ai`=智能體可填、`teacher`=留待老師）；`tone.forbidden` 词表编辑 | 同上 |
+| `TreatmentForm` | 大文本域（`content`，计数器 / 2000 字）+ `placeholders` 列表 + 「存量遷移」标签（`is_legacy`） | 同上 |
+| `PrescriptionForm` | 药材预选：复用现有药材搜索/网格交互（首字过滤 `GET /api/herbs/search`，`App.tsx:817-823` 同语义）；每味设 `default_amount` / `role` / `cooking_method`；缺库存显示黄字 `warnings` | 同上 + `GET /api/herbs` |
+| `TemplateVersions` | 版本链时间线（`GET /api/templates/{id}` 的 `chain`）；每行一个「基於此版本修訂」按钮 | `POST …/derive` |
+| `TemplatePreview` | 只读预览：`record` → 提交后草案骨架文本；`treatment` → 套用后文本；`prescription` → 药单草表（**仅预览，不落库**） | 纯前端渲染 |
+
+### 13.3 交互流转（主流程）
+
+| # | 步骤 | 前端动作 | 后端接口 | 界面反馈（繁体） |
+| :---- | :---- | :---- | :---- | :---- |
+| 1 | 进入「管理」页签 | 挂载 `TemplateStudio` → 探测 + 拉列表 | `GET /api/templates` | 載入中 → 四類徽章 + 版本列表 |
+| 2 | 新建模板 | 选类型 → 用默认骨架预填 → 编辑 → 存草稿 | `POST /api/templates` | `草稿已儲存（未發佈）` |
+| 3 | 发布草稿 | 点「發佈」 | `POST …/publish` | `已發佈：v2 生效中`；若 `archived_ids` 非空 → 灰条 `舊版本 v1 已歸檔（歷史病歷不受影響）` |
+| 4 | 检视生效模板 | 点「檢視」→ 只读展示 | `GET /api/templates/{id}` | 顶部標籤 `生效中 · v2` |
+| 5 | 修订生效模板 | 点「基於此版本修訂」 | `POST …/derive` | 跳到新草稿 `v3 草稿`；若 `reused_draft` → `已回到未發佈的修訂版` |
+| 6 | 误点编辑（直改 active） | 前端拦截 + 自动改走派生 | `PUT` 得 409 → 立即 `POST …/derive` | `已發佈的版本不可直接修改，已為你開啟修訂版`（**不暴露 409**） |
+| 7 | 归档 | 二次确认 → 归档 | `POST …/archive` | `已歸檔：不再用於新病歷，歷史病歷不受影響` |
+| 8 | 重新启用 | 「重新啟用」→ 二次确认 | `POST …/activate` | `已重新啟用`；若有顶替 → 灰条提示旧版本归档 |
+| 9 | 缺库存药材 | 保存时读 `warnings` | — | 黄字 `「{藥名}」未入庫，開方時將無法扣減庫存` |
+| 10 | 接口关闭 / 未就绪 | 404 `templates_disabled` → 卡片整体隐藏；503 → 卡片内红字 `模板表未就緒，請聯絡管理員` | — | 不弹窗、不阻塞其它页签 |
+
+### 13.4 文案规范（繁体古字，逐条给词）
+
+| 场景 | 文案 |
+| :---- | :---- |
+| 卡片标题 | `📜 模板傳承（四類）` |
+| 四類 tab | `問診`、`病歷`、`施治`、`開方` |
+| 状態徽章 | `草稿`、`生效中`、`已歸檔` |
+| 主要按钮 | `新建模板`、`儲存草稿`、`發佈`、`檢視`、`編輯草稿`、`基於此版本修訂`、`歸檔`、`重新啟用` |
+| 提示 | `已發佈的版本不可直接修改，請基於此版本修訂`、`發布後舊版本將自動歸檔，歷史病歷不受影響`、`歸檔後不再用於新病歷，歷史病歷不受影響`、`模板只提供骨架與參考，診斷、辨證、開方、簽字皆由老師決定` |
+| 术语区分（炁 / 氣，示范） | `先天之炁`（先天稟賦）、`後天之氣`（後天水穀）、`調理氣機`；**禁止全局简繁转换**，一律人工术语表（附录 A 待补） |
+| 边界声明（固定展示于卡片底部） | `智能體永不診斷、永不開方、永不簽字` |
+
+### 13.5 前端状态与数据流（不引状态库）
+
+| state | 类型 | 用途 |
+| :---- | :---- | :---- |
+| `listByType` | `Record<type, Template[]>` | 列表数据 |
+| `activeTabType` | `type` | 当前 tab |
+| `editing` | `{mode:'create'\|'draft', type, id?}` \| null | 编辑器开关 |
+| `draftForm` | 当前编辑中的 `name` + `schema_json` 对象 | 受控编辑 |
+| `warnings` / `error` | `[{code,msg}]` / `string` | 黄字 / 红字 |
+| `probeState` | `'unknown'\|'on'\|'off'\|'unavailable'` | flag 判定（§13.1） |
+
+### 13.6 二次确认文案（防误操作）
+
+- 歸檔：`歸檔「施治 · v2」？歸檔後不再用於新病歷，歷史病歷不受影響。`
+- 發佈（同 scope 已有 active）：`發佈後「v1」將自動歸檔，新病歷改用 v2，歷史病歷不受影響。`
+- 重新啟用：`重新啟用「v1」？若該類型已有生效版本，將一併歸檔。`
+
+---
+
+## 14. 测试清单
+
+### 14.1 后端单测（pytest，文件 `backend/test_templates.py`，沿用 `client` fixture；`test_api.py` 不动）
+
+**A. 迁移与模型（4 条）**
+
+| 用例 | 断言要点 |
+| :---- | :---- |
+| `test_templates_table_created_by_migration` | `sqlite_master` 有 `templates` + 3 索引；部分唯一索引 SQL 含 `WHERE status = 'active'` |
+| `test_migration_backfills_plan_template` | 预置 `plan_templates` 行 → 迁移后 `templates` 有对应 `active` v1 行、`name='施治模板（存量迁移）'`、`meta.legacy_source='plan_templates'`；`plan_templates` 行数与内容不变 |
+| `test_migration_backfill_idempotent` | 连续两次 upgrade（或重跑回填）不产生重复行 |
+| `test_active_unique_partial_index_enforced` | 直插两条同 scope `active` → `IntegrityError`；接口侧收到 409 `template_active_conflict` |
+
+**B. CRUD（5 条）**
+
+| 用例 | 断言要点 |
+| :---- | :---- |
+| `test_create_default_skeleton_per_type` | 四类分别 `POST`（不传 `schema_json`）→ 默认骨架符合 §9 契约（inquiry 10 项、record 6 段、treatment 空 content、prescription 空 herbs） |
+| `test_create_reuses_existing_draft` | 同 scope 二次 `POST` → 200 + `reused=True`，`id` 相同 |
+| `test_list_filter_by_type_and_status` | 四类过滤、`status` 过滤、排序 `type asc, version desc` |
+| `test_get_single_with_chain` | `chain` 含链上全部版本，按 `version` 降序 |
+| `test_no_delete_endpoint` | `DELETE /api/templates/{id}` → 405/404（无该路由） |
+
+**C. 鉴权与参数（3 条）**
+
+| 用例 | 断言要点 |
+| :---- | :---- |
+| `test_teacher_name_id_mismatch_403` | `teacher_name != teacher_id` → 403 `teacher_mismatch` |
+| `test_cross_teacher_access_403` | 用另一老师身份读写他人模板 → 403，且不泄露行内容 |
+| `test_lineage_id_non_empty_400` | 传 `lineage_id='x'` → 400 `lineage_not_supported` |
+
+**D. 状态机（6 条）**
+
+| 用例 | 断言要点 |
+| :---- | :---- |
+| `test_publish_auto_archives_old_active_same_tx` | 旧 `active` → `archived`、新行 `active`、响应 `archived_ids=[旧 id]`；**HTTP 200（不是 409）**；两者 `updated_at` 一致（同事务） |
+| `test_publish_idempotent` | 重复 publish → `changed=False`、`archived_ids=[]` |
+| `test_update_active_returns_409` | `PUT` 改 `active` 行 → 409 `template_published_immutable`；行内容与 `updated_at` 未变 |
+| `test_update_archived_returns_409` | 同上（`archived` 只读） |
+| `test_archive_active_then_generation_falls_back` | 归档后 `GET /api/templates/active` 返回 `null` |
+| `test_activate_archived_requires_no_schema_check` | 重新启用成功且 `changed=True`；已有 active 时 `archived_ids` 非空 |
+
+**E. 版本（5 条）**
+
+| 用例 | 断言要点 |
+| :---- | :---- |
+| `test_derive_from_active_version_monotonic` | 新草稿 `version = max(parent+1, 链内 max+1)`、`parent_template_id=parent.id`、`status='draft'` |
+| `test_derive_reuses_existing_draft` | 同链已有 draft → 200 + `reused_draft=True` |
+| `test_derive_parent_scope_mismatch_400` | 父为别的 `type` / `teacher_id` → 400 `template_parent_scope_mismatch` |
+| `test_derive_parent_not_found_and_self_reference` | 400 `template_parent_not_found` / `template_parent_self_reference` |
+| `test_version_chain_no_duplicate_version` | 连续 derive → 版本序列严格递增且不重复（含「归档草稿占用版本号」场景） |
+
+**F. 兼容与零回溯（5 条）**
+
+| 用例 | 断言要点 |
+| :---- | :---- |
+| `test_legacy_plan_template_api_unchanged` | `GET/POST /api/plan_template` 请求/响应结构与迁移前一致（键集合 + 值） |
+| `test_legacy_write_dual_write_creates_draft_v2` | flag on 时旧接口写 → 同 scope 出现 `draft` v2（不改 `active` 内容） |
+| `test_legacy_write_succeeds_when_templates_broken` | 模拟 `templates` 表不可用 → 旧接口仍 200，仅日志告警（§12.4） |
+| `test_template_archive_does_not_touch_history` | 发布 v2 后，引用 v1 的草案 `content` 与 `patient_records.final_plan` 逐字节不变 |
+| `test_templates_flag_off_returns_404` | `TEMPLATE_API_ENABLED=off` → 全部 `/api/templates*` 404 `templates_disabled` |
+
+**G. 生成接入（4 条）**
+
+| 用例 | 断言要点 |
+| :---- | :---- |
+| `test_generate_draft_records_template_ref` | 有 active `record` 模板时，`drafts.template_id/version` = 模板行列值 |
+| `test_generate_draft_without_template_unchanged` | 无模板 → 输出与 `build_draft_template` 黄金文本逐字节一致，`template_id=0` |
+| `test_insert_draft_backward_compatible` | 不传新参数（老调用方签名）仍成功，两列为 0 |
+| `test_inquiry_template_not_wired_in_epic1` | 配置 `inquiry` 模板不影响学生端追问输出（Epic 1 只存不用） |
+
+**H. 既有回归（红线）**：`cd backend; ..\venv\Scripts\python.exe -m pytest` → `test_api.py` 现有用例**全部保持通过**（含 `test_local_prescription_deducts_stock` / `test_remote_prescription_does_not_deduct`）。
+
+### 14.2 前端手工自测（`tsc build` + `oxlint` + 手工；不引 vitest）
+
+| # | 步骤 | 预期 |
+| :---- | :---- | :---- |
+| 1 | `cd frontend; npm run build` / `npm run lint` | `tsc -b` 与 `oxlint` 零报错 |
+| 2 | 老师端 → 管理 → 模板傳承卡片 | 卡片出现；四類 tab 可切换；文案全繁体 |
+| 3 | 新建 `施治` 模板（默认骨架）→ 存草稿 → 發佈 | `草稿` → `生效中`；无旧 active 时 `archived_ids` 为空 |
+| 4 | 再建并发布 `施治` v2 | 出现灰条「舊版本 v1 已歸檔」；v1 徽章变 `已歸檔` |
+| 5 | 点 v1 的「基於此版本修訂」 | 生成 v3 草稿，`parent_template_id` 指向 v1；再点一次 → 回到同一草稿（不复用第二份） |
+| 6 | 尝试直改「生效中」模板（模拟旧路径） | 不弹 409，而是自动打开修訂版并提示「已發佈的版本不可直接修改…」 |
+| 7 | 歸檔 → 二次确认 | 徽章 `已歸檔`；诊室再次出稿走内置骨架（无报错） |
+| 8 | 「重新啟用」v1 | 变为 `生效中`；若已有生效版本 → 提示旧版本归档 |
+| 9 | 开方模板：选 3 味药 + 设 default_amount/role/cooking_method | 保存后重进，预选与预填完整；`role` / `cooking_method` 选项与九宫格下拉一致 |
+| 10 | 开方模板：加一味未入库存的药 | 保存成功 + 黄字提示「未入庫，開方時將無法扣減庫存」 |
+| 11 | 问诊模板：改顺序 / 增删项（含 3 与 20 的边界） | 顺序与项数保存正确；越界（<3 / >20）有明确提示不提交 |
+| 12 | 病历模板：把 `辨證` 段设 `teacher` | 预览中该段只留 `辨證：`，无任何 AI 填充文案 |
+| 13 | 存量治理核对 | 「施治」列表里存在「施治模板（存量迁移）」`v1` `生效中`（`is_legacy` 标签） |
+| 14 | 施治方案自动套用回归 | 选中学生、方案为空 → 自动套用当前生效模板内容；「已套用模板，可修改」提示仍在；清空后不会被再次填回（`planTemplateFilledRef` 语义不变） |
+| 15 | flag off 回归 | 卡片不渲染；`plan_template` 旧链路、九宫格开方、病历签字链路一切如常 |
+| 16 | 迁移未就绪（手工把 `templates` 改名） | 卡片内红字「模板表未就緒」；其它页签功能不受影响 |
+
+### 14.3 提交门禁（每条 PR 都要过）
+
+1. `cd backend; ..\venv\Scripts\python.exe -m pytest`（全绿，含新增 `test_templates.py`）。
+2. `cd backend; alembic upgrade head` + `alembic downgrade base` + `upgrade head` 三连演练通过；`plan_templates` 数据前后一致。
+3. `cd frontend; npm run build`、`npm run lint` 零报错。
+4. PR 说明含：对齐白皮文章节、验收标准、回退方案（`development-plan-v1.md:306`）。
+
+---
+
+## 15. 第二部分待确认清单
+
+| # | 事项 | 建议 | 备选 |
+| :---- | :---- | :---- | :---- |
+| 1 | 模板配置页挂载位置 | **「管理」页签**新增「📜 模板傳承（四類）」卡片 | 放「設定」页签（与排班/预约并列） |
+| 2 | `prescription` 模板里库存缺失的药材 | **200 + `warnings` 黄字提示**（不拦截） | 400 硬拒（须先补库存） |
+| 3 | `formulas`（常用方剂） | Epic 1 **只定契约、不做 UI**（界面只做 `herbs` 预选） | Epic 1 就做方剂增删 UI（工作量+1 天） |
+| 4 | `inquiry` 模板是否接管学生端追问 | Epic 1 **只做配置 + 存储 + 读接口**，生成路径不动（存量零风险） | Epic 1 即接管学生端追问顺序（触碰学生端存量） |
+| 5 | `drafts` 补列方式 | 走迁移 `0002_add_draft_template_refs`（DDL 单一真相源） | 沿用 `init_db()` 的 `try/except ADD COLUMN` 手法（与第一部分 §1.1 冲突） |
+| 6 | 错误响应包装 | `HTTPException(detail={"error":…,"msg":…})` → 前端读 `res.detail.error` | 200 + `{"error":…}`（与存量老接口一致，但失去状态码语义） |
+
+---
+
+第二部分 完。第三部分（实施顺序与验收）待需要时输出并追加。
 
