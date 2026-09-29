@@ -101,13 +101,16 @@
 | :---- | :---- | :---- |
 | `id` | INTEGER PRIMARY KEY AUTOINCREMENT | |
 | `teacher_name` | TEXT | |
-| `event_type` | TEXT | `stage_upgraded` / `stage_demoted` / `upgrade_recommended` / `upgrade_declined` / `permission_denied` / `evaluation` / `config_changed` / `suggestion_generated` / `predraft_generated` |
+| `event_type` | TEXT | `stage_upgraded` / `stage_demoted` / `upgrade_recommended` / `upgrade_declined` / `permission_denied` / `evaluation` / `config_changed` / `suggestion_generated` / `predraft_generated` / `permission_relaxed` | 共 **10 类**（第 10 类 `permission_relaxed` 见下方补白） |
 | `from_stage` / `to_stage` | TEXT | 变更类事件必填，其余为空串 |
 | `capability` | TEXT | 越权类事件必填（被拒的能力键），其余为空串 |
 | `task_id` | INTEGER | 关联请示（升级推荐 / 确认 / 拒绝）；无则 0 |
 | `metrics_json` | TEXT | 该次事件的指标快照（`permission_denied` 也为空对象 `{}`，不做特例） |
 | `detail` | TEXT | 人类可读说明（进「行动日志」区块的就是它） |
 | `created_at` | TEXT | ISO 字符串 |
+
+> **`permission_relaxed`（第 10 类事件，2026-09-29 补）**：**对应 §2.5 ③ 的权限放宽事件** —— `matrix_enforced=false` 时，`require_capability` 对 `predict_pattern` / `suggest_prescription` / `generate_predraft` 三个新能力的**放行**写这条反向事件（`capability` = 被放宽的能力键、`from_stage` = 当前阶段、`to_stage=''`、`task_id=0`、`metrics_json={}`），防「静默放宽」；矩阵本来就放行的格子**不写**（那里不存在「放宽」）。
+> **事件名契约（2026-09-29 裁决）**：越权拒绝一律用本表原有的 **`permission_denied`**（§1.3 / §2.4 / §6.2-14 三处一致；step 3.3 施工期间的临时名 `capability_denied` **已废弃**，不得再出现在代码或数据里 —— 事件名是契约，历史数据不能分裂）。
 
 > **与 Epic 3 的边界（防重叠）**：本表是**治理审计**（阶段 / 权限 / 配置）；Epic 3 的 `agent_learning_events` 是**学习事件流**（生成 / 修改 / 哈希链）。Epic 2 **不建哈希链**，只保证本表「只增」。Epic 3 如需把本表纳入链，属其范围，不影响本表结构。
 

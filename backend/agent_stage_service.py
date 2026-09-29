@@ -790,3 +790,173 @@ def current_stage(teacher_name):
 
 
 
+# ============================================================================
+# 【施工步骤 3.3】能力闸门（`require_capability`，§2.2 / §2.3 的**唯一**判定点）
+# ----------------------------------------------------------------------------
+# CTO 2026-09-28 放行 step 3.3 的六条约束，本段逐条对应：
+#   约束 1「矩阵必须是显式数据结构」→ 判定表复用 step 1 已落地的 `CAPABILITY_MATRIX`（§2.3 逐格
+#     字面量）；本段只补两个**枚举常量**（flag off 的既有行为例外 / `matrix_enforced=False` 的
+#     放宽范围），`require_capability` 体内**只有查表**：零 `if capability == "…"` 分支
+#     （源码级守护见 ⑮ 组 `test_require_capability_body_has_no_capability_branches`）；
+#   约束 2「白名单、默认拒绝」→ 判定四步写在函数 docstring 里；矩阵**缺格一律拒**
+#     （`.get(stage, {}).get(cap, False)`：将来新增阶段忘了补表也是 fail-closed）；
+#   约束 3「拒绝同点写审计」→ `_stage_audit()` 在**同一个拒绝点**写 `permission_denied` 事件
+#     （当前阶段 / 被拒能力 / 时间三要素齐全），写失败只告警、**绝不改变判定结果**（§2.4
+#     「拒绝先于日志」）；
+#   约束 4「三不铁律独立于开关」→ 三不是「**不存在的能力**」（§2.1：永不诊断 / 永不开方 /
+#     永不签字）：代码级形态 = 能力键不在 `CAPABILITIES` 内 → 枚举外**恒拒**，与 flag、
+#     `matrix_enforced` 都无关（配置只能放宽 §2.3 表内已有的格子，造不出不存在的格子）；
+#   约束 5「返回 bool、拒绝不抛」→ 本函数只返回 `bool`；`AgentStageError('stage_forbidden')`
+#     的抛出点在接口层（step 4，§4.6：`if not require_capability(...): raise`）；
+#   约束 6「⑮ 组即验收」→ 本段**零接线**（`main.py` / `database.py` / `agent_stage_api.py`
+#     一字不动），只有 ⑮ 组用例直接调用本函数。
+#
+# 三条落地口径（本段自行钉死，⑮ 组逐条覆盖）：
+#   A. **flag off → 零 DB 访问、零审计**：总闸 off 时只放行 §2.3 指定的既有能力例外
+#      （`LEGACY_ALLOWED_WHEN_DISABLED`），其余一律拒，且**连 SELECT 都不发**、不写审计 ——
+#      此时拒绝的语义是「功能没开」（接口层第一步就 404 `agent_stage_disabled`，走不到本函数），
+#      而 §5.1 红线① 要求 flag off 不许写任何新表；
+#   B. **`matrix_enforced=False` 只放宽 §2.5 逐项枚举的三个新能力**（`predict_pattern` /
+#      `suggest_prescription` / `generate_predraft`）：`generate_draft` 在 `observation` 期仍为
+#      `False` —— 那一格表达的不是「越权门」而是 §5.3 的本地骨架路径（观察期智能体不参与，
+#      属产品语义，不是权限）。放宽下的**放行也留痕**（§2.5 ③ 的反向事件 `permission_relaxed`），
+#      避免「静默放宽」；
+#   C. 开关 `matrix_enforced` **取自四层配置链**（`load_stage_config`，每调用现读）：配置读坏 →
+#      整份回落内置默认（`True` = 继续强制）→ 「读不到配置」永远不会变成「权限放大」（fail-closed）。
+#
+# 告警统一走 3.2 落地的 `_config_warn()`（单一出口，本段不新增 `print`）；文案一律繁体。
+# ----------------------------------------------------------------------------
+# 【事件名已裁决 · 2026-09-29】设计文档 §1.3 / §2.4 / §6.2-14 **三处一致**写 `permission_denied`，
+# CTO 裁决以**文档契约**为准（事件名是契约，历史数据不能分裂）；step 3.3 期间的临时名
+# `capability_denied` **已废弃**，本段一律用文档名（同样收敛成常量；§1.3 已补 `permission_relaxed`，
+# 9 类 → 10 类，对应 §2.5 ③ 的权限放宽反向事件）。
+_LOG_EVENT_PERMISSION_DENIED = "permission_denied"
+_LOG_EVENT_PERMISSION_RELAXED = "permission_relaxed"
+
+# flag off 时的既有行为例外（§2.3：「flag off 的特例：`cap == 'generate_draft'` 恒放行 …… 该特例
+# **只写一处**，不得散落」）：名字与语义逐字对齐设计伪码，收敛成这**唯一**一处定义。
+LEGACY_ALLOWED_WHEN_DISABLED = {"generate_draft"}
+
+# `matrix_enforced=False` 的放宽范围（§2.5 作用域「只关闭 L2 阶段门控」并**逐项枚举**的三项）。
+# 刻意不含 `generate_draft`（理由见上文口径 B）与 `record_observation`（它本就全员可用）。
+_MATRIX_RELAXED_CAPABILITIES = ("predict_pattern", "suggest_prescription", "generate_predraft")
+
+
+def _matrix_allows(stage, capability):
+    """查表（约束 1：判定只有查表）：`CAPABILITY_MATRIX[stage][capability]`，**缺阶段 / 缺格 → False**。
+
+    单点转调（而非在闸门里内联下标）让「矩阵是数据」在源码层也成立：将来新增阶段或能力只需改
+    常量表，判定逻辑零改动；忘了补表也只是该格恒拒（fail-closed），不会变成放行。
+    """
+    return bool(CAPABILITY_MATRIX.get(stage, {}).get(capability, False))
+
+
+def _audit_capability(value):
+    """审计 `capability` 列的取值（TEXT 列）：未知 / 非字符串入参（`None` / 数字 / 拼写错的键）也留痕。"""
+    return value if isinstance(value, str) else repr(value)
+
+
+def _permission_denied_detail(capability, stage):
+    """越权拒绝的**可解释文案**（繁体，§2.4 的「未達階段」口径）：`[warn]` 与审计 `detail` 共用。
+
+    只用 §4.5-① 已公开的两个真相源（`CAPABILITY_MIN_STAGE` / `STAGE_LABELS`）拼出「差多少」，
+    不新增标签常量 —— step 4 接口层拼 403 文案的同样是这两个常量。
+    """
+    label = STAGE_LABELS.get(stage, stage)
+    # 入参可能不是字符串（接口层传错类型 / 请求体里塞了别的类型）：`dict.get()` 只接受可哈希键，
+    # 传 list / dict 会抛 `TypeError: unhashable type`；闸门「永不抛」是硬约束（CTO 约束 5），
+    # 故非字符串一律按「枚舉外的鍵」处理（下面的 `%r` 照旧留下可读值）。
+    need = CAPABILITY_MIN_STAGE.get(capability) if isinstance(capability, str) else None
+    if need is None:
+        return ("智能體越權被拒：能力鍵 %r 不在能力枚舉內（未知 / 拼寫錯誤 / 憲法層禁止的能力），"
+                "白名單外一律拒絕；當前階段「%s」" % (capability, label))
+    return ("智能體越權被拒：能力「%s」需達「%s」，當前階段為「%s」，尚未開放"
+            % (capability, STAGE_LABELS[need], label))
+
+
+def _stage_audit(event_type, teacher_name, capability, from_stage, detail):
+    """`agent_stage_log` 的 best-effort 单条写入（CTO 约束 3：拒绝**同点**写审计）。
+
+    字段口径照 §1.3：`from_stage` = 当前阶段、`capability` = 被拒 / 被放宽的能力键、`to_stage` =
+    `''`（非变更类事件）、`task_id` = `0`（与升级请示无关）、`metrics_json` = `{}`（§1.3 明写
+    「`permission_denied` 也为空对象 `{}`，不做特例」）、`created_at` 由库层补（= 时间要素）。
+    只增不改（① 组「审计表无 update / delete 函数」守护照旧成立）。
+
+    **写失败不得改变判定结果**（§2.4「拒绝先于日志，日志包 try/except」）：`sqlite3.Error`
+    （0003 未跑 / 库被锁）与任何载荷异常都在此吞掉、只留一条繁体告警；返回 `None` 时调用方
+    **照旧**返回原判定。捕获面刻意放宽到 `Exception`：审计是旁路，任何情况下都不许把「拒绝」
+    变成 500，更不许把「放行」变成拒绝。
+    """
+    try:
+        import database      # 只在**函数体内**延迟 import（§4.5-①；方向守护见 ⑩ 组）
+        return database.insert_agent_stage_log(
+            teacher_name, event_type,
+            from_stage=from_stage, to_stage="", capability=capability,
+            task_id=0, metrics_json={}, detail=detail,
+        )
+    except Exception as exc:
+        _config_warn("寫入階段審計失敗（%s）：event_type=%r capability=%r，判定結果不受影響"
+                     % (exc, event_type, capability))
+        return None
+
+
+def require_capability(teacher_name, capability):
+    """**唯一能力闸门**（§2.2：接口层、生成路径接入点与内部嵌套调用都必须经它）—— 返回 `bool`，
+    **永不抛**（CTO 约束 5）。越权语义（403 `stage_forbidden`）由接口层翻译，本函数只回答「能不能」。
+
+    判定四步（全部 fail-closed）：
+
+      ① **总闸**（§2.3 / §5.1 红线①）：`AGENT_STAGE_ENABLED` off → 只放行
+         `LEGACY_ALLOWED_WHEN_DISABLED` 里的既有能力（今天的生成路径必须 1:1），其余一律 `False`；
+         off 时**零 DB 访问、零审计** —— 此时拒绝的语义是「功能没开」，接口层第一步就 404
+         `agent_stage_disabled`，走不到这里；而「flag off 不写任何新表」是红线① 的硬要求。
+      ② **能力白名单**（约束 2 / 约束 4）：`capability` 不在 `CAPABILITIES` 内（未知 / 拼写错 /
+         非字符串 / 三不铁律的键）→ `False`。这是 §2.1 三条铁律（永不诊断 / 永不开方 / 永不签字）
+         的**代码级形态**：铁律不是「可放宽的阶段门」，而是**不存在的能力键**。
+      ③ **阶段矩阵**（§2.3）：`current_stage(teacher_name)`（§1.5 fail-closed 到 `default_stage`）→
+         `CAPABILITY_MATRIX[stage][capability]`，缺格 = `False`。
+      ④ **放宽开关**（§2.5）：`matrix_enforced=False` 时，仅 `_MATRIX_RELAXED_CAPABILITIES` 里的
+         三个新能力放行，且**放行也留痕**（反向事件 `permission_relaxed`，不许静默放宽）。开关现读
+         四层配置链：配置读坏 → 整份回落内置 `True` → 继续强制（fail-closed，读不到配置绝不放大权限）。
+
+    拒绝的留痕（约束 3）：一行 `[warn]`（走 `_config_warn` 单一出口）+ `agent_stage_log` 一条事件
+    （事件名 `_LOG_EVENT_PERMISSION_DENIED` = §1.3 契约名，含当前阶段 / 被拒能力 / 时间）；**写失败不影响返回值**。
+
+    调用约定（step 4 起）：`if not require_capability(teacher, cap): raise AgentStageError(
+    'stage_forbidden', ...)` —— 403 的可解释文案由接口层用 `describe_stage` + `STAGE_LABELS` +
+    `CAPABILITY_MIN_STAGE` 组装（本步不新增符号，签名按约束 5 钉死为「返回 bool」）。
+    """
+    name = teacher_name or ""
+    cap = capability if isinstance(capability, str) else None
+
+    if not agent_stage_enabled():
+        if cap in LEGACY_ALLOWED_WHEN_DISABLED:
+            return True
+        _config_warn("智能體階段功能未啟用（AGENT_STAGE_ENABLED off），能力 %r 不予放行"
+                     "（此路徑不讀庫、不寫審計）" % (capability,))
+        return False
+
+    stage = current_stage(name)         # ③ 真值读取（§1.5 四条路径，fail-closed 到 default_stage）
+
+    if cap is None or cap not in CAPABILITIES:
+        detail = _permission_denied_detail(capability, stage)
+        _config_warn(detail)
+        _stage_audit(_LOG_EVENT_PERMISSION_DENIED, name, _audit_capability(capability), stage, detail)
+        return False
+
+    if _matrix_allows(stage, cap):
+        return True
+
+    if cap in _MATRIX_RELAXED_CAPABILITIES and not load_stage_config(name).get("matrix_enforced", True):
+        detail = ("權限矩陣已由管理員放寬（臨時，matrix_enforced=False）：能力「%s」本應在「%s」"
+                  "才開放，當前階段「%s」予以放行"
+                  % (cap, STAGE_LABELS[CAPABILITY_MIN_STAGE[cap]], STAGE_LABELS.get(stage, stage)))
+        _config_warn(detail)
+        _stage_audit(_LOG_EVENT_PERMISSION_RELAXED, name, cap, stage, detail)
+        return True
+
+    detail = _permission_denied_detail(cap, stage)
+    _config_warn(detail)
+    _stage_audit(_LOG_EVENT_PERMISSION_DENIED, name, cap, stage, detail)
+    return False
+

@@ -40,6 +40,14 @@
        （§3.4 第 5 条：返回 `(ok, errors[{path,msg}])`，**只拦不清**，`default_stage` 不得高于
        learning）+ `current_stage` / `describe_stage`（§1.5 四条路径，fail-closed 到 default_stage）
        + 「读数零写入 / 只发 SELECT」「不读 flag」。**零接线**：本组只用直接调用验证行为。
+    ⑮ 【施工步骤 3.3】**唯一能力闸门** `require_capability`（§2.2 / §2.3）：白名单**默认拒绝**
+       （枚举外一律拒 = §2.1 三不铁律的代码级形态，任何配置都不得解锁）+ `CAPABILITY_MATRIX`
+       **逐格**判定（五阶段 × 五能力 25 格逐格钉住 + 与设计文档 §2.3 表格交叉核对）+ flag off 时
+       只放行 §2.3 的既有能力例外（零 DB 访问 / 零审计）+ `matrix_enforced=False` 只放宽 §2.5
+       逐项枚举的三个新能力（放行也写反向事件 `permission_relaxed`）+ 拒绝**同点**写
+       `permission_denied` 审计（stage / capability / 时间）且写失败不改判定 + 库坏了不抛。
+       **返回 bool、拒绝不抛**（403 的抛出点属 step 4 接口层）。**零接线**，且不改 ⑭ 组一行。
+
 
 运行方式（Windows，串行；见 pytest.ini）：
     cd backend
@@ -2247,4 +2255,406 @@ def test_describe_stage_tolerates_corrupt_pending_task_id(db):
 
     view = agent_stage_service.describe_stage(TEACHER)      # 不抛异常 = 核心断言
     assert view["stage"] == "learning" and view["pending_task_id"] == 0
+
+
+# ============ ⑮ 【施工步骤 3.3】唯一能力闸门：require_capability ============
+#
+# CTO 2026-09-28 放行 step 3.3 的六条约束，本组逐条落地（本组即约束 6 说的「⑮ 组」）：
+#   ① 矩阵是**显式数据结构**：25 格**逐格**行为断言 + 数据表 ↔ 设计文档 §2.3 表格逐格交叉核对
+#      + 源码级守护「闸门体内没有能力字面量分支」；
+#   ② **白名单、默认拒绝**：未知 / 拼写错 / 非字符串 / 三不铁律的能力键一律拒（阶段给到最高也一样）；
+#   ③ **拒绝同点写审计**：`permission_denied` 事件（当前阶段 / 能力键 / 时间）+ 越权告警；拒绝路径
+#      **只**多这一条审计写入（业务表零改动 = §6.2-15 的服务层等价物）；
+#   ④ **三不铁律独立于开关**：`matrix_enforced=False` 下矩阵解锁，但枚举外键仍全拒；flag off 同理；
+#   ⑤ **返回 bool、拒绝不抛**：三张新表全被删也不抛；审计写失败只告警、判定结果不变；
+#   ⑥ 五阶段 × 关键 capability 的**组合矩阵逐格验证**（25 格 + 五条「五键组合」）。
+# 本组**不改** ⑭ 组一行：只复用它的造数 / 断言助手（`_put_raw_state_row` / `_put_raw_config_row` /
+# `_raw_scalar` / `_copy_tested_db` / `_drop_table` / `_all_calls`），造数一律绕过 `get_connection`
+# 直连库文件（⑭ 组的既有口径：避免与被测代码的语句级断言混在一起）。
+# 与 ⑬ ⑭ 组同一纪律：**不**断言 3.4 符号（`evaluate` / 三个钩子 …）的缺席。
+
+
+@pytest.fixture
+def gate(monkeypatch):
+    """⑮ 组公共前置：打开总闸 `AGENT_STAGE_ENABLED=on`（矩阵只在 flag on 时才会被问到）。"""
+    monkeypatch.setenv("AGENT_STAGE_ENABLED", "on")
+
+
+# §2.3 表格的**逐格字面量转录**（刻意不从 `CAPABILITY_MATRIX` 取值：数据表漂移时必须红）
+_GATE_STAGES = ("observation", "learning", "apprentice", "assistant", "authorized")
+_GATE_CAPS = ("record_observation", "generate_draft", "predict_pattern",
+              "suggest_prescription", "generate_predraft")
+_GATE_GRID = {
+    "observation": (True, False, False, False, False),
+    "learning": (True, True, False, False, False),
+    "apprentice": (True, True, True, False, False),
+    "assistant": (True, True, True, True, False),
+    "authorized": (True, True, True, True, True),
+}
+
+# §2.1 三不铁律（AI 永不诊断 / 永不开方 / 永不签字）的**能力键形态**：它们是「不存在的能力」，
+# 故任何阶段的矩阵里都没有它们的格子 —— 含 §4.5-① 禁止 import 清单里的符号名。
+_BANNED_CAPABILITIES = ("diagnose", "create_prescription", "sign_draft", "update_draft_content",
+                        "batch_deduct_herbs", "open_prescription")
+
+
+def _gate_cells():
+    """五阶段 × 五能力 = 25 格（stage, capability, expected）三元组。"""
+    return [(stage, cap, expected)
+            for stage in _GATE_STAGES
+            for cap, expected in zip(_GATE_CAPS, _GATE_GRID[stage])]
+
+
+# ---- 闸门 ①：矩阵是数据（数据表自检 + 设计文档交叉核对）----
+
+def test_capability_matrix_is_design_table_transcribed():
+    """交付自检：`CAPABILITY_MATRIX` 就是 §2.3 表格的逐格转录（含五键顺序 = `CAPABILITIES`）。"""
+    import agent_stage_service
+
+    assert agent_stage_service.CAPABILITIES == _GATE_CAPS
+    assert agent_stage_service.STAGES == _GATE_STAGES
+    assert agent_stage_service.CAPABILITY_MATRIX == {
+        stage: dict(zip(_GATE_CAPS, _GATE_GRID[stage])) for stage in _GATE_STAGES
+    }
+    assert all(isinstance(cell, bool)
+               for row in agent_stage_service.CAPABILITY_MATRIX.values() for cell in row.values()), \
+        "矩阵格子必须是真 bool（`1` / `0` 会让「查表」与「真值判断」分叉）"
+
+
+def test_capability_matrix_matches_design_document_table():
+    """矩阵 ↔ 设计文档 §2.3 表格**逐格**交叉核对（防服务层手抄漂移：表格改了，用例立刻红）。"""
+    import agent_stage_service
+
+    doc = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(database.__file__))),
+                       "docs", "epic2-agent-stage-design-v1.md")
+    with open(doc, encoding="utf-8") as fh:
+        lines = fh.read().splitlines()
+
+    parsed = {}
+    for line in lines:
+        cells = [c.strip() for c in line.strip().strip("|").split("|")]
+        if len(cells) != 7 or not cells[0].startswith("`"):
+            continue            # §2.3 表：能力 + 五阶段 + 说明 = 7 列
+        name = cells[0].strip("`").split("`")[0]
+        if name not in _GATE_CAPS:
+            continue
+        row = []
+        for cell in cells[1:6]:
+            assert ("✅" in cell) != ("❌" in cell), "§2.3 表格格子无法判读：%r" % cell
+            row.append("✅" in cell)
+        parsed[name] = tuple(row)
+
+    assert set(parsed) == set(_GATE_CAPS), "§2.3 表格行与能力枚举分叉：%s" % sorted(parsed)
+    expected = {cap: tuple(_GATE_GRID[stage][index] for stage in _GATE_STAGES)
+                for index, cap in enumerate(_GATE_CAPS)}
+    assert parsed == expected, "服务层矩阵与设计文档 §2.3 表格不一致"
+
+
+# ---- 闸门 ②：25 格逐格判定 + 五阶段「五键组合」（§2.3 / §6.2 9–13 的服务层等价物）----
+
+@pytest.mark.parametrize("stage,capability,expected", _gate_cells(),
+                         ids=["%s-%s" % (stage, cap) for stage, cap, _ in _gate_cells()])
+def test_require_capability_matches_design_matrix_cell(db, gate, stage, capability, expected):
+    """**逐格**（约束 6）：该阶段 × 该能力的闸门结果必须 = §2.3 表格那一格。"""
+    import agent_stage_service
+
+    _put_raw_state_row(TEACHER, stage)
+
+    assert agent_stage_service.require_capability(TEACHER, capability) is expected
+
+
+@pytest.mark.parametrize("stage", _GATE_STAGES)
+def test_require_capability_stage_capability_combination(db, gate, stage):
+    """五条「五键能力组合」：每个阶段的能力组合与 §2.3 表格该行**完全一致**（顺序也钉住）。"""
+    import agent_stage_service
+
+    _put_raw_state_row(TEACHER, stage)
+
+    combo = tuple(agent_stage_service.require_capability(TEACHER, cap) for cap in _GATE_CAPS)
+
+    assert combo == _GATE_GRID[stage]
+
+
+# ---- 闸门 ③：白名单、默认拒绝（§2.1 三不铁律的代码级形态 = 「不存在的能力」）----
+
+@pytest.mark.parametrize("capability", ("", "diagnose", "create_prescription", "sign_draft",
+                                        "update_draft_content", "batch_deduct_herbs",
+                                        "open_prescription", "Generate_Draft",
+                                        "record_observations", "predict_pattern "))
+def test_require_capability_denies_unknown_capability(db, gate, capability):
+    """约束 2：枚举外的键（三不铁律 / 拼写错 / 大小写错 / 多一个空格 / 空串）一律拒 ——
+    即便阶段已经给到最高（`authorized`）：白名单外没有格子，任何阶段都不放行。"""
+    import agent_stage_service
+
+    _put_raw_state_row(TEACHER, "authorized")
+
+    assert agent_stage_service.require_capability(TEACHER, capability) is False
+
+    rows = db.get_agent_stage_logs(TEACHER)
+    assert len(rows) == 1 and rows[0]["event_type"] == "permission_denied", \
+        "未知能力被拒也必须留痕（含三不铁律的越权尝试）"
+
+
+@pytest.mark.parametrize("capability", (None, 123, 3.14, True, ["predict_pattern"],
+                                        {"predict_pattern": True}, ("predict_pattern",)))
+def test_require_capability_denies_non_string_capability(db, gate, capability):
+    """非字符串入参（接口层传错类型 / JSON 里塞了别的类型）走同一条白名单拒绝路径：不抛、不崩。"""
+    import agent_stage_service
+
+    _put_raw_state_row(TEACHER, "authorized")
+
+    assert agent_stage_service.require_capability(TEACHER, capability) is False
+    assert len(db.get_agent_stage_logs(TEACHER)) == 1
+    assert db.get_agent_stage_logs(TEACHER)[0]["capability"] == repr(capability), \
+        "非字符串入参也要在审计里留下可读的值（`repr`）"
+
+
+@pytest.mark.parametrize("stage", _GATE_STAGES)
+def test_require_capability_matrix_disabled_still_denies_banned_capabilities(db, gate, monkeypatch, stage):
+    """约束 4（本步最关键的一条）：`matrix_enforced=False` 放宽矩阵，但三不铁律**仍全拒** ——
+    放宽开关只能放宽 §2.3 表里**已有的格子**，造不出不存在的格子；五个阶段都不例外。"""
+    import agent_stage_service
+
+    monkeypatch.setenv("AGENT_STAGE_MATRIX_ENFORCED", "off")
+    _put_raw_state_row(TEACHER, stage)
+
+    assert agent_stage_service.load_stage_config(TEACHER)["matrix_enforced"] is False
+
+    for capability in _BANNED_CAPABILITIES:
+        assert agent_stage_service.require_capability(TEACHER, capability) is False, capability
+    for capability in ("", None, 123, "DIAGNOSE"):
+        assert agent_stage_service.require_capability(TEACHER, capability) is False, capability
+
+
+# ---- 闸门 ④：`matrix_enforced=False` 的放宽范围（§2.5 逐项枚举）+ 开关来自配置链 ----
+
+def test_require_capability_matrix_disabled_relaxes_only_l2(db, gate, monkeypatch):
+    """§2.5 的作用域：只放宽**逐项枚举的三个新能力**（L2 阶段门控）；`generate_draft` 在
+    `observation` 期**仍是 False** —— 那一格是 §5.3 的本地骨架路径（观察期智能体不参与），
+    不是权限闸门，放宽矩阵不该把本地确定性链路也一并放开。"""
+    import agent_stage_service
+
+    monkeypatch.setenv("AGENT_STAGE_MATRIX_ENFORCED", "off")
+    assert agent_stage_service.load_stage_config(TEACHER)["matrix_enforced"] is False
+
+    _put_raw_state_row(TEACHER, "observation")
+
+    for capability in ("predict_pattern", "suggest_prescription", "generate_predraft"):
+        assert agent_stage_service.require_capability(TEACHER, capability) is True, capability
+    assert agent_stage_service.require_capability(TEACHER, "generate_draft") is False
+    assert agent_stage_service.require_capability(TEACHER, "record_observation") is True
+
+
+def test_require_capability_matrix_enabled_default_keeps_matrix(db, gate, monkeypatch):
+    """默认（未设 `AGENT_STAGE_MATRIX_ENFORCED`）= 矩阵继续强制：learning 期三个新能力照旧全拒。"""
+    import agent_stage_service
+
+    monkeypatch.delenv("AGENT_STAGE_MATRIX_ENFORCED", raising=False)
+    _put_raw_state_row(TEACHER, "learning")
+
+    assert agent_stage_service.load_stage_config(TEACHER)["matrix_enforced"] is True
+    assert agent_stage_service.require_capability(TEACHER, "predict_pattern") is False
+
+
+def test_require_capability_reads_matrix_enforced_from_config_chain(db, gate):
+    """放宽开关取自**四层配置链**（不只 env）：老师专属行只放宽自己那一份（别人不受影响），
+    配置读坏 → 整份回落内置 `True` → 继续强制（绝不因「读不到配置」而放大权限）。"""
+    import agent_stage_service
+
+    _put_raw_config_row(TEACHER, json.dumps({"matrix_enforced": False}))
+    _put_raw_state_row(TEACHER, "learning")
+    _put_raw_state_row(OTHER_TEACHER, "learning")
+
+    assert agent_stage_service.require_capability(TEACHER, "suggest_prescription") is True
+    assert agent_stage_service.require_capability(OTHER_TEACHER, "suggest_prescription") is False
+
+    _put_raw_config_row(OTHER_TEACHER, "{ 这不是 JSON")
+    assert agent_stage_service.require_capability(OTHER_TEACHER, "suggest_prescription") is False, \
+        "配置读坏必须回落内置默认（matrix_enforced=True）而不能放宽"
+
+
+# ---- 闸门 ⑤：拒绝留痕（约束 3：同点写审计 + 告警）与「业务表零改动」 ----
+
+def test_require_capability_denial_writes_permission_denied_event(db, gate, capsys):
+    """约束 3：拒绝**同点**写一条 `permission_denied` 审计（§1.3 契约名）—— stage / capability /
+    时间三要素齐全，并配一条越权告警（§2.4）。字段口径照 §1.3：`to_stage=''`、`task_id=0`、`metrics_json={}`。"""
+    import agent_stage_service
+
+    _put_raw_state_row(TEACHER, "learning")
+
+    assert agent_stage_service.require_capability(TEACHER, "predict_pattern") is False
+
+    assert "越權被拒" in capsys.readouterr().out, "拒绝必须配一条可解释告警"
+
+    rows = db.get_agent_stage_logs(TEACHER)
+    assert [row["event_type"] for row in rows] == ["permission_denied"]
+    row = rows[0]
+    assert row["teacher_name"] == TEACHER
+    assert row["capability"] == "predict_pattern", "审计必须记下**被拒的能力键**"
+    assert row["from_stage"] == "learning", "审计必须记下**当时的阶段**"
+    assert row["to_stage"] == "" and row["task_id"] == 0 and row["metrics_json"] == "{}"
+    assert row["created_at"], "审计必须带时间戳（约束 3 的时间要素）"
+    assert "見習期" in row["detail"] and "學習期" in row["detail"], \
+        "审计文案要说清「差多少」（可解释拒绝，§2.4）"
+
+
+def test_require_capability_denial_touches_only_the_audit_table(db, gate, sql_log):
+    """§6.2-15 的服务层等价物：拒绝路径**只多一条 `INSERT INTO agent_stage_log`** ——
+    业务表（drafts / patient_records / prescriptions）与状态表 / 配置表**零改动**，其余全是 SELECT。"""
+    import agent_stage_service
+
+    _put_raw_state_row(TEACHER, "learning")
+    counted = ("drafts", "patient_records", "prescriptions", "agent_stage_state",
+               "agent_stage_config", "agent_stage_log")
+    before = {table: _raw_scalar("SELECT COUNT(*) FROM %s" % table) for table in counted}
+
+    marker = len(_all_calls(sql_log))
+    assert agent_stage_service.require_capability(TEACHER, "generate_predraft") is False
+
+    writes = [sql for sql, _ in _all_calls(sql_log)[marker:]
+              if not sql.lstrip().upper().startswith("SELECT")]
+    assert len(writes) == 1 and writes[0].startswith("INSERT INTO agent_stage_log"), writes
+
+    for table in counted[:-1]:
+        assert _raw_scalar("SELECT COUNT(*) FROM %s" % table) == before[table], table
+    assert _raw_scalar("SELECT COUNT(*) FROM agent_stage_log") == before["agent_stage_log"] + 1
+
+
+def test_require_capability_relaxed_allow_is_audited_as_permission_relaxed(db, gate, monkeypatch, capsys):
+    """§2.5 ③「放行也留痕」：放宽下的放行写**反向事件** `permission_relaxed`（不许静默放宽）；
+    矩阵本来就放行的格子不写（那里没有「放宽」这回事）。"""
+    import agent_stage_service
+
+    monkeypatch.setenv("AGENT_STAGE_MATRIX_ENFORCED", "off")
+    _put_raw_state_row(TEACHER, "learning")
+
+    assert agent_stage_service.require_capability(TEACHER, "suggest_prescription") is True
+    assert "放寬" in capsys.readouterr().out
+
+    rows = db.get_agent_stage_logs(TEACHER)
+    assert [row["event_type"] for row in rows] == ["permission_relaxed"]
+    assert rows[0]["capability"] == "suggest_prescription"
+    assert rows[0]["from_stage"] == "learning" and rows[0]["created_at"]
+
+    assert agent_stage_service.require_capability(TEACHER, "record_observation") is True
+    assert len(db.get_agent_stage_logs(TEACHER)) == 1, "矩阵本就放行的格子不该写「放宽」事件"
+
+
+# ---- 闸门 ⑥：总闸 off 的既有行为（§2.3 例外 + §5.1 红线①）----
+
+def test_require_capability_flag_off_allows_legacy_generate_draft_only(db, monkeypatch, sql_log):
+    """§2.3 的 flag off 例外 + §5.1 红线①：off 时**只有** `generate_draft` 恒放行（既有行为 1:1），
+    其余（基础能力 / 三个新能力 / 三不 / 未知键 / 非字符串）全拒，且**零 DB 访问、零审计** ——
+    off 的语义是「功能没开」，不许碰任何新表。"""
+    import agent_stage_service
+
+    monkeypatch.delenv("AGENT_STAGE_ENABLED", raising=False)
+    assert agent_stage_service.agent_stage_enabled() is False
+
+    marker = len(_all_calls(sql_log))
+    assert agent_stage_service.require_capability(TEACHER, "generate_draft") is True
+    for capability in ("record_observation", "predict_pattern", "suggest_prescription",
+                       "generate_predraft") + _BANNED_CAPABILITIES + ("", None, 123):
+        assert agent_stage_service.require_capability(TEACHER, capability) is False, capability
+
+    assert _all_calls(sql_log)[marker:] == [], "flag off 不得触库（连 SELECT 都不发）"
+    assert _raw_scalar("SELECT COUNT(*) FROM agent_stage_log") == 0
+    _put_raw_state_row(TEACHER, "authorized")
+    assert agent_stage_service.require_capability(TEACHER, "generate_draft") is True, \
+        "既有行为与阶段无关（off 时本路径不读状态表）"
+
+
+def test_require_capability_gate_really_follows_the_flag(db, monkeypatch):
+    """闸门真的看总闸（不是摆设）：同一个 `authorized` 阶段，flag on → 放行，flag off → 拒绝。"""
+    import agent_stage_service
+
+    _put_raw_state_row(TEACHER, "authorized")
+
+    monkeypatch.setenv("AGENT_STAGE_ENABLED", "on")
+    assert agent_stage_service.require_capability(TEACHER, "predict_pattern") is True
+
+    monkeypatch.delenv("AGENT_STAGE_ENABLED", raising=False)
+    assert agent_stage_service.require_capability(TEACHER, "predict_pattern") is False
+
+
+@pytest.mark.parametrize("flag,expected", [("on", True), ("1", True), ("true", True), ("TRUE", True),
+                                           ("yes", True), (" yes ", True),
+                                           ("off", False), ("0", False), ("no", False),
+                                           ("maybe", False), ("", False)])
+def test_require_capability_flag_values_match_agent_stage_enabled(db, monkeypatch, flag, expected):
+    """总闸取值口径与 `agent_stage_enabled()`（⑨ 组钉过的真值集）**逐个**一致 ——
+    闸门不许自造第二套 flag 判断；同一个 `authorized` 阶段下四个新能力随 flag 起落。"""
+    import agent_stage_service
+
+    _put_raw_state_row(TEACHER, "authorized")
+    monkeypatch.setenv("AGENT_STAGE_ENABLED", flag)
+
+    assert agent_stage_service.agent_stage_enabled() is expected
+    for capability in ("predict_pattern", "suggest_prescription", "generate_predraft"):
+        assert agent_stage_service.require_capability(TEACHER, capability) is expected, capability
+
+
+# ---- 闸门 ⑦：fail-closed（库坏了不抛、脏行 / 无行不悄悄提权）----
+
+def test_require_capability_store_missing_never_raises_and_fails_closed(db, gate, monkeypatch,
+                                                                       tmp_path, capsys):
+    """约束 5 + §1.5 + §2.4：三张新表全被删（0003 未跑 / 库坏了）→ **不抛异常**，判定 fail-closed
+    到配置链的 `default_stage`；审计写不进去**只告警、不改判定**（「拒绝先于日志」）。"""
+    import agent_stage_service
+
+    path = _copy_tested_db(monkeypatch, tmp_path, "gate_without_tables.db")
+    for table in ("agent_stage_state", "agent_stage_config", "agent_stage_log"):
+        _drop_table(path, table)
+
+    assert agent_stage_service.require_capability(TEACHER, "predict_pattern") is False, \
+        "读不到状态必须 fail-closed 到兜底阶段，而不是放行"
+
+    out = capsys.readouterr().out
+    assert "失敗" in out, "阶段真值读取降级必须留告警"
+    assert "審計" in out, "审计写入失败必须留告警（不许静默吞掉、更不许抛出去）"
+
+    assert agent_stage_service.require_capability(TEACHER, "record_observation") is True, \
+        "兜底阶段（内置 default_stage = learning）下基础能力仍可用：fail-closed 不是阻断既有链路"
+
+
+def test_require_capability_judges_on_fallback_stage_when_row_absent_or_dirty(db, gate, capsys):
+    """fail-closed 端到端：**无行**（③，正常态）与**脏行**（②，人手 SQL 写坏）都按配置链的
+    `default_stage` 判能力，且脏行不会悄悄提权；审计里记的也必须是**判定所用的兜底阶段**。"""
+    import agent_stage_service
+
+    _put_raw_config_row("", json.dumps({"default_stage": "observation"}))
+
+    assert agent_stage_service.require_capability(OTHER_TEACHER, "record_observation") is True
+    assert agent_stage_service.require_capability(OTHER_TEACHER, "predict_pattern") is False
+
+    _put_raw_state_row(TEACHER, "master")           # 白名单外阶段（人手 SQL 写坏）
+    assert agent_stage_service.require_capability(TEACHER, "predict_pattern") is False
+    assert "不在五階段枚舉內" in capsys.readouterr().out, "脏行必须留痕（不静默兜底）"
+
+    rows = db.get_agent_stage_logs(TEACHER)
+    assert len(rows) == 1
+    assert rows[0]["event_type"] == "permission_denied"
+    assert rows[0]["from_stage"] == "observation"
+
+
+# ---- 闸门 ⑧：约束 1 的源码级守护（矩阵 = 数据，判定 = 查表）----
+
+def test_require_capability_body_has_no_capability_branches():
+    """能力名只许出现在**数据表 / 常量**里：闸门函数体内不得出现 `== "能力名"` 这类散落分支
+    （否则「矩阵是显式数据结构」就退化成 if-else 链）；flag off 例外也只许来自那一个常量。"""
+    import inspect
+
+    import agent_stage_service
+
+    source = inspect.getsource(agent_stage_service.require_capability)
+    offenders = [cap for cap in agent_stage_service.CAPABILITIES
+                 if '== "%s"' % cap in source or '!= "%s"' % cap in source]
+    assert offenders == [], "能力名散落在闸门体内：%s" % offenders
+    assert "CAPABILITY_MATRIX" in source, "闸门必须查显式矩阵表（约束 1）"
+
+    assert agent_stage_service.LEGACY_ALLOWED_WHEN_DISABLED == {"generate_draft"}, \
+        "§2.3 的 flag off 例外只许来自这一个常量（「该特例只写一处，不得散落」）"
+    assert agent_stage_service._MATRIX_RELAXED_CAPABILITIES == (
+        "predict_pattern", "suggest_prescription", "generate_predraft"), \
+        "§2.5 的放宽范围必须逐项枚举（且不含 generate_draft：那是 §5.3 的本地骨架路径）"
 
