@@ -1573,6 +1573,229 @@ def get_agent_action_log(teacher_name, limit=20):
     return [dict(r) for r in rows]
 
 
+# ============ 【Epic 2 §4.2】智能体五阶段：状态 / 审计 / 配置 的库访问函数 ============
+# 说明（设计 §1.2 / §1.3 / §4.2 / §7.1-⑥，CTO 五项裁决 2026-09-28）：
+#   · 本区段**只做库的「门」**：裸 SQL + TEXT 时间 + json.dumps(..., ensure_ascii=False)，
+#     与既有 24+ 张表的函数同款；**不吞 sqlite3.Error**，读 / 写异常一律冒泡给
+#     agent_stage_service 与接口层（表未就绪 → 503 agent_stage_store_unavailable，裁决⑤）；
+#     `None` 只表示「查询成功但没有行」。
+#   · **flag 闸门（AGENT_STAGE_ENABLED）不在本区段**：阶段门控属服务层
+#     （agent_stage_service.agent_stage_enabled），调用方过了闸门才进这里（裁决②）。
+#   · 审计表 agent_stage_log 只提供 insert + get，**永不提供 update / delete**
+#     → 「只增」由代码层强制，不靠约定（§1.3）。
+#   · 共 8 + 1 个函数：+1 是 insert_agent_action_log —— §4.5-① 已把该函数列为服务层可调用的
+#     既有函数，但全库原本不存在；工作台「行动日志」区块要靠它写入，故在此一并补齐（§7.1-⑥）。
+#   · 列名全部来自下列白名单 → 无 SQL 注入面。
+
+# ---------- 白名单常量（与 0003_add_agent_stage.py 的建表列一一对应，测试有逐列一致性守护）----------
+
+# agent_stage_state 可写列（不含主键 teacher_name）
+AGENT_STAGE_STATE_UPSERT_FIELDS = (
+    "lineage_id", "stage", "stage_since", "stage_source", "pending_stage",
+    "pending_task_id", "last_evaluated_at", "last_metrics_json", "updated_at",
+)
+# agent_stage_log 可写列（不含主键 id 与 event_type）
+AGENT_STAGE_LOG_INSERT_FIELDS = (
+    "from_stage", "to_stage", "capability", "task_id", "metrics_json", "detail", "created_at",
+)
+# `*_json` 列允许直接传 dict / list（自动序列化）
+_AGENT_STAGE_JSON_COLUMNS = ("last_metrics_json", "metrics_json")
+
+
+def _agent_stage_column_value(column, value):
+    """`*_json` 列：非字符串入参自动 json.dumps(..., ensure_ascii=False)；其余列原样透传。
+
+    故意**不做 None 兜底**：NOT NULL 列传 None 时由 SQLite 抛 IntegrityError（属 sqlite3.Error，
+    按裁决⑤冒泡），比静默替换成 '' 更容易定位调用方 bug。
+    """
+    if column in _AGENT_STAGE_JSON_COLUMNS and not isinstance(value, str):
+        return json.dumps(value if value is not None else {}, ensure_ascii=False)
+    return value
+
+
+def get_agent_stage_state(teacher_name):
+    """读该老师的状态行：无行 → None（不塞默认行，兜底由服务层按 default_stage 完成，§1.2 / §1.5）。"""
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT * FROM agent_stage_state WHERE teacher_name = ?", (teacher_name or "",)
+    ).fetchone()
+    conn.close()
+    if row is None:
+        return None
+    return dict(row)
+
+
+def upsert_agent_stage_state(teacher_name, **fields):
+    """单事务 upsert 状态行（INSERT ... ON CONFLICT(teacher_name) DO UPDATE），只接受白名单字段。
+
+    · 白名单外的键 → `ValueError`（调用方只有服务层，属编程错误，立刻炸出来比静默丢字段好）；
+    · **只写本次传入的列**：没传的列在 INSERT 时走建表默认值、在 UPDATE 时保持原值（不做隐式清零）；
+    · `updated_at` 未传时自动补当前时间（全库 TEXT 时间惯例）；
+    · 列名全部来自白名单 → 无 SQL 注入面。
+    """
+    unknown = [k for k in fields if k not in AGENT_STAGE_STATE_UPSERT_FIELDS]
+    if unknown:
+        raise ValueError("upsert_agent_stage_state 不支持这些字段：%s" % ", ".join(sorted(unknown)))
+
+    payload = [(name, _agent_stage_column_value(name, fields[name]))
+               for name in AGENT_STAGE_STATE_UPSERT_FIELDS if name in fields]
+    if "updated_at" not in fields:
+        payload.append(("updated_at", datetime.now().isoformat()))
+
+    columns = ", ".join(["teacher_name"] + [name for name, _ in payload])
+    placeholders = ", ".join("?" for _ in range(len(payload) + 1))
+    assignments = ", ".join("%s = excluded.%s" % (name, name) for name, _ in payload)
+
+    conn = get_connection()
+    conn.execute(
+        "INSERT INTO agent_stage_state (%s) VALUES (%s) ON CONFLICT(teacher_name) DO UPDATE SET %s"
+        % (columns, placeholders, assignments),
+        tuple([teacher_name or ""] + [value for _, value in payload]),
+    )
+    conn.commit()
+    conn.close()
+
+
+def insert_agent_stage_log(teacher_name, event_type, **fields):
+    """【只增审计】往 agent_stage_log 追加一条事件，返回新 log_id（§1.3）。
+
+    · `event_type` 的取值白名单属服务层（§1.3 共 9 类），本函数只校验非空；
+    · 白名单外字段 → `ValueError`；`created_at` 未传时自动补当前时间；
+    · 本区段永不提供 update / delete —— 「只增」由代码层强制。
+    """
+    if not event_type:
+        raise ValueError("insert_agent_stage_log 必须给 event_type")
+    unknown = [k for k in fields if k not in AGENT_STAGE_LOG_INSERT_FIELDS]
+    if unknown:
+        raise ValueError("insert_agent_stage_log 不支持这些字段：%s" % ", ".join(sorted(unknown)))
+
+    payload = [(name, _agent_stage_column_value(name, fields[name]))
+               for name in AGENT_STAGE_LOG_INSERT_FIELDS if name in fields]
+    if "created_at" not in fields:
+        payload.append(("created_at", datetime.now().isoformat()))
+
+    columns = ", ".join(["teacher_name", "event_type"] + [name for name, _ in payload])
+    placeholders = ", ".join("?" for _ in range(len(payload) + 2))
+
+    conn = get_connection()
+    cursor = conn.execute(
+        "INSERT INTO agent_stage_log (%s) VALUES (%s)" % (columns, placeholders),
+        tuple([teacher_name or "", str(event_type)] + [value for _, value in payload]),
+    )
+    conn.commit()
+    log_id = cursor.lastrowid
+    conn.close()
+    return log_id
+
+
+def get_agent_stage_logs(teacher_name, limit=20):
+    """倒序读该老师的阶段审计（created_at DESC，同秒按 id DESC）；limit 口径与 get_agent_action_log 一致。"""
+    if not teacher_name:
+        return []
+    if limit is None or limit <= 0:
+        limit = 20
+    limit = min(limit, 200)
+
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT * FROM agent_stage_log WHERE teacher_name = ? ORDER BY created_at DESC, id DESC LIMIT ?",
+        (teacher_name, limit)
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+# ---------- 配置表 agent_stage_config（teacher_name='' 为全局默认行，§3.4 / §3.5）----------
+
+def get_agent_stage_config_row(teacher_name):
+    """读单行配置：无行 → None（读取链由服务层继续往「全局行 → env → 内置默认」，§3.4 / §3.5）。"""
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT * FROM agent_stage_config WHERE teacher_name = ?", (teacher_name or "",)
+    ).fetchone()
+    conn.close()
+    if row is None:
+        return None
+    return dict(row)
+
+
+def upsert_agent_stage_config(teacher_name, config_json):
+    """写单行配置（`teacher_name=''` 即全局行）：内容合法性由服务层校验（§3.4），本函数只落库。
+
+    `config_json` 传 dict 时自动 json.dumps(..., ensure_ascii=False)（库列是 TEXT，与全库惯例一致）。
+    """
+    if not isinstance(config_json, str):
+        config_json = json.dumps(config_json if config_json is not None else {}, ensure_ascii=False)
+    conn = get_connection()
+    conn.execute(
+        "INSERT INTO agent_stage_config (teacher_name, config_json, updated_at) VALUES (?, ?, ?) "
+        "ON CONFLICT(teacher_name) DO UPDATE SET "
+        "config_json = excluded.config_json, updated_at = excluded.updated_at",
+        (teacher_name or "", config_json, datetime.now().isoformat()),
+    )
+    conn.commit()
+    conn.close()
+
+
+# ---------- 升级推荐请示（复用既有 agent_tasks 通道，§3.6 / §4.2）----------
+
+def find_pending_upgrade_task(teacher_name):
+    """该老师是否已有 pending 的升级请示：有 → dict（复用 _agent_task_row_to_dict），无 → None。
+
+    去重判据（§3.6 第 3 步）：`status='pending'` 且 action_data 含 upgrade_agent_stage。
+    不复用 agent.py 的 _pending_task_exists（模块私有函数，跨模块调用会造隐式耦合）。
+    """
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT * FROM agent_tasks WHERE teacher_name = ? AND status = 'pending' "
+        "AND action_data LIKE '%upgrade_agent_stage%' ORDER BY created_at DESC, id DESC LIMIT 1",
+        (teacher_name or "",)
+    ).fetchone()
+    conn.close()
+    if row is None:
+        return None
+    return _agent_task_row_to_dict(row)
+
+
+def insert_agent_stage_upgrade_task(teacher_name, title, content, action_data):
+    """写一条升级推荐请示，返回新 task_id。
+
+    字段集与既有两处裸 INSERT 完全同构（agent.py 的 _insert_student_request、本文件 scan_silent_students）：
+    task_type='request' / category='agent' / status='pending' → 既有前端渲染、GET /api/agent/tasks、
+    resolve_agent_task 与 approve / reject 两个接口**零改动**即可适配（§4.2 / §7.1-⑤）。
+    """
+    if not isinstance(action_data, str):
+        action_data = json.dumps(action_data if action_data is not None else {}, ensure_ascii=False)
+    conn = get_connection()
+    cursor = conn.execute(
+        "INSERT INTO agent_tasks (teacher_name, task_type, category, title, content, action_data, status, created_at) "
+        "VALUES (?, 'request', 'agent', ?, ?, ?, 'pending', ?)",
+        (teacher_name or "", title or "", content or "", action_data, datetime.now().isoformat()),
+    )
+    conn.commit()
+    task_id = cursor.lastrowid
+    conn.close()
+    return task_id
+
+
+def insert_agent_action_log(teacher_name, action, detail, task_id=0, created_at=None):
+    """往既有 agent_action_log（工作台「行动日志」区块）追加一行，返回新 id。
+
+    §7.1-⑥：阶段升级 / 降级 / 推荐升级等关键节点要写一行人话，让工作台该区块**零改动**就能显示；
+    §4.5-① 把它列为服务层可调用的既有函数，但它此前并不存在 —— 本区段补齐「写入」这一个动作。
+    """
+    conn = get_connection()
+    cursor = conn.execute(
+        "INSERT INTO agent_action_log (teacher_name, task_id, action, detail, created_at) VALUES (?, ?, ?, ?, ?)",
+        (teacher_name or "", task_id or 0, action or "", detail or "",
+         created_at or datetime.now().isoformat()),
+    )
+    conn.commit()
+    log_id = cursor.lastrowid
+    conn.close()
+    return log_id
+
+
 # ============ 【第75天新增】施治方案模板（老师维度的模板记忆） ============
 
 def get_plan_template(teacher_name):
