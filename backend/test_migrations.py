@@ -24,9 +24,22 @@ import migrations_runner
 # 改为从 alembic 脚本目录动态取当前 head —— 只读脚本目录，不连库、不写 alembic_version。
 # 用 backend/alembic.ini（其 script_location 由 %(here)s 锚定），故与 cwd 无关
 # （从仓库根或 backend/ 跑结果一致）。
-ALEMBIC_HEAD = ScriptDirectory.from_config(
+ALEMBIC_SCRIPT = ScriptDirectory.from_config(
     Config(os.path.join(BACKEND_DIR, "alembic.ini"))
-).get_current_head()
+)
+ALEMBIC_HEAD = ALEMBIC_SCRIPT.get_current_head()
+
+# 【Epic 2 施工步骤 2.6】降级中止后 alembic 可能停下的「中间态」同样改由上面这个动态来源给出：
+# 语义与原先的字面量元组一字不差 —— 「允许停在 head 之前的任一 revision（今天展开即 0001 / 0002），
+# 绝不允许退到 base」；原先写死的 ("0001_create_templates", "0002_add_draft_template_refs")
+# 只是当时 head=0002 的展开结果，新增 revision 时不必再回来改测试（断言口径 / 强度均不变）。
+# `iterate_revisions(head, "base")` 自上而下遍历整条链且**含 head 端点**（base 不是 revision，故不在链上），
+# 因此这里剔掉 head 自身，只留中间态。
+ALEMBIC_INTERMEDIATE_REVS = tuple(
+    rev.revision
+    for rev in ALEMBIC_SCRIPT.iterate_revisions(ALEMBIC_HEAD, "base")
+    if rev.revision != ALEMBIC_HEAD
+)
 
 LEGACY_NAME = "施治模板（存量迁移）"
 LEGACY_SOURCE = "plan_templates"
@@ -255,12 +268,13 @@ def test_downgrade_safety_gate_blocks_when_teacher_created_template(tmp_path):
         migrations_runner.run_downgrade("base", db_file=str(db))
     assert "downgrade 已中止" in str(excinfo.value)
 
-    # 安全闸中止后：模板表与两行数据完好（未执行任何 DROP），版本号最多退到 0001 一步
-    # （SQLite 方言下 alembic_version 每步迁移后即落定，故多 revision 顺序回退时可能停在中间态；
+    # 安全闸中止后：模板表与两行数据完好（未执行任何 DROP），版本号只停在 head 之前的中间态
+    # （即 ALEMBIC_INTERMEDIATE_REVS；SQLite 方言下 alembic_version 每步迁移后即落定，
+    #  故多 revision 顺序回退时可能停在中间态；
     #  关键不变式是「老师配好的模板没被吃掉、也不许退到 base」——这是本用例真正要守的东西）
     assert _one(str(db), "SELECT COUNT(*) AS c FROM templates")["c"] == 2
     assert _one(str(db), "SELECT version_num FROM alembic_version")["version_num"] in (
-        "0001_create_templates", "0002_add_draft_template_refs",
+        ALEMBIC_INTERMEDIATE_REVS
     )
     assert _one(str(db), "SELECT COUNT(*) AS c FROM templates WHERE type='record'")["c"] == 1
 
