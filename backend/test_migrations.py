@@ -4,6 +4,8 @@
 - 全部用例都在 tmp_path 下自建独立 SQLite 文件，不碰 backend/zhiheng.db 与 backend/test.db；
 - 直接调用 migrations_runner（与 main.py / conftest.py 同一条路径），另有一条真实 CLI 用例。
 """
+import hashlib
+import importlib.util
 import json
 import os
 import sqlite3
@@ -367,6 +369,687 @@ def test_migration_0002_adds_draft_template_refs(tmp_path):
     # downgrade base：按 §12.1 默认不删列（删列会丢「依哪个模板哪个版本生成」的溯源信息）
     migrations_runner.run_downgrade("base", db_file=str(db))
     assert {"template_id", "template_version"} <= set(_names(_read(str(db), "PRAGMA table_info('drafts')")))
+
+
+# ===========================================================================
+# 【Epic 4 step 4.1】迁移 0005 守护测试：lineage 表 + 12 张必须表补 lineage_id + 默认师门种子 + 回填
+# 对齐：docs/epic4-lineage-design-v1.md §2.1（lineage DDL = 迁移即唯一真相源）/ §2.3（必须 12 张、
+#       明确不加 plan_templates 等）/ §2.4（`''` = 未归属，禁 COALESCE 兜底）/ §2.5（idx_patient_teachers_lineage）
+#       / §6.1（upgrade 七步）/ §6.2（真机回填基线 1/10/5/4/1）/ §6.3（downgrade 只回收结构、不删业务列）
+#       / §8 ① ② 组；CTO 2026-09-29「step 4.1 放行」五条约束（先红后绿、计数校验、downgrade 新口径…）。
+# 纪律：全部用例都在 tmp_path 下自建独立 SQLite 文件，**绝不碰** backend/zhiheng.db 与 backend/test.db。
+# ===========================================================================
+
+# §2.3「必须」补 lineage_id 的 12 张表（`agent_stage_log` 由迁移 0003 在同一趟 upgrade 内建出；
+# 本组基线夹具按「已跑到 0004」造库，与 §6.5 真机升级窗口一致）
+LINEAGE_ID_TABLES = (
+    "drafts",
+    "patient_records",
+    "complaints",
+    "appointments",
+    "prescriptions",
+    "homework",
+    "transcriptions",
+    "record_tags",
+    "agent_tasks",
+    "agent_action_log",
+    "agent_stage_log",
+    "patient_teachers",
+)
+
+# §2.3「明确不加 lineage_id 列」的表（A1 裁决：plan_templates 不加 —— Epic 1 兼容镜像）
+NO_LINEAGE_ID_TABLES = (
+    "plan_templates",
+    "patients",
+    "patient_profiles",
+    "teachers",
+)
+
+# 0005 **不得触碰**的表（裁决 ③-A：`agent_stage_state` 已有 lineage_id 列且恒 ''，结构一字不动；
+# `agent_stage_config` 属老师维度的阈值配置，不师门化）
+NO_LINEAGE_TOUCH_TABLES = NO_LINEAGE_ID_TABLES + ("agent_stage_state", "agent_stage_config")
+
+MIGRATION_0005_PATH = os.path.join(BACKEND_DIR, "alembic", "versions", "0005_add_lineage.py")
+
+# 真机 §6.2 基线（只读实测 2026-09-29）：整表行数（= 基线签名）+ 回填预期行数
+REAL_DB_SIGNATURE = (
+    ("teachers", 1),
+    ("patient_teachers", 10),
+    ("templates", 5),
+    ("patient_records", 4),
+    ("drafts", 1),
+)
+REAL_DB_EXPECTED_FILL = (
+    ("patient_teachers", 10),
+    ("templates", 5),
+    ("patient_records", 4),
+    ("drafts", 1),
+)
+REAL_TEACHER = "李老师"
+REAL_LINEAGE_ID = "lin-ua8739bc7"  # 'lin-' + sha1('李老师')[:8]（真机 1 位老师 → 冻结值）
+REAL_LINEAGE_NAME = "李老师師門"
+PREVIOUS_REVISION = "0004_add_patient_record_template_refs"  # 0005 的上一版（基线夹具停在 / downgrade 回到这里）
+
+# 与 database.py init_db() 逐字一致的建表语句（0005 只补列 / 只回填，不改这些表的形状）
+LINEAGE_BASE_DDL = (
+    """
+CREATE TABLE IF NOT EXISTS teachers (
+    name TEXT PRIMARY KEY,
+    description TEXT DEFAULT '',
+    status TEXT DEFAULT 'active',
+    last_active_at TEXT,
+    complaint_count INTEGER DEFAULT 0,
+    created_at TEXT
+)
+""",
+    """
+CREATE TABLE IF NOT EXISTS patient_teachers (
+    patient_name TEXT,
+    teacher_name TEXT,
+    status TEXT DEFAULT 'active',
+    created_at TEXT,
+    PRIMARY KEY (patient_name, teacher_name)
+)
+""",
+    """
+CREATE TABLE IF NOT EXISTS homework (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    patient_name TEXT,
+    teacher_name TEXT,
+    task TEXT,
+    detail TEXT,
+    status TEXT DEFAULT 'pending',
+    created_at TEXT
+)
+""",
+    """
+CREATE TABLE IF NOT EXISTS transcriptions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    patient_name TEXT,
+    teacher_name TEXT,
+    content TEXT,
+    data_type TEXT,
+    processed INTEGER DEFAULT 0
+)
+""",
+    """
+CREATE TABLE IF NOT EXISTS drafts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    transcript_id INTEGER,
+    patient_name TEXT,
+    teacher_name TEXT,
+    content TEXT,
+    signed INTEGER
+)
+""",
+    """
+CREATE TABLE IF NOT EXISTS patient_records (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    patient_name TEXT,
+    teacher_name TEXT,
+    ai_draft TEXT,
+    final_plan TEXT,
+    doctor TEXT,
+    visit_at TEXT
+)
+""",
+    """
+CREATE TABLE IF NOT EXISTS appointments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    patient_name TEXT,
+    teacher_name TEXT,
+    initiator TEXT,
+    scheduled_date TEXT,
+    scheduled_time TEXT,
+    reason TEXT,
+    status TEXT DEFAULT 'pending',
+    created_at TEXT,
+    confirmed_at TEXT,
+    is_remote INTEGER DEFAULT 0
+)
+""",
+    """
+CREATE TABLE IF NOT EXISTS record_tags (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    record_id INTEGER,
+    teacher_name TEXT,
+    tag_type TEXT,
+    tag_value TEXT,
+    created_at TEXT
+)
+""",
+    """
+CREATE TABLE IF NOT EXISTS complaints (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    teacher_name TEXT,
+    patient_name TEXT,
+    content TEXT,
+    created_at TEXT,
+    status TEXT DEFAULT 'pending',
+    resolved_at TEXT
+)
+""",
+    """
+CREATE TABLE IF NOT EXISTS prescriptions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    teacher_name TEXT,
+    patient_name TEXT DEFAULT '',
+    items_json TEXT,
+    note TEXT DEFAULT '',
+    created_at TEXT,
+    is_remote INTEGER DEFAULT 0
+)
+""",
+    """
+CREATE TABLE IF NOT EXISTS agent_tasks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    teacher_name TEXT,
+    task_type TEXT,
+    category TEXT,
+    title TEXT,
+    content TEXT,
+    action_data TEXT,
+    status TEXT DEFAULT 'pending',
+    created_at TEXT,
+    resolved_at TEXT
+)
+""",
+    """
+CREATE TABLE IF NOT EXISTS agent_action_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    teacher_name TEXT,
+    task_id INTEGER,
+    action TEXT,
+    detail TEXT,
+    created_at TEXT
+)
+""",
+)
+
+
+def _exec_script(db_path, script):
+    """按句执行建表 / 造数脚本（等价于 `sqlite3 < file.sql`；本机无 sqlite3 CLI，故走 Python，§6.4 同款判据）。"""
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.executescript(script)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _count(db_path, table, where=""):
+    sql = "SELECT COUNT(*) AS c FROM %s%s" % (table, (" WHERE " + where) if where else "")
+    return _one(db_path, sql)["c"]
+
+
+def _filled_counts(db_path, tables=None):
+    """指定表里 `lineage_id <> ''` 的行数（= 实回填行数）；不存在的表直接跳过。
+
+    默认 = §2.3「必须」的 12 张（**不含** `templates` —— 它自带 `lineage_id`，只回填不补列）。
+    """
+    present = _tables(db_path)
+    return {
+        t: _count(db_path, t, "lineage_id <> ''")
+        for t in (tables or LINEAGE_ID_TABLES)
+        if t in present
+    }
+
+
+def _tables(db_path):
+    return set(_names(_read(db_path, "SELECT name FROM sqlite_master WHERE type='table'")))
+
+
+def _indexes(db_path):
+    return set(_names(_read(db_path, "SELECT name FROM sqlite_master WHERE type='index'")))
+
+
+def _columns_of(db_path, table):
+    return [row["name"] for row in _read(db_path, "PRAGMA table_info('%s')" % table)]
+
+
+def _load_migration_0005():
+    """按文件路径载入迁移模块（alembic 也是按路径载入的），用于核对 id 契约与红线常量。"""
+    assert os.path.exists(MIGRATION_0005_PATH), "迁移 0005 尚未创建：%s" % MIGRATION_0005_PATH
+    spec = importlib.util.spec_from_file_location("migration_0005_add_lineage", MIGRATION_0005_PATH)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _lineage_row(db_path):
+    rows = _read(db_path, "SELECT * FROM lineage")
+    assert len(rows) == 1, "lineage 应恰好 1 行（真机 1 位老师），实测 %d 行" % len(rows)
+    return rows[0]
+
+
+def _survivors(row):
+    """只取「幂等重跑必须一字不动」的字段（时间戳每次种子按当时时刻落，属预期变化）。"""
+    return {key: row[key] for key in ("id", "name", "owner_teacher_name", "description", "status")}
+
+
+def _seed_baseline_db(db_path, orphan_rows=0):
+    """造一份与真机 §6.2 基线同形的库（teachers 1 / patient_teachers 10 / templates 5 / records 4 / drafts 1）。
+
+    两段式：① 存量表 + 存量行（跑到 0004；0001 会把 plan_templates 那 1 行回填成 templates 第 1 行）；
+    ② 补 4 行 templates（凑满 §6.2 的 5 行）→ 停在 0004，调用方随后 `run_upgrade()` 就只差 0005。
+
+    orphan_rows：塞几个「老师不在 teachers 表」的 patient_teachers 行（回填必须留 `''`，不得兜底进默认师门）。
+    """
+    _exec_script(db_path, ";\n".join(LINEAGE_BASE_DDL) + ";")
+    _exec_script(db_path, PLAN_TEMPLATES_DDL + ";")
+
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            "INSERT INTO teachers (name, description, status, last_active_at, complaint_count, created_at) "
+            "VALUES (?, '', 'active', '2026-09-01T00:00:00', 0, '2026-09-01T00:00:00')",
+            (REAL_TEACHER,),
+        )
+        for i in range(10 - orphan_rows):
+            conn.execute(
+                "INSERT INTO patient_teachers (patient_name, teacher_name, status, created_at) "
+                "VALUES (?, ?, 'active', '2026-09-01T00:00:00')",
+                ("患者%02d" % (i + 1), REAL_TEACHER),
+            )
+        for i in range(orphan_rows):
+            conn.execute(
+                "INSERT INTO patient_teachers (patient_name, teacher_name, status, created_at) "
+                "VALUES (?, ?, 'active', '2026-09-01T00:00:00')",
+                ("孤儿%02d" % (i + 1), "無此老师"),
+            )
+        for i in range(4):
+            conn.execute(
+                "INSERT INTO patient_records (patient_name, teacher_name, ai_draft, final_plan, doctor, visit_at) "
+                "VALUES (?, ?, 'AI 原稿', '老师定稿', ?, '2026-09-0%dT10:00:00')" % (i + 2),
+                ("患者%02d" % (i + 1), REAL_TEACHER, REAL_TEACHER),
+            )
+        conn.execute(
+            "INSERT INTO drafts (transcript_id, patient_name, teacher_name, content, signed) "
+            "VALUES (0, '患者01', ?, '老草案', 0)",
+            (REAL_TEACHER,),
+        )
+        conn.execute(
+            "INSERT INTO plan_templates (teacher_name, content, updated_at) "
+            "VALUES (?, '疏肝理氣，健脾和胃。', '2026-09-01T10:00:00')",
+            (REAL_TEACHER,),
+        )
+        for i in range(5):
+            conn.execute(
+                "INSERT INTO agent_tasks (teacher_name, task_type, category, title, content, action_data, "
+                "status, created_at, resolved_at) "
+                "VALUES (?, 'request', 'student', '请示%d', '内容', '{}', 'pending', "
+                "'2026-09-01T00:00:00', '')" % (i + 1),
+                (REAL_TEACHER,),
+            )
+        conn.execute(
+            "INSERT INTO complaints (teacher_name, patient_name, content, created_at, status, resolved_at) "
+            "VALUES (?, '患者01', '十问歌摘要', '2026-09-01T00:00:00', 'pending', '')",
+            (REAL_TEACHER,),
+        )
+        conn.execute(
+            "INSERT INTO appointments (patient_name, teacher_name, initiator, scheduled_date, scheduled_time, "
+            "reason, status, created_at, confirmed_at, is_remote) "
+            "VALUES ('患者01', ?, 'patient', '2026-09-10', '09:00', '复诊', 'pending', "
+            "'2026-09-01T00:00:00', '', 0)",
+            (REAL_TEACHER,),
+        )
+        conn.execute(
+            "INSERT INTO prescriptions (teacher_name, patient_name, items_json, note, created_at, is_remote) "
+            "VALUES (?, '患者01', '[]', '', '2026-09-01T00:00:00', 0)",
+            (REAL_TEACHER,),
+        )
+        conn.execute(
+            "INSERT INTO homework (patient_name, teacher_name, task, detail, status, created_at) "
+            "VALUES ('患者01', ?, '每日泡脚', '20 分钟', 'pending', '2026-09-01T00:00:00')",
+            (REAL_TEACHER,),
+        )
+        conn.execute(
+            "INSERT INTO transcriptions (patient_name, teacher_name, content, data_type, processed) "
+            "VALUES ('患者01', ?, '转述内容', 'text', 0)",
+            (REAL_TEACHER,),
+        )
+        conn.execute(
+            "INSERT INTO record_tags (record_id, teacher_name, tag_type, tag_value, created_at) "
+            "VALUES (1, ?, 'symptom', '失眠', '2026-09-01T00:00:00')",
+            (REAL_TEACHER,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    assert migrations_runner.run_upgrade(PREVIOUS_REVISION, db_file=db_path) is True
+
+    conn = sqlite3.connect(db_path)
+    try:
+        for tpl_type, status in (("record", "active"), ("inquiry", "active"),
+                                 ("prescription", "active"), ("record", "archived")):
+            conn.execute(
+                "INSERT INTO templates (type, lineage_id, teacher_id, name, schema_json, version, "
+                "parent_template_id, status, created_at, updated_at) "
+                "VALUES (?, '', ?, '夹具模板', '{}', 1, NULL, ?, '2026-09-01T00:00:00', '2026-09-01T00:00:00')",
+                (tpl_type, REAL_TEACHER, status),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+    # 基线签名硬前置：夹具一旦漂移就当场失败，避免 Tier-2（真机基线）断言静默失效
+    for table, expected in REAL_DB_SIGNATURE:
+        actual = _count(db_path, table)
+        assert actual == expected, "基线夹具失真：%s 应 %d 行，实测 %d 行" % (table, expected, actual)
+    return db_path
+
+
+def _seed_small_db(db_path, orphan_rows=0):
+    """小夹具（**故意不匹配真机基线签名**）：只建部分业务表，用来验「表不存在 → 跳过」与孤儿行分支。
+
+    只建 teachers / patient_teachers / drafts 三张表 —— 其余表**故意缺失**（`patient_records` /
+    `templates` / `agent_stage_log` …），用来覆盖 0005 的「表不存在 → 探测后跳过、不报错」分支；
+    0001 仍会在 upgrade 时建出 `templates`。
+    """
+    subset = (LINEAGE_BASE_DDL[0], LINEAGE_BASE_DDL[1], LINEAGE_BASE_DDL[4])
+    _exec_script(db_path, ";\n".join(subset) + ";")
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            "INSERT INTO teachers (name, status, created_at) VALUES (?, 'active', '2026-09-01T00:00:00')",
+            (REAL_TEACHER,),
+        )
+        for i in range(2 - orphan_rows):
+            conn.execute(
+                "INSERT INTO patient_teachers (patient_name, teacher_name, status, created_at) "
+                "VALUES (?, ?, 'active', '2026-09-01T00:00:00')",
+                ("小患者%02d" % (i + 1), REAL_TEACHER),
+            )
+        for i in range(orphan_rows):
+            conn.execute(
+                "INSERT INTO patient_teachers (patient_name, teacher_name, status, created_at) "
+                "VALUES (?, ?, 'active', '2026-09-01T00:00:00')",
+                ("孤儿%02d" % (i + 1), "無此老师"),
+            )
+        conn.execute(
+            "INSERT INTO drafts (transcript_id, patient_name, teacher_name, content, signed) "
+            "VALUES (0, '小患者01', ?, '草案', 0)",
+            (REAL_TEACHER,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return db_path
+
+
+def test_0005_slug_and_lineage_id_contract():
+    """§0.1 / §2.1：`id = 'lin-' + slugify(name)`；非 ASCII → `-`、折叠、去首尾；空结果回落 `u<sha1(名)[:8]>`。"""
+    module = _load_migration_0005()
+
+    assert module.slugify("Li") == "li"
+    assert module.slugify("Li 老師") == "li"
+    assert module.slugify("Dr. Li 老師") == "dr-li"
+    assert module.slugify("--A--B--") == "a-b"
+    assert module.slugify("A_B.C") == "a-b-c"
+    fallback = "u" + hashlib.sha1(REAL_TEACHER.encode("utf-8")).hexdigest()[:8]  # 独立复算，冻结公式
+    assert module.slugify(REAL_TEACHER) == fallback
+    assert module.lineage_id_for(REAL_TEACHER) == REAL_LINEAGE_ID
+    assert module.lineage_name_for(REAL_TEACHER) == REAL_LINEAGE_NAME
+    assert module.lineage_id_for(REAL_TEACHER) == module.lineage_id_for(REAL_TEACHER)  # 稳定可复现
+
+
+def test_0005_source_keeps_epic4_redlines():
+    """§2.3 / §2.4 / §6.3 + 裁决③④：不加不该加的表、无 COALESCE 兜底、downgrade 不删列、不动阶段表。"""
+    module = _load_migration_0005()
+    source = open(MIGRATION_0005_PATH, encoding="utf-8").read()
+
+    touched = {table for table, _column in module.ADD_COLUMNS}
+    touched |= {table for table, _owner in module.BACKFILL_SOURCES}
+    assert set(NO_LINEAGE_TOUCH_TABLES) & touched == set()  # plan_templates（A1）/ agent_stage_* （裁决③）…
+    assert "COALESCE(lineage_id" not in source  # §2.4 纪律 3
+    assert "DROP COLUMN" not in source  # 裁决④：只回收结构，不删业务列
+    assert "ALTER TABLE agent_stage_state" not in source  # 裁决③-A：阶段表结构不动
+    assert set(LINEAGE_ID_TABLES) - touched == set()  # §2.3「必须」12 张一张不漏
+
+
+def test_0005_upgrade_adds_table_columns_and_backfill(tmp_path):
+    """§8 组①：真机同形库 upgrade → lineage 表 + 2 个索引 + 12 张表补列 + 回填 10/5/4/1。"""
+    db = str(tmp_path / "m9.db")
+    _seed_baseline_db(db)
+
+    assert migrations_runner.run_upgrade(db_file=db) is True
+
+    # ① lineage 表（§2.1：TEXT 主键、零 FK/CHECK，与 templates.lineage_id 同构）
+    assert "lineage" in _tables(db)
+    ddl = _one(db, "SELECT sql FROM sqlite_master WHERE type='table' AND name='lineage'")["sql"]
+    assert "id                  TEXT PRIMARY KEY" in ddl
+    for column in ("name", "owner_teacher_name", "description", "status", "created_at", "updated_at"):
+        assert column in ddl
+    assert "FOREIGN KEY" not in ddl.upper() and "CHECK" not in ddl.upper()
+    assert {"idx_lineage_owner", "idx_patient_teachers_lineage"} <= _indexes(db)
+
+    # ② 默认师门种子：真机 1 位老师 → 1 行；id = 'lin-' + slugify(name)（计算得出，非常量）
+    row = _lineage_row(db)
+    assert row["id"] == REAL_LINEAGE_ID
+    assert row["name"] == REAL_LINEAGE_NAME
+    assert row["owner_teacher_name"] == REAL_TEACHER
+    assert row["description"] == "" and row["status"] == "active"
+    assert row["created_at"] and row["updated_at"]
+
+    # ③ §2.3：必须 12 张都有 lineage_id；明确不加的表没有
+    for table in LINEAGE_ID_TABLES:
+        assert "lineage_id" in _columns_of(db, table), "%s 缺 lineage_id" % table
+    for table in NO_LINEAGE_ID_TABLES:
+        if table in _tables(db):
+            assert "lineage_id" not in _columns_of(db, table), "%s 不该有 lineage_id" % table
+    # A1 裁决：plan_templates 是 Epic 1 兼容镜像 —— 形状与内容一字未动
+    assert _columns_of(db, "plan_templates") == ["id", "teacher_name", "content", "updated_at"]
+    assert _count(db, "plan_templates") == 1
+
+    # ④ §6.2 回填计数（真机预期 10/5/4/1；其余表按实表有行才回填）
+    filled = _filled_counts(db)
+    assert filled["patient_teachers"] == 10
+    assert _count(db, "templates", "lineage_id <> ''") == 5  # templates 自带列，只回填
+    assert filled["patient_records"] == 4
+    assert filled["drafts"] == 1
+    for table in ("complaints", "appointments", "prescriptions", "homework", "transcriptions", "record_tags"):
+        assert filled[table] == 1, "%s 回填 %d 行" % (table, filled[table])
+    assert filled["agent_tasks"] == 5
+    assert filled["agent_action_log"] == 0 and filled["agent_stage_log"] == 0
+    assert {r["lineage_id"] for r in _read(db, "SELECT lineage_id FROM patient_teachers")} == {REAL_LINEAGE_ID}
+
+    # ⑤ 裁决③-A：阶段表结构不动（PK 仍 teacher_name），其 lineage_id 恒 ''
+    pk = [r["name"] for r in _read(db, "PRAGMA table_info('agent_stage_state')") if r["pk"]]
+    assert pk == ["teacher_name"]
+    assert _count(db, "agent_stage_state", "lineage_id <> ''") == 0
+
+    assert _one(db, "SELECT version_num FROM alembic_version")["version_num"] == ALEMBIC_HEAD
+
+
+def test_0005_upgrade_is_idempotent(tmp_path):
+    """§6.1 / §8 组①：head 再 upgrade = no-op；downgrade→upgrade 重跑本 revision 亦不重复补列 / 种子 / 回填。"""
+    db = str(tmp_path / "m10.db")
+    _seed_baseline_db(db)
+    assert migrations_runner.run_upgrade(db_file=db) is True
+    first = _filled_counts(db)
+    lineage_first = _survivors(_lineage_row(db))
+
+    assert migrations_runner.run_upgrade(db_file=db) is True  # 已在 head：no-op
+    assert _filled_counts(db) == first
+    assert _count(db, "lineage") == 1
+
+    # 真正重跑本 revision：回 0004（业务列按裁决④保留）→ 再 upgrade
+    migrations_runner.run_downgrade(PREVIOUS_REVISION, db_file=db)
+    assert "lineage" not in _tables(db)
+    assert migrations_runner.run_upgrade(db_file=db) is True
+    assert _filled_counts(db) == first  # 已有值的行不被重算，候选为空 → 回填 0 行
+    assert _count(db, "lineage") == 1  # 种子不重复（幂等）
+    # 师门表的字段口径稳定（id 由 slugify 复现；created_at / updated_at 重跑时按新时间落，属预期）
+    assert _survivors(_lineage_row(db)) == lineage_first
+    assert _columns_of(db, "patient_teachers").count("lineage_id") == 1
+
+
+def test_0005_orphan_rows_stay_unassigned(tmp_path):
+    """§2.4 纪律 2 / §6.2：找不到映射的行留 `''`（未归属），不得兜底进默认师门；表不存在则跳过。"""
+    db = str(tmp_path / "m11.db")
+    _seed_small_db(db, orphan_rows=1)  # 非真机签名：2 行归属其中 1 行是孤儿；无 templates / patient_records
+
+    assert migrations_runner.run_upgrade(db_file=db) is True
+
+    filled = _filled_counts(db, ("patient_teachers", "drafts"))
+    assert filled["patient_teachers"] == 1
+    orphan = _one(db, "SELECT lineage_id FROM patient_teachers WHERE teacher_name = '無此老师'")
+    assert orphan["lineage_id"] == ""  # 留 `''`（不 COALESCE 成默认师门）
+    owned = _one(db, "SELECT lineage_id FROM patient_teachers WHERE teacher_name = ?", (REAL_TEACHER,))
+    assert owned["lineage_id"] == REAL_LINEAGE_ID
+    assert filled["drafts"] == 1
+    assert _lineage_row(db)["id"] == REAL_LINEAGE_ID
+    # 表不存在 → 0005 探测后跳过（不建表、不报错）
+    assert "patient_records" not in _tables(db)
+
+
+def test_0005_backfill_count_mismatch_aborts_revision(tmp_path, capsys):
+    """CTO「回填计数校验」：真机基线签名命中但实填 ≠ 预期（10/5/4/1）→ 抛错 + 整 revision 回滚。"""
+    db = str(tmp_path / "m12.db")
+    _seed_baseline_db(db, orphan_rows=1)  # 签名命中（patient_teachers 共 10 行），但其中 1 行无映射 → 实填 9
+
+    assert migrations_runner.run_upgrade(db_file=db) is False
+    out = capsys.readouterr().out
+    assert "回填计数校验失败" in out
+    assert "patient_teachers" in out
+
+    # 失败后的现场（step 4.1 实测）：`alembic_version` 停在 0004、业务数据零变更；
+    # 但 SQLAlchemy / pysqlite 默认隔离级别下 **DDL 不在事务内**，空的 `lineage` 表与 `lineage_id` 列会残留。
+    # 关键不变式（本用例真正要守的）：**版本号不前进、业务数据零变更、修好触发条件后重跑即收敛**。
+    assert _one(db, "SELECT version_num FROM alembic_version")["version_num"] == PREVIOUS_REVISION
+    assert _filled_counts(db)["patient_teachers"] == 0  # 没有任何一行被写上 lineage_id
+    assert _count(db, "templates", "lineage_id <> ''") == 0
+    assert _count(db, "lineage") == 0  # 种子未落地
+    assert "lineage_id" in _columns_of(db, "patient_teachers")  # DDL 残留（pysqlite 不对 DDL 开事务）
+
+    # 修好触发条件（孤儿行的老师改成真实老师）→ 重跑 0005：幂等探测跳过已有表 / 列，随后全部校验通过
+    conn = sqlite3.connect(db)
+    try:
+        conn.execute(
+            "UPDATE patient_teachers SET teacher_name = ? WHERE teacher_name = '無此老师'", (REAL_TEACHER,)
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    assert migrations_runner.run_upgrade(db_file=db) is True
+    assert _one(db, "SELECT version_num FROM alembic_version")["version_num"] == ALEMBIC_HEAD
+    assert _count(db, "lineage") == 1
+    assert _filled_counts(db)["patient_teachers"] == 10  # 真机基线 10 行全部归属
+    assert _columns_of(db, "patient_teachers").count("lineage_id") == 1  # 补列未重复
+
+
+def test_0005_downgrade_keeps_business_columns(tmp_path):
+    """§6.3 / 裁决④：downgrade 只回收结构（lineage 表 + 两个索引），12 张表的 lineage_id 与值全部保留。"""
+    db = str(tmp_path / "m13.db")
+    _seed_baseline_db(db)
+    assert migrations_runner.run_upgrade(db_file=db) is True
+    before = _filled_counts(db)
+    lineage_id = _lineage_row(db)["id"]
+
+    migrations_runner.run_downgrade(PREVIOUS_REVISION, db_file=db)
+
+    assert "lineage" not in _tables(db)
+    assert "idx_patient_teachers_lineage" not in _indexes(db)
+    assert "idx_lineage_owner" not in _indexes(db)
+    assert _filled_counts(db) == before  # 值原样保留
+    for table in LINEAGE_ID_TABLES:
+        assert "lineage_id" in _columns_of(db, table)
+    assert _one(db, "SELECT lineage_id FROM drafts")["lineage_id"] == lineage_id
+    assert _one(db, "SELECT version_num FROM alembic_version")["version_num"] == PREVIOUS_REVISION
+
+    # 往返可用：再 upgrade → 表 / 索引回来、种子同 id、值不变
+    assert migrations_runner.run_upgrade(db_file=db) is True
+    assert "lineage" in _tables(db) and _lineage_row(db)["id"] == lineage_id
+    assert _filled_counts(db) == before
+
+
+def test_0005_downgrade_safety_gates(tmp_path):
+    """§6.3 安全闸：① 师门数 > 老师数（自建 / 多门数据）→ 中止；② 有已退出师门记录 → 中止（不静默吃数据）。"""
+    db = str(tmp_path / "m14.db")
+    _seed_baseline_db(db)
+    assert migrations_runner.run_upgrade(db_file=db) is True
+
+    # ① 第 2 个师门（= 老师自建 / 多门数据）→ 中止，且一条 DROP 都不执行
+    conn = sqlite3.connect(db)
+    try:
+        conn.execute(
+            "INSERT INTO lineage (id, name, owner_teacher_name, description, status, created_at, updated_at) "
+            "VALUES ('lin-wang', '王老师師門', '王老师', '', 'active', '2026-09-02T00:00:00', '2026-09-02T00:00:00')"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    with pytest.raises(Exception) as excinfo:
+        migrations_runner.run_downgrade(PREVIOUS_REVISION, db_file=db)
+    assert "downgrade 已中止" in str(excinfo.value)
+    assert "lineage" in _tables(db)
+    assert _count(db, "lineage") == 2
+
+    # ② 只剩「已退出师门」记录（lineage_id 非空 + status='inactive'）→ 同样中止
+    conn = sqlite3.connect(db)
+    try:
+        conn.execute("DELETE FROM lineage WHERE id = 'lin-wang'")
+        conn.execute("UPDATE patient_teachers SET status = 'inactive' WHERE patient_name = '患者01'")
+        conn.commit()
+    finally:
+        conn.close()
+    with pytest.raises(Exception) as excinfo:
+        migrations_runner.run_downgrade(PREVIOUS_REVISION, db_file=db)
+    assert "downgrade 已中止" in str(excinfo.value)
+    assert "lineage" in _tables(db)
+
+    # ③ 恢复 active → 闸门放行（证明闸门是唯一阻塞点）
+    conn = sqlite3.connect(db)
+    try:
+        conn.execute("UPDATE patient_teachers SET status = 'active'")
+        conn.commit()
+    finally:
+        conn.close()
+    migrations_runner.run_downgrade(PREVIOUS_REVISION, db_file=db)
+    assert "lineage" not in _tables(db)
+
+
+def test_0005_init_db_then_upgrade(tmp_path, monkeypatch):
+    """§8 组①「空库」：init_db() 建出存量表（数据极少）→ 全链 upgrade 跑通、每位老师都有默认师门。"""
+    import database
+
+    db_file = tmp_path / "empty_0005.db"
+    monkeypatch.setattr(database, "DB_PATH", str(db_file))
+    database.init_db()
+
+    assert migrations_runner.run_upgrade(db_file=str(db_file)) is True
+
+    db = str(db_file)
+    assert _count(db, "lineage") == _count(db, "teachers")  # 每位老师一个默认师门
+    for table in LINEAGE_ID_TABLES:
+        if table in _tables(db):
+            assert "lineage_id" in _columns_of(db, table), "%s 缺 lineage_id" % table
+    assert "lineage_id" not in _columns_of(db, "plan_templates")  # A1：兼容镜像不师门化
+    assert _one(db, "SELECT version_num FROM alembic_version")["version_num"] == ALEMBIC_HEAD
+
+
+def test_0005_offline_sql_artifact_matches_migration():
+    """§6.4 / CTO 约束 5：`docs/migrations/0005_add_lineage.sql` 的结构语句与回填语句与迁移内联常量逐字一致。"""
+    module = _load_migration_0005()
+    artifact = os.path.join(os.path.dirname(BACKEND_DIR), "docs", "migrations", "0005_add_lineage.sql")
+    assert os.path.exists(artifact), "离线产物缺失：%s" % artifact
+    text = open(artifact, encoding="utf-8-sig").read().replace("\r\n", "\n")
+
+    assert module.LINEAGE_TABLE_DDL.strip() + ";" in text
+    assert "CREATE INDEX IF NOT EXISTS idx_lineage_owner ON lineage (owner_teacher_name, status);" in text
+    for ddl in module.PATIENT_TEACHERS_INDEX_DDL:
+        assert ddl + ";" in text
+    for table, _column in module.ADD_COLUMNS:
+        assert (module.ADD_COLUMN_TPL % table) + ";" in text, "产物缺 %s 的补列语句" % table
+    for table, owner_column in module.BACKFILL_SOURCES:
+        assert module.backfill_sql(table, owner_column) + ";" in text, "产物缺 %s 的回填语句" % table
+    # 种子语句：真机唯一老师的 lin-* id 必须以内联字面量出现（离线产物可直接人工预审）
+    assert module.lineage_id_for(REAL_TEACHER) in text
+    assert module.LINEAGE_NAME_SUFFIX in text
+    # §6.3 / 裁决 ④：产物中不得出现任何删列语句
+    assert "DROP COLUMN" not in text.upper()
 
 
 def test_migration_0004_adds_patient_record_template_refs(tmp_path):

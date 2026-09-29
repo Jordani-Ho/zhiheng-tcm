@@ -161,14 +161,26 @@ def test_agent_stage_log_has_no_update_or_delete_function():
 
 
 def test_whitelists_match_migration_0003_columns(db):
-    """白名单 ↔ 0003 建表列 逐列一致（列名漂移立刻红）。"""
+    """白名单 ↔ 0003 建表列 逐列一致（列名漂移立刻红）。
+
+    【Epic 4 step 4.1 同步点】迁移 `0005_add_lineage` 按 CTO 裁决 ③-C / 设计 §2.3 给
+    `agent_stage_log` 补了一列 `lineage_id`（**只作审计标注**：阶段本身仍恒「老师维度」，
+    `agent_stage_state` 结构一字未动）。故本用例的日志表期望集合显式多出这一列 ——
+    除它以外仍逐列严格相等，列名漂移依旧立刻红；`AGENT_STAGE_LOG_INSERT_FIELDS` 常量本身
+    （= `insert_agent_stage_log` 的写入字段）**一字不改**，带 lineage 写入属 step 4.2 的写路径改造。
+    """
     conn = database.get_connection()
     state_columns = {row["name"] for row in conn.execute("PRAGMA table_info('agent_stage_state')")}
     log_columns = {row["name"] for row in conn.execute("PRAGMA table_info('agent_stage_log')")}
     conn.close()
 
     assert set(database.AGENT_STAGE_STATE_UPSERT_FIELDS) | {"teacher_name"} == state_columns
-    assert set(database.AGENT_STAGE_LOG_INSERT_FIELDS) | {"id", "teacher_name", "event_type"} == log_columns
+    assert set(database.AGENT_STAGE_LOG_INSERT_FIELDS) | {
+        "id",
+        "teacher_name",
+        "event_type",
+        "lineage_id",  # 【Epic 4 裁决③-C】0005 新增的审计标注列（唯一白名单外例外）
+    } == log_columns
 
 
 # ============ ② 状态表 agent_stage_state ============

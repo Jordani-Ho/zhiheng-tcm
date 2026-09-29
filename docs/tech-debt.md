@@ -13,10 +13,17 @@
 | :---- | :---- | :---- | :---- | :---- | :---- |
 | TD-001 | `_drafts_supports_template_refs()` 未收敛到 `_table_has_columns()` | Epic 1（已验收） | `backend/database.py:645-651` | 低 | **不动**（Epic 2 不碰 Epic 1 已验收代码） |
 | TD-002 | `resolve_agent_task()` 中 approved + 非对象 JSON 的既有 `AttributeError` | 存量（Epic 2 之前） | `backend/database.py:1697-1703` | 中低 | **不修**（「既有语义一字不改」原则） |
-| TD-003 | 迁移回退口径不一致：0004 downgrade **删**两列，0002 / 0003 **保留**列 | Epic 2 迁移层（0004 按 CTO 裁决 A1） | `backend/alembic/versions/0004_add_patient_record_template_refs.py` | 低 | **不动**（口径差异 = CTO 明确裁决；0004 删列带幂等探测 + 失败即抛） |
+| TD-003 | 迁移回退口径：**全库已统一为「downgrade 不删业务列，只回收结构（表、索引）」**；0004 为**已存在例外**（不追溯修改） | Epic 2 迁移层（0004 按 CTO 裁决 A1 落地）→ **Epic 4 迁移层（0005 起执行新口径）** | `backend/alembic/versions/0004_add_patient_record_template_refs.py`（**例外**）；`backend/alembic/versions/0005_*.py`（**新口径**） | 低（方向已裁决、口径已定） | **不动 0004**；Epic 4 的 `0005` 按新口径实施（downgrade 只回收新增表与索引，`lineage_id` 等业务列回退时**保留**） |
+| TD-005 | `plan_templates` 未按师门过滤（Epic 1 兼容镜像，未师门化） | Epic 1 兼容镜像 → **Epic 4 明确不师门化**（CTO 2026-09-29 裁决 A1） | `backend/database.py:372-381`（建表 + 旧「施治模板」入口）；`backend/alembic/versions/0005_add_lineage.py`（**不补列 / 不回填 / 不过滤**，见 §4） | 低（阶段一「一师一门」下不产生越权） | **不动**（不加 `lineage_id`）：它是 Epic 1 兼容镜像、已被 `templates` 取代；触发条件 = 开放「一师多门」或白皮书要求旧接口按师门过滤，届时单独立项 |
+| TD-006 | `alembic/env.py` 未做 DDL 事务化 → **DDL 不在事务内**（结构残留由幂等探测吸收） | 迁移层（**Epic 1 起既有**，非 Epic 4 引入） | `backend/alembic/env.py:51-72`（在线模式 `transaction_per_migration=False` + 「SQLite 3.49 支持 DDL 事务」注释）；`backend/alembic/versions/0005_add_lineage.py`（依赖幂等探测吸收残留） | 低（无数据面缺陷） | **不动**（CTO 2026-09-29 裁决②：**不立项**）；触发条件 = 出现**真实 DDL 残留导致的生产事故** |
 
 > 登记例外：TD-003 由 CTO 2026-09-28 裁决③ 指令于 **Epic 2 step 3.1** 提前登记（一般纪律是「只在收口回归步登记」）。
 > 本条**只登记、不在 step 3.1 内修缮** —— 请 CTO 在 step 3.6 收口时复核是否需要调整等级 / 处置。
+> **2026-09-29 CTO 裁决④（Epic 4 step 4.0 放行时给出）**：口径已定 —— 全库**统一**为「downgrade **不删业务列**，只回收结构（表、索引）」；**0004 为已存在例外，不追溯修改**（不改其 `downgrade()`、不改其离线 SQL、不改其往返断言）；**Epic 4 的迁移 `0005` 采用新口径**。本条**等级维持「低」**，处置已从「待裁决」转为「已裁决，实施随 0005 落地」，详见 §3 表格内的「CTO 裁决」行与「将来怎么修」行。
+>
+> 登记例外：TD-005 由 CTO 2026-09-29「step 4.1 放行」指令于 **Epic 4 step 4.1** 登记（同为提前登记）。登记理由：`plan_templates` 的师门化在 step 4.0 附录 A-A1 被提出、当次裁决为「**不加**」，故该缺口必须留痕，否则后续「为什么旧施治模板接口不过滤师门」将无据可查。**只登记、不在 4.1 内修缮**。
+>
+> 登记例外：TD-006 由 CTO 2026-09-29「真机升级窗口放行」指令登记（同为提前登记，不进收口步）。登记理由：`docs/epic4-lineage-design-v1.md` §9 注② 在 step 4.1 实测发现「DDL 不在事务内、结构残留不随回滚消失」，该事实必须留痕（否则后续「为什么退回后还留着空表 / 空列」无据可查）。**只登记、不在 4.1 / 升级窗口内修缮**；裁决为**不立项**，触发条件见本条「等级 / 风险」行。
 
 ---
 
@@ -63,13 +70,48 @@
 | 等级 | 低 —— 各迁移与其自身设计一致：0004 的两列是**引用快照**（`DEFAULT 0` = 未记录），删掉不损失病历正文，只损失 ① 指标「这份病历是照哪版模板写的」的归因；`upgrade head` 路径与 flag off 语义完全不受影响。 |
 | 风险 | 中远期：运维若按 Epic 1 口径的直觉（「downgrade 不丢列」）回退，会在 0004 上丢两列归因数据；若反向统一成「都不删列」，则与 0004 的已验收产物（含 `docs/migrations/0004_add_patient_record_template_refs.sql` 的说明与 `test_migrations.py` 的往返断言）不一致。 |
 | 为什么现在不修 | 「0004 删列」是 CTO 裁决 A1 的明确要求（step 3.0 已验收）。把已验收迁移改成「不删列」属**变更已验收交付物**，必须单独提交 + 单独批准，不能在 step 3.x 内顺手改。 |
-| 将来怎么修 | 二选一，均需 CTO 先裁决方向：① 全库统一「downgrade 只回收结构、不删数据列」→ 改 0004 的 `downgrade()`，同步改 `docs/migrations/0004_*.sql` 说明与 `test_migrations.py` 的 0004 往返断言（改为「回退后两列仍在、老行仍为 0」）；② 全库统一「downgrade 逐列回收」→ 给 0002 / 0003 补删列，属行为变更，需先批准并单独回归。 |
-| 完成判据 | ① 选定方向后改对应迁移 + 离线 SQL 产物 + 用例；② `pytest backend/test_migrations.py -q` 全绿；③ 全量 `pytest backend -q` 绿；④ 提交说明显式标注「回退口径变更」，避免被误读为静默修 bug。 |
+| **CTO 裁决（2026-09-29，Epic 4 step 4.0 放行时给出）** | **④ 全库统一为「downgrade 不删业务列，只回收结构（表、索引）」；0004 为已存在例外，不追溯修改；Epic 4 的 `0005` downgrade 采用新口径。** 等价于「取方向①的口径 + 豁免 0004」：不改 0004 的 `downgrade()`、不改 `docs/migrations/0004_*.sql`、不改 `test_migrations.py` 的 0004 往返断言（避免变更已验收交付物）。 |
+| 将来怎么修 | **口径已定，不再二选一。** 剩余动作只在「未来某次允许变更已验收产物的窗口」才考虑：若届时要把 0004 也统一为「不删列」，需**单独提交 + 单独批准**，并同步改 `docs/migrations/0004_add_patient_record_template_refs.sql` 的说明与 `test_migrations.py` 的 0004 往返断言（改为「回退后两列仍在、老行仍为 0」）。默认**不做**。 |
+| 完成判据 | **口径侧（2026-09-29 已达成）**：§0 总表行 + 本条 + `docs/epic4-lineage-design-v1.md` §6.3 三处写成**同一句话**。**实施侧（Epic 4 step 4.1 起适用）**：① `0005` 的 `downgrade()` 只 `DROP` 新增表与索引，**不** `DROP` 任何业务列（`lineage_id` 等回退后**保留**）；② `pytest backend/test_migrations.py -q` 全绿（含 0005 往返断言「回退后新增列仍在、老行值不变」）；③ 全量 `pytest backend -q` 绿；④ 提交说明显式标注「回退口径：只回收结构、不删业务列」，避免被误读为静默修 bug。 |
 | 关联 | **真机升级窗口（CTO 裁决③）**：step 3.1–3.4 全部完成后、step 3.5（`sign_draft` 写 0004 两列 + 真机 `alembic upgrade head`）之前，**强制**先文件级备份 `backend/zhiheng.db` → `backend/zhiheng.db.bak-20260928`，备份**不进仓库**。✅ 已闭环：`.gitignore` 已加忽略规则 `backend/zhiheng.db.bak-*`（CTO 2026-09-28 批准，紧跟 `backend/zhiheng.db` 之后）。现状核对：`backend/zhiheng.db.bak-20260928`（184320 B，与库同尺寸）在 `git status` 中**已消失**、`git check-ignore` 退出码 0；`backend/backups/`（磁盘已存在）本就已被忽略，可作后续集中备份目录；仓库内**无任何**被跟踪的 `*db` 文件（`git ls-files` 为空）。备份文件**留在原位不动**（它是当前唯一副本，移动无收益）。 |
 
 ---
 
-## 4. 未登记项（说明）
+## 4. TD-005 · `plan_templates` 未按师门过滤（Epic 1 兼容镜像，未师门化）
+
+| 项 | 内容 |
+| :---- | :---- |
+| 编号 | TD-005 |
+| 归属 | **Epic 1 兼容镜像**（旧「施治模板」`plan_templates`）→ Epic 4 **明确不师门化**（CTO 2026-09-29 裁决 A1） |
+| 位置 | `backend/database.py:372-381`（`plan_templates` 建表 + 注释）；`backend/template_service.py` 的 `sync_legacy_plan_template()`（旧 → `templates` 的**单向双写**）；`backend/alembic/versions/0005_add_lineage.py`（`ADD_COLUMNS` / `BACKFILL_SOURCES` 里**都没有** `plan_templates` —— 不补列、不回填、不过滤） |
+| 事实 | ① 旧「施治模板」接口（`plan_templates`，一位老师一行 `teacher_name UNIQUE`）自 Epic 1 起被定位为**兼容镜像**（`docs/epic1-template-design-v1.md` §7.6：Epic 2 起只读、只由旧接口维护）；② flag on 时其内容**单向双写**进 `templates`（带 `lineage_id`），新链路的师门维度由 `templates` 承载；③ Epic 4 step 4.1 的 12 张「必须补 `lineage_id`」清单（设计 §2.3）**不含** `plan_templates`，故旧接口的返回行**仍是老师维度、不带师门过滤**。 |
+| 等级 | 低 —— 阶段一硬约束「一师一门」（`lineage.owner_teacher_name` 唯一）下，一位老师只有一个师门，`plan_templates` 的行天然属于该老师唯一师门，**不产生越权**；数值面也无影响（旧接口只服务其所属老师本人）。 |
+| 风险 | 中远期：① 若阶段二开放「一师多门」，同一位老师的旧施治模板将无法区分「哪一门」；② 若白皮书要求「旧接口也按师门过滤」，届时需再开一次迁移补列 + 回填（**比现在补列贵**：此刻补列最便宜，A1 已权衡并放弃）。 |
+| 为什么现在不修 | CTO 2026-09-29 裁决 A1：**不加**。理由：`plan_templates` 是 Epic 1 兼容镜像、已被 `templates` 取代；补 `lineage_id` 会连带触发旧「施治模板」接口（读 / 写两处）的改动，属**变更已验收交付物** + 范围蔓延。已按「只登记、不修缮」入册。 |
+| 将来怎么修 | **单独立项**（不并入任何现有 Epic）：① 迁移补 `plan_templates.lineage_id TEXT NOT NULL DEFAULT ''` + 按 `teacher_name` 回填；② 旧接口读路径加师门过滤、写路径带 `lineage_id`；③ `sync_legacy_plan_template()` 双写时带上当时师门；④ 同步更新 `docs/epic1-template-design-v1.md` §7.6（兼容镜像的定位变更）与本册本条。 |
+| 完成判据 | ① 「一师多门」fixture 下旧接口只返回本门行（跨门行 4xx 或不可见，不得返回全量）；② `pytest backend -q` 全绿；③ Epic 1 的兼容镜像语义仍成立（旧 → `templates` 单向双写不变）；④ 设计文档 §2.3 / §11 与本册本条同步更新。 |
+| 关联 | 设计文档 `docs/epic4-lineage-design-v1.md` §2.3（明确不加清单）/ §11-12（不做的事）/ 附录 A-A1（裁决来源）；`docs/epic1-template-design-v1.md` §7.6（兼容镜像定位）；`backend/test_migrations.py::test_0005_source_keeps_epic4_redlines`（用例固定「0005 不碰 `plan_templates`」）。 |
+
+---
+
+## 5. TD-006 · `alembic/env.py` 未做 DDL 事务化（DDL 不在事务内）
+
+| 项 | 内容 |
+| :---- | :---- |
+| 编号 | TD-006 |
+| 归属 | **迁移层既有基础设施**（`backend/alembic/env.py`，自 Epic 1 迁移 0001 起；**非 Epic 4 引入**） |
+| 位置 | `backend/alembic/env.py:51-72` `run_migrations_online()`：`context.configure(..., transaction_per_migration=False)` 与注释「同一个连接、同一个事务内跑完所有迁移（SQLite 3.49 支持 DDL 事务）」；受影响调用方：`backend/migrations_runner.py`（`main.py` / `conftest.py` / CLI 同一条路径）；依赖方：`backend/alembic/versions/0005_add_lineage.py`（靠自身幂等探测吸收残留） |
+| 事实 | 本机（Python 3.12 + SQLAlchemy 2.0 + pysqlite / `sqlite3` 默认 `isolation_level=""` legacy 事务模式）下，**DDL 不受事务保护**：`CREATE TABLE` / `ALTER TABLE ... ADD COLUMN` 会被 SQLite 隐式提交并绕过 `context.begin_transaction()`。**实测证据**（Epic 4 step 4.1 的「孤儿行」用例）：让 `0005` 在回填阶段抛错后 —— ① `alembic_version` 停在 `0004`（版本号回滚成立）、② 业务数据零变更（DML 回滚成立）、③ 但**空的 `lineage` 表与 12 张表的 `lineage_id` 列全部残留**。故「整 revision 回滚」的**实际语义 = 版本号 + 数据回滚，结构不回滚**；修正数据后重跑 `upgrade` 由幂等探测吸收（`sqlite_master` / `PRAGMA table_info` 探测后跳过），实测收敛到 `0005`。 |
+| 等级 | 低 —— 现状无数据面缺陷：① 残留物恰是「目标状态的一部分」（新列 + 新空表），`0005` 的重跑路径把它当「已完成」跳过；② 迁移失败时旧代码向后兼容（flag off 不读 `lineage_id`；`plan_templates` 等旧接口零影响）；③ 全库 0001–0005 五条迁移均为「只增 + 幂等」（`IF [NOT] EXISTS`、探测后补列），故残留不会引发二次执行错误（唯一「第二遍原样执行离线 SQL」会报 `duplicate column name`，属预期并已在设计 §6.4 说明）。 |
+| 风险 | 中远期：① 残留会让「半途失败的 revision」在库结构上看起来是「部分完成」，一旦未来出现**破坏性 DDL** 迁移（`DROP COLUMN` / 重建表改类型 / 先 `DROP` 后 `ADD`），重跑行为会分歧（二次 DROP 报错，或真的丢列）；② 在线与离线（人工逐句执行）的行为不能保证同构，运维心智负担；③ 生产事故时「回滚到上一个 revision」的预期与库结构实际状态不符，需要人工核对。 |
+| 为什么现在不修 | **CTO 2026-09-29 裁决②：不立项**。触发条件 = 若将来出现**真实 DDL 残留导致的生产事故**，再立项。技术理由：修它必须改 `env.py` 的事务接入方式（显式 `BEGIN` / 调整 `isolation_level` / 关 autocommit），属**全库共用基础设施**改动，会连带影响 0001–0005 五条已验收迁移的执行路径、离线 SQL 生成与测试基座（`test_migrations.py` 全部往返用例），属「动已验收交付物」；而当前「只增 + 幂等」的迁移纪律已把危害面吸收到可接受范围（见「等级」行），收益与风险不成比例。 |
+| 将来怎么修 | **单独立项**（不并入任何现有 Epic）：① 在 `run_migrations_online()` 内显式开事务并对 DDL 生效（如 `connection.exec_driver_sql("BEGIN")` + 迁移结束显式 `COMMIT`，或改用 `sqlite3` 非 legacy 事务模式 / `isolation_level=None` + 手动事务）；② 新增**跨 revision 守护用例**：临时 revision 中途抛错 → 断言 `lineage` 表**不存在**、`alembic_version` 回起点；③ 复核 0001–0005 五条迁移在该路径下的往返结果与离线产物逐字一致性；④ 同步更新 `docs/epic4-lineage-design-v1.md` §9 注② 与本册本条。 |
+| 完成判据 | ① 造「中途抛错」的临时 revision，断言**结构 + 版本号双双回到起点**（无残留空表 / 空列）；② `pytest backend -q` 全绿（含 0001–0005 全部往返断言与 0005 幂等收敛用例）；③ 真机升级窗口「分步 upgrade + 每步 `alembic current`」流程不变、`docs/migrations/0005_*.sql` 零变化。 |
+| 关联 | 发现于 **Epic 4 step 4.1**（设计 `docs/epic4-lineage-design-v1.md` §9 注② 与 附录 B 4.1 备注② 留痕）；证据用例 `backend/test_migrations.py::test_0005_orphan_row_aborts_and_converges`；裁决来源 = CTO 2026-09-29「step 4.1 验收 + 三项裁决」②。 |
+
+---
+
+## 6. 未登记项（说明）
 
 - Epic 2 自身引入的可见风险（快照列写入、flag 双闸门、钩子两态等）**不**进本册：它们属**在设计范围内已实现并有用例守护**的内容，见 `docs/epic2-agent-stage-design-v1.md` §7.3「风险与缓解」。
 - 新增债务必须以「本 Epic 明确不修」为前提，凡「本 Epic 应当且能够修」的，一律在施工步内修完，不进本册。
