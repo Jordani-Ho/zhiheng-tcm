@@ -61,14 +61,32 @@
        `stage_config_source()`（§3.4 第 4 条）+ 库层只读统计 `database.get_agent_stage_log_stats`
        （批复 C-2：越权计数 + 推荐冷却）。CTO 八条约束逐条钉住：
        ① 三块各有契约用例；② `evaluate()` 首行 flag 闸门（off → 零 SQL、零写入）；
-       ③ **绝不向上写 `stage`**（AST 数 `stage=` 关键字实参恰好 1 处、只在 `_ensure_state_row()`、
-       值恒为 `view["stage"]` → 零 delta；另配「有行老师 `stage` / `stage_since` / `stage_source`
-       评估前后逐字节不变」与「无行老师生效阶段 + 权限面不变」两条行为级断言）；
+       ③ **绝不向上写 `stage`**（AST 数 `stage=` 关键字实参并**逐处归位**：`_ensure_state_row()` 的
+        零 delta 一处、3.4-c 老师确认钩子的唯一向上写一处、该钩子返回体回显一处（不落库）——
+        3.4-c 落地后由 3 处断言接续钉住；另配「有行老师 `stage` / `stage_since` / `stage_source`
+        评估前后逐字节不变」与「无行老师生效阶段 + 权限面不变」两条行为级断言）；
        ④ 十条判定逐条进 `blockers`（`value=None` / `pending_stage` / 冷却期三条各有专项）；
        ⑤ `pending_stage` 与 `pending_task_id` **成对**写（先 state 后建单 + 建单抛异常不留半对）；
        ⑥ `stage_config_source()` 与 `load_stage_config` **同源**（同一层走读 + 调用点唯一守护）；
        ⑦ `agent_action_log` 只在推荐建单时写（无推荐的评估一行都不写）；⑧ 阈值改了判定就变。
        本组**不改** ⑬–⑯ 组一行，只复用它们的造数 / 断言助手。
+
+    ⑱ 【施工步骤 3.4-c】**三个既有链路钩子** + 「唯一向上写路径」：`on_draft_signed`（薄封装，
+       只转一次评估）/ `apply_upgrade_confirmation`（老师 ✅ 确认 → **全系统唯一 rank 增加点**）/
+       `decline_upgrade`（老师 ❌ 忽略 → 清待确认对 + 冷却起点）。CTO 约束逐条钉住：
+       ① 唯一向上写路径（**源码级**：全文件 `stage=` 写入点枚举 + 逐处归位到「所属函数 + 所属调用」，
+       真正落库的状态行写入点恰好 2 处、其中 **rank 增加点计数 = 1**，且值表达式恒为钩子入参
+       `to_stage`；`**` 展开形状出现即红；**行为级**：越级 / 向下 / 非法目标一律拒绝且阶段一个字不动）；
+       ② 拒绝用既有 `upgrade_declined` 事件（**不新造第 11 类**、**不用**语义不符的 `permission_denied`），
+       跳级 detail 固定含「越級請求被拒：to_stage=X, current=Y」；
+       ③ 幂等（已在目标阶段 → `stage` / `stage_since` / `stage_source` 逐字节不变、不写第二条
+       `stage_upgraded`）；④ `on_draft_signed` 是薄封装（**不判 flag**：总闸只许一份，源码级断言体内
+       无 flag 标识符且只有一次评估调用）；⑤ 三钩子互不调用（源码级无环）；⑥ `agent_action_log`
+       只写升阶 / 被拒两类（`confirm_upgrade` / `decline_upgrade`）；⑦ 端到端：签字 → 评估 → 推荐
+       （阶段不动）+ ❌ → 紧接着的评估被 3.4-b 口径 F 的冷却拦住 + flag off 三钩子零 SQL 零写入。
+       本组**不改** ⑬–⑯ 组一行；⑰ 组那条「恰好 1 处」的临时钉按它自己的预告升级为「3 处 + 逐处
+       归位」，⑪ 组两条 flag on 用例按「钩子已真实存在」调整口径（前 5 条语句仍逐字节等于 flag off
+       基线，评估链语句一律排在其后）。
 
 
 运行方式（Windows，串行；见 pytest.ini）：
@@ -958,7 +976,12 @@ def legacy_full_db(monkeypatch, tmp_path):
 
 
 def test_sign_draft_flag_on_legacy_db_still_uses_original_sql(legacy_full_db, sql_log, monkeypatch):
-    """双闸门的第二道：flag 已 on 但列未就位（老库）→ 仍走原 6 列 SQL，序列与 flag off 基线一致。"""
+    """双闸门的第二道：flag 已 on 但列未就位（老库）→ 仍走原 6 列 SQL，序列与 flag off 基线一致。
+
+    【3.4-c 注】钩子真实存在之后，flag on 的签字会在 commit 之后追加一次评估（§4.2 改 2b：新病历 =
+    新样本）。老库里那次评估会逐级降级（库表未就位、绝不改阶段），但**语句照样入账**；故本条按
+    「签字那一段逐字节等于 flag off 基线 + 评估链的语句一律排在它之后」来钉，见下面两行断言。
+    """
     monkeypatch.setenv("AGENT_STAGE_ENABLED", "on")
     draft_id = _sign_fixture_draft(legacy_full_db)
     sql_log.clear()
@@ -970,8 +993,11 @@ def test_sign_draft_flag_on_legacy_db_still_uses_original_sql(legacy_full_db, sq
 
     calls = _normalized_calls(sql_log)
     assert calls[1] == ("PRAGMA table_info('patient_records')", ()), "flag on 时必须真的探到列（第二道闸门）"
-    assert [c for c in calls if not c[0].startswith("PRAGMA")] == _sign_draft_baseline(draft_id), \
-        "除那一次列探测外，语句序列与 flag off 基线逐字节一致"
+    # 【3.4-c 起】钩子真实存在 → 签字之后接一次评估。本条只钉**签字那一段**：前 5 条与 flag off
+    # 基线逐字节相同，且评估链的语句一律排在它们**之后**（钩子在 commit 之后才被调用）。
+    non_pragma = [c for c in calls if not c[0].startswith("PRAGMA")]
+    assert non_pragma[:5] == _sign_draft_baseline(draft_id), \
+        "签字那一段的语句序列必须与 flag off 基线逐字节一致（评估语句只许跟在后面）"
 
 
 def test_sign_draft_hook_absent_is_silent_noop(db, monkeypatch, capsys):
@@ -1053,6 +1079,8 @@ def test_sign_draft_hook_runs_after_commit(db, monkeypatch):
 
 def test_single_flag_gate_and_probe_helpers_are_shared(db, monkeypatch):
     """【要求 1】两个快照写入点必须共用**同一个**闸门函数与**同一个**列探测实现（不得各写一份）。"""
+    import agent_stage_service
+
     calls = []
     real_gate = database._agent_stage_snapshot_enabled
     real_probe = database._table_has_columns
@@ -1068,6 +1096,11 @@ def test_single_flag_gate_and_probe_helpers_are_shared(db, monkeypatch):
     monkeypatch.setenv("AGENT_STAGE_ENABLED", "on")
     monkeypatch.setattr(database, "_agent_stage_snapshot_enabled", gate_spy)
     monkeypatch.setattr(database, "_table_has_columns", probe_spy)
+    # 【3.4-c 起】flag on 的 `sign_draft()` 会在 commit 后真实触发一次评估（§4.2 改 2b），而评估链
+    # 自己也会过闸门、探阶段表的列 → 本条只量**两个快照写入点**，故把钩子换成零副作用的哨兵
+    # （与 ⑫ 组 `_install_fake_hooks` 同款纪律）。
+    seen = []
+    monkeypatch.setattr(agent_stage_service, "on_draft_signed", seen.append, raising=False)
 
     draft_id = _sign_fixture_draft(db)                        # insert_draft：闸门 1 次 + 草案列探测 1 次
     db.sign_draft(draft_id, "最终方案")                        # sign_draft：闸门 1 次 + 历史表列探测 1 次
@@ -1075,6 +1108,7 @@ def test_single_flag_gate_and_probe_helpers_are_shared(db, monkeypatch):
     assert calls.count("gate") == 2, "两个写入点各过一次**同一个**闸门（不得存在第二份 flag 判断）"
     assert calls.count("probe:drafts") == 1 and calls.count("probe:patient_records") == 1, \
         "两个快照列探测共用唯一实现 _table_has_columns"
+    assert seen == [TEACHER], "签字钩子恰好被调用一次，且实参是草案上的老师（评估链已被哨兵隔离）"
 
 
 def test_database_module_never_imports_agent_stage_service_at_module_level():
@@ -3417,10 +3451,11 @@ def test_evaluate_third_metric_is_null_placeholder(db, stage_gate):
 # ---- 约束 3：绝不向上写 stage（AST 守护 + 两条行为级断言）----
 
 def test_evaluate_stage_write_point_is_pinned_to_the_zero_delta_helper():
-    """CTO 约束 3 的**精确形态**：服务层的 `stage=` 关键字实参**恰好 1 处**，只在
-    `_ensure_state_row()` 里、值表达式恒为 `view["stage"]`（评估前 `describe_stage()` 已报告的
-    同一个阶段 → 零 delta）。`pending_stage=` / `from_stage=` / `to_stage=` 是别的形参名，
-    AST 精确匹配不计入；3.4-c 落地「唯一向上写路径」后本断言改为 2。
+    """CTO 约束 3 的**精确形态**（3.4-c 落地后按预告升级）：服务层的 `stage=` 关键字实参**恰好 3 处**，
+    逐处归位 —— ① `_ensure_state_row()`：值表达式恒为 `view["stage"]`（评估前 `describe_stage()` 已
+    报告的同一个阶段 → **零 delta**）；② 3.4-c 老师确认钩子的状态行写入（**全系统唯一 rank 增加点**，
+    见 ⑱ 组）；③ 同一钩子把结果装进**返回体**时对 `_transition_result()` 的 `stage=` 回显（**不落库**）。
+    `pending_stage=` / `from_stage=` / `to_stage=` 是别的形参名，AST 精确匹配不计入。
     """
     import ast
     import inspect
@@ -3430,14 +3465,17 @@ def test_evaluate_stage_write_point_is_pinned_to_the_zero_delta_helper():
     tree = ast.parse(inspect.getsource(agent_stage_service))
     keywords = [node for node in ast.walk(tree)
                 if isinstance(node, ast.keyword) and node.arg == "stage"]
-    assert len(keywords) == 1, \
-        "3.4-b 期间 stage= 写入点必须恰好 1 处，实测行号 %r" % [n.lineno for n in keywords]
+    assert len(keywords) == 3, \
+        "3.4-c 落地后 stage= 关键字实参必须恰好 3 处（零 delta + 唯一向上写 + 返回体回显），" \
+        "实测行号 %r" % [n.lineno for n in keywords]
+    keywords.sort(key=lambda node: node.lineno)
 
     lines, start = inspect.getsourcelines(agent_stage_service._ensure_state_row)
-    assert keywords[0].lineno in range(start, start + len(lines)), \
-        "唯一的 stage= 写入点只许在 _ensure_state_row() 里（别处出现就是「向上写」）"
+    zero_delta = [kw for kw in keywords if kw.lineno in range(start, start + len(lines))]
+    assert len(zero_delta) == 1, \
+        "唯一的一处零 delta 写入只许在 _ensure_state_row() 里（别处出现就是「向上写」）"
 
-    assert ast.dump(keywords[0].value) == ast.dump(ast.parse('view["stage"]', mode="eval").body), \
+    assert ast.dump(zero_delta[0].value) == ast.dump(ast.parse('view["stage"]', mode="eval").body), \
         "写入值必须是「评估前读到的阶段」本身（零 delta），不得是别的表达式"
 
     for name in ("evaluate", "_evaluate", "_recommend_upgrade", "stage_config_source"):
@@ -4023,4 +4061,566 @@ def test_get_agent_stage_log_stats_bad_input_is_safe(db):
     assert database.get_agent_stage_log_stats(TEACHER, None, None)["counts"] == {}
     single = database.get_agent_stage_log_stats(TEACHER, "evaluation", None)
     assert single["counts"] == {"evaluation": 1} and single["since"] == ""
+
+
+# ============ ⑱ 【§4.2 改 2b / 改 3 / 施工步骤 3.4-c】三个既有链路钩子 + 唯一向上写路径 ============
+#
+# 本组**零接线**：库层两条链路的转发段（2.3 的 `sign_draft()`、2.4 的 `resolve_agent_task()`）已接好，
+# 本组用「直接调用」+「真实转发」两条视角验证服务层三个钩子；造数 / 断言助手全部复用 ⑯⑰ 组。
+#
+# 钩子清单（源码级守护与「互不调用」断言共用同一份清单，避免两处漂移）：
+_HOOK_NAMES = ("on_draft_signed", "apply_upgrade_confirmation", "decline_upgrade")
+
+# 状态转移钩子返回体的**逐键**契约（13 键，形状即契约；flag off 的短路体同形）
+_TRANSITION_KEYS = (
+    "teacher_name", "skipped", "applied", "degraded", "reason",
+    "stage", "stage_label", "previous_stage", "stage_since", "stage_source",
+    "pending_stage", "pending_task_id", "task_id",
+)
+
+# 库层「状态行唯一写口」的函数名（源码级写入点归位用；库层改名 → 本组守护即红）
+_STATE_ROW_WRITER = "upsert_agent_stage_state"
+
+
+def _stage_write_sites():
+    """【⑱ 核心守护的骨架】枚举服务层全文件的 `stage=` 关键字实参并**逐处归位**。
+
+    返回 `(sites, state_row_sites, star_expansions)`：
+      · `sites`：`[(所属函数名, 所属调用名, 行号, 值表达式 AST)]`，按行号升序 —— 即「谁写的、写给谁」；
+      · `state_row_sites`：`sites` 里**真落库**的那些（所属调用 = `upsert_agent_stage_state`）；
+      · `star_expansions`：状态行写入点里用了 `**` 展开的所属函数名 —— **必须为空**：`stage` 一旦
+        被藏进 `**fields` 里，上面的枚举口径就不再完整，守护会**静默失效**。
+
+    口径：只认 `ast.keyword(arg="stage")`，故 `pending_stage=` / `from_stage=` / `to_stage=` 天然不计入；
+    归属映射取**最内层**函数（`ast.walk` 先父后子，后写覆盖 → 内层胜出）。
+    """
+    import ast
+    import inspect
+
+    import agent_stage_service
+
+    tree = ast.parse(inspect.getsource(agent_stage_service))
+
+    owners = {}
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for inner in ast.walk(node):
+                owners[id(inner)] = node.name
+
+    callers = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            func = node.func
+            name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", "")
+            for keyword in node.keywords:
+                callers[id(keyword)] = name
+
+    sites, state_row_sites, star = [], [], []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            func = node.func
+            name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", "")
+            if name == _STATE_ROW_WRITER and any(kw.arg is None for kw in node.keywords):
+                star.append(owners.get(id(node), ""))
+        if isinstance(node, ast.keyword) and node.arg == "stage":
+            site = (owners.get(id(node), ""), callers.get(id(node), ""), node.lineno, node.value)
+            sites.append(site)
+            if site[1] == _STATE_ROW_WRITER:
+                state_row_sites.append(site)
+    sites.sort(key=lambda site: site[2])
+    return sites, state_row_sites, star
+
+
+# ---- 交付面：钩子存在 + 签名（库层按位置传参）+ flag off 零 SQL 零写入 ----
+
+def test_stage_hooks_exist_with_the_contract_signatures():
+    """【3.4-c 交付面】三个钩子必须是**模块级可调用**，且签名与 CTO 指定的调用形状逐参一致。
+
+    库层转发段（2.3 / 2.4 已接线）按**位置**传参：改参数名/加必填位 = 静默断链，故逐个钉死。
+    """
+    import inspect
+
+    import agent_stage_service
+
+    expected = {
+        "on_draft_signed": ("teacher_name",),
+        "apply_upgrade_confirmation": ("teacher_name", "to_stage", "task_id"),
+        "decline_upgrade": ("teacher_name", "task_id"),
+    }
+    for name in _HOOK_NAMES:
+        hook = getattr(agent_stage_service, name, None)
+        assert callable(hook), "%s 必须存在（库层转发段已在调它）" % name
+        parameters = list(inspect.signature(hook).parameters.values())
+        assert tuple(p.name for p in parameters) == expected[name], name
+        assert all(p.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
+                   and p.default is inspect.Parameter.empty for p in parameters), name
+
+
+def test_all_three_stage_hooks_flag_off_are_zero_sql_and_zero_writes(db, sql_log, monkeypatch, capsys):
+    """【3.4-c 约束 2 / 4 + §5.1 红线①】flag off：三个钩子各自**零 SQL、零写入**、返回短路体。
+
+    「零写入」含**状态行都不许建**（`_ensure_state_row` 那条路径也进不去）—— 开关关了，新表
+    不许再长一行（这是 3.4-b 已定的红线①，本步把三个新入口一并钉在同一坐标上）。
+    """
+    import agent_stage_service
+
+    monkeypatch.delenv("AGENT_STAGE_ENABLED", raising=False)
+    before = _table_counts()
+    marker = len(_all_calls(sql_log))
+
+    draft_result = agent_stage_service.on_draft_signed(TEACHER)
+    apply_result = agent_stage_service.apply_upgrade_confirmation(TEACHER, "apprentice", 7)
+    decline_result = agent_stage_service.decline_upgrade(TEACHER, 7)
+
+    assert _all_calls(sql_log)[marker:] == [], "flag off 下三个钩子连一次 SELECT 都不许发"
+    assert _table_counts() == before, "flag off 必须零写入"
+    assert database.get_agent_stage_state(TEACHER) is None, "连状态行都不许建"
+
+    assert draft_result["skipped"] is True and draft_result["reason"] == "agent_stage_disabled"
+    assert set(draft_result) == set(_EVALUATE_SNAPSHOT_KEYS) | {"changed"}, \
+        "签字钩子是评估的薄封装 → 返回体就是评估契约（18 键 + changed）"
+
+    for result in (apply_result, decline_result):
+        assert set(result) == set(_TRANSITION_KEYS)
+        assert (result["skipped"], result["applied"], result["degraded"]) == (True, False, False)
+        assert result["reason"] == "agent_stage_disabled"
+        assert (result["stage"], result["stage_since"], result["stage_source"]) == ("", "", "")
+        assert result["task_id"] == 7
+    assert "未啟用" in capsys.readouterr().out, "短路必须留一条繁体告警（可观测）"
+
+
+def test_hooks_present_with_flag_off_keep_both_forwarders_zero_stage_sql(db, task_sql_log, monkeypatch):
+    """【3.4-c 约束 2 + 要求 3 的「钩子真实存在」形态】flag off：两条既有链路跑完，
+    **一条碰阶段三表的语句都没有**，任务状态与返回值照旧。
+
+    ⑪ / ⑫ 组用「改动前实测基线」逐字节钉住整条语句序列；本条补的是**阶段表视角** —— 钩子从
+    「不存在」变成「存在」，转发段照样发零条阶段 SQL（闸门在服务层首行，不在转发段）。
+    """
+    monkeypatch.delenv("AGENT_STAGE_ENABLED", raising=False)
+    draft_id = _sign_fixture_draft(db)
+    task_id = _seed_agent_task(_TASK_UPGRADE, _TITLE_UPGRADE)
+    before = _table_counts()
+    task_sql_log.clear()
+
+    assert db.sign_draft(draft_id, "最终方案") == "张三"
+    assert db.resolve_agent_task(task_id, "approved") == {"message": "已处理", "status": "approved"}
+
+    touched = [sql for sql, _params in _all_calls(task_sql_log) if "agent_stage" in sql]
+    assert touched == [], "flag off 下不得有任何一条语句碰阶段三表（实测 %r）" % touched
+    assert _table_counts()["agent_stage_state"] == before["agent_stage_state"], \
+        "flag off 下阶段状态表一行都不许长（迁移给存量老师的那 1 行是基线）"
+    assert _table_counts()["agent_stage_log"] == before["agent_stage_log"] == 0, "审计表零写入"
+    assert database.get_agent_stage_state(TEACHER) is None
+    assert database.find_pending_upgrade_task(TEACHER) is None
+
+
+
+# ---- 约束 1：唯一向上写路径（源码级：写入点枚举 + 逐处归位 + rank 增加点计数 = 1）----
+
+def test_only_upward_stage_write_path_is_teacher_confirmation():
+    """【3.4-c 约束 1 · 源码级守护】全文件 `stage=` 写入点枚举 + 逐处归位 + **rank 增加点计数 = 1**。
+
+    枚举口径（两条形状都枚举，漏一种守护就有缝）：
+      ① `<调用>(..., stage=…)` 关键字实参 —— 逐处归位到「所属函数 + 所属调用」；
+      ② 状态行写入函数的 `**` 展开形状 —— **出现即红**（`stage` 可能被藏在展开里，枚举就不再完整）。
+    `pending_stage=` / `from_stage=` / `to_stage=` 是别的形参名，AST 精确匹配天然不计入。
+
+    本步落地后的定态（**三处 `stage=` 实参 / 两处状态行写入 / 一处 rank 增加**）：
+      · `_ensure_state_row()` 的零 delta 写入（值恒为 `view["stage"]` → 不改变 rank）；
+      · `apply_upgrade_confirmation()` 的状态行写入（**唯一 rank +1**，值恒为钩子入参 `to_stage`）；
+      · 同一钩子把结果装配进返回体时对 `_transition_result()` 的 `stage=` 回显（**不落库**）。
+    为什么钉「写入点」而不是直接钉「向上写」：rank 增加是**运行时**属性，源码级只能钉「值从哪来」；
+    写入值恒为 `to_stage`（非字面量）+ 该分支只在 `_next_stage()` 单级校验之后才可达 —— 后半句由
+    `test_apply_upgrade_confirmation_rejects_cross_level_targets` 行为级用例补全。
+    """
+    import ast
+    import inspect
+
+    import agent_stage_service
+
+    sites, state_row_sites, star = _stage_write_sites()
+
+    assert sites, "枚举必须能抓到写入点（守护自身不许静默失效）"
+    assert star == [], "状态行写入点不得用 ** 展开（实测 %r）：stage 藏进展开里枚举就漏了" % star
+    assert [(s[0], s[1]) for s in sites] == [
+        ("_ensure_state_row", _STATE_ROW_WRITER),
+        ("apply_upgrade_confirmation", _STATE_ROW_WRITER),
+        ("apply_upgrade_confirmation", "_transition_result"),
+    ], "stage= 写入点清单变了（实测 %r）—— 多一处就说明「唯一向上写路径」被绕开" % [
+        (s[0], s[1], s[2]) for s in sites]
+
+    assert len(state_row_sites) == 2 and len(sites) == 3
+    increasing = [s for s in state_row_sites if s[0] != "_ensure_state_row"]
+    assert [s[0] for s in increasing] == ["apply_upgrade_confirmation"], \
+        "rank 增加点必须**恰好 1 个**且就是老师确认钩子（实测 %r）" % [s[0] for s in state_row_sites]
+
+    zero_delta = state_row_sites[0]
+    assert zero_delta[0] == "_ensure_state_row"
+    assert ast.dump(zero_delta[3]) == ast.dump(ast.parse('view["stage"]', mode="eval").body), \
+        "零 delta 写入的值必须是「评估前读到的阶段」本身"
+    assert ast.dump(increasing[0][3]) == ast.dump(ast.parse("to_stage", mode="eval").body), \
+        "唯一向上写路径的值必须是钩子入参 to_stage（不是字面量、也不是别处的行值）"
+
+    # 逐处按行号归位：行号必须落在「所属函数」的源码区间内，且所属调用名必须非空
+    for owner, called, lineno, _value in sites:
+        lines, start = inspect.getsourcelines(getattr(agent_stage_service, owner))
+        assert lineno in range(start, start + len(lines)), (owner, lineno)
+        assert called, (owner, lineno)
+
+
+def test_three_stage_hooks_never_call_each_other():
+    """【3.4-c 约束 5】三个钩子**互不调用、无环**：任一钩子体内不得出现另一个钩子的**调用**。
+
+    为什么重要：钩子互调会让一次老师点击产生两条链路（签字顺带评估、确认又顺带评估…），
+    「谁负责升阶」「写了几次」立刻含糊。故源码级钉住。
+    """
+    import ast
+    import inspect
+
+    import agent_stage_service
+
+    for name in _HOOK_NAMES:
+        body = ast.parse(inspect.getsource(getattr(agent_stage_service, name)))
+        called = {
+            (node.func.id if isinstance(node.func, ast.Name) else getattr(node.func, "attr", ""))
+            for node in ast.walk(body) if isinstance(node, ast.Call)
+        }
+        assert name not in called, "%s 不得自我调用" % name
+        assert called.isdisjoint(set(_HOOK_NAMES)), \
+            "%s 体内调了另一个钩子 %r —— 钩子互调 = 一次点击两条链路" % (
+                name, sorted(called & set(_HOOK_NAMES)))
+
+
+def test_stage_hook_gate_placement_is_single_and_first_line():
+    """【3.4-c 约束 4】闸门位置：`on_draft_signed` **不判 flag**（总闸只许一份，在评估入口首行）；
+    另两个钩子**首行就是闸门**，且闸门不通过时**立即 `return`**（这是「零 SQL」的源码级形态）。"""
+    import ast
+    import inspect
+
+    import agent_stage_service
+
+    def _body(name):
+        tree = ast.parse(inspect.getsource(getattr(agent_stage_service, name)))
+        function = tree.body[0]
+        statements = [s for s in function.body
+                      if not (isinstance(s, ast.Expr) and isinstance(s.value, ast.Constant)
+                              and isinstance(s.value.value, str))]
+        return function, statements
+
+    # ① 薄封装：体内**没有** flag 标识符，且只有一次评估调用
+    function, statements = _body("on_draft_signed")
+    assert "agent_stage_enabled" not in ast.dump(function), \
+        "薄封装不得自判 flag（flag 判定只许一份：评估入口的第一条语句）"
+    called = [node.func.id for node in ast.walk(function)
+              if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)]
+    assert called.count("evaluate") == 1, "薄封装只转调一次评估（实测 %r）" % called
+    assert set(called) <= {"evaluate", "_config_warn"}, "薄封装不得调别的东西（实测 %r）" % called
+    assert len(statements) == 1 and isinstance(statements[0], ast.Try), \
+        "薄封装体 = 一个 try（转调 + 第二道保险），不得长出别的语句"
+
+    # ② 另两个钩子：**第一条 `if` 就是总闸**且不通过时立即 return；它前面只许有「无害赋值」
+    #    （`name = teacher_name or ""` 这类：体内没有任何函数调用 → 不可能发 SQL）
+    for name in ("apply_upgrade_confirmation", "decline_upgrade"):
+        _function, statements = _body(name)
+        first_if = next(s for s in statements if isinstance(s, ast.If))
+        assert "agent_stage_enabled" in ast.dump(first_if.test), \
+            "%s 的第一条 if 必须是总闸（它不经过评估入口，须自判 flag）" % name
+        assert any(isinstance(s, ast.Return) for s in first_if.body), \
+            "%s 闸门不通过必须立即返回（零 SQL）" % name
+        for leading in statements[:statements.index(first_if)]:
+            assert isinstance(leading, ast.Assign) and not any(
+                isinstance(node, ast.Call) for node in ast.walk(leading)), \
+                "%s 闸门前只许有无害赋值（出现调用就可能先发 SQL）" % name
+
+
+# ---- 约束 1 行为级 + 约束 2：升阶生效；越级 / 向下 / 非法目标一律拒绝且阶段不动 ----
+
+def test_apply_upgrade_confirmation_upgrades_exactly_one_level_with_audit(db, stage_gate):
+    """老师点 ✅：**单级**升阶（`learning` → `apprentice`）→ 状态行写全（阶段真值 + 进入时刻 +
+    来源 `teacher_confirm` + 清待确认对），并留两行留痕（`stage_upgraded` 事件 + `confirm_upgrade` 行动）。"""
+    import agent_stage_service
+
+    _put_raw_state_row(TEACHER, "learning", pending_stage="apprentice", pending_task_id=12)
+    before = database.get_agent_stage_state(TEACHER)
+
+    result = agent_stage_service.apply_upgrade_confirmation(TEACHER, "apprentice", 12)
+
+    assert set(result) == set(_TRANSITION_KEYS)
+    assert (result["skipped"], result["applied"], result["degraded"]) == (False, True, False)
+    assert result["reason"] == "stage_upgraded"
+    assert result["stage"] == "apprentice" and result["previous_stage"] == "learning"
+    assert result["stage_label"] == agent_stage_service.STAGE_LABELS["apprentice"]
+    assert result["stage_source"] == "teacher_confirm" and result["task_id"] == 12
+    assert (result["pending_stage"], result["pending_task_id"]) == ("", 0)
+
+    row = database.get_agent_stage_state(TEACHER)
+    assert (row["stage"], row["stage_source"]) == ("apprentice", "teacher_confirm")
+    assert row["stage_since"] == result["stage_since"] != before["stage_since"], \
+        "升阶必须刷新进入时刻（新阶段的 `stage_since` 基准）"
+    assert (row["pending_stage"], row["pending_task_id"]) == ("", 0), "升阶后不得残留「⏳ 待確認」"
+
+    logs = database.get_agent_stage_logs(TEACHER)
+    assert [log["event_type"] for log in logs] == ["stage_upgraded"], "变更类事件只此一行"
+    assert (logs[0]["from_stage"], logs[0]["to_stage"]) == ("learning", "apprentice"), \
+        "§1.3：变更类事件 from_stage / to_stage 都必填"
+    assert logs[0]["task_id"] == 12 and "見習期" in logs[0]["detail"]
+
+    actions = database.get_agent_action_log(TEACHER)
+    assert [action["action"] for action in actions] == ["confirm_upgrade"]
+    assert actions[0]["task_id"] == 12
+
+
+@pytest.mark.parametrize("to_stage, expected_detail", [
+    ("assistant", "越級請求被拒：to_stage=assistant, current=learning"),   # 跳级（rank +2）
+    ("observation", "降級請求被拒"),                                      # 向下（误走升级钩子）
+    (None, "目標階段非法"),                                               # 缺 to
+    ("", "目標階段非法"),                                                 # 空串
+    ("vip", "目標階段非法"),                                              # 五阶段白名单外
+])
+def test_apply_upgrade_confirmation_rejects_cross_level_targets(db, stage_gate, to_stage, expected_detail):
+    """【3.4-c 约束 2】目标 ≠ 「当前 + 1」→ **拒绝且阶段一个字不动**（含阶段起始时刻与来源）。
+
+    跳级 / 向下 / 非法目标**都不新造第 11 类事件**、也**不用** `permission_denied`（那条的语义是
+    「智能体越权被拦」，§2.4），统一用既有 `upgrade_declined`；跳级 detail 是 CTO 指定的字面形态。
+    顺手清掉待确认对：`to_stage ≠ 下一阶段` 的请示**永远无法**被满足，留着会挡住后续推荐、老师端
+    还永远显示「⏳ 待你確認」。
+    """
+    import agent_stage_service
+
+    _put_raw_state_row(TEACHER, "learning", stage_since="S1", stage_source="default",
+                       pending_stage="apprentice", pending_task_id=12)
+
+    result = agent_stage_service.apply_upgrade_confirmation(TEACHER, to_stage, 12)
+
+    assert set(result) == set(_TRANSITION_KEYS)
+    assert (result["applied"], result["skipped"]) == (False, False)
+    assert result["reason"] == "stage_transition_invalid"
+    assert result["previous_stage"] == "learning" and result["stage"] == "learning"
+
+    row = database.get_agent_stage_state(TEACHER)
+    assert (row["stage"], row["stage_since"], row["stage_source"]) == ("learning", "S1", "default")
+    assert (row["pending_stage"], row["pending_task_id"]) == ("", 0)
+    assert database.find_pending_upgrade_task(TEACHER) is None
+
+    logs = database.get_agent_stage_logs(TEACHER)
+    assert [log["event_type"] for log in logs] == ["upgrade_declined"], \
+        "不新造第 11 类事件、不用 permission_denied"
+    assert expected_detail in logs[0]["detail"]
+    assert (logs[0]["from_stage"], logs[0]["to_stage"]) == ("learning", ""), \
+        "§1.3：被拒不是阶段变更 → to_stage 留空（目标写在 detail 里）"
+    assert logs[0]["task_id"] == 12
+    assert [action["action"] for action in database.get_agent_action_log(TEACHER)] == ["decline_upgrade"]
+
+
+def test_apply_upgrade_confirmation_is_idempotent_when_already_at_target(db, stage_gate):
+    """【3.4-c 约束 3】已在目标阶段（老师重复点 ✅）→ 幂等 no-op：`stage` / `stage_since` /
+    `stage_source` **逐字节不变**、不写第二条 `stage_upgraded`（否则阶段审计无法区分「真升了两次」与
+    「老师点了两次」）；只清残留待确认对 + 一行写明「無需變更」的行动日志（§1.1）。"""
+    import agent_stage_service
+
+    _put_raw_state_row(TEACHER, "apprentice", stage_since="S9", stage_source="teacher_confirm",
+                       pending_stage="assistant", pending_task_id=99)
+    before = database.get_agent_stage_state(TEACHER)
+
+    result = agent_stage_service.apply_upgrade_confirmation(TEACHER, "apprentice", 99)
+
+    assert set(result) == set(_TRANSITION_KEYS)
+    assert (result["applied"], result["reason"]) == (False, "already_at_stage")
+    assert (result["previous_stage"], result["stage"]) == ("apprentice", "apprentice")
+
+    row = database.get_agent_stage_state(TEACHER)
+    assert (row["stage"], row["stage_since"], row["stage_source"]) == \
+        (before["stage"], before["stage_since"], before["stage_source"]) == \
+        ("apprentice", "S9", "teacher_confirm")
+    assert (row["pending_stage"], row["pending_task_id"]) == ("", 0), "残留的旧待确认对必须清掉"
+    assert database.get_agent_stage_logs(TEACHER) == [], "不得写第二条变更类事件"
+
+    actions = database.get_agent_action_log(TEACHER)
+    assert [action["action"] for action in actions] == ["confirm_upgrade"]
+    assert "無需變更" in actions[0]["detail"] and actions[0]["task_id"] == 99
+
+
+# ---- 失败方向（§1.5 / §3.8）+ ❌ 忽略推荐（含 3.4-b 口径 F 的冷却端到端）----
+
+def test_apply_upgrade_confirmation_fail_closed_when_stage_read_degraded(db, stage_gate,
+                                                                        monkeypatch, capsys):
+    """读不到阶段真值（库坏 / 表未就位）→ **绝不升阶**（fail-closed）：`degraded=True` +
+    `stage_read_degraded`，且**零写入**（连审计都不写：读不到真值就根本无从记起「谁被升到哪」）。
+
+    与 §1.5 的关键区分：「读不到」≠「当前是兜底阶段」—— 后者可以零 delta 落一行，前者一个字节都不许动。
+    """
+    import sqlite3 as _sqlite3
+
+    import agent_stage_service
+
+    _put_raw_state_row(TEACHER, "learning")
+    before = _table_counts()
+
+    def boom(teacher_name):
+        raise _sqlite3.OperationalError("no such table: agent_stage_state")
+
+    monkeypatch.setattr(database, "get_agent_stage_state", boom)
+
+    result = agent_stage_service.apply_upgrade_confirmation(TEACHER, "apprentice", 12)
+
+    assert set(result) == set(_TRANSITION_KEYS)
+    assert (result["degraded"], result["skipped"], result["applied"]) == (True, False, False)
+    assert result["reason"] == "stage_read_degraded"
+    assert result["stage"] == "learning", "回显配置链的兜底阶段（如实回显，不编造、不改动）"
+    assert _table_counts() == before, "读不到真值 → 零写入（不改阶段、不写审计）"
+    assert "讀不到階段真值" in capsys.readouterr().out, "降级必须留繁体告警"
+
+
+def test_decline_upgrade_clears_pending_and_feeds_the_34b_cooldown(db, stage_gate):
+    """❌ 端到端（**真实转发段** + 3.4-b 口径 F 的冷却链路）：真实推荐 → 老师点 ❌ → 待确认对摘掉 +
+    阶段不动 + 紧接着的 `evaluate()` 被 `cooldown_active` 拦住。
+
+    冷却**不新增字段**（§1.2 的状态行没有冷却列）：冷却 = 审计里最新一条 `upgrade_recommended` /
+    `upgrade_declined` 的时刻 + `recommend_cooldown_hours`（3.4-b 的 `_cooldown_blocks()` 唯一读法）
+    —— 本钩子写下的这一行 `upgrade_declined` 就是冷却起点。
+    注：`agent_tasks` 那一行由库层 `resolve_agent_task()` 先落定（2.4 已接线的决策），本钩子只管
+    阶段状态与审计（约束 6 的写点克制）。
+    """
+    import agent_stage_service
+
+    _put_raw_state_row(TEACHER, "learning")
+    _seed_ready_for_recommendation()
+
+    recommended = agent_stage_service.evaluate(TEACHER)
+    assert recommended["changed"]["recommended"] is True
+    task_id = recommended["pending_task_id"]
+    assert task_id and database.get_agent_stage_state(TEACHER)["pending_stage"] == "apprentice"
+
+    # 老师点 ❌：库层先落定决策（`status='rejected'` + 行动日志，已 commit）→ best-effort 转发本钩子
+    assert db.resolve_agent_task(task_id, "rejected") == {"message": "已处理", "status": "rejected"}
+
+    row = database.get_agent_stage_state(TEACHER)
+    assert row["stage"] == "learning", "拒绝绝不改阶段（也不降级）"
+    assert (row["pending_stage"], row["pending_task_id"]) == ("", 0), "老师已明确忽略 → 摘掉「⏳ 待確認」"
+    assert database.find_pending_upgrade_task(TEACHER) is None, "请示已落定（那行任务归 2.4 管）"
+
+    # 下面两行留痕**只可能**来自服务层钩子 → 它们出现即证明转发链路真的跑通了
+    logs = database.get_agent_stage_logs(TEACHER)
+    # 倒序读（`created_at DESC`，同刻按 id DESC）：写入顺序是 推荐 → 评估快照 → ❌，倒序读正好反过来
+    assert [log["event_type"] for log in logs[:3]] == \
+        ["upgrade_declined", "evaluation", "upgrade_recommended"]
+    assert logs[0]["task_id"] == task_id and "冷卻" in logs[0]["detail"]
+    assert [action["action"] for action in database.get_agent_action_log(TEACHER)] == \
+        ["decline_upgrade", "reject", "recommend_upgrade"]
+
+    after = agent_stage_service.evaluate(TEACHER)
+
+    assert after["changed"]["recommended"] is False
+    assert after["blockers"] == ["cooldown_active"], \
+        "刚被拒 → 24h 冷却期内不再推荐（口径 F：被拒的那一行就是冷却起点）"
+    assert (after["pending_stage"], after["pending_task_id"]) == ("", 0)
+    assert database.get_agent_stage_state(TEACHER)["stage"] == "learning", "评估链也绝不升阶"
+
+
+def test_decline_upgrade_is_repeatable_and_never_touches_stage(db, stage_gate):
+    """❌ 幂等：重复点（同一条已处理的请示再点一次）→ 阶段三元组**逐字节不变**、审计只增一行
+    （每次点击如实留一行），绝不产生 `stage_upgraded`。"""
+    import agent_stage_service
+
+    _put_raw_state_row(TEACHER, "learning", stage_since="S7", stage_source="default",
+                       pending_stage="apprentice", pending_task_id=12)
+
+    first = agent_stage_service.decline_upgrade(TEACHER, 12)
+    second = agent_stage_service.decline_upgrade(TEACHER, 12)
+
+    assert first["reason"] == second["reason"] == "upgrade_declined"
+    assert (first["applied"], first["skipped"]) == (second["applied"], second["skipped"]) == (False, False)
+
+    row = database.get_agent_stage_state(TEACHER)
+    assert (row["stage"], row["stage_since"], row["stage_source"]) == ("learning", "S7", "default")
+    assert (row["pending_stage"], row["pending_task_id"]) == ("", 0)
+    assert [log["event_type"] for log in database.get_agent_stage_logs(TEACHER)] == \
+        ["upgrade_declined", "upgrade_declined"], "审计只增、每次点击一行"
+    assert [action["action"] for action in database.get_agent_action_log(TEACHER)] == \
+        ["decline_upgrade", "decline_upgrade"]
+
+
+# ---- 端到端（真实转发段）+ 永不抛 / 形状恒同形 + 行为级「只有确认路径动 stage」----
+
+def test_on_draft_signed_end_to_end_recommends_without_upgrading(db, stage_gate):
+    """§4.2 改 2b 端到端：真实 `sign_draft()` → 库层转发段 → `on_draft_signed` → 一次评估。
+
+    新病历 = 新样本（这正是「签字后再评估」的理由）→ 满分样本下**推荐**升级（待确认对 + 请示 + 事件）；
+    但阶段**一个字节都不动** —— 升阶只能由老师点 ✅ 走 `apply_upgrade_confirmation`（约束 1）。
+    """
+    import agent_stage_service
+
+    _put_raw_state_row(TEACHER, "learning", stage_since="S1", stage_source="default")
+    template_id, _draft_id, _record_id = _seed_ready_for_recommendation()
+    draft_id = _seed_draft(_PERFECT_DRAFT, template_id)      # 待签字草案（第 2 个触发点）
+
+    assert db.sign_draft(draft_id, _PERFECT_DRAFT) == "张三"
+
+    row = database.get_agent_stage_state(TEACHER)
+    assert (row["stage"], row["stage_since"], row["stage_source"]) == ("learning", "S1", "default"), \
+        "评估绝不升阶（钩子只转调评估）"
+    assert row["pending_stage"] == "apprentice" and row["pending_task_id"] > 0, "推荐写成待确认对"
+    assert row["last_evaluated_at"], "评估把「评估时刻」写进状态行（同一位老师，参数透传）"
+    assert database.find_pending_upgrade_task(TEACHER) is not None, "推荐建了请示单"
+
+    # 倒序读：写入顺序是 推荐（建单留痕）→ 评估快照留痕，故倒序读 = 快照在前
+    assert [log["event_type"] for log in database.get_agent_stage_logs(TEACHER)] == \
+        ["evaluation", "upgrade_recommended"], "推荐 + 评估各留一行（倒序读）"
+    assert [action["action"] for action in database.get_agent_action_log(TEACHER)] == ["recommend_upgrade"]
+
+
+def test_stage_hooks_never_raise_and_keep_uniform_shape(db, stage_gate, monkeypatch):
+    """无效调用 / 缺 `to` / 库坏 都**不抛**，且返回体恒同形（前端不必写第二套渲染）。
+
+    尤其「库坏了」：老师这次点击照样进审计（限制方向的留痕不能丢），但读降级**如实**报出去
+    （`degraded=True`）—— 调用方不得把它当「已落库的结果」。
+    """
+    import sqlite3 as _sqlite3
+
+    import agent_stage_service
+
+    _put_raw_state_row(TEACHER, "learning", stage_since="S1", pending_stage="apprentice",
+                       pending_task_id=7)
+
+    empty_apply = agent_stage_service.apply_upgrade_confirmation("", "apprentice", 7)
+    empty_decline = agent_stage_service.decline_upgrade("", 7)
+    assert empty_apply["reason"] == empty_decline["reason"] == "teacher_required"
+    assert set(empty_apply) == set(empty_decline) == set(_TRANSITION_KEYS)
+
+    illegal = agent_stage_service.apply_upgrade_confirmation(TEACHER, None, None)
+    assert illegal["reason"] == "stage_transition_invalid" and illegal["task_id"] == 0
+
+    def boom(teacher_name):
+        raise _sqlite3.OperationalError("庫壞了")
+
+    monkeypatch.setattr(database, "get_agent_stage_state", boom)
+    broken = agent_stage_service.decline_upgrade(TEACHER, 7)
+
+    assert set(broken) == set(_TRANSITION_KEYS)
+    assert broken["reason"] == "upgrade_declined" and broken["degraded"] is True
+    assert broken["stage"] == "learning", "回显兜底阶段（读不到真值就如实报 degraded=True）"
+    assert (broken["pending_stage"], broken["pending_task_id"]) == ("", 0)
+
+
+def test_only_confirmation_path_changes_the_stage_triple(db, stage_gate):
+    """行为级配对（与源码级守护同口径）：`evaluate`（含签字钩子转调）与 `decline_upgrade` 跑完，
+    `stage` / `stage_since` / `stage_source` **逐字节不变**；同一行的老师点 ✅ 才变。"""
+    import agent_stage_service
+
+    _put_raw_state_row(TEACHER, "learning", stage_since="S1", stage_source="default",
+                       pending_stage="apprentice", pending_task_id=12)
+    _seed_ready_for_recommendation()
+
+    agent_stage_service.on_draft_signed(TEACHER)          # 有待确认对 → 本轮只挡不写（`upgrade_pending`）
+    agent_stage_service.decline_upgrade(TEACHER, 12)
+
+    row = database.get_agent_stage_state(TEACHER)
+    assert (row["stage"], row["stage_since"], row["stage_source"]) == ("learning", "S1", "default")
+    assert (row["pending_stage"], row["pending_task_id"]) == ("", 0)
+
+    agent_stage_service.apply_upgrade_confirmation(TEACHER, "apprentice", 12)
+
+    row = database.get_agent_stage_state(TEACHER)
+    assert (row["stage"], row["stage_source"]) == ("apprentice", "teacher_confirm")
+    assert row["stage_since"] != "S1", "确认路径是**唯一**动这三列的地方"
 

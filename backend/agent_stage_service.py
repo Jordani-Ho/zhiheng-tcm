@@ -2097,7 +2097,8 @@ def evaluate(teacher_name):
 
     **绝不向上写 `stage`**（约束 3）：本函数只写 `pending_stage` 一对、指标快照与两类日志；
     `stage` 的向上变化只有 3.4-c 的老师确认一条路径（`apply_upgrade_confirmation`）。
-    3.4-b 期间源码级 `stage=` 写入点被钉在 `_ensure_state_row()` **一处**（零 delta，见其 docstring）。
+    全文件 `stage=` 关键字实参共 3 处（零 delta `_ensure_state_row()` + 唯一向上写 + 返回体回显），
+    见 ⑰ / ⑱ 组的源码级守护。
 
     返回体（**18 键快照 + `changed`**，形状即契约；接口层直出）：
       `teacher_name` / `skipped` / `reason`
@@ -2128,5 +2129,371 @@ def evaluate(teacher_name):
         return _evaluate(name)
     except Exception as exc:
         return _evaluate_failed(name, exc)
+
+
+# ============================================================================
+# 【施工步骤 3.4-c】三个既有链路钩子 + 「唯一向上写路径」（CTO 2026-09-29 放行）
+# ----------------------------------------------------------------------------
+# 调用方全部是库层 2.3 / 2.4 已接好的转发段 `database._call_agent_stage_hook()` → **本步零接线**：
+#   · `on_draft_signed(teacher_name)`                                ← `sign_draft()` 末尾（§4.2 改 2b）
+#   · `apply_upgrade_confirmation(teacher_name, to_stage, task_id)`   ← `resolve_agent_task()` 末尾（§4.2 改 3 · ✅）
+#   · `decline_upgrade(teacher_name, task_id)`                        ← 同处（§4.2 改 3 · ❌）
+#
+# CTO 七条约束 → 本段逐条落点：
+#   约束 1「apply_upgrade_confirmation 是唯一 rank 增加点」→ 本段唯一的 `stage` 真值写入就在该钩子
+#     **函数体内**，且现场校验「目标 == `_next_stage(当前)`」（单级、不可跳级，§1.1）。全文件
+#     `stage=` 关键字实参因此恰好 **3 处**：`_ensure_state_row()` 的零 delta、本钩子唯一向上写、
+#     本钩子把结果装进返回体时对 `_transition_result()` 的**回显**（不落库）；其中真正落库的
+#     **状态行写入点只有 2 处**（`upsert_agent_stage_state(..., stage=…)`），**rank 增加点计数 = 1**。
+#     两处计数都由 ⑱ 组源码级守护钉住（⑰ 组那条「恰好 1 处」的临时钉同步升级为「3 处 + 逐处归位」
+#     —— 该断言自己的 docstring 与 `_ensure_state_row()` 的注释都预告了这次升级）。
+#   约束 2「越级拒绝」→ 目标 ≠ 下一阶段（跳级 / 向下 / 未知 / 缺 `to`）→ **阶段一个字不动**，
+#     事件仍用 §1.3 契约里已有的 `upgrade_declined`（**不新造第 11 类**；这也不是「智能体越权」，
+#     故**不用** `permission_denied`），`detail` 固定含「越級請求被拒：to_stage=X, current=Y」。
+#   约束 3「幂等」→ 已是 `to_stage` → no-op：`stage` / `stage_since` / `stage_source` 逐字节不变、
+#     不写第二条 `stage_upgraded`（只清掉残留的待确认对 + 一行 no-op 行动日志，§1.1）。
+#   约束 4「on_draft_signed 是薄封装」→ 它自己**不判 flag**：总闸在 `evaluate()` 的第一条语句；
+#     另两个钩子不经过 `evaluate()`，故**首行自闸门**（三处闸门都是同一个 `agent_stage_enabled()`，
+#     不出现第二份 flag 判定）。
+#   约束 5「三个钩子互不调用，无环」→ 本段没有任何钩子之间的调用（⑱ 组有源码级断言）。
+#   约束 6「agent_action_log 写点克制」→ 本段只写「升阶」/「被拒」两类，各恰好一处
+#     （`_ACTION_CONFIRM` / `_ACTION_DECLINE`）；降级类（`manual_demote` / `rule_demote` / `rule_reset`）
+#     属 §3.7 规则链路，**不在 3.4-c 范围**，本步不落。
+#   约束 7「⑱ 组测试」→ 见 `backend/test_agent_stage.py` ⑱ 组（含 3.4-b 口径 F 的端到端覆盖）。
+#
+# 本段写点清单（**四类，与 3.4-b 的四类同款，无第五类**）：
+#   ① `stage` 真值 + `stage_since` / `stage_source` + 待确认对（仅 `apply_upgrade_confirmation()`）；
+#   ② 待确认对的清空（`_clear_pending_pair()`：被拒 / 幂等两条分支复用同一个写口）；
+#   ③ `agent_stage_log` 两行（`stage_upgraded` / `upgrade_declined`）；
+#   ④ `agent_action_log` 两行（`confirm_upgrade` / `decline_upgrade`，被拒与幂等各一行）。
+#   **不动**指标快照（`last_evaluated_at` / `last_metrics_json`）：那是评估的产物，本钩子不重算指标。
+# 写序统一为「**状态先行、审计殿后**」（升级 / 被拒 / 幂等三条分支一致）：业务结果不依赖审计
+# （§1.3「审计写入失败不得改变结果」）；审计写口本身都是 best-effort 包装
+# （`_stage_event` / `_stage_change_event` / `_action_log` 内部吞异常 + 繁体告警）。
+# ============================================================================
+
+# 状态转移的 `stage_source`（§1.2：老师确认升阶的唯一来源字面量）
+_STAGE_SOURCE_TEACHER_CONFIRM = "teacher_confirm"
+
+# 状态转移的审计事件名 / 行动日志动作名（§1.3 契约名 + §1.6 状态转移名；
+# 与 §4.2 的 `_ACTION_UPGRADE`（`agent_tasks.action_data["action"]`）**不得混用**）
+_LOG_EVENT_STAGE_UPGRADED = "stage_upgraded"
+_ACTION_CONFIRM = "confirm_upgrade"
+_ACTION_DECLINE = "decline_upgrade"
+
+# 钩子返回体的 `reason`（顶层字面量；接口层 3.5 起按它映射 HTTP 码）。
+# 复用 `_LOG_EVENT_*` / `_BLOCKER_*` 的**同一份字面量**，不新增同义词。
+_REASON_STAGE_UPGRADED = _LOG_EVENT_STAGE_UPGRADED              # 阶段真的升上去了
+_REASON_STAGE_TRANSITION_INVALID = "stage_transition_invalid"   # §6.1-8：越级 / 非法目标 → 接口层 409
+_REASON_ALREADY_AT_STAGE = "already_at_stage"                   # §1.1：已是目标阶段（幂等 no-op）
+_REASON_STAGE_READ_DEGRADED = "stage_read_degraded"             # §1.5：真值读不到 → 拒绝升阶（fail-closed）
+_REASON_UPGRADE_WRITE_FAILED = "upgrade_write_failed"           # 状态行写入失败（阶段保持原值、无半写）
+_REASON_UPGRADE_DECLINED = _LOG_EVENT_UPGRADE_DECLINED          # 老师忽略（❌）：阶段不变 + 进冷却
+
+
+def _transition_short_circuit(teacher_name, reason, skipped=True, task_id=0):
+    """状态转移钩子的**零 SQL** 返回体（flag off / 无效调用 / 失败）：每个值都由常量拼出。
+
+    形状与正常路径**逐键一致**（13 键）：`stage` 一族的空串是诚实的 —— 短路路径**没有**读状态行
+    （flag off 不许读库），故不编造阶段（与 `_snapshot_short_circuit()` 同口径）。
+    """
+    return {
+        "teacher_name": teacher_name,
+        "skipped": skipped,
+        "applied": False,
+        "degraded": False,
+        "reason": reason,
+        "stage": "",
+        "stage_label": "",
+        "previous_stage": "",
+        "stage_since": "",
+        "stage_source": "",
+        "pending_stage": "",
+        "pending_task_id": 0,
+        "task_id": _metric_int(task_id, 0),
+    }
+
+
+def _view_fields(view):
+    """把 `describe_stage()` 的视图折成返回体要的「阶段真值」5 键（缺键 → 空串 / 0）。
+
+    **读到的与回显的必须是同一份**（§1.5）：本段不做二次加工，读不到就回显兜底值
+    （`degraded=True` 由 `_transition_result()` 一并如实回答，调用方不必猜）。
+    """
+    view = view if isinstance(view, dict) else {}
+    return {
+        "stage": view.get("stage") or "",
+        "stage_since": view.get("stage_since") or "",
+        "stage_source": view.get("stage_source") or "",
+        "pending_stage": view.get("pending_stage") or "",
+        "pending_task_id": _metric_int(view.get("pending_task_id"), 0),
+    }
+
+
+def _transition_result(teacher_name, reason, *, applied=False, skipped=False, degraded=False,
+                       stage="", previous_stage="", stage_since="", stage_source="",
+                       pending_stage="", pending_task_id=0, task_id=0):
+    """状态转移钩子的统一返回体（**13 键恒同形**，前端 / 接口层不必为每个分支写第二套渲染）。
+
+    `previous_stage` 是**写前**那一阶段（升阶分支 = 旧值；被拒 / 幂等分支 = 与 `stage` 同一个值），
+    专供工作台显示「學習期 → 見習期」；`stage_label` 由 `stage` 现算（繁体古字，§0.4）。
+    本函数**只读常量、零 SQL** —— 短路分支（flag off）也走它。
+    """
+    stage = stage or ""
+    return {
+        "teacher_name": teacher_name,
+        "skipped": bool(skipped),
+        "applied": bool(applied),
+        "degraded": bool(degraded),
+        "reason": reason,
+        "stage": stage,
+        "stage_label": STAGE_LABELS.get(stage, ""),
+        "previous_stage": previous_stage or "",
+        "stage_since": stage_since or "",
+        "stage_source": stage_source or "",
+        "pending_stage": pending_stage or "",
+        "pending_task_id": _metric_int(pending_task_id, 0),
+        "task_id": _metric_int(task_id, 0),
+    }
+
+
+def _stage_change_event(event_type, teacher_name, from_stage, to_stage, detail, task_id=0):
+    """**变更类**事件（§1.3：`from_stage` / `to_stage` **必填**）→ 唯一写口是库层 `insert_agent_stage_log()`。
+
+    与 3.4-b 的 `_stage_event()` 只差 `to_stage` 一列：那一支按 §1.3「其余为空串」恒写 `''`
+    （`evaluation` / `upgrade_recommended` / `upgrade_declined` 都不是阶段变更），本支专给
+    `stage_upgraded` 用 —— 两者都只是「库层唯一 insert 的白名单包装 + best-effort 留痕」，
+    不复制任何业务判定，也不新增库层函数。
+    §1.3「审计失败不得改变结果」：写失败只留一条繁体告警（升级已生效，绝不因审计写不进去而回滚）。
+    """
+    try:
+        import database      # 只在**函数体内**延迟 import（§4.5-①；方向守护见 ⑩ 组）
+        return database.insert_agent_stage_log(
+            teacher_name, event_type,
+            from_stage=from_stage or "", to_stage=to_stage or "", capability="",
+            task_id=_metric_int(task_id, 0), metrics_json={}, detail=detail,
+        )
+    except Exception as exc:
+        _config_warn("寫入階段審計失敗（%s）：event_type=%r task_id=%r，業務結果不受影響"
+                     % (exc, event_type, task_id))
+        return None
+
+
+def _clear_pending_pair(teacher_name):
+    """清掉「待老師確認」那一对（§3.6 step 3 的收尾；被拒 / 幂等两条分支共用**同一个**写口）。
+
+    为什么必须先判**有没有状态行**：状态行的 DDL 默认是 `stage = 'observation'`（§1.2）—— 若为一个
+    从未初始化的老师 INSERT 一行「只清 pending」，`stage` 会被建表默认值落成 `observation`，等于把
+    老师**静默降级**（观察期只剩本地骨架，§5.3）。这正是 `_ensure_state_row()` 要解决的那个坑
+    （§1.5 ③），本函数复用同一条纪律：**无行 → 一个字节都不写**。
+
+    返回「是否真的清过」（无行 / 写失败 → `False` + 繁体告警）。写失败是**限制方向**的失败
+    （pending 残留只会挡住推荐，不会放权），且老师可再点一次 ✅/❌，故不改变钩子结论。
+    """
+    try:
+        import database
+        if database.get_agent_stage_state(teacher_name) is None:
+            return False
+        database.upsert_agent_stage_state(teacher_name, pending_stage="", pending_task_id=0)
+        return True
+    except Exception as exc:
+        _config_warn("清除待確認對失敗（%s）：狀態行可能殘留「待老師確認」（階段真值不受影響）" % (exc,))
+        return False
+
+
+def _reject_upgrade(teacher_name, view, to_stage, current, task_id):
+    """越级 / 非法目标 → **拒绝且阶段一个字不动**（CTO 3.4-c 约束 2）：事件仍用 `upgrade_declined`。
+
+    三种被拒形状各给一条**精确** detail（事件类型只有一个，仍是 §1.3 契约里已有的那一类）：
+      · 目标不是五阶段之一（`None` / `""` / 白名单外的值）→「升級請求被拒：目標階段非法…」；
+      · 合法但 rank **低于**当前（降级请求误走升级钩子）→「降級請求被拒…」；
+      · 合法但「不是当前 +1」（**跳级**，§1.1 不可跳级 / §6.1-8）→ CTO 指定的字面
+        「越級請求被拒：to_stage=X, current=Y」。
+    为什么**不**用 `permission_denied`：那条事件的语义是「智能体越权被拦」（§2.4），而这里是
+    「一个不可能被满足的升级请求」——语义属「升级被拒」；也**不新造第 11 类**（§1.3 契约只有 10 类）。
+    为什么顺手清掉待确认对：`to_stage ≠ 下一阶段` 的请求**永远无法**被满足，留着会让状态行带着一个
+    假 pending —— 挡住后续推荐，老师端还永远显示「⏳ 待你確認」。
+    §1.3 字段口径：非变更类事件 `to_stage` 留空（被拒的目标写在 detail 里），`from_stage` = 当前阶段。
+    """
+    if to_stage not in STAGE_RANK:
+        detail = "升級請求被拒：目標階段非法（to_stage=%r, current=%s）" % (to_stage, current)
+    elif STAGE_RANK[to_stage] < STAGE_RANK.get(current, 0):
+        detail = ("降級請求被拒：to_stage=%s, current=%s（本步只做升階；降級走老師手動 / 規則鏈路）"
+                  % (to_stage, current))
+    else:
+        detail = "越級請求被拒：to_stage=%s, current=%s" % (to_stage, current)
+
+    cleared = _clear_pending_pair(teacher_name)                       # 状态先行
+    _stage_event(_LOG_EVENT_UPGRADE_DECLINED, teacher_name, current, detail, task_id=task_id)
+    _action_log(teacher_name, task_id, _ACTION_DECLINE, detail)       # 审计殿后（best-effort）
+    fields = _view_fields(view)
+    if cleared:
+        fields["pending_stage"], fields["pending_task_id"] = "", 0
+    return _transition_result(teacher_name, _REASON_STAGE_TRANSITION_INVALID,
+                              previous_stage=current, task_id=task_id, **fields)
+
+
+def _upgrade_noop(teacher_name, view, to_stage, task_id):
+    """幂等 no-op（CTO 3.4-c 约束 3）：已在目标阶段 → `stage` / `stage_since` / `stage_source` 不动。
+
+    §1.1「同阶段重复操作幂等」的精确形态：
+      · **不刷新** `stage_since`：那是「在这个阶段待了多久」的审计基准（也是降级判定的输入），
+        刷新它等于篡改历史；
+      · **不写第二条 `stage_upgraded`**：变更类事件只对应**真实的**阶段变化（否则阶段审计里会出现
+        两次「升入見習期」，运维无法区分「真升了两次」与「老师点了两次」）。
+    只做两件**限制方向**的收尾：清掉残留的待确认对（`to_stage == 当前` 的请示已无意义）+ 一行
+    no-op 行动日志（§1.1「记一条 no-op 日志」= 如实记下老师这次点击，人话里写明「無需變更」）。
+    """
+    cleared = _clear_pending_pair(teacher_name)
+    detail = ("老師確認升級：「%s」已在生效，本次無需變更"
+              "（同階段重複確認按冪等處理，階段起始時刻不刷新）。"
+              % STAGE_LABELS.get(to_stage, to_stage))
+    _action_log(teacher_name, task_id, _ACTION_CONFIRM, detail)
+    fields = _view_fields(view)
+    if cleared:
+        fields["pending_stage"], fields["pending_task_id"] = "", 0
+    return _transition_result(teacher_name, _REASON_ALREADY_AT_STAGE,
+                              previous_stage=to_stage, task_id=task_id, **fields)
+
+
+def apply_upgrade_confirmation(teacher_name, to_stage, task_id):
+    """【§4.2 改 3 · ✅ / §1.6 `confirm_upgrade`】老师点 ✅ 确认升级 → **全系统唯一向上写路径**（约束 1）。
+
+    调用链：老师在 `/api/agent/tasks/{id}/approve` 点 ✅ → 库层 `resolve_agent_task()` 先落定决策
+    （`status='approved'` + 行动日志，**已 commit**）→ 末尾 best-effort 转发到本函数
+    （2.3 / 2.4 已接好的转发段 `_call_agent_stage_hook()`）。因此**本函数失败绝不回滚老师已落定的
+    决策**，也不抛（本函数自己兜住一切异常，并把结论写进返回体的 `reason`）。
+
+    唯一门槛只有两条（都不省）：
+      ① **以老师确认为准**：本函数只处理「已落定的 ✅」这一件事，不重算指标、不看 `can_recommend`
+         （推荐判定是评估链的职责，§3.6）；
+      ② **单级校验**：`to_stage` 必须**恰好**是 `_next_stage(当前阶段)`（§1.1 不可跳级）——
+         越级 / 向下 / 非法目标一律拒绝且**不动阶段**（§6.1-8）；已是目标阶段则幂等 no-op。
+
+    分支与 `reason`（返回体 13 键恒同形，表驱动）：
+      · flag off → `skipped=True` / `agent_stage_disabled`（**首行闸门、零 SQL**）；
+      · 空 `teacher_name` → `skipped=True` / `teacher_required`（零 SQL；避免写出 `teacher_name=''` 的行）；
+      · 真值读不到（`describe_stage()` 为降级态）→ `stage_read_degraded`（**fail-closed**：读不到真值
+        就绝不给自己升阶；「读不到」≠「当前是兜底阶段」，与 3.4-a 的读法同口径）；
+      · 已是 `to_stage` → `already_at_stage`（幂等，见 `_upgrade_noop()`）；
+      · 目标 ≠ 下一阶段 → `stage_transition_invalid`（越级被拒，事件 `upgrade_declined`）；
+      · 状态行写失败 → `upgrade_write_failed`（**单条** upsert，无半写；阶段保持原值）；
+      · 成功 → `stage_upgraded` / `applied=True`（`stage_source='teacher_confirm'`）。
+    """
+    name = teacher_name or ""
+    if not agent_stage_enabled():
+        _config_warn("智能體階段功能未啟用（AGENT_STAGE_ENABLED off）：本次升級確認直接跳過"
+                     "（零查詢、零寫入）")
+        return _transition_short_circuit(name, _BLOCKER_DISABLED, True, task_id)
+    if not name:
+        _config_warn("升級確認缺少 teacher_name（無效調用）：本次直接跳過（零查詢、零寫入）")
+        return _transition_short_circuit(name, _BLOCKER_TEACHER_REQUIRED, True, task_id)
+
+    try:
+        import database
+
+        task_id = _metric_int(task_id, 0)
+        view = describe_stage(name)          # §1.5：真值读取，永不抛（读不到就如实回 degraded=True）
+        current = view.get("stage") or ""
+        if view.get("degraded"):
+            _config_warn("讀不到階段真值（降級態）：拒絕本次升級，階段保持「%s」不變"
+                         % (current or "—",))
+            return _transition_result(name, _REASON_STAGE_READ_DEGRADED, degraded=True,
+                                      task_id=task_id, **_view_fields(view))
+        if to_stage == current:
+            return _upgrade_noop(name, view, to_stage, task_id)
+        if to_stage not in STAGE_RANK or _next_stage(current) != to_stage:
+            return _reject_upgrade(name, view, to_stage, current, task_id)
+
+        # ---- 唯一向上写路径：**一条** upsert 写全（阶段真值 + 进入时刻 + 来源 + 清待确认对）----
+        now = datetime.now().isoformat()
+        try:
+            database.upsert_agent_stage_state(
+                name, stage=to_stage, stage_since=now, stage_source=_STAGE_SOURCE_TEACHER_CONFIRM,
+                pending_stage="", pending_task_id=0,
+            )
+        except Exception as exc:
+            _config_warn("寫入升級結果失敗（%s）：階段保持「%s」不變（單條 upsert，無半寫）"
+                         % (exc, current))
+            return _transition_result(name, _REASON_UPGRADE_WRITE_FAILED, previous_stage=current,
+                                      task_id=task_id, **_view_fields(view))
+
+        detail = ("老師確認升級：「%s」→「%s」（請示 #%d），新階段權限已生效。"
+                  % (STAGE_LABELS.get(current, current),
+                     STAGE_LABELS.get(to_stage, to_stage), task_id))
+        _stage_change_event(_LOG_EVENT_STAGE_UPGRADED, name, current, to_stage, detail, task_id)
+        _action_log(name, task_id, _ACTION_CONFIRM, detail)      # 审计殿后（best-effort，§1.3）
+        return _transition_result(name, _REASON_STAGE_UPGRADED, applied=True, stage=to_stage,
+                                  previous_stage=current, stage_since=now,
+                                  stage_source=_STAGE_SOURCE_TEACHER_CONFIRM,
+                                  pending_stage="", pending_task_id=0, task_id=task_id)
+    except Exception as exc:
+        _config_warn("升級確認流程異常（%s）：本次不改動任何階段狀態" % (exc,))
+        return _transition_short_circuit(name, _REASON_UPGRADE_WRITE_FAILED, False, task_id)
+
+
+def decline_upgrade(teacher_name, task_id):
+    """【§4.2 改 3 · ❌ / §1.6 `decline_upgrade`】老师点 ❌ 忽略升级推荐 → 清待确认对 + 记被拒 + 进冷却。
+
+    与升级钩子同款的三条纪律：首行自闸门（flag off → 零 SQL）、空名短路（零 SQL）、**永不抛**
+    （库层调用点在 `resolve_agent_task()` 已 commit 之后，绝不回滚老师已落定的 ❌）。
+
+    冷却**不新增字段**（§1.2 的状态行没有冷却列）：冷却 = 「审计里最新一条 `upgrade_recommended` /
+    `upgrade_declined` 的时刻」+ `recommend_cooldown_hours`（3.4-b 的 `_cooldown_blocks()` 唯一读法）
+    —— 本函数写下的这一行 `upgrade_declined` 就是冷却起点，**不需要第二份真相源**。
+    阶段真值一个字不动（§6.1-6）：拒绝是限制方向的动作，绝不降级、也绝不升阶。
+
+    重复点击（对同一条已处理的请示再点 ❌）：阶段仍不变、待确认对保持空、幂等；每次点击都留一行
+    `upgrade_declined`（事件）+ 一行行动日志（`task_id` 指回那条请示），冷却按**最后一次**点击起算
+    —— 更保守 = 更少打扰老师，方向安全。
+    返回体 13 键与升级钩子同形：`reason='upgrade_declined'`、`applied=False`、`skipped=False`。
+    """
+    name = teacher_name or ""
+    if not agent_stage_enabled():
+        _config_warn("智能體階段功能未啟用（AGENT_STAGE_ENABLED off）：本次忽略推薦直接跳過"
+                     "（零查詢、零寫入）")
+        return _transition_short_circuit(name, _BLOCKER_DISABLED, True, task_id)
+    if not name:
+        _config_warn("忽略推薦缺少 teacher_name（無效調用）：本次直接跳過（零查詢、零寫入）")
+        return _transition_short_circuit(name, _BLOCKER_TEACHER_REQUIRED, True, task_id)
+
+    try:
+        task_id = _metric_int(task_id, 0)
+        view = describe_stage(name)
+        current = view.get("stage") or ""
+        cleared = _clear_pending_pair(name)                      # 状态先行：把「⏳ 待確認」摘掉
+        detail = ("老師忽略了升級推薦：「%s」維持不變（請示 #%d），進入冷卻期、暫不再推薦。"
+                  % (STAGE_LABELS.get(current, current), task_id))
+        _stage_event(_LOG_EVENT_UPGRADE_DECLINED, name, current, detail, task_id=task_id)
+        _action_log(name, task_id, _ACTION_DECLINE, detail)      # 审计殿后（best-effort，§1.3）
+        fields = _view_fields(view)
+        if cleared:
+            fields["pending_stage"], fields["pending_task_id"] = "", 0
+        return _transition_result(name, _REASON_UPGRADE_DECLINED, previous_stage=current,
+                                  # 真值读不到也照样记下老师这次「忽略」（审计是限制方向的留痕），
+                                  # 但把读降级**如实**报出去 —— 调用方不得把它当「已落库的结果」。
+                                  degraded=bool(view.get("degraded")),
+                                  task_id=task_id, **fields)
+    except Exception as exc:
+        _config_warn("忽略推薦流程異常（%s）：本次不改動任何階段狀態" % (exc,))
+        return _transition_short_circuit(name, _REASON_UPGRADE_WRITE_FAILED, False, task_id)
+
+
+def on_draft_signed(teacher_name):
+    """【§4.2 改 2b / §3.6 step 1 第 2 个触发点】签字落库后的**薄封装**：转一次评估。
+
+    薄封装的边界（CTO 3.4-c 约束 4）：本函数**不自己判 flag** —— 总闸只存在于评估入口的第一条语句
+    （flag off → 立即返回，零 SQL、零写入）。「flag off 时钩子到位也零副作用」因此只有**一处**判定，
+    不会随钩子数量长出第二份 flag 判断（与库层转发段不判 flag 同口径，2.3 批复）。
+    除转调之外本函数什么都不做：不算指标、不建请示、不写审计（那些都在评估链内部，§3.6）。
+
+    best-effort：评估入口自己永不抛（§3.8 内部兜住异常并降级返回）；这里再包一层是第二道保险
+    （§5.1 红线③ —— 签字已经 commit，评估失败绝不能冒泡出去污染签字结果），异常 → 繁体告警 + 返回 None。
+    """
+    try:
+        return evaluate(teacher_name)
+    except Exception as exc:
+        _config_warn("簽字後的階段評估異常（%s）：本次跳過，簽字結果不受影響" % (exc,))
+        return None
 
 
