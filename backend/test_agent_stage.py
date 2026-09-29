@@ -34,6 +34,13 @@
        warnings 与统一错误体一一对应，且不与 `TemplateError` 混链）。本组**不**断言状态机符号
        （`current_stage` / `require_capability` / `evaluate` / 三个钩子 …）的缺席 —— 它们属 3.2–3.4。
 
+    ⑭ 【施工步骤 3.2】配置链 + 阶段真值读取：`DEFAULT_STAGE_CONFIG`（§3.5 键表逐字）/
+       `load_stage_config`（§3.4 四层读取链：内置默认 ← 全局行 ← 老师行 ← env 白名单；行缺失 /
+       JSON 损坏 / 库异常三种态都降级不抛；非法值整份回落内置默认）/ `validate_stage_config`
+       （§3.4 第 5 条：返回 `(ok, errors[{path,msg}])`，**只拦不清**，`default_stage` 不得高于
+       learning）+ `current_stage` / `describe_stage`（§1.5 四条路径，fail-closed 到 default_stage）
+       + 「读数零写入 / 只发 SELECT」「不读 flag」。**零接线**：本组只用直接调用验证行为。
+
 运行方式（Windows，串行；见 pytest.ini）：
     cd backend
     ..\\venv\\Scripts\\python.exe -m pytest test_agent_stage.py -v
@@ -1606,4 +1613,638 @@ def test_agent_stage_error_shape_is_unified_error_body():
     ref = template_service.TemplateError("templates_disabled", "模板接口未啟用")
     assert set(vars(ref)) == {"code", "msg"}
     assert not issubclass(agent_stage_service.AgentStageError, template_service.TemplateError)
+
+
+# ============ ⑭ 【施工步骤 3.2】配置链 + 阶段真值读取 ============
+#
+# CTO 2026-09-28 放行 step 3.2 的六条约束，本组逐条落地（约束 5 的「flag off 逐字节不变」由既有
+# ⑨ ⑪ ⑫ 组的改动前基线与本组的「零写入 / 只发 SELECT / 不读 flag」用例共同保证）：
+#   ① 配置链三符号：`DEFAULT_STAGE_CONFIG` / `load_stage_config` / `validate_stage_config`；
+#   ② 阶段真值两符号：`current_stage` / `describe_stage` —— 四条路径（行在内 / 行值非法 / 无行 /
+#     读库异常）全部 **fail-closed 到 `default_stage`**（校验层只放行 observation / learning）；
+#   ③ `load_stage_config` 三态：**行存在 / 行缺失 / JSON 损坏**（外加 0003 未跑的 sqlite3.Error）；
+#   ④ `validate_stage_config` 拒绝非法值且**不清洗**（回写入参 / 删非法键 / 补默认值都不许）；
+#   ⑥ 本组即约束 6 说的「⑭ 组」。
+# 本组**不**断言 3.3 / 3.4 符号（`require_capability` / `evaluate` / 三个钩子 …）的缺席 —— 与 ⑬ 组
+# 同一口径：写一条「现在必须不存在」的用例会把后续子步的落地顺序锁死。
+
+
+def _raw_execute(sql, params=()):
+    """绕过 `database.get_connection()` 直连库文件执行一条 SQL（造前置态 / 模拟「人手 SQL 写坏」）。
+
+    刻意不走 `database.get_connection()`：本组有「读数只发 SELECT」的语句级断言（`sql_log`），
+    造前置态的写语句若走同一条口子，就分不清「测试自己写的」与「被测代码写的」。
+    """
+    conn = sqlite3.connect(database.DB_PATH)
+    try:
+        conn.execute(sql, params)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _raw_scalar(sql, params=()):
+    """绕过 `database.get_connection()` 直连库文件读一个标量（断言「库没被写坏」用）。"""
+    conn = sqlite3.connect(database.DB_PATH)
+    try:
+        return conn.execute(sql, params).fetchone()[0]
+    finally:
+        conn.close()
+
+
+def _clear_stage_config_rows():
+    """删掉 `agent_stage_config` 全部行（含迁移种子的全局行）→ 造「行缺失」态。"""
+    _raw_execute("DELETE FROM agent_stage_config")
+
+
+def _put_raw_config_row(teacher_name, raw_config_json):
+    """直接写一行 `config_json`（**原文照写**，用于造「JSON 损坏 / 非对象」态）。"""
+    _raw_execute(
+        "INSERT INTO agent_stage_config (teacher_name, config_json, updated_at) VALUES (?, ?, '') "
+        "ON CONFLICT(teacher_name) DO UPDATE SET config_json = excluded.config_json",
+        (teacher_name, raw_config_json),
+    )
+
+
+def _put_raw_state_row(teacher_name, stage, pending_task_id=0, stage_since="", stage_source="default",
+                       pending_stage=""):
+    """直接写一行状态（各列**原文照写**，用于造「白名单外值 / 坏整数 / 已有行」态）。"""
+    _raw_execute(
+        "INSERT INTO agent_stage_state "
+        "(teacher_name, stage, stage_since, stage_source, pending_stage, pending_task_id, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, '') "
+        "ON CONFLICT(teacher_name) DO UPDATE SET stage = excluded.stage, "
+        "stage_since = excluded.stage_since, stage_source = excluded.stage_source, "
+        "pending_stage = excluded.pending_stage, pending_task_id = excluded.pending_task_id",
+        (teacher_name, stage, stage_since, stage_source, pending_stage, pending_task_id),
+    )
+
+
+# ---- 配置链 ①：内置默认配置（§3.5 键表 = 唯一硬编码点）----
+
+def test_default_stage_config_matches_design_key_table():
+    """§3.5 的 16 键键表**逐字**钉住（含每个默认值），并交叉核对键名确实出现在设计文档里。
+
+    本常量是全 Epic 的**唯一硬编码点**（§3.4：最终配置 = 内置默认 ← 全局行 ← 老师行 ← env）：
+    它漂移了，① ② 的阈值、冷却、TTL 就全线跟着漂 —— 所以钉字面值，不做「大致相等」。
+    """
+    import agent_stage_service
+
+    expected = {
+        "schema_version": 1,
+        "default_stage": "learning",
+        "window_days": 90,
+        "max_samples": 50,
+        "min_samples": 5,
+        "min_template_match": 0.75,
+        "min_modification_consistency": 0.80,
+        "max_violations": 0,
+        "max_permission_denials": 0,
+        "recommend_cooldown_hours": 24,
+        "demote_consistency_floor": 0.50,
+        "demote_streak": 3,
+        "truncate_chars": 2000,
+        "template_match_weights": {"section_hit": 0.6, "section_order": 0.4},
+        "metrics_ttl_hours": 24,
+        "matrix_enforced": True,
+    }
+    assert agent_stage_service.DEFAULT_STAGE_CONFIG == expected
+    assert len(expected) == 16, "§3.5 键表共 16 键（键表增删必须同步设计文档）"
+
+    # 键名交叉核对：设计文档 §3.5 键表里必须有过这个名字（防「凭空多键 / 悄悄少键」）
+    doc = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(database.__file__))),
+                       "docs", "epic2-agent-stage-design-v1.md")
+    with open(doc, encoding="utf-8") as fh:
+        text = fh.read()
+    for key in expected:
+        assert "`%s`" % key in text, "§3.5 键表里没有 `%s`（常量与设计分叉）" % key
+
+
+def test_load_stage_config_returns_fresh_objects(db):
+    """每次调用返回**新建对象**（含嵌套的 `template_match_weights`）：改它不得污染常量 / 上次结果。"""
+    import agent_stage_service
+
+    first = agent_stage_service.load_stage_config(TEACHER)
+    first["min_samples"] = 999
+    first["template_match_weights"]["section_hit"] = 0.0
+
+    assert agent_stage_service.DEFAULT_STAGE_CONFIG["min_samples"] == 5
+    assert agent_stage_service.DEFAULT_STAGE_CONFIG["template_match_weights"]["section_hit"] == 0.6
+    assert agent_stage_service.load_stage_config(TEACHER)["min_samples"] == 5
+
+
+# ---- 配置链 ②：四层合并链（§3.4 第 1 条）----
+
+def test_load_stage_config_row_absent_uses_builtin_defaults_silently(db, capsys):
+    """**三态之一：行缺失** → 全内置默认，且**不告警**（新老师还没有专属行 = 正常态）。"""
+    import agent_stage_service
+
+    _clear_stage_config_rows()
+
+    assert agent_stage_service.load_stage_config(TEACHER) == agent_stage_service.DEFAULT_STAGE_CONFIG
+    assert "[warn]" not in capsys.readouterr().out, "行缺失属正常态，不该打告警"
+
+
+def test_load_stage_config_global_row_overrides_builtin(db):
+    """全局行（`teacher_name=''`）逐键覆盖内置默认，其余键仍是内置值。"""
+    import agent_stage_service
+
+    _put_raw_config_row("", json.dumps({"min_template_match": 0.6, "window_days": 30}))
+
+    cfg = agent_stage_service.load_stage_config(TEACHER)
+    assert cfg["min_template_match"] == 0.6
+    assert cfg["window_days"] == 30
+    assert cfg["min_samples"] == 5, "未被覆盖的键必须回落内置默认"
+    assert cfg["matrix_enforced"] is True
+
+
+def test_load_stage_config_teacher_row_overrides_global_row(db):
+    """老师专属行**赢过**全局行（§3.4 的覆盖顺序），且只覆盖它自己声明的键。"""
+    import agent_stage_service
+
+    _put_raw_config_row("", json.dumps({"min_samples": 7, "max_samples": 20, "demote_streak": 5}))
+    _put_raw_config_row(TEACHER, json.dumps({"min_samples": 9}))
+
+    cfg = agent_stage_service.load_stage_config(TEACHER)
+    assert cfg["min_samples"] == 9, "老师专属行优先"
+    assert cfg["max_samples"] == 20, "老师行没声明的键仍由全局行覆盖"
+    assert cfg["demote_streak"] == 5
+
+    other = agent_stage_service.load_stage_config(OTHER_TEACHER)
+    assert other["min_samples"] == 7, "别的老师不受这位老师的专属行影响"
+
+
+def test_load_stage_config_keeps_unknown_keys(db):
+    """未知键**原样保留**（前向兼容，§3.4 第 1 条）：本层的合并器不得当过滤器用。"""
+    import agent_stage_service
+
+    _clear_stage_config_rows()
+    _put_raw_config_row("", json.dumps({"future_scoring": {"mode": "strict"}, "extra_flag": True}))
+
+    cfg = agent_stage_service.load_stage_config(TEACHER)
+    assert cfg["future_scoring"] == {"mode": "strict"}
+    assert cfg["extra_flag"] is True
+    assert cfg["min_samples"] == 5
+
+
+# ---- 配置链 ③：三态之「JSON 损坏」（该层按无覆盖处理 + 告警；不抛）----
+
+def test_load_stage_config_corrupt_global_row_is_ignored_with_warning(db, capsys):
+    """全局行 `config_json` 不是合法 JSON → 该行按「无覆盖」处理 + 告警，**不抛异常**。"""
+    import agent_stage_service
+
+    _clear_stage_config_rows()
+    _put_raw_config_row("", "{not json at all")
+
+    assert agent_stage_service.load_stage_config(TEACHER) == agent_stage_service.DEFAULT_STAGE_CONFIG
+    out = capsys.readouterr().out
+    assert "損壞" in out and "全局" in out, "损坏行必须留下可定位的告警：%r" % out
+
+
+def test_load_stage_config_corrupt_teacher_row_keeps_global_row(db, capsys):
+    """老师行损坏时**只丢坏的那一层**：全局行的覆盖照旧生效（不是整份回落内置默认）。"""
+    import agent_stage_service
+
+    _clear_stage_config_rows()
+    _put_raw_config_row("", json.dumps({"window_days": 30}))
+    _put_raw_config_row(TEACHER, "{\"window_days\": 30,")
+
+    cfg = agent_stage_service.load_stage_config(TEACHER)
+    assert cfg["window_days"] == 30, "全局行仍应生效"
+    assert cfg["min_samples"] == 5
+    assert "老師專屬" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("raw", ["[1, 2, 3]", "\"just a string\"", "null", "42"])
+def test_load_stage_config_non_object_json_is_treated_as_corrupt(db, capsys, raw):
+    """合法 JSON 但**不是对象**（数组 / 字符串 / null / 数字）→ 与损坏同款处理（该层无覆盖 + 告警）。"""
+    import agent_stage_service
+
+    _clear_stage_config_rows()
+    _put_raw_config_row("", raw)
+
+    assert agent_stage_service.load_stage_config(TEACHER) == agent_stage_service.DEFAULT_STAGE_CONFIG
+    assert "不是 JSON 對象" in capsys.readouterr().out
+
+
+# ---- 配置链 ④：非法值 → 整份回落内置默认（§3.4 第 5 条「读取时回落」）----
+
+def test_load_stage_config_invalid_value_falls_back_wholesale(db, capsys):
+    """行里的值越界（`min_samples > max_samples`）→ **整份**回落内置默认 + 告警。
+
+    刻意不「只丢那一个键」：§3.4 第 5 条写的是「读取时非法 → 回落内置默认」；半信半疑地混用
+    「一半脏值 + 一半默认」，会让老师看到的阈值来源无法解释。
+    """
+    import agent_stage_service
+
+    _clear_stage_config_rows()
+    _put_raw_config_row("", json.dumps({"min_samples": 9, "max_samples": 5, "window_days": 30}))
+
+    cfg = agent_stage_service.load_stage_config(TEACHER)
+    assert cfg == agent_stage_service.DEFAULT_STAGE_CONFIG
+    assert cfg["window_days"] == 90, "同一行里合法的键也不得生效（整份回落）"
+    out = capsys.readouterr().out
+    assert "非法" in out and "min_samples" in out
+
+
+def test_load_stage_config_missing_store_degrades_to_builtin(db, monkeypatch, tmp_path, capsys):
+    """**库层异常**（0003 未跑：`agent_stage_config` 表不在）→ 内置默认 + 告警、**绝不抛**（§1.5 第 3 条）。"""
+    import agent_stage_service
+
+    path = _copy_tested_db(monkeypatch, tmp_path, "no_config_table.db")
+    _drop_table(path, "agent_stage_config")
+
+    assert agent_stage_service.load_stage_config(TEACHER) == agent_stage_service.DEFAULT_STAGE_CONFIG
+    assert "失敗" in capsys.readouterr().out
+
+
+# ---- 配置链 ⑤：环境变量白名单（§3.4 第 2 条）----
+
+def test_load_stage_config_applies_env_whitelist_over_every_row(db, monkeypatch):
+    """env 是**最高一层**（内置 ← 全局 ← 老师 ← env），按各键类型转换；总闸不入配置。"""
+    import agent_stage_service
+
+    _put_raw_config_row("", json.dumps({"max_samples": 20, "window_days": 30}))
+    _put_raw_config_row(TEACHER, json.dumps({"max_samples": 10}))
+
+    monkeypatch.setenv("AGENT_STAGE_MAX_SAMPLES", "123")
+    monkeypatch.setenv("AGENT_STAGE_MATRIX_ENFORCED", "off")
+    monkeypatch.setenv("AGENT_STAGE_MIN_TEMPLATE_MATCH", "0.5")
+    monkeypatch.setenv("AGENT_STAGE_DEFAULT_STAGE", "  Observation  ")
+    monkeypatch.setenv("AGENT_STAGE_ENABLED", "on")
+
+    cfg = agent_stage_service.load_stage_config(TEACHER)
+    assert cfg["max_samples"] == 123, "env 赢过老师专属行与全局行"
+    assert cfg["matrix_enforced"] is False, "布尔键按 on/off 语义解析"
+    assert cfg["min_template_match"] == 0.5
+    assert cfg["default_stage"] == "observation", "阶段名统一小写，并去掉前后空白"
+    assert cfg["window_days"] == 30, "未被 env 覆盖的键仍走行"
+    assert "enabled" not in cfg, "AGENT_STAGE_ENABLED 是总闸、不是配置键（不得混进配置）"
+
+
+def test_load_stage_config_ignores_non_whitelisted_env_with_warning(db, monkeypatch, capsys):
+    """白名单外的 `AGENT_STAGE_*` 一律忽略 + 告警（防 typo 静默生效）。
+
+    `template_match_weights` 这种复合键**不在** env 白名单里：env 的字符串无法无损表达它，
+    只能走配置行（否则「半边覆盖」会让权重来源无法解释）。
+    """
+    import agent_stage_service
+
+    monkeypatch.setenv("AGENT_STAGE_TEMPLATE_MATCH_WEIGHTS", "{\"section_hit\": 1.0}")
+    monkeypatch.setenv("AGENT_STAGE_WINDOWDAYS", "30")
+
+    cfg = agent_stage_service.load_stage_config(TEACHER)
+    assert cfg["template_match_weights"] == {"section_hit": 0.6, "section_order": 0.4}
+    assert cfg["window_days"] == 90, "拼错的键不得生效（否则 typo 静默生效）"
+    out = capsys.readouterr().out
+    assert "未知的環境變量 AGENT_STAGE_TEMPLATE_MATCH_WEIGHTS" in out
+    assert "未知的環境變量 AGENT_STAGE_WINDOWDAYS" in out
+
+
+def test_load_stage_config_bad_env_value_is_ignored_not_fatal(db, monkeypatch, capsys):
+    """env 值无法解析（给整数键写 `abc`）→ 只忽略该键 + 告警，其余链路照常（**不炸链路**）。"""
+    import agent_stage_service
+
+    _put_raw_config_row("", json.dumps({"window_days": 30}))
+    monkeypatch.setenv("AGENT_STAGE_MAX_SAMPLES", "abc")
+    monkeypatch.setenv("AGENT_STAGE_MATRIX_ENFORCED", "maybe")
+
+    cfg = agent_stage_service.load_stage_config(TEACHER)
+    assert cfg["max_samples"] == 50, "坏值 → 回落下一级（内置）"
+    assert cfg["matrix_enforced"] is True
+    assert cfg["window_days"] == 30, "同一次调用里其它层照旧生效"
+    out = capsys.readouterr().out
+    assert "無法解析" in out and "AGENT_STAGE_MAX_SAMPLES" in out
+
+
+def test_load_stage_config_out_of_range_env_falls_back_wholesale(db, monkeypatch, capsys):
+    """env 值**能解析但非法**（`0` / `apprentice`）→ 与行里的脏值同款：整份回落内置默认 + 告警。
+
+    这条是 fail-closed 的 env 侧证明：`AGENT_STAGE_DEFAULT_STAGE=apprentice` 绝不能生效 ——
+    否则运维一个错字就能把全体未初始化老师的兜底阶段抬到見習期以上。
+    """
+    import agent_stage_service
+
+    monkeypatch.setenv("AGENT_STAGE_MAX_SAMPLES", "0")
+    assert agent_stage_service.load_stage_config(TEACHER) == agent_stage_service.DEFAULT_STAGE_CONFIG
+
+    monkeypatch.delenv("AGENT_STAGE_MAX_SAMPLES")
+    monkeypatch.setenv("AGENT_STAGE_DEFAULT_STAGE", "apprentice")
+    cfg = agent_stage_service.load_stage_config(TEACHER)
+    assert cfg == agent_stage_service.DEFAULT_STAGE_CONFIG
+    assert cfg["default_stage"] == "learning"
+    assert "default_stage" in capsys.readouterr().out
+
+
+def test_load_stage_config_re_reads_every_call_and_only_selects(db, sql_log, monkeypatch):
+    """§3.4 第 3 条「每次调用现读、不缓存」+ 本段纪律「读数只发 SELECT」。"""
+    import agent_stage_service
+
+    _put_raw_config_row("", json.dumps({"window_days": 30}))
+
+    marker = len(_all_calls(sql_log))
+    assert agent_stage_service.load_stage_config(TEACHER)["window_days"] == 30
+
+    monkeypatch.setenv("AGENT_STAGE_WINDOW_DAYS", "45")     # 不缓存 → 立刻生效，无需重启
+    assert agent_stage_service.load_stage_config(TEACHER)["window_days"] == 45
+
+    statements = [sql for sql, _ in _all_calls(sql_log)[marker:]]
+    assert statements, "必须真的读了库（否则「现读」无从谈起）"
+    assert all(sql.lstrip().upper().startswith("SELECT") for sql in statements), statements
+
+
+# ---- 配置校验层 ⑥：合法边界（§3.4 第 5 条 / 只拦不清）----
+
+def test_validate_stage_config_accepts_builtin_partial_and_unknown():
+    """内置默认配置 / 部分键 / 未知键都算合法：**缺失 = 回落上一级**、**未知 = 前向兼容**。"""
+    import agent_stage_service
+
+    assert agent_stage_service.validate_stage_config(agent_stage_service.DEFAULT_STAGE_CONFIG) == (True, [])
+    assert agent_stage_service.validate_stage_config({}) == (True, [])
+    assert agent_stage_service.validate_stage_config({"min_samples": 3}) == (True, [])
+    assert agent_stage_service.validate_stage_config({"future_key": "x", "min_samples": 3}) == (True, [])
+
+
+@pytest.mark.parametrize("cfg", [
+    {"schema_version": 1},
+    {"window_days": 1}, {"window_days": 3650},
+    {"max_samples": 1}, {"max_samples": 500},
+    {"min_samples": 1, "max_samples": 1},                      # 边界相等合法
+    {"truncate_chars": 200}, {"truncate_chars": 4000},
+    {"demote_streak": 1}, {"demote_streak": 10},
+    {"max_violations": 0}, {"max_violations": 50},
+    {"max_permission_denials": 0}, {"max_permission_denials": 100},
+    {"recommend_cooldown_hours": 0}, {"metrics_ttl_hours": 0},  # 设计未给上界 → 只拦负数
+    {"min_template_match": 0.0}, {"min_template_match": 1.0},  # 比率闭区间两端
+    {"min_modification_consistency": 0}, {"min_modification_consistency": 1},
+    {"demote_consistency_floor": 0.5},
+    {"default_stage": "observation"}, {"default_stage": "learning"},
+    {"matrix_enforced": True}, {"matrix_enforced": False},
+    {"template_match_weights": {"section_hit": 0, "section_order": 1}},
+])
+def test_validate_stage_config_accepts_boundary_values(cfg):
+    """闭区间端点 / 布尔两态 / 权重取到端点，都必须放行（边界不能靠「大概」判）。"""
+    import agent_stage_service
+
+    ok, errors = agent_stage_service.validate_stage_config(cfg)
+    assert ok is True and errors == [], "应放行却报了错：%r → %r" % (cfg, errors)
+
+
+@pytest.mark.parametrize("cfg, path", [
+    # 契约版本
+    ({"schema_version": 2}, "schema_version"),
+    ({"schema_version": "1"}, "schema_version"),
+    ({"schema_version": True}, "schema_version"),
+    # 整数键：越界
+    ({"window_days": 0}, "window_days"), ({"window_days": 3651}, "window_days"),
+    ({"max_samples": 0}, "max_samples"), ({"max_samples": 501}, "max_samples"),
+    ({"min_samples": 0}, "min_samples"), ({"min_samples": 501}, "min_samples"),
+    ({"truncate_chars": 199}, "truncate_chars"), ({"truncate_chars": 4001}, "truncate_chars"),
+    ({"demote_streak": 0}, "demote_streak"), ({"demote_streak": 11}, "demote_streak"),
+    ({"max_violations": -1}, "max_violations"), ({"max_violations": 51}, "max_violations"),
+    ({"max_permission_denials": -1}, "max_permission_denials"),
+    ({"max_permission_denials": 101}, "max_permission_denials"),
+    ({"recommend_cooldown_hours": -1}, "recommend_cooldown_hours"),
+    ({"metrics_ttl_hours": -1}, "metrics_ttl_hours"),
+    # 整数键：类型（bool 必须被拒 —— `True` 是 int 子类，静默当 1 用就是静默清洗）
+    ({"window_days": "90"}, "window_days"),
+    ({"max_samples": True}, "max_samples"),
+    ({"demote_streak": 1.5}, "demote_streak"),
+    # 跨键关系
+    ({"min_samples": 9, "max_samples": 5}, "min_samples"),
+    # 比率键
+    ({"min_template_match": 1.0001}, "min_template_match"),
+    ({"min_template_match": -0.01}, "min_template_match"),
+    ({"min_modification_consistency": "0.9"}, "min_modification_consistency"),
+    ({"demote_consistency_floor": 2}, "demote_consistency_floor"),
+    # 布尔键 / 权重
+    ({"matrix_enforced": "true"}, "matrix_enforced"),
+    ({"matrix_enforced": 1}, "matrix_enforced"),
+    ({"template_match_weights": "x"}, "template_match_weights"),
+    ({"template_match_weights": {}}, "template_match_weights"),
+    ({"template_match_weights": {"section_hit": 0, "section_order": 0}}, "template_match_weights"),
+    ({"template_match_weights": {"section_hit": -0.1}}, "template_match_weights.section_hit"),
+    ({"template_match_weights": {"section_hit": True, "section_order": 1}},
+     "template_match_weights.section_hit"),
+])
+def test_validate_stage_config_rejects_out_of_range_by_path(cfg, path):
+    """越界 / 类型错的每一项都必须在 `errors[].path` 上**指名道姓**（400 的 errors 直接给老师看）。"""
+    import agent_stage_service
+
+    ok, errors = agent_stage_service.validate_stage_config(cfg)
+    assert ok is False
+    assert path in [item["path"] for item in errors], "%r 应报在 %s 上：%r" % (cfg, path, errors)
+
+
+@pytest.mark.parametrize("stage", ["apprentice", "assistant", "authorized", "observation_", "*"])
+def test_validate_stage_config_refuses_privileged_default_stage(stage):
+    """**fail-closed 的关键一条**：`default_stage` 只能是 observation / learning。
+
+    若放行 `apprentice` 及以上，「读不到状态行」就等于「自动提权」—— 而 `describe_stage` 的兜底
+    路径正是「读不到时返回 `default_stage`」（§1.5 结尾）。这条用例是那道闸的守门人。
+    """
+    import agent_stage_service
+
+    ok, errors = agent_stage_service.validate_stage_config({"default_stage": stage})
+    assert ok is False
+    assert "default_stage" in [item["path"] for item in errors]
+
+
+def test_validate_stage_config_reports_all_errors_and_never_cleans():
+    """多处非法 → **一次全报**（不短路）；且**不清洗**：入参一个字节都不许被改。"""
+    import agent_stage_service
+
+    cfg = {"min_samples": 0, "matrix_enforced": "true", "default_stage": "apprentice",
+           "unknown_future": {"keep": "me"}}
+    snapshot = json.loads(json.dumps(cfg))
+
+    ok, errors = agent_stage_service.validate_stage_config(cfg)
+    assert ok is False
+    assert sorted(item["path"] for item in errors) == ["default_stage", "matrix_enforced", "min_samples"]
+    assert cfg == snapshot, "校验层回写了入参（静默清洗）"
+    assert set(errors[0]) == {"path", "msg"}, "错误条目形状必须与统一错误体一致（errors: [{path,msg}]）"
+    assert all(isinstance(item["msg"], str) and item["msg"] for item in errors), "msg 必须是人话"
+
+
+@pytest.mark.parametrize("cfg", [None, [], "x", 3, True])
+def test_validate_stage_config_rejects_non_dict(cfg):
+    """根不是 JSON 对象 → 一条错误、path 为空串（对应「请求体本身就不是配置对象」）。"""
+    import agent_stage_service
+
+    ok, errors = agent_stage_service.validate_stage_config(cfg)
+    assert ok is False
+    assert len(errors) == 1 and errors[0]["path"] == ""
+
+
+# ---- 阶段真值读取 ⑦：四条路径（§1.5）----
+
+def test_describe_stage_row_present_is_truth(db):
+    """路径①：状态行存在且 stage 合法 → **原样采用**（含 stage_since / stage_source / pending_*）。"""
+    import agent_stage_service
+
+    _put_raw_state_row(TEACHER, "apprentice", stage_since="2026-09-01T10:00:00",
+                       stage_source="teacher_confirm", pending_stage="assistant", pending_task_id=7)
+
+    view = agent_stage_service.describe_stage(TEACHER)
+    assert view == {
+        "teacher_name": TEACHER,
+        "stage": "apprentice",
+        "stage_label": "見習期",
+        "stage_since": "2026-09-01T10:00:00",
+        "stage_source": "teacher_confirm",
+        "pending_stage": "assistant",
+        "pending_task_id": 7,
+        "degraded": False,
+    }
+    assert view["stage_label"] == agent_stage_service.STAGE_LABELS["apprentice"], "徽章文案走唯一真相源"
+
+
+def test_describe_stage_without_row_uses_default_stage_without_writing(db):
+    """路径③：无行 → 取**配置链**的 `default_stage`、`degraded=False`、**不写库**。
+
+    「新老师还没有状态行」是正常态：既不许报错，也不许为此写一行假状态（那会把「未初始化」变成
+    「已初始化成默认值」，将来想区分就再也分不清了）。
+    """
+    import agent_stage_service
+
+    before = _raw_scalar("SELECT COUNT(*) FROM agent_stage_state")
+    _put_raw_config_row("", json.dumps({"default_stage": "observation"}))
+
+    view = agent_stage_service.describe_stage(TEACHER)
+    assert view["stage"] == "observation", "兜底值必须来自配置链（不是硬编码 learning）"
+    assert view["stage_source"] == "default"
+    assert view["stage_since"] == "" and view["pending_stage"] == "" and view["pending_task_id"] == 0
+    assert view["degraded"] is False, "无行是正常态，不是降级"
+    assert _raw_scalar("SELECT COUNT(*) FROM agent_stage_state") == before, "读数把状态行写出来了"
+
+    assert agent_stage_service.current_stage(TEACHER) == "observation"
+
+
+def test_current_stage_is_scalar_matching_describe(db):
+    """`current_stage` 恒为 `STAGES` 内的字符串，且与 `describe_stage` 同源（只有一份读库实现）。"""
+    import agent_stage_service
+
+    assert isinstance(agent_stage_service.current_stage(TEACHER), str)
+    assert agent_stage_service.current_stage(TEACHER) in agent_stage_service.STAGES
+
+    _put_raw_state_row(TEACHER, "authorized")
+    assert agent_stage_service.current_stage(TEACHER) == "authorized"
+    assert agent_stage_service.current_stage(TEACHER) == agent_stage_service.describe_stage(TEACHER)["stage"]
+
+
+# ---- 阶段真值读取 ⑧：读数纪律（零写入 / 只发 SELECT / 不读 flag）----
+
+def test_stage_read_path_only_selects_and_writes_nothing(db, sql_log):
+    """读数全链路 **只发 SELECT**，且**不改数据、不写审计**。
+
+    走的是「非法 stage 行」这条降级路径：读完之后脏行必须**原样**留在库里；`agent_stage_log` 也
+    增量为零（§1.5 第 1 条的 evaluation 事件写入属 3.4 的 `evaluate()`；§3.8 要求 GET 无副作用）。
+    """
+    import agent_stage_service
+
+    _put_raw_config_row("", json.dumps({"window_days": 30}))
+    _put_raw_state_row(TEACHER, "master")
+    state_before = _raw_scalar("SELECT COUNT(*) FROM agent_stage_state")
+    log_before = _raw_scalar("SELECT COUNT(*) FROM agent_stage_log")
+
+    marker = len(_all_calls(sql_log))
+    agent_stage_service.load_stage_config(TEACHER)
+    agent_stage_service.describe_stage(TEACHER)
+    agent_stage_service.current_stage(TEACHER)
+
+    statements = [sql for sql, _ in _all_calls(sql_log)[marker:]]
+    assert statements, "必须真的读了库"
+    assert all(sql.lstrip().upper().startswith("SELECT") for sql in statements), statements
+    assert _raw_scalar("SELECT COUNT(*) FROM agent_stage_state") == state_before
+    assert _raw_scalar("SELECT COUNT(*) FROM agent_stage_log") == log_before, "读数写了审计日志"
+
+
+@pytest.mark.parametrize("flag", [None, "on", "off"])
+def test_stage_read_path_ignores_flag(db, monkeypatch, flag):
+    """读数**不读 flag**：flag 三态下结果逐字节一致（门卫属 3.3 的 `require_capability` / step 4 接口层）。"""
+    import agent_stage_service
+
+    if flag is None:
+        monkeypatch.delenv("AGENT_STAGE_ENABLED", raising=False)
+    else:
+        monkeypatch.setenv("AGENT_STAGE_ENABLED", flag)
+
+    _put_raw_state_row(TEACHER, "apprentice", stage_source="teacher_confirm")
+
+    assert agent_stage_service.describe_stage(TEACHER) == {
+        "teacher_name": TEACHER,
+        "stage": "apprentice",
+        "stage_label": "見習期",
+        "stage_since": "",
+        "stage_source": "teacher_confirm",
+        "pending_stage": "",
+        "pending_task_id": 0,
+        "degraded": False,
+    }
+    assert agent_stage_service.current_stage(TEACHER) == "apprentice"
+    assert agent_stage_service.load_stage_config(TEACHER) == agent_stage_service.DEFAULT_STAGE_CONFIG
+
+
+def test_describe_stage_illegal_row_value_degrades_to_default_stage(db, capsys):
+    """路径②：行在但 `stage` 白名单外（人手 SQL 写坏 / 高版本数据）→ 回落 `default_stage` + 降级标记。
+
+    同时钉住两件事：① `stage_since` **一并不采用**（返回的阶段已不是那行的阶段，带上它的时间会误导
+    前端）；② **不改写那行脏数据**（读数零写入 —— 脏数据怎么处理属 3.4 的评估流程 + 审计）。
+    """
+    import agent_stage_service
+
+    _put_raw_config_row("", json.dumps({"default_stage": "observation"}))
+    _put_raw_state_row(TEACHER, "master", stage_since="2026-09-01T10:00:00",
+                       stage_source="teacher_confirm")
+
+    view = agent_stage_service.describe_stage(TEACHER)
+    assert view["stage"] == "observation"
+    assert view["stage_source"] == "default"
+    assert view["stage_since"] == "", "非法行的 stage_since 不得被继承"
+    assert view["degraded"] is True
+    assert "master" in capsys.readouterr().out, "非法值必须留下告警（含原值，便于定位）"
+
+    assert _raw_scalar("SELECT stage FROM agent_stage_state WHERE teacher_name = ?", (TEACHER,)) == "master", \
+        "读数改写了脏数据（零写入纪律）"
+
+
+def test_describe_stage_default_stage_never_escalates(db, capsys):
+    """**fail-closed 端到端**：全局行 / 老师行里塞高阶段兜底值 → 校验拒绝 → 整份回落内置 learning。
+
+    「读不到状态行」是兜底路径，若 `default_stage` 能取到 `apprentice` 及以上，它就成了「自动提权」。
+    """
+    import agent_stage_service
+
+    _put_raw_config_row("", json.dumps({"default_stage": "apprentice"}))
+    assert agent_stage_service.load_stage_config(TEACHER)["default_stage"] == "learning"
+    assert agent_stage_service.describe_stage(TEACHER)["stage"] == "learning"
+
+    _put_raw_config_row(TEACHER, json.dumps({"default_stage": "authorized"}))
+    assert agent_stage_service.describe_stage(TEACHER)["stage"] == "learning"
+    assert "default_stage" in capsys.readouterr().out
+
+
+def test_describe_stage_store_missing_degrades_and_never_raises(db, monkeypatch, tmp_path, capsys):
+    """路径④：0003 未跑（状态表不在）→ `default_stage` + `degraded=True` + 告警、**绝不抛**（§1.5 第 3 条）。"""
+    import agent_stage_service
+
+    path = _copy_tested_db(monkeypatch, tmp_path, "no_state_table.db")
+    _drop_table(path, "agent_stage_state")
+
+    view = agent_stage_service.describe_stage(TEACHER)      # 不抛异常 = 本用例的核心断言
+    assert view["stage"] == "learning"
+    assert view["stage_source"] == "default"
+    assert view["degraded"] is True
+    assert view["stage_label"] == agent_stage_service.STAGE_LABELS["learning"]
+    assert "失敗" in capsys.readouterr().out
+
+
+def test_describe_stage_tolerates_corrupt_pending_task_id(db):
+    """库列无 CHECK（§1.2）：`pending_task_id` 被人手 SQL 写成字符串时，读数降级成 0 而不是炸 500。"""
+    import agent_stage_service
+
+    _put_raw_state_row(TEACHER, "learning", pending_task_id="oops")
+
+    view = agent_stage_service.describe_stage(TEACHER)      # 不抛异常 = 核心断言
+    assert view["stage"] == "learning" and view["pending_task_id"] == 0
 
