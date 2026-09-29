@@ -1671,7 +1671,13 @@ def get_agent_tasks(teacher_name, status='pending'):
 
 def resolve_agent_task(task_id, decision):
     """老师决策：decision='approved' / 'rejected'。
-    更新任务状态 + 记一条 agent_action_log；approved 且 action 为 send_care_notice 时再记一条发送日志（暂不真实推送）。"""
+    更新任务状态 + 记一条 agent_action_log；approved 且 action 为 send_care_notice 时再记一条发送日志（暂不真实推送）。
+
+    【Epic 2 §4.2 改 3】（施工步骤 2.4）任务落定后**追加** best-effort 通知服务层：
+    `action_data.action == 'upgrade_agent_stage'` 时，approved → `apply_upgrade_confirmation(
+    teacher_name, to, task_id)`；rejected → `decline_upgrade(teacher_name, task_id)`。
+    纪律：**返回值 / SQL / 既有分支语义一字不改**（逐条见函数末尾那段注释）；两态实现只有
+    `_call_agent_stage_hook()` 一份，本函数不重复判断。"""
     conn = get_connection()
     cur = conn.cursor()
     task = cur.execute("SELECT * FROM agent_tasks WHERE id = ?", (task_id,)).fetchone()
@@ -1702,6 +1708,41 @@ def resolve_agent_task(task_id, decision):
 
     conn.commit()
     conn.close()
+
+    # ---------- 【Epic 2 §4.2 改 3】升级请示落定 → best-effort 通知服务层（施工步骤 2.4）----------
+    # 位置：状态 UPDATE + 行动日志 INSERT + `commit` + `close` **之后**（与改 2b 同款时序）
+    #       → 钩子即便炸了，也不可能污染已落定的任务状态与审计日志。
+    # 纪律（对应 CTO step 2.4 四条追加要求）：
+    #   · 要求 1 / 4：两态判断**复用**改 2b 的同一个调用器 `_call_agent_stage_hook()`
+    #     （函数内延迟 import → `getattr` + `callable` 缺失即静默 → 异常只 print warn）。
+    #     本段**不写第二份**两态判断，也不自己 import 服务层。
+    #   · 要求 2：本段**不参与**任何返回值构造 —— 下面那一行 `return` 与改动前一字不差；
+    #     上面学生类请示的 `send_care_notice` 分支同样一字未动。
+    #   · 要求 3：本段在 flag **on / off 下都发零条 SQL**（钩子缺失时 `_call_agent_stage_hook`
+    #     在 import 之前就返回 False）→ 语句序列与参数逐字节不变；⑫ 组有专门用例守，
+    #     且改动前后各有一次实测捕获留档（%TEMP%\epic2_resolve_baseline_*.txt）。
+    #   · **本段不判 flag**（CTO 2026-09-28 批复①，与改 2b 同口径）：flag off 时算不算指标 /
+    #     写不写新表，由服务层 `apply_upgrade_confirmation` / `decline_upgrade` 的**首行自闸门**
+    #     负责；库层只转发 —— 否则这里就会出现第二个 flag 判断。
+    #   · 既有 approved 分支里的局部 `action` 只活在那个分支作用域内（那几行一字不动），故此处
+    #     另做一次**防御式解析**（与上面那段同款写法；纯读、零副作用、零 SQL）：rejected 路径
+    #     也能拿到 action_data，且 `action_data` 坏掉时绝不冒泡（§4.2 改 3「整段包 try/except」）。
+    #   · 多一层 `isinstance` 兜底的必要性：rejected 路径在改动前**根本不解析** action_data，
+    #     若这里是 JSON 数组 / 字符串 / 数字，`.get` 会 AttributeError —— 那就成了本步引入的回归。
+    #     （approved 路径上的同类脏数据在改动前就会在这条语句**之前**炸，本步不改变那个既有行为。）
+    try:
+        resolved_action = json.loads(task["action_data"]) if task["action_data"] else {}
+        if not isinstance(resolved_action, dict):
+            resolved_action = {}
+    except Exception:
+        resolved_action = {}
+    if resolved_action.get("action") == "upgrade_agent_stage":
+        if new_status == "approved":
+            _call_agent_stage_hook("apply_upgrade_confirmation", task["teacher_name"],
+                                   resolved_action.get("to"), task_id)
+        else:
+            _call_agent_stage_hook("decline_upgrade", task["teacher_name"], task_id)
+
     return {"message": "已处理", "status": new_status}
 
 

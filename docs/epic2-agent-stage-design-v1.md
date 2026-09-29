@@ -539,6 +539,8 @@ and permission_denials_in_window <= max_permission_denials
 
 **⑥ `docs/migrations/0003_add_agent_stage.sql`**：`alembic upgrade head --sql` 产物，供 DBA / CTO 离线预审（沿用 0001 的产物习惯）。
 
+> **CTO 追补（2026-09-28）**：step 2.2 按 §7 裁决②方案 B，在 `agent_stage_service.py` **提前落地** `AGENT_STAGE_ENABLED_VALUES` 与 `agent_stage_enabled()`（供 `database.py` 延迟 import 使用）。符号口径**照抄 `template_service.py:897-909`**。
+
 ### 4.6 接口清单（新增 7 个，全部 `AGENT_STAGE_ENABLED` 门后）
 
 | # | 方法 / 路径 | 入参 | 出参（要点） | 主要错误码 |

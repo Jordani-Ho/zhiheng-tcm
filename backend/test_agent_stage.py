@@ -15,11 +15,18 @@
     ⑨ 【§4.2 改 1】insert_draft 快照写入：四分支逐条 + **flag off 逐字节比对**（基线 = 改动前实测捕获，
        非手抄）+ 快照对老师编辑不可变；
     ⑩ 总闸契约：`agent_stage_service.agent_stage_enabled()` 的取值语义（默认 off）、闸门两态降级，
-       以及「服务层对 database 零 import」的源码级守护（CTO 提醒的循环依赖红线）；
+       以及**依赖方向**的源码级守护（`database` → 服务层的 import 恒在函数体内，不得动态绕开）
+       + §2.1 禁止 import 清单（服务层永不 import 六个禁忌符号）—— 「服务层对 database 零 import」
+       的反向硬断言已按 CTO 批复② 于 step 2.4 删除（§4.5-① 允许服务层 import database）；
     ⑪ 【§4.2 改 2 / 施工步骤 2.3】`sign_draft` 快照进历史表（双闸门 + 空快照回落 content）+ **改动前
        逐字节基线**守护 + best-effort 钩子 `on_draft_signed` 三态（不存在→静默 / 存在→调用一次 /
        抛异常→只打 warn）+「同一个 flag 闸门与同一个列探测只许一份实现」的行为级与源码级守护
        （CTO step 2.3 追加要求 1–3）。
+    ⑫ 【§4.2 改 3 / 施工步骤 2.4】`resolve_agent_task` 升级确认钩子：flag off **逐字节基线**守护
+       （基线 = 13 组用例的改动前实测捕获，非手抄）+ 既有返回值 / 学生类请示分支 / 空与坏
+       `action_data` / 任务不存在全部一字不改 + 钩子三态（缺席→静默 / 在场→按
+       `(teacher_name, to, task_id)` 调用一次 / 抛异常→只打 warn 且**不回滚**老师已落定的决策）
+       + 「只有一个两态调用器」与「调用点不判 flag」的源码级守护（CTO step 2.4 追加要求 1–4）。
 
 运行方式（Windows，串行；见 pytest.ini）：
     cd backend
@@ -414,18 +421,45 @@ _SNAPSHOT_ONLY_DRAFTS_DDL = (
 
 
 class _RecordingConnection:
-    """把 `get_connection()` 包一层，录下 insert_draft 实际执行的每一条 (SQL, 参数)。"""
+    """把 `get_connection()` 包一层，录下被测函数实际执行的每一条 (SQL, 参数)。
 
-    def __init__(self, conn):
+    `record_cursor=True` 时连 `conn.cursor().execute(...)` 一起录：`resolve_agent_task`（改 3）走
+    cursor，而 `insert_draft` / `sign_draft` 走 `conn.execute` —— 故 ⑨ / ⑪ 保持默认 False，
+    录制口径与那两组基线逐字节一致，本步不触碰它们的断言。
+    """
+
+    def __init__(self, conn, record_cursor=False):
         self.__dict__["_conn"] = conn
         self.__dict__["calls"] = []
+        self.__dict__["_record_cursor"] = record_cursor
 
     def execute(self, sql, params=()):
         self.__dict__["calls"].append((sql, params))
         return self.__dict__["_conn"].execute(sql, params)
 
+    def cursor(self):
+        cur = self.__dict__["_conn"].cursor()
+        if not self.__dict__["_record_cursor"]:
+            return cur
+        return _RecordingCursor(cur, self.__dict__["calls"])
+
     def __getattr__(self, name):
         return getattr(self.__dict__["_conn"], name)
+
+
+class _RecordingCursor:
+    """录 `cursor.execute`（写进同一个 calls 列表，保持语句先后次序）。"""
+
+    def __init__(self, cur, calls):
+        self.__dict__["_cur"] = cur
+        self.__dict__["_calls"] = calls
+
+    def execute(self, sql, params=()):
+        self.__dict__["_calls"].append((sql, params))
+        return self.__dict__["_cur"].execute(sql, params)
+
+    def __getattr__(self, name):
+        return getattr(self.__dict__["_cur"], name)
 
 
 @pytest.fixture
@@ -436,6 +470,21 @@ def sql_log(monkeypatch):
 
     def wrapper():
         conn = _RecordingConnection(real())
+        connections.append(conn)
+        return conn
+
+    monkeypatch.setattr(database, "get_connection", wrapper)
+    return connections
+
+
+@pytest.fixture
+def task_sql_log(monkeypatch):
+    """⑫ 组专用：连 `cursor.execute` 一起录（`resolve_agent_task` 走的是 cursor）。"""
+    real = database.get_connection
+    connections = []
+
+    def wrapper():
+        conn = _RecordingConnection(real(), record_cursor=True)
         connections.append(conn)
         return conn
 
@@ -650,20 +699,83 @@ def test_snapshot_gate_emits_no_sql_when_flag_off(monkeypatch, sql_log):
     assert _all_calls(sql_log) == [], "flag off 时闸门不得发任何 SQL（短路必须发生在列探测之前）"
 
 
-def test_service_module_never_imports_database():
-    """CTO 提醒的循环依赖红线：`agent_stage_service` 对 `database` **零 import**（含函数级）。
+_FORBIDDEN_SERVICE_IMPORTS = (
+    "create_prescription",
+    "sanitize_prescription_items",
+    "batch_deduct_herbs",
+    "sign_draft",
+    "update_draft_content",
+    "save_prescription",
+)
 
-    方向恒为单向 `database → agent_stage_service`（且只在函数内延迟），反向由本用例读源码守住。
+
+def _service_source():
+    path = os.path.join(os.path.dirname(os.path.abspath(database.__file__)), "agent_stage_service.py")
+    with open(path, encoding="utf-8") as fh:
+        return fh.read()
+
+
+def _service_imports_and_database_attrs(source):
+    """AST 口径：抽出**真实**的 import 名与 `database.<属性>` 访问。
+
+    必须用 AST 才能把「docstring / 注释里提到 `database.sign_draft()`」和「代码里真的碰它」分开 ——
+    本文件头部就写着 §2.1 禁止清单、交接说明里也会引用这些函数名（口径是「提到可以、import 不行」）。
     """
-    import agent_stage_service
+    import ast
 
-    source_path = os.path.join(os.path.dirname(os.path.abspath(database.__file__)), "agent_stage_service.py")
-    with open(source_path, encoding="utf-8") as fh:
-        source = fh.read()
+    tree = ast.parse(source)
+    imported = set()
+    attributes = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                imported.add(alias.name.split(".")[-1])
+        elif isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                imported.add(alias.name)
+        elif (isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)
+                and node.value.id == "database"):
+            attributes.add(node.attr)
+    return imported, attributes
 
-    assert not re.search(r"(?m)^\s*(import\s+database\b|from\s+database\b)", source)
-    assert "import_module(" not in source and "__import__(" not in source
-    assert "database" not in vars(agent_stage_service), "运行期也不得把 database 绑进命名空间"
+
+def test_database_to_service_import_stays_inside_function_bodies():
+    """依赖方向守护（CTO 2026-09-28 批复②修正版）。
+
+    真正的红线是**方向与时机**：`database` → `agent_stage_service` 的依赖必须恒在**函数体内**
+    （模块级 import 会与 `agent_stage_service` 形成循环依赖），且不得用 `__import__` /
+    `importlib.import_module` 动态绕开源码级守护。
+
+    「服务层对 `database` 零 import」的反向硬断言已按批复②**删除**：设计 §4.5-① **允许**服务层
+    import `database`（只调 §4.2 的 8 个新函数 + 只读函数），step 3 落地时它会正常 import，旧断言
+    会误红。服务层侧的守护改为「永不 import 六个禁忌符号」（见下一条用例）。
+    """
+    with open(os.path.abspath(database.__file__), encoding="utf-8") as fh:
+        db_source = fh.read()
+
+    # 锚定**第 0 列**：缩进的（函数体内）延迟 import 是设计要求，不算违规
+    assert not re.search(r"(?m)^(?:import\s+agent_stage_service\b|from\s+agent_stage_service\b)", db_source), \
+        "服务层必须只在函数体内延迟 import（模块级 = 循环依赖）"
+    assert "import_module(" not in db_source and "__import__(" not in db_source, \
+        "不得用动态 import 绕过源码级守护"
+    assert "agent_stage_service" not in vars(database), "运行期也不得把服务层模块绑进 database 命名空间"
+
+    service_source = _service_source()
+    assert "import_module(" not in service_source and "__import__(" not in service_source, \
+        "服务层同样不得用动态 import 绕开守护"
+
+
+def test_service_module_never_imports_forbidden_symbols():
+    """§2.1 三条铁律（AI 永不诊断 / 永不开方 / 永不签字）的代码级保证：禁止 import 清单。
+
+    口径（AST 精确判定）：**import 名**与 `database.<符号>` **属性访问**一律不许出现；文档 / 注释里
+    「提到」这些名字是允许的（本文件头部就列着这份清单）。step 3 起服务层可以 import `database`，
+    但绝不碰这六个符号。
+    """
+    imported, attributes = _service_imports_and_database_attrs(_service_source())
+    for symbol in _FORBIDDEN_SERVICE_IMPORTS:
+        assert symbol not in imported, f"服务层不得 import 禁忌符号 {symbol}"
+        assert symbol not in attributes, f"服务层不得访问 database.{symbol}"
 
 # ============ ⑪ 【§4.2 改 2】sign_draft：快照进历史表 + best-effort 钩子 ============
 #
@@ -930,4 +1042,352 @@ def test_database_module_never_imports_agent_stage_service_at_module_level():
     assert not re.search(r"(?m)^(?:import|from)\s+agent_stage_service", source), "模块级 import = 循环依赖"
     lazy = re.findall(r"(?m)^(\s+)import agent_stage_service\s*$", source)
     assert len(lazy) >= 2, "延迟 import 至少两处：闸门 `_agent_stage_snapshot_enabled` + 钩子转发 `_call_agent_stage_hook`"
+
+
+
+# ============ ⑫ 【§4.2 改 3 / 施工步骤 2.4】resolve_agent_task：升级确认钩子 ============
+#
+# 基线来源（＝ CTO 要求 3 的「专门用例」）：本步改动**之前**用同一套 Recorder 实测捕获，
+# 一次跑完 13 组：flag off/on × approved/rejected（升级请示）、学生类 deduct_herbs / send_care_notice、
+# 空 action_data、坏 JSON、缺 to、任务不存在 —— 留档于 %TEMP%\epic2_resolve_baseline_before.txt，
+# 改动后又用**同一版脚本**跑了一次逐行比对（%TEMP%\epic2_resolve_baseline_after.txt）。
+# 口径：把实际发给 SQLite 的 (SQL 文本, 参数) 全序列逐条比对 ——
+#   · SQL 归一化空白（`agent_action_log` 的 INSERT 在源码里是多行字面量）；
+#   · 唯一非确定性参数 `datetime.now().isoformat()` 归一为 "<NOW>"；
+#   · 返回值 / 任务状态 / 行动日志一并断言（要求 2 的「一字不改」包含返回值）。
+
+_RESOLVE_TASK_ID = 1
+_TITLE_UPGRADE = "升级请示"
+_TITLE_UPGRADE_NO_TO = "升级请示（无 to）"
+_TITLE_DEDUCT = "扣减请示"
+_TITLE_NOTICE = "关怀请示"
+_TITLE_EMPTY = "空 action_data"
+_TITLE_BAD_JSON = "坏 JSON 请示"
+_TITLE_NON_DICT = "非对象 JSON"
+
+_TASK_UPGRADE = json.dumps(
+    {"action": "upgrade_agent_stage", "from": "learning", "to": "apprentice",
+     "metrics": {"approved_rate": 0.92, "samples": 12}},
+    ensure_ascii=False,
+)
+_TASK_UPGRADE_NO_TO = json.dumps({"action": "upgrade_agent_stage"}, ensure_ascii=False)
+_TASK_DEDUCT = json.dumps({"action": "deduct_herbs", "patient_name": "张三"}, ensure_ascii=False)
+_TASK_NOTICE = json.dumps({"action": "send_care_notice", "patient_name": "张三"}, ensure_ascii=False)
+_TASK_BAD_JSON = "{不是 JSON"
+
+
+def _seed_agent_task(action_data, title, teacher=TEACHER, status="pending"):
+    """种一条待处理请示（用**裸 sqlite3**，绕开 Recorder → 被测函数的语句序列从零开始录）。
+
+    每个用例都是新库（`db` fixture），故任务 id 恒为 `_RESOLVE_TASK_ID`。
+    """
+    conn = sqlite3.connect(database.DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cur = conn.execute(
+        "INSERT INTO agent_tasks (teacher_name, task_type, category, title, content, action_data, status, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (teacher, "upgrade", "stage", title, "内容", action_data, status, "2026-09-28T10:00:00"),
+    )
+    task_id = cur.lastrowid
+    conn.commit()
+    conn.close()
+    return task_id
+
+
+def _read_agent_task(task_id):
+    """读回任务行 + 该老师的行动日志（同样走裸 sqlite3，不污染录制）。"""
+    conn = sqlite3.connect(database.DB_PATH)
+    conn.row_factory = sqlite3.Row
+    row = conn.execute("SELECT * FROM agent_tasks WHERE id = ?", (task_id,)).fetchone()
+    logs = conn.execute(
+        "SELECT action, detail FROM agent_action_log WHERE teacher_name = ? ORDER BY id", (TEACHER,)
+    ).fetchall()
+    conn.close()
+    return row, [(r["action"], r["detail"]) for r in logs]
+
+
+def _task_calls(connections):
+    """⑫ 组口径的录制结果：全部语句（含 cursor.execute），SQL 归一空白 + 时间戳归一 "<NOW>"。"""
+    return [
+        (" ".join(sql.split()),
+         tuple("<NOW>" if isinstance(p, str) and _ISO_NOW_RE.match(p) else p for p in (params or ())))
+        for sql, params in _all_calls(connections)
+    ]
+
+
+def _resolve_baseline(decision, title, notice_patient=None):
+    """改动前实测捕获的 resolve_agent_task 语句序列（flag off，逐条与留档文件一致）。"""
+    calls = [
+        ("SELECT * FROM agent_tasks WHERE id = ?", (_RESOLVE_TASK_ID,)),
+        ("UPDATE agent_tasks SET status = ?, resolved_at = ? WHERE id = ?",
+         (decision, "<NOW>", _RESOLVE_TASK_ID)),
+        ("INSERT INTO agent_action_log (teacher_name, task_id, action, detail, created_at) VALUES (?, ?, ?, ?, ?)",
+         (TEACHER, _RESOLVE_TASK_ID, "approve" if decision == "approved" else "reject",
+          ("老师确认执行：" if decision == "approved" else "老师忽略：") + title, "<NOW>")),
+    ]
+    if notice_patient is not None:
+        calls.append(
+            ("INSERT INTO agent_action_log (teacher_name, task_id, action, detail, created_at) "
+             "VALUES (?, ?, 'send_notice', ?, ?)",
+             (TEACHER, _RESOLVE_TASK_ID, f"已发送关怀通知给 {notice_patient}", "<NOW>"))
+        )
+    return calls
+
+
+def _install_fake_hooks(monkeypatch, boom=None):
+    """给服务层挂两个**假钩子**（只记录参数、零 SQL）→ ⑫ 组语句断言在任何施工步骤都成立。
+
+    `boom` 指定哪个钩子抛异常（用于「抛异常 → 只打 warn、不回滚决策」用例）。
+    """
+    import agent_stage_service
+
+    calls = []
+
+    def apply_upgrade_confirmation(teacher_name, to_stage, task_id):
+        calls.append(("apply_upgrade_confirmation", teacher_name, to_stage, task_id))
+        if boom == "apply_upgrade_confirmation":
+            raise RuntimeError("服务层炸了")
+
+    def decline_upgrade(teacher_name, task_id):
+        calls.append(("decline_upgrade", teacher_name, task_id))
+        if boom == "decline_upgrade":
+            raise RuntimeError("服务层炸了")
+
+    monkeypatch.setattr(agent_stage_service, "apply_upgrade_confirmation", apply_upgrade_confirmation, raising=False)
+    monkeypatch.setattr(agent_stage_service, "decline_upgrade", decline_upgrade, raising=False)
+    return calls
+
+
+def test_resolve_agent_task_flag_off_upgrade_approved_is_byte_identical(db, task_sql_log, monkeypatch):
+    """要求 3（专门用例）：flag off + 升级请示被确认 → 语句序列 / 参数 / 返回值逐字节不变。"""
+    monkeypatch.delenv("AGENT_STAGE_ENABLED", raising=False)
+    task_id = _seed_agent_task(_TASK_UPGRADE, _TITLE_UPGRADE)
+
+    result = db.resolve_agent_task(task_id, "approved")
+
+    assert _task_calls(task_sql_log) == _resolve_baseline("approved", _TITLE_UPGRADE)
+    assert result == {"message": "已处理", "status": "approved"}
+    row, logs = _read_agent_task(task_id)
+    assert row["status"] == "approved" and row["resolved_at"]
+    assert logs == [("approve", f"老师确认执行：{_TITLE_UPGRADE}")]
+
+
+def test_resolve_agent_task_flag_off_upgrade_rejected_is_byte_identical(db, task_sql_log, monkeypatch):
+    """要求 3：同一口径的 rejected 分支（改 3 的 `decline_upgrade` 路径）。"""
+    monkeypatch.delenv("AGENT_STAGE_ENABLED", raising=False)
+    task_id = _seed_agent_task(_TASK_UPGRADE, _TITLE_UPGRADE)
+
+    result = db.resolve_agent_task(task_id, "rejected")
+
+    assert _task_calls(task_sql_log) == _resolve_baseline("rejected", _TITLE_UPGRADE)
+    assert result == {"message": "已处理", "status": "rejected"}
+    row, logs = _read_agent_task(task_id)
+    assert row["status"] == "rejected"
+    assert logs == [("reject", f"老师忽略：{_TITLE_UPGRADE}")]
+
+
+def test_resolve_agent_task_flag_on_with_absent_hook_is_identical_to_flag_off(db, task_sql_log, monkeypatch, capsys):
+    """态一（与改 2b 同口径）：服务层**没有**该钩子 → 静默 no-op，且本段代码在 flag on 下也发零条 SQL。
+
+    用 `delattr` 模拟「服务层尚未实现」—— step 3 起钩子会真实存在，故不写成「flag on 就是基线」，
+    那时的等价用例是挂**假钩子**（见下面的 upgrade_approved / upgrade_rejected 两条）。
+    """
+    import agent_stage_service
+
+    monkeypatch.setenv("AGENT_STAGE_ENABLED", "on")
+    monkeypatch.delattr(agent_stage_service, "apply_upgrade_confirmation", raising=False)
+    task_id = _seed_agent_task(_TASK_UPGRADE, _TITLE_UPGRADE)
+
+    result = db.resolve_agent_task(task_id, "approved")
+
+    assert _task_calls(task_sql_log) == _resolve_baseline("approved", _TITLE_UPGRADE)
+    assert result == {"message": "已处理", "status": "approved"}
+    assert capsys.readouterr().out == "", "态一必须完全静默（缺失不算异常）"
+
+
+def test_resolve_agent_task_student_notice_branch_unchanged(db, task_sql_log, monkeypatch):
+    """要求 2：学生类请示 `send_care_notice` 分支（多一条发送日志）一字不改，且不误触发升级钩子。"""
+    monkeypatch.delenv("AGENT_STAGE_ENABLED", raising=False)
+    calls = _install_fake_hooks(monkeypatch)
+    task_id = _seed_agent_task(_TASK_NOTICE, _TITLE_NOTICE)
+
+    result = db.resolve_agent_task(task_id, "approved")
+
+    assert _task_calls(task_sql_log) == _resolve_baseline("approved", _TITLE_NOTICE, notice_patient="张三")
+    assert result == {"message": "已处理", "status": "approved"}
+    assert calls == [], "action != upgrade_agent_stage → 升级钩子一次都不许调"
+
+
+def test_resolve_agent_task_student_deduct_branch_unchanged(db, task_sql_log, monkeypatch):
+    """要求 2：学生类请示 `deduct_herbs` 分支（无附加日志）一字不改、返回值一字不改。"""
+    monkeypatch.delenv("AGENT_STAGE_ENABLED", raising=False)
+    calls = _install_fake_hooks(monkeypatch)
+    task_id = _seed_agent_task(_TASK_DEDUCT, _TITLE_DEDUCT)
+
+    result = db.resolve_agent_task(task_id, "approved")
+
+    assert _task_calls(task_sql_log) == _resolve_baseline("approved", _TITLE_DEDUCT)
+    assert result == {"message": "已处理", "status": "approved"}
+    assert calls == []
+
+
+def test_resolve_agent_task_missing_task_is_untouched(db, task_sql_log, monkeypatch):
+    """任务不存在：仍返回 None、仍只发那一条 SELECT、不触发任何钩子。"""
+    monkeypatch.delenv("AGENT_STAGE_ENABLED", raising=False)
+    calls = _install_fake_hooks(monkeypatch)
+
+    result = db.resolve_agent_task(999999, "approved")
+
+    assert result is None
+    assert _task_calls(task_sql_log) == [("SELECT * FROM agent_tasks WHERE id = ?", (999999,))]
+    assert calls == []
+
+
+@pytest.mark.parametrize("decision", ["approved", "rejected"])
+@pytest.mark.parametrize("action_data,title", [("", _TITLE_EMPTY), (_TASK_BAD_JSON, _TITLE_BAD_JSON)])
+def test_resolve_agent_task_malformed_action_data_never_raises(db, task_sql_log, monkeypatch,
+                                                              action_data, title, decision):
+    """§4.2 改 3「整段包 try/except」：空 / 坏 `action_data` 下仍按原语义落定，绝不冒泡（4 组）。
+
+    同时守住「改 3 段落的解析失败也不许影响返回值」—— 与既有 approved 分支里那段同款防御。
+    """
+    monkeypatch.delenv("AGENT_STAGE_ENABLED", raising=False)
+    task_id = _seed_agent_task(action_data, title)
+
+    result = db.resolve_agent_task(task_id, decision)
+
+    assert _task_calls(task_sql_log) == _resolve_baseline(decision, title)
+    assert result == {"message": "已处理", "status": decision}
+
+
+def test_resolve_agent_task_rejected_with_non_dict_action_data_stays_unchanged(db, task_sql_log, monkeypatch):
+    """非对象 JSON（数组 / 字符串 / 数字）+ rejected：**不许**因改 3 新增的那次解析而冒泡。
+
+    改动前 rejected 路径根本不解析 `action_data`，所以期望序列与 rejected 基线严格同构；本形态未列入
+    改动前 13 组留档（那里只有空 / 坏 JSON），由 `isinstance` 守卫 + 本条用例直接守住 —— 没有它就会
+    是本步引入的回归。
+    注：approved 路径遇到同类脏数据在改动前就会在 `action.get(...)` 那一行抛 AttributeError，
+    本步不改变它（不属改 3 范围，此处仅作既有行为记录）。
+    """
+    monkeypatch.delenv("AGENT_STAGE_ENABLED", raising=False)
+    calls = _install_fake_hooks(monkeypatch)
+    task_id = _seed_agent_task("[1, 2, 3]", _TITLE_NON_DICT)
+
+    result = db.resolve_agent_task(task_id, "rejected")
+
+    assert _task_calls(task_sql_log) == _resolve_baseline("rejected", _TITLE_NON_DICT)
+    assert result == {"message": "已处理", "status": "rejected"}
+    assert calls == []
+
+
+def test_resolve_agent_task_upgrade_approved_calls_apply_hook_with_to_stage(db, task_sql_log, monkeypatch):
+    """改 3 主路径（✅确认）：`apply_upgrade_confirmation(teacher_name, to, task_id)` 恰好一次。"""
+    monkeypatch.delenv("AGENT_STAGE_ENABLED", raising=False)
+    calls = _install_fake_hooks(monkeypatch)
+    task_id = _seed_agent_task(_TASK_UPGRADE, _TITLE_UPGRADE)
+
+    result = db.resolve_agent_task(task_id, "approved")
+
+    assert calls == [("apply_upgrade_confirmation", TEACHER, "apprentice", task_id)]
+    assert _task_calls(task_sql_log) == _resolve_baseline("approved", _TITLE_UPGRADE), \
+        "假钩子零 SQL → 语句序列仍与改动前基线逐条一致"
+    assert result == {"message": "已处理", "status": "approved"}
+
+
+def test_resolve_agent_task_upgrade_rejected_calls_decline_hook(db, monkeypatch):
+    """改 3 另一条路径（❌忽略）：`decline_upgrade(teacher_name, task_id)` 恰好一次（不调 apply）。"""
+    monkeypatch.delenv("AGENT_STAGE_ENABLED", raising=False)
+    calls = _install_fake_hooks(monkeypatch)
+    task_id = _seed_agent_task(_TASK_UPGRADE, _TITLE_UPGRADE)
+
+    result = db.resolve_agent_task(task_id, "rejected")
+
+    assert calls == [("decline_upgrade", TEACHER, task_id)]
+    assert result == {"message": "已处理", "status": "rejected"}
+
+
+def test_resolve_agent_task_upgrade_without_to_passes_none(db, monkeypatch):
+    """韧性：`action_data` 缺 `to` 键 → 仍转发（`to_stage=None`），合法性由服务层校验，库层不擅自跳过。"""
+    monkeypatch.delenv("AGENT_STAGE_ENABLED", raising=False)
+    calls = _install_fake_hooks(monkeypatch)
+    task_id = _seed_agent_task(_TASK_UPGRADE_NO_TO, _TITLE_UPGRADE_NO_TO)
+
+    result = db.resolve_agent_task(task_id, "approved")
+
+    assert calls == [("apply_upgrade_confirmation", TEACHER, None, task_id)]
+    assert result == {"message": "已处理", "status": "approved"}
+
+
+def test_resolve_agent_task_hook_runs_even_when_flag_off(db, monkeypatch):
+    """CTO 批复①：调用点**不判 flag** —— flag off 下库层照样转发，算不算指标由服务层首行自闸门决定。"""
+    monkeypatch.setenv("AGENT_STAGE_ENABLED", "off")
+    calls = _install_fake_hooks(monkeypatch)
+    task_id = _seed_agent_task(_TASK_UPGRADE, _TITLE_UPGRADE)
+
+    db.resolve_agent_task(task_id, "approved")
+
+    assert calls == [("apply_upgrade_confirmation", TEACHER, "apprentice", task_id)]
+
+
+def test_resolve_agent_task_hook_exception_only_warns(db, task_sql_log, monkeypatch, capsys):
+    """态二（与改 2b 同口径）：钩子抛异常 → 只 print warn；决策已落定（不回滚）、不冒泡、返回值不变。"""
+    monkeypatch.delenv("AGENT_STAGE_ENABLED", raising=False)
+    _install_fake_hooks(monkeypatch, boom="apply_upgrade_confirmation")
+    task_id = _seed_agent_task(_TASK_UPGRADE, _TITLE_UPGRADE)
+
+    result = db.resolve_agent_task(task_id, "approved")
+
+    out = capsys.readouterr().out
+    assert "[warn]" in out and "apply_upgrade_confirmation" in out
+
+    assert result == {"message": "已处理", "status": "approved"}
+    assert _task_calls(task_sql_log) == _resolve_baseline("approved", _TITLE_UPGRADE)
+    row, logs = _read_agent_task(task_id)
+    assert row["status"] == "approved", "钩子炸了也必须保持老师已确认的状态（commit 在前）"
+    assert logs == [("approve", f"老师确认执行：{_TITLE_UPGRADE}")]
+
+
+def test_resolve_agent_task_hook_runs_after_commit(db, monkeypatch):
+    """时序：钩子在 `commit` **之后**被调用 —— 钩子内另开连接已能看到「任务已落定 + 行动日志已写」。"""
+    import agent_stage_service
+
+    monkeypatch.delenv("AGENT_STAGE_ENABLED", raising=False)
+    task_id = _seed_agent_task(_TASK_UPGRADE, _TITLE_UPGRADE)
+    observed = {}
+
+    def apply_upgrade_confirmation(teacher_name, to_stage, got_task_id):
+        conn = sqlite3.connect(database.DB_PATH)
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT status FROM agent_tasks WHERE id = ?", (got_task_id,)).fetchone()
+        log_count = conn.execute(
+            "SELECT COUNT(*) AS n FROM agent_action_log WHERE task_id = ?", (got_task_id,)
+        ).fetchone()["n"]
+        conn.close()
+        observed["status"] = row["status"]
+        observed["log_count"] = log_count
+
+    monkeypatch.setattr(agent_stage_service, "apply_upgrade_confirmation", apply_upgrade_confirmation, raising=False)
+
+    db.resolve_agent_task(task_id, "approved")
+
+    assert observed == {"status": "approved", "log_count": 1}
+
+
+def test_resolve_agent_task_reuses_single_two_state_caller():
+    """要求 1 / 4（源码级）：改 3 只许**复用** `_call_agent_stage_hook()`。
+
+    不 import 服务层、不判 flag、不出现第二份两态实现 —— 与改 2b 同一口径。
+    """
+    import inspect
+
+    source = inspect.getsource(database.resolve_agent_task)
+
+    # 只数**真实调用**：注释 / docstring 里写的是 `_call_agent_stage_hook()`，括号后紧跟反引号 → 不计入
+    assert source.count('_call_agent_stage_hook("') == 2, "approved / rejected 各一次，且都走同一个调用器"
+    assert "import agent_stage_service" not in source, "库层不得直接 import 服务层（延迟 import 在调用器里）"
+    assert "agent_stage_enabled" not in source, "调用点不判 flag（批复①）"
+    assert "except Exception" in source, "action_data 解析必须有防御（§4.2 改 3「整段包 try/except」）"
+
+    assert inspect.getsource(database).count("def _call_agent_stage_hook(") == 1, \
+        "两态实现只许一份（改 2b / 改 3 共用同一个调用器）"
 
