@@ -13,6 +13,10 @@
 | :---- | :---- | :---- | :---- | :---- | :---- |
 | TD-001 | `_drafts_supports_template_refs()` 未收敛到 `_table_has_columns()` | Epic 1（已验收） | `backend/database.py:645-651` | 低 | **不动**（Epic 2 不碰 Epic 1 已验收代码） |
 | TD-002 | `resolve_agent_task()` 中 approved + 非对象 JSON 的既有 `AttributeError` | 存量（Epic 2 之前） | `backend/database.py:1697-1703` | 中低 | **不修**（「既有语义一字不改」原则） |
+| TD-003 | 迁移回退口径不一致：0004 downgrade **删**两列，0002 / 0003 **保留**列 | Epic 2 迁移层（0004 按 CTO 裁决 A1） | `backend/alembic/versions/0004_add_patient_record_template_refs.py` | 低 | **不动**（口径差异 = CTO 明确裁决；0004 删列带幂等探测 + 失败即抛） |
+
+> 登记例外：TD-003 由 CTO 2026-09-28 裁决③ 指令于 **Epic 2 step 3.1** 提前登记（一般纪律是「只在收口回归步登记」）。
+> 本条**只登记、不在 step 3.1 内修缮** —— 请 CTO 在 step 3.6 收口时复核是否需要调整等级 / 处置。
 
 ---
 
@@ -48,7 +52,24 @@
 
 ---
 
-## 3. 未登记项（说明）
+## 3. TD-003 · 迁移回退口径不一致（0004 删两列，0002 / 0003 保留列）
+
+| 项 | 内容 |
+| :---- | :---- |
+| 编号 | TD-003 |
+| 归属 | **Epic 2 迁移层**（迁移 0004；按 CTO 2026-09-28 裁决 A1 落地，step 3.0 已验收） |
+| 位置 | `backend/alembic/versions/0004_add_patient_record_template_refs.py` 的 `downgrade()`：逐列 `DROP COLUMN patient_records.template_id` / `template_version`，失败抛 `RuntimeError`。对照：`0002_add_draft_template_refs.py`（回退**保留** `drafts.template_id` / `template_version`）、`0003_add_agent_stage.py`（回退**保留**两个快照列，只删 3 张新表，另带「有审计事件即中止」安全闸）。 |
+| 事实 | 三份迁移对「回退要不要删列」并存两种口径：0002 / 0003 走「只回收结构、不删数据列」（Epic 1 §12.1 纪律），0004 走「逐列 DROP」。0004 的删列本身是**幂等**的（先 `PRAGMA table_info` 探测，缺列即跳过）且失败即抛，不存在静默半删。 |
+| 等级 | 低 —— 各迁移与其自身设计一致：0004 的两列是**引用快照**（`DEFAULT 0` = 未记录），删掉不损失病历正文，只损失 ① 指标「这份病历是照哪版模板写的」的归因；`upgrade head` 路径与 flag off 语义完全不受影响。 |
+| 风险 | 中远期：运维若按 Epic 1 口径的直觉（「downgrade 不丢列」）回退，会在 0004 上丢两列归因数据；若反向统一成「都不删列」，则与 0004 的已验收产物（含 `docs/migrations/0004_add_patient_record_template_refs.sql` 的说明与 `test_migrations.py` 的往返断言）不一致。 |
+| 为什么现在不修 | 「0004 删列」是 CTO 裁决 A1 的明确要求（step 3.0 已验收）。把已验收迁移改成「不删列」属**变更已验收交付物**，必须单独提交 + 单独批准，不能在 step 3.x 内顺手改。 |
+| 将来怎么修 | 二选一，均需 CTO 先裁决方向：① 全库统一「downgrade 只回收结构、不删数据列」→ 改 0004 的 `downgrade()`，同步改 `docs/migrations/0004_*.sql` 说明与 `test_migrations.py` 的 0004 往返断言（改为「回退后两列仍在、老行仍为 0」）；② 全库统一「downgrade 逐列回收」→ 给 0002 / 0003 补删列，属行为变更，需先批准并单独回归。 |
+| 完成判据 | ① 选定方向后改对应迁移 + 离线 SQL 产物 + 用例；② `pytest backend/test_migrations.py -q` 全绿；③ 全量 `pytest backend -q` 绿；④ 提交说明显式标注「回退口径变更」，避免被误读为静默修 bug。 |
+| 关联 | **真机升级窗口（CTO 裁决③）**：step 3.1–3.4 全部完成后、step 3.5（`sign_draft` 写 0004 两列 + 真机 `alembic upgrade head`）之前，**强制**先文件级备份 `backend/zhiheng.db` → `backend/zhiheng.db.bak-20260928`，备份**不进仓库**。✅ 已闭环：`.gitignore` 已加忽略规则 `backend/zhiheng.db.bak-*`（CTO 2026-09-28 批准，紧跟 `backend/zhiheng.db` 之后）。现状核对：`backend/zhiheng.db.bak-20260928`（184320 B，与库同尺寸）在 `git status` 中**已消失**、`git check-ignore` 退出码 0；`backend/backups/`（磁盘已存在）本就已被忽略，可作后续集中备份目录；仓库内**无任何**被跟踪的 `*db` 文件（`git ls-files` 为空）。备份文件**留在原位不动**（它是当前唯一副本，移动无收益）。 |
+
+---
+
+## 4. 未登记项（说明）
 
 - Epic 2 自身引入的可见风险（快照列写入、flag 双闸门、钩子两态等）**不**进本册：它们属**在设计范围内已实现并有用例守护**的内容，见 `docs/epic2-agent-stage-design-v1.md` §7.3「风险与缓解」。
 - 新增债务必须以「本 Epic 明确不修」为前提，凡「本 Epic 应当且能够修」的，一律在施工步内修完，不进本册。

@@ -5,6 +5,7 @@ __pycache__/
 *.pyc
 backend/test.db
 backend/zhiheng.db
+backend/zhiheng.db.bak-*
 backend/backups/
 venv/
 backend/uploads/
