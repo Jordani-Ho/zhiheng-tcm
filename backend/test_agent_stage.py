@@ -47,6 +47,15 @@
        逐项枚举的三个新能力（放行也写反向事件 `permission_relaxed`）+ 拒绝**同点**写
        `permission_denied` 审计（stage / capability / 时间）且写失败不改判定 + 库坏了不抛。
        **返回 bool、拒绝不抛**（403 的抛出点属 step 4 接口层）。**零接线**，且不改 ⑭ 组一行。
+    ⑯ 【施工步骤 3.4-a】**指标层**：`compute_template_match`（§3.2 ①）+ `compute_modification_consistency`
+       （§3.3 ②）+ 库层只读样本原语 `database.get_draft_samples`（批复 C-1：窗口 + 类型过滤 + LIMIT）：
+       样本集合与三类排除计数（`skipped_no_template` / `skipped_stale_template` / `skipped_empty`）+
+       铁律违规样本（AI 填了 `teacher` 段 → 该样本 `match = 0.0`）+ **空集语义 `value is None` ≠ 0**
+       （CTO 硬约束 2：空值既不是 0 分、也不可能「通过」任何阈值）+ 权重 / 截断 / 窗口 / 上限
+       **全部来自 `cfg`**（不硬编码）+ **全程只读**（只发 SELECT / PRAGMA，五张表零写入，flag off 照算）
+       + 缺列 / 读库异常都降级不抛 + 严格 LCS 的回归用例。`evaluate` / 三个钩子 /
+       `get_agent_stage_log_stats`（§6.3-27 的 ③ 占位键亦同）属 **3.4-b**，本组**不**断言它们的缺席
+       —— 与 ⑬ ⑭ ⑮ 组同一纪律。
 
 
 运行方式（Windows，串行；见 pytest.ini）：
@@ -58,6 +67,7 @@ import os
 import re
 import sqlite3
 import sys
+from datetime import datetime
 
 import pytest
 
@@ -2657,4 +2667,590 @@ def test_require_capability_body_has_no_capability_branches():
     assert agent_stage_service._MATRIX_RELAXED_CAPABILITIES == (
         "predict_pattern", "suggest_prescription", "generate_predraft"), \
         "§2.5 的放宽范围必须逐项枚举（且不含 generate_draft：那是 §5.3 的本地骨架路径）"
+
+
+# ============ ⑯ 【施工步骤 3.4-a】指标层：① 模板匹配度 + ② 病历修改一致率 ============
+#
+# CTO 2026-09-29 放行 step 3.4-a 的边界，本组逐条落地（本组即「⑯ 组」）：
+#   ① 「3.4 含 ①②」→ §6.3 里属指标层的用例（第 20–26 条）在本组落地；**第 27 条**
+#      （③ `inquiry_preference_consistency` 恒为 `null` 的占位键）测的是 `evaluate` 的返回体
+#      → 随 3.4-b 落地，本组不含（也不断言其缺席）；
+#   ② **空集语义**（CTO 硬约束 2）：`value is None`（**不是 0**）+ 对应 blocker，并钉住
+#      「`None` 与阈值比较抛 `TypeError`」这一不变量 → 3.4-b 的判定只能显式 `is not None`；
+#   ③ **指标只读**：语句级断言（只发 SELECT / PRAGMA）+ 五张表零写入；flag off 下照常算出结果
+#      （闸门在 `evaluate`，不在纯计算里）；
+#   ④ **不硬编码**：权重（`template_match_weights`）与截断（`truncate_chars`）改配置即改结果；
+#   ⑤ 库层只读原语 `get_draft_samples`（批复 C-1）：9 键形状 / 两类来源 / 每类各自带 LIMIT /
+#      窗口只作用于病历 / `visit_at` 为空的老行照收 / 缺列降级（迁移 0002 / 0003 / 0004 未跑都不抛）。
+# 本组**不改** ⑭ ⑮ 组一行：只复用它们的造数 / 断言助手（`_raw_execute` / `_raw_scalar` /
+# `_copy_tested_db` / `sql_log` / `_all_calls`）。造数一律走裸 sqlite3（⑭ 组既有口径）。
+# 与 ⑬ ⑭ ⑮ 组同一纪律：**不**断言 3.4-b 符号（`evaluate` / 三个钩子 / `get_agent_stage_log_stats`）的缺席。
+
+# ⑯ 组的 5 段模板（§9.2 默认骨架的前 5 段：2 段 `ai` + 3 段 `teacher`）——
+# 与 `template_service._DEFAULT_RECORD_SECTIONS` 的前 5 项逐字一致，改默认骨架时必须同步这里。
+_METRIC_SECTIONS = (
+    ("chief_complaint", "主訴（學生原話）", "ai"),
+    ("past_records", "既往病歷參考", "ai"),
+    ("tongue", "舌象", "teacher"),
+    ("pulse", "脈象", "teacher"),
+    ("pattern", "辨證", "teacher"),
+)
+
+# 「完美样本」：5 段全中、段序全对、`teacher` 段全部留空（含 `【】` 包裹与 `- ` 列表符两种写法）
+_PERFECT_DRAFT = (
+    "【主訴（學生原話）】\n頭痛三日，無發熱\n"
+    "【既往病歷參考】\n無\n"
+    "- 舌象：（留待老師）\n"
+    "- 脈象：（留待老師）\n"
+    "- 辨證：（留待老師）"
+)
+
+# 「段序打乱」样本：命中率满分（5/5）但顺序一致率下降（严格 LCS = 2/5）→ 用于证明权重来自配置
+_OUT_OF_ORDER_DRAFT = (
+    "辨證：（留待老師）\n"
+    "舌象：（留待老師）\n"
+    "脈象：（留待老師）\n"
+    "主訴（學生原話）：頭痛三日\n"
+    "既往病歷參考：無"
+)
+
+
+@pytest.fixture
+def metric_env(monkeypatch):
+    """⑯ 组公共前置：打开 Epic 1 病歷模板通道（① 的基准来自生效 `record` 模板）。
+
+    刻意**不**开总闸 `AGENT_STAGE_ENABLED`：两个指标函数不看 flag（纯计算、零写入），
+    闸门判定在 `evaluate`（3.4-b）—— ⑯ 组用 flag off 下照常算出结果来钉住这条。
+    """
+    monkeypatch.setenv("TEMPLATE_API_ENABLED", "on")
+
+
+def _today():
+    """今天的 ISO 时间串（写 `visit_at` 用；与 `database.sign_draft()` 的写法一致）。"""
+    return datetime.now().isoformat()
+
+
+def _publish_record_template(sections=None, teacher=TEACHER, version=1, status="active"):
+    """直接写一行模板（裸 SQL，绕开模板接口）→ 返回模板 id。
+
+    ① 读的是**库里的生效行**（`template_service.get_active_record_template()`），
+    故这里只需把 `schema_json` 造成 §9.2 的形状（`sections[].title / order / writable_by`）。
+    """
+    schema = {
+        "version": 1,
+        "sections": [
+            {"key": key, "title": title, "hint": "", "order": index + 1,
+             "required": False, "writable_by": writable_by}
+            for index, (key, title, writable_by) in enumerate(sections or _METRIC_SECTIONS)
+        ],
+        "tone": {"style": "", "forbidden": []},
+        "meta": {},
+    }
+    _raw_execute(
+        "INSERT INTO templates (type, lineage_id, teacher_id, name, schema_json, version, "
+        "parent_template_id, status, created_at, updated_at) "
+        "VALUES ('record', '', ?, '病歷', ?, ?, NULL, ?, '', '')",
+        (teacher, json.dumps(schema, ensure_ascii=False), version, status),
+    )
+    return _raw_scalar("SELECT MAX(id) FROM templates")
+
+
+def _seed_draft(text, template_id, teacher=TEACHER, snapshot=None):
+    """直接写一行**未签字草案**（§4.2 改 1 的落库形状）→ 返回 draft id。
+
+    `snapshot=None` → 快照列写同一份 `text`（flag on 的真实形态）；传 `""` → 无快照的老草案。
+    """
+    _raw_execute(
+        "INSERT INTO drafts (transcript_id, patient_name, teacher_name, content, signed, "
+        "template_id, template_version, ai_original_content) VALUES (0, '张三', ?, ?, 0, ?, 1, ?)",
+        (teacher, text, template_id, text if snapshot is None else snapshot),
+    )
+    return _raw_scalar("SELECT MAX(id) FROM drafts")
+
+
+def _seed_record(ai_text, final_text, template_id, visit_at=None, teacher=TEACHER, with_snapshot=True):
+    """直接写一行**已签字病历** → 返回 record id。
+
+    `with_snapshot=True` → `ai_original_text` 落 AI 侧文本（② 的 `strict` 样本）；
+    `False` → 快照列为空、只有 `ai_draft`（存量旧数据，② 的 `approx` 样本）。
+    """
+    _raw_execute(
+        "INSERT INTO patient_records (patient_name, teacher_name, ai_draft, final_plan, doctor, "
+        "visit_at, ai_original_text, template_id, template_version) "
+        "VALUES ('张三', ?, ?, ?, ?, ?, ?, ?, 1)",
+        (teacher, ai_text, final_text, teacher, _today() if visit_at is None else visit_at,
+         ai_text if with_snapshot else "", template_id),
+    )
+    return _raw_scalar("SELECT MAX(id) FROM patient_records")
+
+
+def _drop_column(path, table, column):
+    """删一列（模拟「对应迁移未跑」的老库）：SQLite 3.35+ 支持 `DROP COLUMN`（本机实测 3.49.1）。"""
+    conn = sqlite3.connect(path)
+    conn.execute("ALTER TABLE %s DROP COLUMN %s" % (table, column))
+    conn.commit()
+    conn.close()
+
+
+def _table_counts():
+    """⑯ 组「零写入」断言用的五张表行数快照（三张新表 + 两张业务表）。"""
+    return {
+        table: _raw_scalar("SELECT COUNT(*) FROM %s" % table)
+        for table in ("agent_stage_state", "agent_stage_config", "agent_stage_log",
+                      "drafts", "patient_records")
+    }
+
+
+# ---- ① 模板匹配度（§3.2；§6.3 第 20–23 条）----
+
+def test_template_match_perfect(db, metric_env):
+    """§6.3-20：草案完全按模板段名与段序 → `value ≈ 1.0`（两个子项也都满分）。
+
+    样本刻意混用两种标题写法（`【主訴（學生原話）】` 与 `- 舌象：（留待老師）`），
+    钉住「行首列表符 / `【】` 包裹 / `（留待老師）` 尾巴」三种允许差异（口径 B）。
+    """
+    import agent_stage_service
+
+    template_id = _publish_record_template()
+    _seed_draft(_PERFECT_DRAFT, template_id)
+
+    metric = agent_stage_service.compute_template_match(TEACHER, {})
+
+    assert metric["samples"] == 1
+    assert metric["value"] == pytest.approx(1.0)
+    assert metric["hit_rate"] == pytest.approx(1.0)
+    assert metric["order_rate"] == pytest.approx(1.0)
+    assert metric["violations"] == 0
+    assert metric["blockers"] == []
+    assert (metric["skipped_no_template"], metric["skipped_stale_template"],
+            metric["skipped_empty"]) == (0, 0, 0)
+
+
+def test_template_match_missing_sections(db, metric_env):
+    """§6.3-21：5 段模板里只出现 3 段 → 命中率与段序一致率都是 3/5，落值按权重可复算。"""
+    import agent_stage_service
+
+    template_id = _publish_record_template()
+    _seed_draft("主訴（學生原話）：頭痛三日\n舌象：（留待老師）\n辨證：（留待老師）", template_id)
+
+    metric = agent_stage_service.compute_template_match(TEACHER, {})
+
+    assert metric["samples"] == 1
+    assert metric["hit_rate"] == pytest.approx(3 / 5)
+    assert metric["order_rate"] == pytest.approx(3 / 5)
+    # 权重来自内置默认（`section_hit=0.6` / `section_order=0.4`）→ 0.6 * 0.6 + 0.4 * 0.6
+    assert metric["value"] == pytest.approx(0.6 * 0.6 + 0.4 * 0.6)
+    assert metric["violations"] == 0
+
+
+def test_template_match_teacher_section_filled_is_violation(db, metric_env):
+    """§6.3-22（铁律）：AI 填了 `writable_by='teacher'` 的段 → 该样本 `match = 0.0`、`violations + 1`；
+    同一样本的命中率 / 段序仍是满分 —— 证明 0 分来自违规规则，而不是「漏填段」。"""
+    import agent_stage_service
+
+    template_id = _publish_record_template()
+    violated = _PERFECT_DRAFT.replace("- 舌象：（留待老師）", "- 舌象：舌紅苔薄白")
+    _seed_draft(violated, template_id)
+
+    metric = agent_stage_service.compute_template_match(TEACHER, {})
+
+    assert metric["value"] == 0.0
+    assert metric["violations"] == 1
+    assert metric["hit_rate"] == pytest.approx(1.0)
+    assert metric["order_rate"] == pytest.approx(1.0)
+
+
+def test_template_match_skips_stale_and_no_template(db, metric_env):
+    """§6.3-23：`template_id=0`（无模板生成的样本）与旧版 `template_id`（换过版本）分别计入
+    `skipped_no_template` / `skipped_stale_template`，**不进均值**（均值仍等于满分样本的 1.0）。"""
+    import agent_stage_service
+
+    template_id = _publish_record_template()
+    _seed_draft(_PERFECT_DRAFT, template_id)
+    _seed_draft("當時沒有生效模板的舊輸出", 0)
+    _seed_draft("舊版本模板的輸出", template_id + 7)
+
+    metric = agent_stage_service.compute_template_match(TEACHER, {})
+
+    assert metric["samples"] == 1
+    assert metric["value"] == pytest.approx(1.0)
+    assert metric["skipped_no_template"] == 1
+    assert metric["skipped_stale_template"] == 1
+
+
+def test_template_match_counts_empty_text_samples_explicitly(db, metric_env):
+    """§3.2「排除样本必须显式计数，不静默丢」：命中模板但 AI 侧文本为空的样本 → `skipped_empty`，
+    不进均值（`value` 仍只看有效样本）；若一份有效样本都没有 → `value is None` + blocker。"""
+    import agent_stage_service
+
+    template_id = _publish_record_template()
+    _seed_draft("", template_id)
+    perfect_id = _seed_draft(_PERFECT_DRAFT, template_id)
+
+    metric = agent_stage_service.compute_template_match(TEACHER, {})
+
+    assert metric["skipped_empty"] == 1 and metric["samples"] == 1
+    assert metric["value"] == pytest.approx(1.0)
+
+    _raw_execute("DELETE FROM drafts WHERE id = ?", (perfect_id,))
+    only_empty = agent_stage_service.compute_template_match(TEACHER, {})
+
+    assert only_empty["value"] is None
+    assert only_empty["samples"] == 0
+    assert only_empty["skipped_empty"] == 1
+    assert only_empty["blockers"] == ["template_match_no_samples"]
+
+
+def test_template_match_no_active_template_is_null_not_zero(db, metric_env):
+    """口径 A：老师没有生效 `record` 模板（含 `TEMPLATE_API_ENABLED` off）→
+    `value is None` + `blockers=["no_active_record_template"]`（**不是 0 分**：空值 ≠ 差评）。"""
+    import agent_stage_service
+
+    no_template = agent_stage_service.compute_template_match(TEACHER, {})
+    assert no_template["value"] is None and no_template["samples"] == 0
+    assert no_template["blockers"] == ["no_active_record_template"]
+
+    _publish_record_template()
+    no_sample = agent_stage_service.compute_template_match(TEACHER, {})
+    assert no_sample["value"] is None
+    assert no_sample["blockers"] == ["template_match_no_samples"]
+
+
+def test_template_match_weights_come_from_config(db, metric_env):
+    """不硬编码（§3.4 / §6.4-29 的指标侧）：权重改配置即改结果。
+
+    样本 = `_OUT_OF_ORDER_DRAFT`（命中率 5/5、严格 LCS = 2/5）：
+      · 内置默认 0.6 / 0.4 → 0.6 * 1.0 + 0.4 * 0.4 = 0.76；
+      · 只给 `section_hit=1.0` → 就是命中率 1.0（缺省子键按 0 计，不做部分合并，裁决 B）；
+      · 0.5 / 0.5 → 0.5 * 1.0 + 0.5 * 0.4 = 0.8。
+    """
+    import agent_stage_service
+
+    template_id = _publish_record_template()
+    _seed_draft(_OUT_OF_ORDER_DRAFT, template_id)
+
+    default_weights = agent_stage_service.compute_template_match(TEACHER, {})
+    hit_only = agent_stage_service.compute_template_match(
+        TEACHER, {"template_match_weights": {"section_hit": 1.0}})
+    balanced = agent_stage_service.compute_template_match(
+        TEACHER, {"template_match_weights": {"section_hit": 0.5, "section_order": 0.5}})
+
+    assert default_weights["hit_rate"] == pytest.approx(1.0)
+    assert default_weights["order_rate"] == pytest.approx(2 / 5)
+    assert default_weights["value"] == pytest.approx(0.6 + 0.4 * 0.4)
+    assert hit_only["value"] == pytest.approx(1.0)
+    assert balanced["value"] == pytest.approx(0.5 + 0.5 * 0.4)
+
+
+def test_template_match_order_rate_uses_strict_lcs(db, metric_env):
+    """回归：段序一致率用**严格 LCS**（§3.2 的公式），不是 `difflib` 的块匹配启发式。
+
+    实测同一对段序 `[A,B,C,D,E]` vs `[A,C,E,D,B]`：块匹配只得 2、严格 LCS = 3 ——
+    改用块匹配会把 `order_rate` 系统性低估（更难达标）。本条把口径钉死（服务层 `_lcs_length()`）。"""
+    import difflib
+
+    import agent_stage_service
+
+    sections = tuple((chr(ord("a") + index), chr(ord("A") + index), "ai") for index in range(5))
+    template_id = _publish_record_template(sections=sections)
+    _seed_draft("\n".join("%s：（留待老師）" % title for title in ("A", "C", "E", "D", "B")),
+                template_id)
+
+    metric = agent_stage_service.compute_template_match(TEACHER, {})
+
+    block_matching = sum(block.size for block in difflib.SequenceMatcher(
+        None, list("ABCDE"), list("ACEDB"), autojunk=False).get_matching_blocks())
+    assert block_matching == 2, "difflib 块匹配的实测值（口径说明的论据，变了必须复核）"
+    assert agent_stage_service._lcs_length(list("ABCDE"), list("ACEDB")) == 3
+    assert metric["hit_rate"] == pytest.approx(1.0)
+    assert metric["order_rate"] == pytest.approx(3 / 5)
+    assert metric["value"] == pytest.approx(0.6 + 0.4 * 0.6)
+
+
+# ---- ② 病历修改一致率（§3.3；§6.3 第 24–26 条）----
+
+def test_modification_consistency_strict_pair(db, metric_env):
+    """§6.3-24：新数据（`ai_original_text` 有值 = `strict` 样本）→ ② 与手算
+    `SequenceMatcher` 逐位一致。
+
+    样本刻意不含 CRLF / 连续空白 / 首尾空白 → `norm()` 是恒等映射，测试因此不必复刻归一化实现
+    （否则「同一条实现比对自身」就失去验证意义）。
+    """
+    import difflib
+
+    import agent_stage_service
+
+    ai_text = "主訴：頭痛三日，無發熱。舌象：（留待老師）脈象：（留待老師）辨證：（留待老師）"
+    final_text = "主訴：頭痛三日。舌象：舌淡紅。脈象：脈細。辨證：風寒表證。"
+    _seed_record(ai_text, final_text, template_id=0)
+
+    metric = agent_stage_service.compute_modification_consistency(TEACHER, {})
+
+    expected = difflib.SequenceMatcher(None, ai_text, final_text, autojunk=False).ratio()
+    assert metric["samples"] == 1 and metric["approx_samples"] == 0
+    assert metric["value"] == pytest.approx(expected)
+    assert metric["min"] == pytest.approx(expected)
+    assert metric["blockers"] == []
+
+
+def test_modification_consistency_approx_pair(db, metric_env):
+    """§6.3-25：旧数据（`ai_original_text = ''`、只有 `ai_draft`）→ 计入均值且 `approx_samples = 1`
+    （前端据此显示「含 N 份近似樣本（舊數據）」）。"""
+    import difflib
+
+    import agent_stage_service
+
+    ai_draft = "舊格式草案：頭痛"
+    final_plan = "頭痛，風寒表證，桂枝湯加減"
+    _seed_record(ai_draft, final_plan, template_id=0, with_snapshot=False)
+
+    metric = agent_stage_service.compute_modification_consistency(TEACHER, {})
+
+    expected = difflib.SequenceMatcher(None, ai_draft, final_plan, autojunk=False).ratio()
+    assert metric["samples"] == 1
+    assert metric["approx_samples"] == 1
+    assert metric["value"] == pytest.approx(expected)
+    assert metric["min"] == pytest.approx(expected)
+
+
+def test_modification_consistency_ignores_drafts_and_empty_pairs(db, metric_env):
+    """② 只看已签字病历（§3.3）：未签字草案**不进样本**（老师还没定稿）；任一侧文本为空 →
+    `skipped_empty`（不静默丢，也不进均值）。"""
+    import agent_stage_service
+
+    _seed_draft(_PERFECT_DRAFT, 0)                                  # 草案 → ② 不算
+    _seed_record("", "只有老師的最終方案", template_id=0)              # AI 侧空 → 排除
+    _seed_record("只有 AI 的草案", "", template_id=0)                  # 老师侧空 → 排除
+    _seed_record("主訴：頭痛", "主訴：頭痛，無發熱", template_id=0)      # 唯一有效配对
+
+    metric = agent_stage_service.compute_modification_consistency(TEACHER, {})
+
+    assert metric["samples"] == 1
+    assert metric["skipped_empty"] == 2
+    assert metric["approx_samples"] == 0
+
+
+def test_modification_consistency_reads_truncate_chars_from_config(db, metric_env):
+    """不硬编码（§3.3）：`truncate_chars` 缩到差异之前 → 两份文本判满分（也是「耗时有界」的机制）。"""
+    import agent_stage_service
+
+    _seed_record("甲甲乙丙丁", "甲甲戊己庚", template_id=0)
+
+    truncated = agent_stage_service.compute_modification_consistency(TEACHER, {"truncate_chars": 2})
+    full = agent_stage_service.compute_modification_consistency(TEACHER, {"truncate_chars": 2000})
+
+    assert truncated["value"] == pytest.approx(1.0)     # 两侧都只剩「甲甲」
+    assert full["value"] < 1.0
+
+
+def test_metrics_null_when_no_samples(db, metric_env):
+    """§6.3-26 + CTO 硬约束 2（空集语义）：无样本 → `value is None`（**不是 0**）+ 对应 blocker；
+    且 `None` 与阈值比较抛 `TypeError` —— 3.4-b 的判定只能显式 `is not None`，
+    空值没有「静默通过」的路径。"""
+    import agent_stage_service
+
+    _publish_record_template()      # ① 有基准，但一份样本都没有
+
+    template_match = agent_stage_service.compute_template_match(TEACHER, {})
+    consistency = agent_stage_service.compute_modification_consistency(TEACHER, {})
+
+    for metric, blocker in ((template_match, "template_match_no_samples"),
+                            (consistency, "modification_consistency_no_samples")):
+        assert metric["value"] is None
+        assert metric["value"] != 0, "空集（无样本）与 0 分是两件事"
+        assert metric["samples"] == 0
+        assert metric["blockers"] == [blocker]
+        with pytest.raises(TypeError):
+            metric["value"] >= 0.75
+
+
+# ---- 指标层的只读性与文本层口径（CTO 约束 3 / 口径 B）----
+
+def test_metric_functions_are_read_only(db, sql_log, metric_env, monkeypatch):
+    """指标层**零写入**（CTO 约束 3 / §5.1 红线① 的服务层等价物）：
+
+    · 全部语句只有 SELECT / PRAGMA（没有 INSERT / UPDATE / DELETE / CREATE）；
+    · 两条样本 SELECT 都必须带 `LIMIT`（批复 C 的硬约束）；
+    · 五张表（三张新表 + `drafts` / `patient_records`）行数与草案内容一字不变；
+    · flag off 下照常算出结果（指标是纯计算，闸门在 `evaluate`），但依旧一行不写。
+    """
+    import agent_stage_service
+
+    template_id = _publish_record_template()
+    _seed_draft(_PERFECT_DRAFT, template_id)
+    _seed_record("主訴：頭痛", "主訴：頭痛，無發熱", template_id)
+    before = _table_counts()
+    draft_content = _raw_scalar("SELECT content FROM drafts ORDER BY id DESC LIMIT 1")
+
+    monkeypatch.delenv("AGENT_STAGE_ENABLED", raising=False)    # flag off：指标仍可算，只是不落盘
+    metric = agent_stage_service.compute_template_match(TEACHER, {})
+    consistency = agent_stage_service.compute_modification_consistency(TEACHER, {})
+
+    assert metric["value"] is not None and consistency["value"] is not None, \
+        "指标不读 flag：闸门与判定在 evaluate（3.4-b）"
+
+    statements = [sql for sql, _ in _all_calls(sql_log)]
+    assert statements, "至少要发出读样本的 SELECT"
+    assert [sql for sql in statements if not sql.startswith(("SELECT", "PRAGMA"))] == [], \
+        "指标层只许发读语句"
+    sample_statements = [sql for sql in statements
+                         if "FROM drafts" in sql or "FROM patient_records" in sql]
+    assert len(sample_statements) == 4, sample_statements        # 两个指标 × 两类来源各一条
+    assert all("LIMIT" in sql for sql in sample_statements), "样本读取必须带 LIMIT（批复 C）"
+
+    assert _table_counts() == before, "指标层不得写任何表"
+    assert _raw_scalar("SELECT content FROM drafts ORDER BY id DESC LIMIT 1") == draft_content
+
+
+def test_metric_text_normalization_contract():
+    """口径 B 的文本层契约（纯函数、无需 DB）：② 的折叠 / 截断、① 的行结构与标题尾巴白名单、
+    违规判定的「提示语不算内容」。这些规则是**指标可解释性的地基**，故逐条钉住。"""
+    import agent_stage_service as service
+
+    assert service._normalize_metric_text("  頭痛\r\n\r\n三日  ", None) == "頭痛 三日"
+    assert service._normalize_metric_text("甲甲乙丙", 2) == "甲甲"
+    assert service._normalize_metric_text(None) == ""
+    assert service._normalize_metric_text(123) == ""
+
+    assert service._normalize_section_text("【主訴】：　頭痛\r\n\r\n- 舌象（留待老師）　") == \
+        "【主訴】: 頭痛\n舌象（留待老師）"
+    assert service._split_heading("【主訴】: 頭痛") == ("主訴", "頭痛")
+    assert service._split_heading("舌象: （留待老師）") == ("舌象", "（留待老師）")
+
+    assert service._heading_matches("舌象（留待老師）", "舌象") is True
+    assert service._heading_matches("舌象。", "舌象") is True
+    assert service._heading_matches("舌象", "舌象") is True
+    assert service._heading_matches("舌紅苔薄白", "舌象") is False
+    assert service._heading_matches("舌象", "舌象（留待老師）") is False, "不做缩写 / 模糊匹配"
+    assert service._strip_heading_tail("主訴（學生原話）") == "主訴（學生原話）", "真标题不被误剥"
+
+    assert service._teacher_section_is_filled("（留待老師）") is False
+    assert service._teacher_section_is_filled("　← 留待老師（智能體永不填）") is False
+    assert service._teacher_section_is_filled("") is False
+    assert service._teacher_section_is_filled("舌紅苔薄白") is True
+
+    assert service._lcs_length(["A", "B", "C"], ["A", "C"]) == 2
+    assert service._lcs_length([], ["A"]) == 0
+
+
+# ---- 库层只读原语 `database.get_draft_samples`（批复 C-1）----
+
+def test_get_draft_samples_returns_both_sources_with_contract_keys(db):
+    """返回契约：9 键 + 两类来源 + 顺序（已签字病历 → 未签字草案，各自倒序）；
+    草案按 `id DESC`（唯一的「新近」信号），病历带时间锚。"""
+    template_id = _publish_record_template()
+    _seed_draft("草案一", template_id)
+    _seed_draft("草案二", 0)
+    _seed_record("AI 原稿", "老師終稿", template_id)
+
+    samples = database.get_draft_samples(TEACHER, 90, 5)
+
+    assert [row["source"] for row in samples] == ["record", "draft", "draft"]
+    expected_keys = {"source", "id", "patient_name", "ai_text", "final_text",
+                     "template_id", "template_version", "has_snapshot", "at"}
+    assert set(samples[0]) == expected_keys
+    assert set(samples[1]) == expected_keys
+    assert (samples[0]["ai_text"], samples[0]["final_text"]) == ("AI 原稿", "老師終稿")
+    assert samples[0]["has_snapshot"] is True and samples[0]["at"] != ""
+    assert samples[0]["template_id"] == template_id
+    assert (samples[1]["ai_text"], samples[1]["template_id"]) == ("草案二", 0)
+    assert samples[1]["at"] == "" and samples[1]["has_snapshot"] is True
+    assert samples[2]["ai_text"] == "草案一"
+
+
+def test_get_draft_samples_falls_back_to_content_without_snapshot(db):
+    """快照列为空（flag off 期间落库的老草案）→ `ai_text` 回落 `content`、`has_snapshot = False`
+    （② 据此把它算成 `approx`）；病历侧同款回落 `ai_draft`。"""
+    _seed_draft("老草案（無快照）", 0, snapshot="")
+    _seed_record("舊 AI 文本", "舊終稿", 0, with_snapshot=False)
+
+    samples = database.get_draft_samples(TEACHER, 90, 5)
+
+    record, draft = samples[0], samples[1]
+    assert (record["ai_text"], record["has_snapshot"]) == ("舊 AI 文本", False)
+    assert (draft["ai_text"], draft["has_snapshot"]) == ("老草案（無快照）", False)
+
+
+def test_get_draft_samples_limit_applies_per_source(db):
+    """`limit` 对**每个来源**各生效（最多 2 × limit 行，两指标因此互不挤占）；
+    坏 `limit`（`<= 0` / 非数字）→ 回落默认 50。"""
+    for index in range(3):
+        _seed_draft("草案 %d" % index, 0)
+    for index in range(3):
+        _seed_record("AI %d" % index, "老師 %d" % index, 0, visit_at="")
+
+    samples = database.get_draft_samples(TEACHER, 90, 2)
+
+    assert len([row for row in samples if row["source"] == "draft"]) == 2
+    assert len([row for row in samples if row["source"] == "record"]) == 2
+    assert len(database.get_draft_samples(TEACHER, 90, 0)) == 6
+    assert len(database.get_draft_samples(TEACHER, 90, "不是數字")) == 6
+
+
+def test_get_draft_samples_window_applies_to_records_only(db):
+    """窗口只作用于**有时间锚**的病历：今天之内 → 收；`2000-01-01`（远超任何窗口）→ 排除；
+    `visit_at = ''`（迁移前的老签字）→ **照收**（§3.3 的 `approx` 样本就在这类行里）；
+    草案无时间列 → 不受窗口影响（口径 2 / 3）。"""
+    _seed_draft("草案（id 序即新近信号）", 0)
+    _seed_record("最近的", "最近的", 0)
+    _seed_record("很久以前的", "很久以前的", 0, visit_at="2000-01-01T00:00:00")
+    _seed_record("老數據（無時間）", "老數據（無時間）", 0, visit_at="")
+
+    texts = [row["ai_text"] for row in database.get_draft_samples(TEACHER, 1, 10)]
+
+    assert "最近的" in texts and "老數據（無時間）" in texts
+    assert "很久以前的" not in texts
+    assert "草案（id 序即新近信号）" in texts
+
+
+def test_get_draft_samples_survives_missing_migration_columns(monkeypatch, tmp_path, db):
+    """迁移 0002 / 0003 / 0004 的列都还没跑的老库 → 照常返回（缺列读作 `0` / `''`、AI 侧回落
+    `content` / `ai_draft`），**不抛异常**（§4.5-①「指标可降级，存储没坏」）。"""
+    path = _copy_tested_db(monkeypatch, tmp_path, "samples_without_new_columns.db")
+    for table, column in (("drafts", "template_id"), ("drafts", "template_version"),
+                          ("drafts", "ai_original_content"),
+                          ("patient_records", "template_id"),
+                          ("patient_records", "template_version"),
+                          ("patient_records", "ai_original_text")):
+        _drop_column(path, table, column)
+
+    _raw_execute("INSERT INTO drafts (transcript_id, patient_name, teacher_name, content, signed) "
+                 "VALUES (0, '张三', ?, '老庫草案', 0)", (TEACHER,))
+    _raw_execute("INSERT INTO patient_records (patient_name, teacher_name, ai_draft, final_plan, "
+                 "doctor, visit_at) VALUES ('张三', ?, '老庫 AI', '老庫終稿', ?, '')",
+                 (TEACHER, TEACHER))
+
+    samples = database.get_draft_samples(TEACHER, 90, 10)      # 不抛异常 = 本条的核心断言
+
+    record, draft = samples[0], samples[1]
+    assert (record["template_id"], record["template_version"]) == (0, 0)
+    assert (record["ai_text"], record["final_text"], record["has_snapshot"]) == \
+        ("老庫 AI", "老庫終稿", False)
+    assert (draft["template_id"], draft["template_version"]) == (0, 0)
+    assert (draft["ai_text"], draft["has_snapshot"]) == ("老庫草案", False)
+
+
+def test_get_draft_samples_is_read_only_and_limited(db, sql_log):
+    """批复 C 的两条硬约束：**只读**（无写语句）+ **必带 LIMIT**（每条样本 SELECT 都有）。"""
+    _seed_draft("草案", 0)
+    _seed_record("AI 文本", "老師文本", 0)
+
+    samples = database.get_draft_samples(TEACHER, 90, 3)
+
+    assert len(samples) == 2
+    statements = [sql for sql, _ in _all_calls(sql_log)]
+    assert statements and all(sql.startswith(("SELECT", "PRAGMA")) for sql in statements), statements
+    sample_statements = [sql for sql in statements
+                         if "FROM drafts" in sql or "FROM patient_records" in sql]
+    assert len(sample_statements) == 2
+    assert all("LIMIT" in sql for sql in sample_statements)
+
+
+def test_get_draft_samples_bad_input_is_safe(db):
+    """坏入参不炸：空老师名 → `[]`（连 SQL 都不发）；坏窗口 → 不过滤；坏 limit → 兜底默认。"""
+    _seed_draft("草案", 0)
+
+    assert database.get_draft_samples("", 90, 10) == []
+    assert len(database.get_draft_samples(TEACHER, "不是數字", 1)) == 1
+    assert len(database.get_draft_samples(TEACHER, None, None)) == 1
 

@@ -1991,6 +1991,148 @@ def insert_agent_action_log(teacher_name, action, detail, task_id=0, created_at=
     return log_id
 
 
+# ---------- 【施工步骤 3.4-a】指标样本的只读读取原语（§3.2 / §3.3；CTO 2026-09-29 批复 C-1）----------
+# 背景：①② 两个指标需要的样本散布在**两张表**（未签字 `drafts` + 已签字 `patient_records`），
+# 服务层不拼 SQL（§4.5-① 只允许它调库层函数）→ 库层给**唯一**的只读入口。
+# 批复 C 的四条约束逐条落地：只读 / 不改现有签名 / 不动表结构 / 必带 LIMIT。
+# 同批批复的 `get_agent_stage_log_stats()`（越权计数 + 推荐冷却）属 3.4-b，与 `evaluate` 一起落地
+# —— 此处不预先占名（服务层 3.4-a 段头已记「假实现比缺席更坏」这条纪律）。
+
+# `patient_records.template_id / template_version`（迁移 0004 添加）—— 探测口径与
+# `_DRAFT_TEMPLATE_REF_COLUMNS` 同款：迁移未跑 → 该列读作 0，服务层按 §3.2 把这些样本
+# 计入 `skipped_no_template`（「指标可降级，存储没坏」，§4.5-①）。
+_PATIENT_RECORD_TEMPLATE_REF_COLUMNS = ("template_id", "template_version")
+
+# 样本读取的 LIMIT 兜底与上限（与 `get_agent_action_log` / `get_agent_stage_logs` 的 20 / 200 同款风格；
+# 上限 500 = §3.4 第 5 条给 `max_samples` 定的上界，两者不许分叉）
+_STAGE_SAMPLE_LIMIT_DEFAULT = 50
+_STAGE_SAMPLE_LIMIT_MAX = 500
+
+
+def _agent_stage_sample_int(value):
+    """样本行的整型列读数兜底（库列无 CHECK，人手 SQL 可能写坏）：非整数 → `0` + 一行 warn。
+
+    与 `agent_stage_service._coerce_pending_task_id()` 同向：**不抛**，只留痕
+    （指标不因脏行炸掉整条评估链路）。
+    """
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        print("[warn] 階段指標樣本的整型列無法解析：%r，已按 0 處理（庫列無 CHECK）" % (value,))
+        return 0
+
+
+def get_draft_samples(teacher_name, window_days, limit):
+    """【Epic 2 §3.2 / §3.3】指标样本的**统一只读入口**（3.4-a 新增，CTO 批复 C-1）。
+
+    返回该老师的可用样本行（未签字草案 + 已签字病历**两类**，「类型」由每行的 `source` 键标出），
+    每行固定 9 键（形状即契约，服务层两个指标函数直接消费）：
+
+      `source`           `'record'`（已签字病历）/ `'draft'`（未签字草案）
+      `id`               该表主键
+      `patient_name`     患者名
+      `ai_text`          AI 侧文本：草案 = `ai_original_content` 为空则回落 `content`；
+                         病历 = `ai_original_text` 为空则回落 `ai_draft`（§3.2 / §3.3 的基准列）
+      `final_text`       老师侧文本：草案 = `content`；病历 = `final_plan`
+      `template_id`      生成时的生效模板 id（列未就位 → `0` = 未记录）
+      `template_version` 同上（版本号）
+      `has_snapshot`     AI 侧文本是否来自**不可变快照**（② 据此分 strict / approx）
+      `at`               时间锚：病历 = `visit_at`；草案 = `''`（`drafts` **无时间列**）
+
+    五条口径（写死在这里，服务层不得再补一套）：
+      1. **只读 + 必带 LIMIT**（批复 C 约束）：两条 SELECT 各带 `LIMIT ?`；本函数不写任何表
+         （不发 INSERT / UPDATE / DELETE，不建索引、不改表结构）；
+      2. **窗口只对有时间的来源生效**：病历按 `visit_at >= date('now','localtime','-N days')`
+         过滤（`N = window_days`，非正整数 → 不过滤）；`drafts` 无时间列 → **不受窗口约束**，
+         按 `id DESC` 取最近 `limit` 条（`id` 单调递增 = 插入序，是这张表唯一的「新近」信号；
+         设计 §3.2 假设 `drafts` 有时间列，实测没有 → 服务层把草案当「无时间锚样本」处理）；
+      3. **`visit_at` 为空的老行照收**：`''` = 迁移前的历史签字，§3.3 明确把这类行算作
+         `approx` 样本 ——「没有时间基准」不等于「不是样本」（不降级、不惩罚）；
+      4. **缺列降级**（§4.5-①「指标可降级，存储没坏」）：`drafts` 模板引用列（迁移 0002）、
+         `patient_records` 模板引用列（迁移 0004）、两个快照列（迁移 0003）任一未跑 →
+         该列读作 `0` / `''`，**不抛异常**；
+      5. **每个来源各取 `limit` 行**（最多返回 `2 * limit` 行）：`max_samples` 的「取前 N 条」
+         由两个指标各自再截断（① 只看命中当前模板的样本、② 只看已签字病历）→ 两个指标
+         **互不挤占**同一份额度。返回顺序 = 已签字病历（`visit_at` 倒序）→ 未签字草案（`id` 倒序）。
+
+    调用方（3.4-a 起）：`agent_stage_service.compute_template_match()` /
+    `compute_modification_consistency()`；`sqlite3.Error` **不吞**（裁决⑤：表未就绪冒泡给服务层，
+    由服务层降级成「无样本」+ 一行告警）。
+    """
+    if not teacher_name:
+        return []
+
+    limit = _agent_stage_sample_int(limit)
+    if limit <= 0:
+        limit = _STAGE_SAMPLE_LIMIT_DEFAULT
+    limit = min(limit, _STAGE_SAMPLE_LIMIT_MAX)
+    days = _agent_stage_sample_int(window_days)
+
+    conn = get_connection()
+    try:
+        drafts_have_refs = _table_has_columns(conn, "drafts", _DRAFT_TEMPLATE_REF_COLUMNS)
+        drafts_have_snapshot = _drafts_supports_ai_original(conn)
+        records_have_refs = _table_has_columns(conn, "patient_records",
+                                               _PATIENT_RECORD_TEMPLATE_REF_COLUMNS)
+        records_have_snapshot = _patient_records_supports_ai_original(conn)
+
+        draft_rows = conn.execute(
+            "SELECT id, patient_name, content, %s AS ai_original_content, "
+            "%s AS template_id, %s AS template_version FROM drafts "
+            "WHERE teacher_name = ? AND signed = 0 ORDER BY id DESC LIMIT ?"
+            % ("ai_original_content" if drafts_have_snapshot else "''",
+               "template_id" if drafts_have_refs else "0",
+               "template_version" if drafts_have_refs else "0"),
+            (teacher_name, limit),
+        ).fetchall()
+
+        record_filter = ""
+        if days > 0:
+            record_filter = (" AND (visit_at IS NULL OR visit_at = '' OR "
+                             "date(visit_at) >= date('now', 'localtime', '-%d days'))" % days)
+        record_rows = conn.execute(
+            "SELECT id, patient_name, final_plan, ai_draft, %s AS ai_original_text, "
+            "%s AS template_id, %s AS template_version, visit_at FROM patient_records "
+            "WHERE teacher_name = ?%s ORDER BY visit_at DESC, id DESC LIMIT ?"
+            % ("ai_original_text" if records_have_snapshot else "''",
+               "template_id" if records_have_refs else "0",
+               "template_version" if records_have_refs else "0",
+               record_filter),
+            (teacher_name, limit),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    samples = []
+    for row in record_rows:         # 已签字病历优先：完成的学习轨迹（② 只吃这一类）
+        snapshot = row["ai_original_text"] or ""
+        samples.append({
+            "source": "record",
+            "id": row["id"],
+            "patient_name": row["patient_name"] or "",
+            "ai_text": snapshot or (row["ai_draft"] or ""),
+            "final_text": row["final_plan"] or "",
+            "template_id": _agent_stage_sample_int(row["template_id"]),
+            "template_version": _agent_stage_sample_int(row["template_version"]),
+            "has_snapshot": bool(snapshot),
+            "at": row["visit_at"] or "",
+        })
+    for row in draft_rows:          # 未签字草案（① 用得到；② 忽略）
+        snapshot = row["ai_original_content"] or ""
+        samples.append({
+            "source": "draft",
+            "id": row["id"],
+            "patient_name": row["patient_name"] or "",
+            "ai_text": snapshot or (row["content"] or ""),
+            "final_text": row["content"] or "",
+            "template_id": _agent_stage_sample_int(row["template_id"]),
+            "template_version": _agent_stage_sample_int(row["template_version"]),
+            "has_snapshot": bool(snapshot),
+            "at": "",
+        })
+    return samples
+
+
 # ============ 【第75天新增】施治方案模板（老师维度的模板记忆） ============
 
 def get_plan_template(teacher_name):

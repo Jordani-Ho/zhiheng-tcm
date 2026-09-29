@@ -35,6 +35,7 @@
     守护测试保证。本文件永远不得 import 上述任何符号。
 """
 
+import difflib
 import json
 import os
 import sqlite3
@@ -959,4 +960,487 @@ def require_capability(teacher_name, capability):
     _config_warn(detail)
     _stage_audit(_LOG_EVENT_PERMISSION_DENIED, name, cap, stage, detail)
     return False
+
+
+# ============================================================================
+# 【施工步骤 3.4-a】指标层：① 模板匹配度 + ② 病历修改一致率（§3.2 / §3.3）
+# ----------------------------------------------------------------------------
+# CTO 2026-09-29 放行 step 3.4-a 的边界，本段逐条对应：
+#   约束 1「3.4 含 ①②，批 1 = 3.4-a」→ 本段落 §4.5-① 的两个公开符号
+#     `compute_template_match(teacher_name, cfg)` /
+#     `compute_modification_consistency(teacher_name, cfg)`，
+#     外加库层一个**只读**原语 `database.get_draft_samples()`（批复 C-1：窗口 + 类型过滤 + LIMIT）。
+#     批复 C-2 的 `get_agent_stage_log_stats()`（越权计数 / 推荐冷却）属 **3.4-b**，与 `evaluate`
+#     同批落地 —— 本步不放「名字在、无人调」的空壳（3.1 段已定过这条纪律：假实现比缺席更坏）。
+#   约束 2「空集语义 `value=None` ≠ 0」→ 两个指标各有 `_BLOCKER_*_NO_SAMPLES` 分支；
+#     「空值不得通过任何阈值」的**判定侧**属 3.4-b，本步用 ⑯ 组钉住不变量：`value is None`
+#     且 `None` 与阈值比较会抛 `TypeError`（3.4-b 只能显式 `is not None`，没有静默通过的空间）。
+#   约束 3「本批只做 3.4-a」→ 不改 `database.py` 既有函数签名 / `main.py` / `agent_stage_api.py`；
+#     只**追加**一个库层只读函数（批复 C）。本段**零写入**：不发 INSERT / UPDATE / DELETE，
+#     不写状态行、不写审计（落盘与事件属 `evaluate`，3.4-b）。
+#   约束 4「不引依赖」→ 只用 stdlib `difflib`（§3.3 的 `SequenceMatcher`）；§3.2 的 `LCS` 用
+#     20 × 20 的 DP 表算**严格** LCS（括号里的 `difflib` 是实现提示：它的块匹配会系统性低估
+#     `order_rate`，口径与实测见 `_lcs_length()`）。
+#
+# 三条口径（本段自行钉死，⑯ 组逐条覆盖，汇报里列清）：
+#   口径 A「当前 active `record` 模板」= `template_service.get_active_record_template(teacher_name)`
+#     （§4.5-① 允许服务层只读它）：该函数自带 `TEMPLATE_API_ENABLED` 闸门 + 表就绪探测 +
+#     schema 版本判定 → 返回 `None` 即「此刻没有生效病历模板」= ① **无基准** →
+#     `value=None` + `blockers=["no_active_record_template"]`。**不算 0 分**：0 分会变成
+#     「智能体不守模板」的错误指控（空值 ≠ 差评，§3.2 空集语义的同一方向）。
+#   口径 B「① 的标题识别是纯文本规则、零 LLM」（§3.2）：允许的写法差异**只**有三类，全部写死在
+#     `_normalize_section_text()` / `_split_heading()` / `_heading_matches()` 里 ——
+#       ① 行首列表符（`- ` / `* ` / `· `）与 `【】` / `[]` / `〔〕` / `《》` 包裹；
+#       ② `（留待老師）` 这类**提示性尾巴**（`_SECTION_HEADING_TAILS` 逐条枚举，含简体写法）；
+#       ③ 句末标点。
+#     **不做**简繁互换、**不做**缩写匹配、**不做**相似度匹配：模糊化会静默放大指标，而模板标题
+#     是 §9.2 规定的 1–20 字完整标签（`_section_metas()` 按 `order` 取值）。
+#   口径 C「样本一律走库层那一条只读原语」：服务层不拼 SQL、不认识 `sqlite3.Row` 的列形状；
+#     `max_samples` 的「取前 N 条」由两个指标**各自**完成（① 只看命中当前模板的样本、② 只看
+#     已签字病历），于是同一个样本集能同时服务两个指标而互不挤占（读取原语每个来源各取 `limit` 行）。
+#
+# 告警统一走 3.2 落地的 `_config_warn()`（单一出口，本段不新增 `print`）；文案一律繁体。
+# ============================================================================
+
+# 样本行的「类型」标记（与 `database.get_draft_samples()` 的 `source` 键**同字面量**）
+_SAMPLE_SOURCE_RECORD = "record"    # 已签字病历（`patient_records`）
+_SAMPLE_SOURCE_DRAFT = "draft"      # 未签字草案（`drafts`）
+
+# `blockers` 文案（§3.2 / §3.3 逐字；`no_active_record_template` 见上文口径 A）
+_BLOCKER_TEMPLATE_MATCH_NO_SAMPLES = "template_match_no_samples"
+_BLOCKER_MODIFICATION_NO_SAMPLES = "modification_consistency_no_samples"
+_BLOCKER_NO_ACTIVE_TEMPLATE = "no_active_record_template"
+
+# 行首列表符（归一化时剥掉；`- 舌象：…` / `* 脈象` / `· 辨證` 这些写法因此可识别）。
+# **刻意不含** `【` / `[` / `〔` / `《`：包裹符由 `_split_heading()` 按「配对的首尾」成对剥，
+# 在这里逐字符剥会把 `【主訴（學生原話）】` 切成 `主訴（學生原話）】`（留下半个 `】`）→ 标题比对全错。
+_SECTION_LINE_PREFIXES = ("-", "*", "·", "•", "|", "丨")
+
+# 「留待老師」提示语的词元（违规判定的白名单：这些词被剔除后仍为空 → **不算**填了内容）
+_PLACEHOLDER_WORDS = ("留待老師", "留待老师", "智能體永不填", "智能体永不填", "智能體永不填寫")
+
+# 允许出现在标题后的**提示性尾巴**（逐条枚举，不做通配 —— 口径 B 不允许模糊匹配）
+_SECTION_HEADING_TAILS = (
+    "（留待老師）", "(留待老師)", "（留待老师）", "(留待老师)",
+    "（智能體永不填）", "(智能體永不填)", "（留待老師，智能體永不填）",
+    "← 留待老師（智能體永不填）", "← 留待老師", "←留待老師",
+)
+
+# 句末标点（标题比对前剥掉；模板标题按 §9.2 是「標籤」，不含句末标点）
+_SENTENCE_TAILS = " 。，、；:;."
+
+# 违规判定里**不算内容**的字符：纯标点 / 留白 / 提示箭头。
+# 刻意**不**含汉字与字母 —— 「舌紅苔薄白」这类真内容必然留下非空残料 → 判违规。
+
+
+def _metric_int(value, default):
+    """配置 / 样本行的整数读数兜底：非整数（含 `bool`、`None`、字符串）→ 返回 `default`。
+
+    `bool` 明确拒绝：`True` 是 `int` 子类，静默当 1 用就是静默清洗（与 3.2 校验层同一口径）。
+    """
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    return default
+
+
+def _metric_float(value, default):
+    """配置项的浮点读数兜底（`bool` 同样拒绝；非数 → `default`）。"""
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    return default
+
+
+def _normalize_metric_text(text, truncate_chars=None):
+    """② 的文本归一化（§3.3）：`\\r\\n` / `\\r` → `\\n`、首尾裁剪、连续空白折叠为单空格、双侧截断。
+
+    · 非字符串（`None` / 数字 / dict）→ `""`（§3.3「两个文本任一为空 / 非字符串 → 排除」由调用方计数）；
+    · `truncate_chars` 缺失 / 非正整数 → **不截断**；
+    · 刻意与 ① 的 `_normalize_section_text()` 分开：相似度计算必须把换行折叠成空格（否则同一份
+      病历的换行差异会污染 ②），而 ① 的「行首标题」与「段序」依赖换行结构。
+    """
+    if not isinstance(text, str):
+        return ""
+    normalized = " ".join(text.replace("\r\n", "\n").replace("\r", "\n").split())
+    limit = _metric_int(truncate_chars, 0)
+    if limit > 0:
+        normalized = normalized[:limit]
+    return normalized
+
+
+def _normalize_section_text(text):
+    """① 的文本归一化（§3.2）：**保留换行** —— 逐行去首尾空白、行内连续空白折叠为单空格、
+    全角冒号 → 半角（统一后续 `partition` 切分）、剥掉行首列表符、丢掉空行。
+
+    口径细节：
+      · **包裹符不在这里剥**（`【主訴（學生原話）】`）：那是 `_split_heading()` 的职责 ——
+        它按「**配对**的首尾包裹符」成对剥；在这里逐字符剥会留下半个 `】`，把标题切坏
+        （step 3.4-a 的 ⑯ 组就抓到了这个 bug）；
+      · 空行一律丢掉：① 只关心「段标题 + 该标题之后到下一个段标题之前的行」，空行是噪声；
+      · 非字符串 → `""`。
+    """
+    if not isinstance(text, str):
+        return ""
+    lines = []
+    for raw in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        line = " ".join(raw.replace("：", ":").replace("\u3000", " ").split())
+        while line[:1] in _SECTION_LINE_PREFIXES:
+            line = line[1:].strip()
+        if line:
+            lines.append(line)
+    return "\n".join(lines)
+
+
+def _split_heading(line):
+    """归一化后的一行 → `(heading, rest)`：`heading` = 首个冒号前的标题（无冒号则整行），
+    `rest` = 冒号之后的内容（无冒号则空串）；标题两侧的 `【】` / `[]` / `〔〕` / `《》` 在此剥掉。
+    """
+    head, sep, rest = line.partition(":")
+    heading = head.strip()
+    for start, end in (("【", "】"), ("[", "]"), ("〔", "〕"), ("《", "》")):
+        if len(heading) > len(start) + len(end) and heading.startswith(start) and heading.endswith(end):
+            heading = heading[len(start):-len(end)].strip()
+            break
+    return heading, (rest.strip() if sep else "")
+
+
+def _strip_heading_tail(heading):
+    """剥掉标题后的**提示性尾巴**与句末标点（`舌象（留待老師）` → `舌象`；支持多重尾巴）。"""
+    text = heading
+    changed = True
+    while changed and text:
+        changed = False
+        for tail in _SECTION_HEADING_TAILS:
+            if text.endswith(tail):
+                text = text[: -len(tail)].strip()
+                changed = True
+        while text and text[-1] in _SENTENCE_TAILS:
+            text = text[:-1].strip()
+            changed = True
+    return text
+
+
+def _heading_matches(heading, title):
+    """行首标题是否命中模板段标题（§3.2「`s.title` 作为行首标题出现」的精确实现）。
+
+    命中 = **完全相等**，或「剥掉提示性尾巴后完全相等」；其余一律不算（口径 B：不模糊匹配）。
+    """
+    return heading == title or _strip_heading_tail(heading) == title
+
+
+def _teacher_section_is_filled(text):
+    """`writable_by='teacher'` 的段在草案里是否**被填了内容**（§3.2 的铁律违规判定）。
+
+    口径：剔除提示语词元（`留待老師` / `智能體永不填` …）与纯标点 / 留白后仍有残料 → 填了内容。
+    于是 `舌象：` / `舌象：（留待老師）` / `舌象：　← 留待老師（智能體永不填）` 都不算违规，
+    而 `舌象：舌紅苔薄白` 一定违规（AI 永不辨证 / 永不填舌脈，§0.2 铁律）。
+    """
+    cleaned = text if isinstance(text, str) else ""
+    for word in _PLACEHOLDER_WORDS:
+        cleaned = cleaned.replace(word, "")
+    for char in _NON_CONTENT_CHARS:
+        cleaned = cleaned.replace(char, "")
+    return bool(cleaned.strip())
+
+
+def _section_metas(template_row):
+    """active `record` 模板行 → 段落元数据（按 `order` 升序；`order` 缺失 / 非法 → 数组下标兜底）。
+
+    真相源 = `schema_json.sections`（Epic 1 §9.2：`title` / `order` / `writable_by`）。
+    与 `template_service.record_section_skeleton()` 是**同一份数据的两条渲染路径**：那条给生成
+    智能体（提示文本），本函数给指标（结构化）—— 服务层不重新实现模板读取，只用
+    `get_active_record_template()` 的返回行（§4.5-① 允许的只读调用）。
+    形状不对（`None` / 非 dict / 无有效段落）→ `[]`（调用方据此判「无基准可比」）。
+    """
+    schema = (template_row or {}).get("schema_json")
+    if not isinstance(schema, dict):
+        return []
+    metas = []
+    for index, section in enumerate(schema.get("sections") or []):
+        if not isinstance(section, dict):
+            continue
+        title = section.get("title") or section.get("key") or ""
+        if not isinstance(title, str) or not title.strip():
+            continue
+        order = _metric_int(section.get("order"), index + 1)
+        metas.append({
+            "title": title.strip(),
+            "order": order,
+            "index": index,
+            "writable_by": section.get("writable_by") or "ai",
+        })
+    metas.sort(key=lambda meta: (meta["order"], meta["index"]))
+    return metas
+
+
+def _lcs_length(left, right):
+    """两个段序列表的**严格最长公共子序列**长度（§3.2 的 `LCS(模板段序, 草案段序)`）。
+
+    实现口径（本段自行钉死，⑯ 组覆盖）：**不 import 任何东西**，用 20 × 20 的 DP 表算严格 LCS。
+    §3.2 括号里写的是 `difflib`，那是「标准库、零依赖、开销可忽略」的实现提示；但
+    `difflib.SequenceMatcher.get_matching_blocks()` 给的是**块匹配启发式**、不保证等于 LCS ——
+    实测模板堆 `[A,B,C,D,E]` vs 草案堆 `[A,C,E,D,B]`：块匹配只得 2，严格 LCS = 3（⑯ 组有回归用例），
+    于是 `order_rate` 会被系统性低估、① 整体偏严（更难达标）。文档公式是契约、括号是实现提示，
+    故取严格 LCS；`difflib` 仍按 §3.3 用于 ② 的相似度。段数 ≤ 20 → 400 格，开销可忽略。
+    """
+    columns = len(right)
+    previous = [0] * (columns + 1)
+    for row_item in left:
+        current = [0]
+        for index, column_item in enumerate(right):
+            if row_item == column_item:
+                current.append(previous[index] + 1)
+            else:
+                current.append(max(previous[index + 1], current[index]))
+        previous = current
+    return previous[columns]
+
+
+def _match_weights(cfg):
+    """① 的内部权重（§3.2 `template_match_weights`，配置化、不硬编码）。
+
+    · 整个键缺失 / 非 dict → 回落内置默认（`DEFAULT_STAGE_CONFIG`，全 Epic 唯一硬编码点）；
+    · 只给了部分子键（CTO 3.2 裁决 B「只校验给出来的项」）→ 未给出的子键按 `0.0` 计：
+      **不做部分合并、不补默认权重**（补默认 = 静默清洗）；于是「只给 `section_hit`」的老师
+      得到的 ① 就是**命中率本身**，比「悄悄掺进一个他没配的 0.4」更可解释。
+    """
+    weights = (cfg or {}).get("template_match_weights")
+    if not isinstance(weights, dict):
+        weights = DEFAULT_STAGE_CONFIG["template_match_weights"]
+    return {
+        "hit": _metric_float(weights.get("section_hit"), 0.0),
+        "order": _metric_float(weights.get("section_order"), 0.0),
+    }
+
+
+def _blank_template_match():
+    """① 的返回体骨架（9 键，⑯ 组逐键钉住）：提前建好 → 各条降级路径都能 `return` 同一个形状。"""
+    return {
+        "value": None,                      # 空集 → None（**不是 0**，CTO 硬约束 2）
+        "samples": 0,                       # 入选样本数（命中当前 active 模板且文本非空）
+        "violations": 0,                    # 铁律违规样本数（AI 填了 teacher 段）
+        "skipped_no_template": 0,           # `template_id = 0`（生成时没有生效模板）
+        "skipped_stale_template": 0,        # `template_id` ≠ 当前 active（老师换过版本）
+        "skipped_empty": 0,                 # AI 侧文本为空的样本（不静默丢，§3.2「显式计数」）
+        "hit_rate": None,                   # 入选样本的段命中率均值（便于运维复核总分来源）
+        "order_rate": None,                 # 入选样本的段序一致率均值
+        "blockers": [],
+    }
+
+
+def _blank_modification_consistency():
+    """② 的返回体骨架（6 键，⑯ 组逐键钉住）。"""
+    return {
+        "value": None,                      # 空集 → None（**不是 0**）
+        "samples": 0,                       # 入选配对样本数（strict + approx）
+        "approx_samples": 0,                # 其中「旧数据」近似样本数（只有 `ai_draft`）
+        "skipped_empty": 0,                 # 任一侧文本为空的排除数
+        "min": None,                        # 最差一份（便于发现异常样本）
+        "blockers": [],
+    }
+
+
+def _template_match_sample(text, metas, weights):
+    """单样本 ①（§3.2）：返回 `(match, hit_rate, order_rate, violation)`。
+
+    · `hit_rate` = 命中的段数 / 模板段数（标题按**行首**匹配，见 `_heading_matches()`）；
+    · `order_rate` = `LCS(模板段序, 草案中实际出现的段序) / 段数`（顺序敏感；草案多出的无关行
+      不影响 LCS —— 它们不参与段序）；
+    · `violation` = 某个 `writable_by='teacher'` 的段在「它的标题行之后、下一个段标题之前」
+      被填了内容 → 该样本 `match = 0.0`（§3.2 铁律违规直接判 0，不按比例折算）；
+    · 同名段只认**第一次**出现（§9.2 `sections[].title` 是标签；同标题后续行按普通内容处理）。
+    """
+    normalized = _normalize_section_text(text)
+    lines = normalized.split("\n") if normalized else []
+    meta_by_title = {meta["title"]: meta for meta in metas}
+
+    hits = []       # [(行号, 段标题)]，按行号升序
+    rests = {}      # 段标题 → 该标题行「冒号之后」的内容
+    for line_index, line in enumerate(lines):
+        heading, rest = _split_heading(line)
+        if not heading:
+            continue
+        for meta in metas:
+            title = meta["title"]
+            if title in rests:
+                continue
+            if _heading_matches(heading, title):
+                hits.append((line_index, title))
+                rests[title] = rest
+                break
+
+    hit_rate = len(hits) / len(metas)
+    order_rate = _lcs_length([meta["title"] for meta in metas],
+                             [title for _, title in hits]) / len(metas)
+
+    violation = False
+    for position, (line_index, title) in enumerate(hits):
+        if meta_by_title[title]["writable_by"] != "teacher":
+            continue
+        end = hits[position + 1][0] if position + 1 < len(hits) else len(lines)
+        content = "\n".join([rests.get(title, "")] + lines[line_index + 1:end])
+        if _teacher_section_is_filled(content):
+            violation = True
+            break
+
+    if violation:
+        return 0.0, hit_rate, order_rate, True
+    return weights["hit"] * hit_rate + weights["order"] * order_rate, hit_rate, order_rate, False
+
+
+def compute_template_match(teacher_name, cfg):
+    """① 模板匹配度（§3.2）—— **只算不判**（阈值判定 / 落盘 / 事件属 `evaluate`，3.4-b）。
+
+    返回体 9 键（形状即契约，⑯ 组逐键钉住）：`value` / `samples` / `violations` /
+    `skipped_no_template` / `skipped_stale_template` / `skipped_empty` / `hit_rate` /
+    `order_rate` / `blockers`。
+
+    样本集合（§3.2，来自 `database.get_draft_samples()` 的两类来源：未签字草案 + 已签字病历）：
+      · `template_id = 0`（生成时没有生效模板）→ `skipped_no_template`；
+      · `template_id` ≠ 当前 active 模板 id（老师换过版本）→ `skipped_stale_template`
+        （拿旧模板的输出比新模板骨架不公平）；
+      · `template_id` == 当前 active id 且 AI 侧文本非空 → **入选**，按「时间倒序取前
+        `max_samples` 条」计均值；AI 侧文本为空 → `skipped_empty`。
+      排除项一律**显式计数**（§3.2「不静默丢」）。
+
+    三条降级（都**不抛**、都**不写库**，返回体形状不变）：
+      · 无生效模板（口径 A：`get_active_record_template()` 返回 `None`，含 `TEMPLATE_API_ENABLED`
+        off / 模板表未就绪 / schema 版本不支持 / schema 无有效段落）→ `value=None` +
+        `blockers=["no_active_record_template"]`（**不**算 0 分）；
+      · 有模板但无入选样本 → `value=None` + `blockers=["template_match_no_samples"]`；
+      · 读样本抛 `sqlite3.Error`（0003 未跑 / 库被锁）→ 一行告警 → 按「无样本」处理
+        （fail-closed：空值不可能通过任何阈值，§3.4-⑤ 同一方向）。
+
+    阈值 / 权重 / 窗口 / 样本上限**全部来自 `cfg`**（§3.4：不硬编码；`cfg` 缺失键回落
+    `DEFAULT_STAGE_CONFIG`）。配置闸门（flag / `matrix_enforced`）不在本函数：它不发写语句，
+    没有「绕过闸门」的副作用；真正的闸门与判定在 `evaluate`（3.4-b）。
+    """
+    import database
+    import template_service
+
+    config = cfg if isinstance(cfg, dict) else {}
+    result = _blank_template_match()
+
+    template_row = template_service.get_active_record_template(teacher_name)
+    active_id = _metric_int(template_row.get("id"), 0) if isinstance(template_row, dict) else 0
+    metas = _section_metas(template_row)
+    if active_id <= 0 or not metas:
+        result["blockers"].append(_BLOCKER_NO_ACTIVE_TEMPLATE)
+        return result
+
+    window_days = _metric_int(config.get("window_days"), DEFAULT_STAGE_CONFIG["window_days"])
+    max_samples = _metric_int(config.get("max_samples"), DEFAULT_STAGE_CONFIG["max_samples"])
+    if max_samples <= 0:
+        max_samples = DEFAULT_STAGE_CONFIG["max_samples"]
+    try:
+        samples = database.get_draft_samples(teacher_name, window_days, max_samples)
+    except sqlite3.Error as exc:
+        _config_warn("讀取階段指標樣本失敗（%s），① 模板匹配度本次按無樣本處理" % (exc,))
+        result["blockers"].append(_BLOCKER_TEMPLATE_MATCH_NO_SAMPLES)
+        return result
+
+    weights = _match_weights(config)
+    values, hit_rates, order_rates = [], [], []
+    for row in samples or []:
+        template_id = _metric_int(row.get("template_id"), 0)
+        if template_id <= 0:
+            result["skipped_no_template"] += 1
+            continue
+        if template_id != active_id:
+            result["skipped_stale_template"] += 1
+            continue
+        if not (row.get("ai_text") or "").strip():
+            result["skipped_empty"] += 1
+            continue
+        if len(values) >= max_samples:
+            continue        # 已取满「前 max_samples 条」；继续跑完是为了把排除项计数干净
+        match, hit_rate, order_rate, violation = _template_match_sample(
+            row["ai_text"], metas, weights)
+        values.append(match)
+        hit_rates.append(hit_rate)
+        order_rates.append(order_rate)
+        if violation:
+            result["violations"] += 1
+
+    result["samples"] = len(values)
+    if not values:
+        result["blockers"].append(_BLOCKER_TEMPLATE_MATCH_NO_SAMPLES)
+        return result
+    result["value"] = sum(values) / len(values)
+    result["hit_rate"] = sum(hit_rates) / len(hit_rates)
+    result["order_rate"] = sum(order_rates) / len(order_rates)
+    return result
+
+
+def compute_modification_consistency(teacher_name, cfg):
+    """② 病历修改一致率（§3.3）—— **只算不判**（阈值判定 / 落盘 / 事件属 `evaluate`，3.4-b）。
+
+    返回体 6 键（形状即契约，⑯ 组逐键钉住）：`value` / `samples` / `approx_samples` /
+    `skipped_empty` / `min` / `blockers`。
+
+    样本与口径（§3.3）：
+      · **只看 `source == 'record'`**（已签字病历）：未签字草案的老师编辑还没定稿，
+        「改了多少」不成立（草案的后续编辑会写进 `drafts.content`）；
+      · 单样本相似度 = `difflib.SequenceMatcher(None, norm(ai_text), norm(final_text),
+        autojunk=False).ratio()`（§3.3 选它而非编辑距离：标准库、零新依赖、与 Epic 3 的字段级
+        diff 复用同一套归一化）；`norm()` = `_normalize_metric_text()` + `truncate_chars` 双侧截断
+        → 耗时有界；
+      · `strict`（`ai_original_text` 非空，`has_snapshot=True`）与 `approx`（存量旧数据只有
+        `ai_draft`，**会系统性高估**）**都进均值**，但 `approx_samples` 单独计数
+        （前端显示「含 N 份近似樣本（舊數據）」）；
+      · 任一侧文本为空 / 非字符串 → `skipped_empty`（不进均值，也不静默丢）；
+      · `min` = 入选样本的最小相似度（最差一份，便于发现异常样本）。
+
+    窗口与样本上限来自 `cfg`（`window_days` / `max_samples` 直接传给库层只读原语，
+    由它做「时间锚倒序 + LIMIT」）。两条降级（都不抛、都不写库，返回体形状不变）：
+      · 无入选样本（含窗口内一份都没有）→ `value=None` +
+        `blockers=["modification_consistency_no_samples"]`（**不是 0**，CTO 硬约束 2）；
+      · 读样本抛 `sqlite3.Error`（0003 未跑 / 库被锁）→ 一行告警 → 按「无样本」处理（fail-closed）。
+    """
+    import database
+
+    config = cfg if isinstance(cfg, dict) else {}
+    result = _blank_modification_consistency()
+
+    window_days = _metric_int(config.get("window_days"), DEFAULT_STAGE_CONFIG["window_days"])
+    max_samples = _metric_int(config.get("max_samples"), DEFAULT_STAGE_CONFIG["max_samples"])
+    if max_samples <= 0:
+        max_samples = DEFAULT_STAGE_CONFIG["max_samples"]
+    truncate_chars = _metric_int(config.get("truncate_chars"), DEFAULT_STAGE_CONFIG["truncate_chars"])
+
+    try:
+        samples = database.get_draft_samples(teacher_name, window_days, max_samples)
+    except sqlite3.Error as exc:
+        _config_warn("讀取階段指標樣本失敗（%s），② 病歷修改一致率本次按無樣本處理" % (exc,))
+        result["blockers"].append(_BLOCKER_MODIFICATION_NO_SAMPLES)
+        return result
+
+    similarities = []
+    for row in samples or []:
+        if row.get("source") != _SAMPLE_SOURCE_RECORD:
+            continue
+        ai_text = row.get("ai_text")
+        final_text = row.get("final_text")
+        if not isinstance(ai_text, str) or not isinstance(final_text, str) \
+                or not ai_text.strip() or not final_text.strip():
+            result["skipped_empty"] += 1
+            continue
+        if len(similarities) >= max_samples:
+            continue        # 已取满「前 max_samples 条」；继续跑完是为了把排除项计数干净
+        similarities.append(difflib.SequenceMatcher(
+            None,
+            _normalize_metric_text(ai_text, truncate_chars),
+            _normalize_metric_text(final_text, truncate_chars),
+            autojunk=False,
+        ).ratio())
+        if not row.get("has_snapshot"):
+            result["approx_samples"] += 1
+
+    result["samples"] = len(similarities)
+    if not similarities:
+        result["blockers"].append(_BLOCKER_MODIFICATION_NO_SAMPLES)
+        return result
+    result["value"] = sum(similarities) / len(similarities)
+    result["min"] = min(similarities)
+    return result
+_NON_CONTENT_CHARS = " \t\u3000\r\n（）()[]［］【】<>《》←→-—*·:：、,，。.。;；|丨"
 
