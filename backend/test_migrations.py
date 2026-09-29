@@ -68,6 +68,20 @@ CREATE TABLE IF NOT EXISTS drafts (
 """
 
 
+# 与 database.py init_db() 的 patient_records 建表语句逐字一致（迁移 0003 / 0004 只补列，不改形状；
+# visit_at 由 init_db() 里那条 ADD COLUMN 兜底补，这里按建表基线造即可）
+PATIENT_RECORDS_DDL = """
+CREATE TABLE IF NOT EXISTS patient_records (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    patient_name TEXT,
+    teacher_name TEXT,
+    ai_draft TEXT,
+    final_plan TEXT,
+    doctor TEXT
+)
+"""
+
+
 def _seed_legacy_db(db_path, rows=()):
     conn = sqlite3.connect(db_path)
     conn.execute(PLAN_TEMPLATES_DDL)
@@ -313,7 +327,11 @@ def test_cli_upgrade_reads_zhieng_db_env(tmp_path):
         cmd = [alembic_exe, "upgrade", "head"]
     else:  # 兜底：不用 console script 也能跑同一个入口
         cmd = [sys.executable, "-c", "from alembic.config import main; main()", "upgrade", "head"]
-    proc = subprocess.run(cmd, cwd=BACKEND_DIR, env=env, capture_output=True, text=True)
+    # 【CTO 2026-09-28 裁决② · 1 行卫生修复】显式钉住子进程输出的解码口径：alembic 的
+    # print 是 UTF-8（含繁体中文），`text=True` 单独用会按 locale（本机 GBK）解码 → 告警 / 乱码。
+    # 只加解码参数，**断言一字未改**（本用例恒 pass，修的是测量卫生）。
+    proc = subprocess.run(cmd, cwd=BACKEND_DIR, env=env, capture_output=True,
+                          text=True, encoding="utf-8", errors="replace")
 
     assert proc.returncode == 0, proc.stdout + proc.stderr
     row = _one(str(db), "SELECT schema_json, name FROM templates")
@@ -349,4 +367,51 @@ def test_migration_0002_adds_draft_template_refs(tmp_path):
     # downgrade base：按 §12.1 默认不删列（删列会丢「依哪个模板哪个版本生成」的溯源信息）
     migrations_runner.run_downgrade("base", db_file=str(db))
     assert {"template_id", "template_version"} <= set(_names(_read(str(db), "PRAGMA table_info('drafts')")))
+
+
+def test_migration_0004_adds_patient_record_template_refs(tmp_path):
+    """【Epic 2 步骤 3.0 · A1 批复】`patient_records` 补 `template_id` / `template_version`。
+
+    老行落 0 = 未记录；可重跑；downgrade 按批复**删列**（本用例只回退到 0003，隔离本 revision，
+    不牵动 0001 / 0002 / 0003 各自的回退闸），删列后表与存量行原样保留，且能再 upgrade 回来。
+    """
+    db = tmp_path / "m8.db"
+    conn = sqlite3.connect(str(db))
+    conn.execute(PATIENT_RECORDS_DDL)
+    conn.execute(
+        "INSERT INTO patient_records (patient_name, teacher_name, ai_draft, final_plan, doctor) "
+        "VALUES ('张三', '李老师', 'AI 原稿', '老师定稿', '李老师')"
+    )
+    conn.commit()
+    conn.close()
+
+    assert migrations_runner.run_upgrade(db_file=str(db)) is True
+
+    columns = _names(_read(str(db), "PRAGMA table_info('patient_records')"))
+    assert {"template_id", "template_version"} <= set(columns)
+    old_row = _one(str(db), "SELECT * FROM patient_records WHERE patient_name = '张三'")
+    assert old_row["template_id"] == 0 and old_row["template_version"] == 0        # 老数据 = 未记录
+    assert old_row["ai_draft"] == "AI 原稿" and old_row["final_plan"] == "老师定稿"  # 老行内容一字不动
+    assert _one(str(db), "SELECT version_num FROM alembic_version")["version_num"] == ALEMBIC_HEAD
+
+    # 可重跑：已在 head 再 upgrade 一次仍是 no-op（不重复加列、不报错）
+    assert migrations_runner.run_upgrade(db_file=str(db)) is True
+    cols = _names(_read(str(db), "PRAGMA table_info('patient_records')"))
+    assert cols.count("template_id") == 1 and cols.count("template_version") == 1
+
+    # downgrade 回 0003：A1 批复「可删列」→ 两列消失；表与存量行保留（只影响 Epic 2 的归因位）
+    migrations_runner.run_downgrade("0003_add_agent_stage", db_file=str(db))
+    remaining = _names(_read(str(db), "PRAGMA table_info('patient_records')"))
+    assert "template_id" not in remaining and "template_version" not in remaining
+    assert _one(str(db), "SELECT COUNT(*) AS c FROM patient_records")["c"] == 1
+    assert _one(str(db), "SELECT final_plan FROM patient_records")["final_plan"] == "老师定稿"
+    assert _one(str(db), "SELECT version_num FROM alembic_version")["version_num"] == (
+        "0003_add_agent_stage"
+    )
+
+    # 回退后能再升级 → 往返可用、列定义一致（step 3.5 起由 sign_draft 写入这两列）
+    assert migrations_runner.run_upgrade(db_file=str(db)) is True
+    assert {"template_id", "template_version"} <= set(
+        _names(_read(str(db), "PRAGMA table_info('patient_records')"))
+    )
 

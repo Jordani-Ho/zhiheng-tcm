@@ -3,7 +3,7 @@
 对齐：docs/epic2-agent-stage-design-v1.md §1.2 / §1.3 / §3.4–§3.6 / §4.2 / §7.1-①⑥，
 以及 CTO 2026-09-28 的五项裁决（双闸门 / 服务层 flag / 不回落 content / 钩子两态 / 不吞 sqlite3.Error）。
 
-本文件**只测 DB 层**（§6 的服务层与接口层用例在 step 3–4 于本文件继续追加）：
+本文件**从 DB 层起测**（服务层用例自施工步骤 3.1 起在本文件继续追加，见 ⑬ 组；接口层用例属 step 4）：
     ① 9 个新函数齐备 + 白名单 ↔ 0003 建表列一致 + 「审计表只增」；
     ② 状态表：无行 → None、upsert 幂等、局部更新不清零、白名单拦截、JSON 列中文不转义；
     ③ 审计表：只增写入 + 倒序 + limit 口径 + 必填 event_type；
@@ -27,6 +27,12 @@
        `action_data` / 任务不存在全部一字不改 + 钩子三态（缺席→静默 / 在场→按
        `(teacher_name, to, task_id)` 调用一次 / 抛异常→只打 warn 且**不回滚**老师已落定的决策）
        + 「只有一个两态调用器」与「调用点不判 flag」的源码级守护（CTO step 2.4 追加要求 1–4）。
+
+    ⑬ 【施工步骤 3.1】服务层**骨架**：`agent_stage_store_ready()`（0003 三表齐备 → True；缺一 / 空库 /
+       库文件不在 / 表被改名 / 库不可读 → False；异常吞成 False、绝不建库写库、**不读 flag**、
+       **只看 0003 三表不看 0004 两列**）+ `AgentStageError` 的四键形状（code / msg / errors /
+       warnings 与统一错误体一一对应，且不与 `TemplateError` 混链）。本组**不**断言状态机符号
+       （`current_stage` / `require_capability` / `evaluate` / 三个钩子 …）的缺席 —— 它们属 3.2–3.4。
 
 运行方式（Windows，串行；见 pytest.ini）：
     cd backend
@@ -1390,4 +1396,214 @@ def test_resolve_agent_task_reuses_single_two_state_caller():
 
     assert inspect.getsource(database).count("def _call_agent_stage_hook(") == 1, \
         "两态实现只许一份（改 2b / 改 3 共用同一个调用器）"
+
+
+# ============ ⑬ 【施工步骤 3.1】服务层骨架：存储就绪探针 + 服务层错误类型 ============
+#
+# 本步只收两个**行为完整且可验证**的服务层符号（CTO 放行 3.1 的要求 1–3）：
+#   ① `agent_stage_service.agent_stage_store_ready()`：0003 三表齐备 → True，否则 False；异常吞成
+#      False、绝不建库 / 建表 / 写入、**不读 flag**、只看 0003 三表**不看** 0004 两列；
+#   ② `agent_stage_service.AgentStageError`：code / msg / errors / warnings 四键 = 统一错误体形状。
+# 本组**不**断言状态机符号（`current_stage` / `require_capability` / `evaluate` / 三个钩子 …）的缺席：
+# 它们属施工步骤 3.2–3.4，用一条「现在必须不存在」的用例会把后续子步的落地顺序锁死。
+
+
+def _copy_tested_db(monkeypatch, tmp_path, filename):
+    """把当前 test.db（已迁移到 head）复制一份为可随意改坏的同构库，并把 DB_PATH 指过去。
+
+    用 `sqlite3.Connection.backup()` 而非复制文件：上一条连接可能仍持有库文件，backup 拿到的
+    一定是一致快照（本文件既有的 `_raw_db()` 是「从零造老库」，这里要的是「完整库的副本」）。
+    """
+    target = os.path.join(str(tmp_path), filename)
+    src = sqlite3.connect(database.DB_PATH)
+    try:
+        dst = sqlite3.connect(target)
+        try:
+            src.backup(dst)
+        finally:
+            dst.close()
+    finally:
+        src.close()
+    monkeypatch.setattr(database, "DB_PATH", target)
+    return target
+
+
+def _drop_table(path, table):
+    conn = sqlite3.connect(path)
+    conn.execute("DROP TABLE %s" % table)
+    conn.commit()
+    conn.close()
+
+
+def _table_names(path):
+    conn = sqlite3.connect(path)
+    try:
+        return {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    finally:
+        conn.close()
+
+
+def test_service_store_ready_true_after_full_migration(db):
+    """三表齐备（迁移到 head）→ True；探针本身**零副作用**（跑前跑后的表集合一致）。"""
+    import agent_stage_service
+
+    before = _table_names(database.DB_PATH)
+
+    assert agent_stage_service.agent_stage_store_ready() is True
+
+    assert _table_names(database.DB_PATH) == before, "探针不得建表 / 删表 / 改名（纯只读）"
+
+
+def test_service_store_ready_probe_only_reads_sqlite_master(db, sql_log):
+    """行为级守护「绝不建库 / 建表 / 写入」：全程只发**一条**只读查询。"""
+    import agent_stage_service
+
+    assert agent_stage_service.agent_stage_store_ready() is True
+
+    assert _all_calls(sql_log) == [(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN (?, ?, ?)",
+        agent_stage_service.AGENT_STAGE_STORE_TABLES,
+    )], "探针只许发这一条只读语句（零 DDL / 零写入 / 零 PRAGMA）"
+
+
+def test_service_store_tables_constant_matches_migration_0003():
+    """`AGENT_STAGE_STORE_TABLES` ↔ 迁移 0003 的 `CREATE TABLE IF NOT EXISTS <名>` 逐名对得上。
+
+    与 ① 组「白名单 ↔ 0003 建表列一致」同一手法：常量是探针的唯一真相源，表名一漂移就会把
+    「已就位」误判成 503（或反之），所以直接拿迁移源码交叉断言，不靠人眼。
+    """
+    import agent_stage_service
+
+    path = os.path.join(os.path.dirname(os.path.abspath(database.__file__)),
+                        "alembic", "versions", "0003_add_agent_stage.py")
+    with open(path, encoding="utf-8") as fh:
+        declared = set(re.findall(r"CREATE TABLE IF NOT EXISTS\s+(\w+)", fh.read()))
+
+    assert len(agent_stage_service.AGENT_STAGE_STORE_TABLES) == 3
+    assert set(agent_stage_service.AGENT_STAGE_STORE_TABLES) == declared, \
+        "探针常量与 0003 建表语句不一致：常量=%s 迁移=%s" % (
+            sorted(agent_stage_service.AGENT_STAGE_STORE_TABLES), sorted(declared))
+
+
+@pytest.mark.parametrize("table", ["agent_stage_state", "agent_stage_config", "agent_stage_log"])
+def test_service_store_ready_requires_each_of_the_three_tables(db, monkeypatch, tmp_path, table):
+    """三张表**缺一即 False**（参数化覆盖每一张，防「只看其中一张」的假实现）。"""
+    import agent_stage_service
+
+    assert agent_stage_service.agent_stage_store_ready() is True, "前置：完整库必须 True"
+
+    path = _copy_tested_db(monkeypatch, tmp_path, "missing_%s.db" % table)
+    _drop_table(path, table)
+
+    assert agent_stage_service.agent_stage_store_ready() is False
+
+
+def test_service_store_ready_false_on_empty_db_without_raising(monkeypatch, tmp_path):
+    """0003 未跑（文件在、表不在）→ False 且**不抛**（接口层靠它映射 503；抛出去就变 500）。"""
+    import agent_stage_service
+
+    empty = os.path.join(str(tmp_path), "empty_probe.db")
+    sqlite3.connect(empty).close()                 # 只造文件、不建表（与 ⑦ 组同款）
+    monkeypatch.setattr(database, "DB_PATH", empty)
+
+    assert agent_stage_service.agent_stage_store_ready() is False
+    assert _table_names(empty) == set(), "探针不得顺手建表"
+
+
+def test_service_store_ready_false_when_db_file_missing(monkeypatch, tmp_path):
+    """库文件不存在（误删 / 路径写错）→ 同样 False、不抛。
+
+    口径注：`sqlite3.connect()` 会落地一个 0 字节文件 —— 这是 Epic 1 `template_store_ready()` 的
+    既有行为，故本条只断言「False + 不抛」，不把「不得创建文件」当红线（见本步 docstring 第 3 条）。
+    """
+    import agent_stage_service
+
+    monkeypatch.setattr(database, "DB_PATH", os.path.join(str(tmp_path), "never_created.db"))
+
+    assert agent_stage_service.agent_stage_store_ready() is False
+
+
+def test_service_store_ready_ignores_0004_columns(monkeypatch, tmp_path):
+    """口径②：库只迁到 0003（`patient_records` 尚无 0004 两个引用列）→ **仍为 True**。
+
+    「存储就绪」= 0003 三表；0004 两列只是 ① 指标的追加快照（缺列时按 `template_id = 0` 计入
+    `skipped_no_template`，§3.2）。若把 0004 绑进 503，就把「少一个指标基准」升级成「阶段功能
+    整体不可用」—— 这条用真实库形态把这个分界线钉住。
+    """
+    import agent_stage_service
+
+    scratch = os.path.join(str(tmp_path), "rev_0003.db")
+    monkeypatch.setattr(database, "DB_PATH", scratch)
+    database.init_db()
+    assert migrations_runner.run_upgrade("0003_add_agent_stage", db_file=scratch) is True
+
+    conn = database.get_connection()
+    try:
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info('patient_records')")}
+    finally:
+        conn.close()
+    assert "template_id" not in columns and "template_version" not in columns, \
+        "前置：该库只迁到 0003，0004 的两个引用列必须还不存在"
+
+    assert agent_stage_service.agent_stage_store_ready() is True
+
+
+def test_service_store_ready_mirrors_template_store_ready(db, monkeypatch, tmp_path):
+    """与 Epic 1 先例同口径：同一库形态下两个探针返回同一个布尔（本探针的模板就是它）。"""
+    import agent_stage_service
+    import template_service
+
+    assert agent_stage_service.agent_stage_store_ready() is True
+    assert template_service.template_store_ready() is True
+
+    path = _copy_tested_db(monkeypatch, tmp_path, "mirror.db")
+    _drop_table(path, "agent_stage_state")
+    _drop_table(path, "templates")
+
+    assert agent_stage_service.agent_stage_store_ready() is False
+    assert template_service.template_store_ready() is False
+
+
+def test_service_store_ready_is_independent_of_flag(db, monkeypatch):
+    """口径①：探针**不读 flag** —— off / on / 未设置三种取值下结论必须一致（要求 3 的一部分）。"""
+    import agent_stage_service
+
+    for value in ("off", "on", None):
+        if value is None:
+            monkeypatch.delenv("AGENT_STAGE_ENABLED", raising=False)
+        else:
+            monkeypatch.setenv("AGENT_STAGE_ENABLED", value)
+        assert agent_stage_service.agent_stage_store_ready() is True
+
+
+def test_agent_stage_error_shape_is_unified_error_body():
+    """`AgentStageError` 四键 = 统一错误体 `{error, msg, errors, warnings}`；不与 Epic 1 错误类混链。"""
+    import agent_stage_service
+    import template_service
+
+    exc = agent_stage_service.AgentStageError(
+        "stage_config_invalid", "閾值配置非法",
+        errors=[{"path": "min_samples", "msg": "不在 [1, max_samples]"}])
+
+    assert isinstance(exc, Exception)
+    assert str(exc) == "閾值配置非法" == exc.msg
+    assert set(vars(exc)) == {"code", "msg", "errors", "warnings"}, \
+        "四键必须齐备（接口层按 detail 直出，不必判断某键是否存在）"
+    assert exc.errors == [{"path": "min_samples", "msg": "不在 [1, max_samples]"}]
+    assert exc.warnings == []
+
+    # 缺省口径：None → 空列表（detail 里不允许出现 null）
+    bare = agent_stage_service.AgentStageError("stage_forbidden", "智能體當前為「學習期」")
+    assert bare.errors == [] and bare.warnings == []
+
+    # 浅拷贝：抛错方持有的 list 之后再改，不影响异常对象（接口层改 detail 也不会回写异常）
+    given = [{"path": "a", "msg": "b"}]
+    copied = agent_stage_service.AgentStageError("stage_config_invalid", "x", errors=given)
+    given.append({"path": "c", "msg": "d"})
+    assert len(copied.errors) == 1
+
+    # 与 Epic 1 的错误类「同构 + 各加一对」，但不是同一条继承链（互不复用 / Epic 1 零改动）
+    ref = template_service.TemplateError("templates_disabled", "模板接口未啟用")
+    assert set(vars(ref)) == {"code", "msg"}
+    assert not issubclass(agent_stage_service.AgentStageError, template_service.TemplateError)
 
