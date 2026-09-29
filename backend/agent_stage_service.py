@@ -4,12 +4,19 @@
   - §0.4 枚举与命名对照表（唯一口径，全栈共用）：五阶段枚举 / rank / 繁体徽章 / 能力键
   - §2.3 能力 → 阶段矩阵（L2 判定表，唯一真相源）
   - §4.5-① 本文件的公开符号清单（`STAGES` / `STAGE_RANK` / `STAGE_LABELS` /
-    `CAPABILITIES` / `CAPABILITY_MIN_STAGE`）
+    `CAPABILITIES` / `CAPABILITY_MIN_STAGE`）+ §5.2 第 5 條的总闸
+    （`AGENT_STAGE_ENABLED_VALUES` / `agent_stage_enabled`，施工步骤 2.2 追加）
 
 **本步骤（施工步骤 1：数据底座）的边界**
   - 本文件目前**只放常量数据**：阶段枚举、等级、繁体徽章、能力枚举、能力→阶段矩阵，
     以及由矩阵派生的只读查询表 `CAPABILITY_MATRIX`。
-  - **零业务逻辑、零 DB 访问、零 import、零 DDL**（3 张表由迁移 `0003_add_agent_stage` 建）。
+  - **零 DB 访问、零 DDL**（3 张表由迁移 `0003_add_agent_stage` 建）；唯一的 import 是 stdlib `os`
+    （读总闸环境变量）。本步骤仍是「纯常量 + 一个环境变量判读函数」。
+  - **施工步骤 2.2 追加**（CTO 裁决②「方案 B」）：总闸 `AGENT_STAGE_ENABLED` 的取值语义与
+    `agent_stage_enabled()` 提前落在服务层 —— 与 `template_service.template_api_enabled()`
+    （`template_service.py:898-909`）同一先例：flag 真相源在服务层，接口层与非接口路径一律问服务层。
+    **本文件对 `database` 零 import（模块级与函数级都没有）**：由 `database.py` 反向**函数内延迟
+    import** 本文件（`_agent_stage_snapshot_enabled()`），循环依赖由此彻底断开。
   - 状态机与配置链（`current_stage` / `require_capability` / `DEFAULT_STAGE_CONFIG` /
     `load_stage_config` / `evaluate` / …，见 §4.5-①）属**施工步骤 3**，届时**追加**在本文件末尾，
     **不改**本段任何符号名与取值。
@@ -18,6 +25,8 @@
     `batch_deduct_herbs` / `sign_draft` / `update_draft_content` / `save_prescription`）+
     守护测试保证。本文件永远不得 import 上述任何符号。
 """
+
+import os
 
 # ---------------------------------------------------------------------------
 # 五阶段枚举（§0.4）：顺序固定，**不可跳级**（§1.1：只允许 to_rank - from_rank == 1 的升级）
@@ -106,3 +115,27 @@ CAPABILITY_MATRIX = {
         "generate_predraft": True,
     },
 }
+
+# ---------------------------------------------------------------------------
+# 【§5.2 第 5 條 / §4.2 改 1】总闸 flag —— CTO 裁决②「方案 B」：真相源放服务层
+# ---------------------------------------------------------------------------
+# 与 `template_service.TEMPLATE_API_ENABLED_VALUES` / `template_api_enabled()` 逐字同款
+# （`template_service.py:897-909`），**默认 off**。
+AGENT_STAGE_ENABLED_VALUES = ("on", "1", "true", "yes")
+
+
+def agent_stage_enabled():
+    """总闸 `AGENT_STAGE_ENABLED`：**每次调用现读**（便于灰度切换 / 测试，不必重启 uvicorn）。**默认 off。**
+
+    flag off = 与今天 1:1（§5.5-①）：不写 3 张新表、不写两个快照列、不建请示、不算指标、
+    不改任何既有响应字段、`/api/agent/stage*` 全部 404 —— 既有链路一字不改。
+
+    调用方（施工步骤 2.2 起）：
+      · `database.insert_draft()` / `database.sign_draft()` 的**快照列双闸门**
+        （经 `database._agent_stage_snapshot_enabled()` 函数内延迟 import 取用，方向单向）；
+      · 接口层 `/api/agent/stage*` 的 404 闸门（施工步骤 4）。
+
+    **本函数只读环境变量**：不读库、不打日志、不抛异常、不缓存（读到的永远是当前 env）。
+    """
+    return os.environ.get("AGENT_STAGE_ENABLED", "off").strip().lower() in AGENT_STAGE_ENABLED_VALUES
+

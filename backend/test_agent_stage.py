@@ -12,6 +12,10 @@
     ⑥ 行动日志：新行能被既有 get_agent_action_log（工作台区块直接读的函数）读到；
     ⑦ 裁决⑤ 守正：表未就绪时 sqlite3.Error **冒泡**，不得被吞成 None / 空列表；
     ⑧ step 1 种子（存量老师状态行 / 全局配置行）↔ 本步新读函数 互通。
+    ⑨ 【§4.2 改 1】insert_draft 快照写入：四分支逐条 + **flag off 逐字节比对**（基线 = 改动前实测捕获，
+       非手抄）+ 快照对老师编辑不可变；
+    ⑩ 总闸契约：`agent_stage_service.agent_stage_enabled()` 的取值语义（默认 off）、闸门两态降级，
+       以及「服务层对 database 零 import」的源码级守护（CTO 提醒的循环依赖红线）。
 
 运行方式（Windows，串行；见 pytest.ini）：
     cd backend
@@ -19,7 +23,9 @@
 """
 import json
 import os
+import re
 import sqlite3
+import sys
 
 import pytest
 
@@ -370,4 +376,288 @@ def test_migration_seeded_global_config_row_is_readable(db):
     row = db.get_agent_stage_config_row("")
     assert row is not None
     assert json.loads(row["config_json"]) == {}
+
+
+# ============ ⑨ 【§4.2 改 1】insert_draft：双闸门 + 四分支 + flag off 逐字节 ============
+#
+# 基线来源：本步改动**之前**用同一套 Recorder 实测捕获（只写 %TEMP% 临时库，不碰 zhiheng.db），
+# 断言口径 = 把 insert_draft 实际发给 SQLite 的 **(SQL 文本, 参数) 全序列**逐字节比对 —— 不是
+# 「语义等价」而是「一字不变」。入参固定为 (1, "张三", "李老师", "AI 原稿")，与捕获时同一组。
+
+_BASELINE_FLAG_OFF_WITH_TEMPLATE_REFS = [
+    ("PRAGMA table_info('drafts')", ()),
+    ("INSERT INTO drafts (transcript_id, patient_name, teacher_name, content, signed, template_id, template_version) VALUES (?, ?, ?, ?, ?, ?, ?)",
+     (1, "张三", "李老师", "AI 原稿", 0, 0, 0)),
+    ("UPDATE transcriptions SET processed = 1 WHERE id = ?", (1,)),
+]
+
+_BASELINE_FLAG_OFF_LEGACY = [
+    ("PRAGMA table_info('drafts')", ()),
+    ("INSERT INTO drafts (transcript_id, patient_name, teacher_name, content, signed) VALUES (?, ?, ?, ?, ?)",
+     (1, "张三", "李老师", "AI 原稿", 0)),
+    ("UPDATE transcriptions SET processed = 1 WHERE id = ?", (1,)),
+]
+
+_LEGACY_DRAFTS_DDL = (
+    "CREATE TABLE drafts (id INTEGER PRIMARY KEY AUTOINCREMENT, transcript_id INTEGER, patient_name TEXT, "
+    "teacher_name TEXT, content TEXT, signed INTEGER DEFAULT 0, created_at TEXT DEFAULT '')"
+)
+_SNAPSHOT_ONLY_DRAFTS_DDL = (
+    "CREATE TABLE drafts (id INTEGER PRIMARY KEY AUTOINCREMENT, transcript_id INTEGER, patient_name TEXT, "
+    "teacher_name TEXT, content TEXT, signed INTEGER DEFAULT 0, created_at TEXT DEFAULT '', "
+    "ai_original_content TEXT DEFAULT '')"
+)
+
+
+class _RecordingConnection:
+    """把 `get_connection()` 包一层，录下 insert_draft 实际执行的每一条 (SQL, 参数)。"""
+
+    def __init__(self, conn):
+        self.__dict__["_conn"] = conn
+        self.__dict__["calls"] = []
+
+    def execute(self, sql, params=()):
+        self.__dict__["calls"].append((sql, params))
+        return self.__dict__["_conn"].execute(sql, params)
+
+    def __getattr__(self, name):
+        return getattr(self.__dict__["_conn"], name)
+
+
+@pytest.fixture
+def sql_log(monkeypatch):
+    """录下被测函数执行的全部语句（返回 list[_RecordingConnection]）。"""
+    real = database.get_connection
+    connections = []
+
+    def wrapper():
+        conn = _RecordingConnection(real())
+        connections.append(conn)
+        return conn
+
+    monkeypatch.setattr(database, "get_connection", wrapper)
+    return connections
+
+
+def _all_calls(connections):
+    calls = []
+    for conn in connections:
+        calls.extend(conn.calls)
+    return calls
+
+
+def _insert_call(connections):
+    """取出记录里的那条 INSERT（用于断言分支列集与参数）。"""
+    return [c for c in _all_calls(connections) if c[0].startswith("INSERT INTO drafts")][0]
+
+
+@pytest.fixture
+def legacy_db(monkeypatch, tmp_path):
+    """模拟「迁移 0002 / 0003 都没跑」的老库：`drafts` 只有最早的 5 列。"""
+    return _raw_db(monkeypatch, tmp_path, "legacy.db", _LEGACY_DRAFTS_DDL)
+
+
+def _raw_db(monkeypatch, tmp_path, filename, drafts_ddl):
+    path = tmp_path / filename
+    conn = sqlite3.connect(str(path))
+    conn.execute(drafts_ddl)
+    conn.execute("CREATE TABLE transcriptions (id INTEGER PRIMARY KEY, processed INTEGER DEFAULT 0)")
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(database, "DB_PATH", str(path))
+    return database
+
+
+def test_insert_draft_flag_off_is_byte_identical_with_template_refs(db, sql_log, monkeypatch):
+    """分支②（今天真实路径 · §5.5-① / 裁决①）：flag off 时「探测 + INSERT + UPDATE」逐字节不变。"""
+    monkeypatch.delenv("AGENT_STAGE_ENABLED", raising=False)
+
+    draft_id = db.insert_draft(1, "张三", "李老师", "AI 原稿")
+
+    assert _all_calls(sql_log) == _BASELINE_FLAG_OFF_WITH_TEMPLATE_REFS
+    assert draft_id == 1
+
+
+def test_insert_draft_flag_off_is_byte_identical_on_legacy_db(legacy_db, sql_log, monkeypatch):
+    """分支④（老库无模板引用列）：flag off 时逐字节不变，老库永远走原 5 列。"""
+    monkeypatch.delenv("AGENT_STAGE_ENABLED", raising=False)
+
+    draft_id = legacy_db.insert_draft(1, "张三", "李老师", "AI 原稿")
+
+    assert _all_calls(sql_log) == _BASELINE_FLAG_OFF_LEGACY
+    assert draft_id == 1
+
+
+def test_insert_draft_flag_on_legacy_db_still_uses_original_sql(legacy_db, sql_log, monkeypatch):
+    """双闸门的另一半：列还没就位 → 即使 flag on，**写入语句**仍与原 SQL 逐字节相同。
+
+    与 flag off 的唯一差别：多发一条**只读**的列探测 PRAGMA（`_drafts_supports_ai_original`）。
+    INSERT / UPDATE 的文本与参数一字不变 → 老库不可能被写坏（INSERT 里绝不出现不存在的列）。
+    """
+    monkeypatch.setenv("AGENT_STAGE_ENABLED", "on")
+
+    legacy_db.insert_draft(1, "张三", "李老师", "AI 原稿")
+
+    calls = _all_calls(sql_log)
+    writes = [c for c in calls if not c[0].startswith("PRAGMA")]
+    probes = [c for c in calls if c[0].startswith("PRAGMA")]
+    assert writes == _BASELINE_FLAG_OFF_LEGACY[1:], "INSERT + UPDATE 逐字节不变"
+    assert probes == [("PRAGMA table_info('drafts')", ()), ("PRAGMA table_info('drafts')", ())]
+    assert "ai_original_content" not in writes[0][0]
+
+
+def test_insert_draft_flag_off_leaves_snapshot_column_empty(db, monkeypatch):
+    """flag off：既有 7 列语义一字不改，快照列保持迁移默认值 ''（§5.5-① 断言口径之一）。"""
+    monkeypatch.delenv("AGENT_STAGE_ENABLED", raising=False)
+
+    draft_id = db.insert_draft(1, "张三", "李老师", "AI 原稿", template_id=7, template_version=2)
+
+    conn = db.get_connection()
+    row = conn.execute("SELECT * FROM drafts WHERE id = ?", (draft_id,)).fetchone()
+    conn.close()
+    assert row["content"] == "AI 原稿"
+    assert row["template_id"] == 7 and row["template_version"] == 2
+    assert row["ai_original_content"] == ""
+
+
+def test_insert_draft_flag_on_writes_immutable_snapshot(db, sql_log, monkeypatch):
+    """分支①（flag on 且两列都就位）：同一份 `content` 同时写进快照列（§4.2 改 1）。"""
+    monkeypatch.setenv("AGENT_STAGE_ENABLED", "on")
+
+    draft_id = db.insert_draft(1, "张三", "李老师", "AI 原稿", template_id=7, template_version=2)
+
+    insert_sql, insert_params = _insert_call(sql_log)
+    assert "template_id, template_version, ai_original_content" in insert_sql
+    assert insert_params == (1, "张三", "李老师", "AI 原稿", 0, 7, 2, "AI 原稿")
+
+    conn = db.get_connection()
+    row = conn.execute("SELECT * FROM drafts WHERE id = ?", (draft_id,)).fetchone()
+    conn.close()
+    assert row["ai_original_content"] == "AI 原稿"
+    assert row["signed"] == 0
+
+
+def test_insert_draft_flag_on_writes_snapshot_even_without_template(db, monkeypatch):
+    """分支①的另一半：无模板生成（`template_id=0`）也要写快照 —— ② 指标基准不依赖模板。"""
+    monkeypatch.setenv("AGENT_STAGE_ENABLED", "on")
+
+    draft_id = db.insert_draft(1, "张三", "李老师", "AI 原稿")
+
+    conn = db.get_connection()
+    row = conn.execute("SELECT * FROM drafts WHERE id = ?", (draft_id,)).fetchone()
+    conn.close()
+    assert row["ai_original_content"] == "AI 原稿"
+    assert row["template_id"] == 0 and row["template_version"] == 0
+
+
+def test_insert_draft_branch_snapshot_without_template_refs(monkeypatch, tmp_path, sql_log):
+    """分支③（防御性）：`drafts` 有快照列但**无**模板引用列。
+
+    标准迁移链（0003 的 down_revision = 0002）下不可达，但两个探测彼此独立且各自可能因表结构被手工
+    改动而为假 —— 这条守住「任何组合都不抛 OperationalError」，即四分支矩阵的完备性。
+    """
+    odd_db = _raw_db(monkeypatch, tmp_path, "snapshot_only.db", _SNAPSHOT_ONLY_DRAFTS_DDL)
+    monkeypatch.setenv("AGENT_STAGE_ENABLED", "on")
+
+    draft_id = odd_db.insert_draft(1, "张三", "李老师", "AI 原稿")
+
+    insert_sql, insert_params = _insert_call(sql_log)
+    assert "template_id" not in insert_sql
+    assert "ai_original_content" in insert_sql
+    assert insert_params == (1, "张三", "李老师", "AI 原稿", 0, "AI 原稿")
+
+    conn = odd_db.get_connection()
+    row = conn.execute("SELECT * FROM drafts WHERE id = ?", (draft_id,)).fetchone()
+    conn.close()
+    assert row["ai_original_content"] == "AI 原稿"
+
+
+def test_snapshot_survives_teacher_edit(db, monkeypatch):
+    """§3.3 纪律：快照 = 生成时刻的 content，此后老师编辑**只改 content**，快照一字不变（② 的基准）。"""
+    monkeypatch.setenv("AGENT_STAGE_ENABLED", "on")
+    draft_id = db.insert_draft(1, "张三", "李老师", "AI 原稿", template_id=7, template_version=2)
+
+    db.update_draft_content(draft_id, "老师改后的内容")
+
+    conn = db.get_connection()
+    row = conn.execute("SELECT * FROM drafts WHERE id = ?", (draft_id,)).fetchone()
+    conn.close()
+    assert row["content"] == "老师改后的内容"
+    assert row["ai_original_content"] == "AI 原稿"
+
+
+# ============ ⑩ 总闸契约：取值语义 / 两态降级 / 零循环依赖 ============
+
+def test_agent_stage_flag_semantics(monkeypatch):
+    """§5.2 第 5 條：默认 **off**，取值语义与 `TEMPLATE_API_ENABLED` 逐字同款（去空格 + 小写）。"""
+    import agent_stage_service
+
+    monkeypatch.delenv("AGENT_STAGE_ENABLED", raising=False)
+    assert agent_stage_service.agent_stage_enabled() is False, "未设置 = off（默认关）"
+
+    for value in ("on", "ON", " 1 ", "true", "Yes"):
+        monkeypatch.setenv("AGENT_STAGE_ENABLED", value)
+        assert agent_stage_service.agent_stage_enabled() is True, value
+
+    for value in ("off", "", "0", "no", "enabled", "on!"):
+        monkeypatch.setenv("AGENT_STAGE_ENABLED", value)
+        assert agent_stage_service.agent_stage_enabled() is False, value
+
+
+def test_snapshot_gate_two_state(monkeypatch, capsys):
+    """裁决④「两态」纪律：服务层缺失 / 无该函数 → 静默 off；闸门自己抛异常 → 打 warn 后按 off。
+
+    两种情形都**不得冒泡**（否则会打断既有生成 / 签字链路）—— 这是「不吞 sqlite3.Error」（裁决⑤）
+    的例外边界：吞的是**闸门读取**异常，不是库异常。
+    """
+    import agent_stage_service
+
+    monkeypatch.setenv("AGENT_STAGE_ENABLED", "on")
+    assert database._agent_stage_snapshot_enabled() is True
+
+    monkeypatch.delattr(agent_stage_service, "agent_stage_enabled", raising=False)
+    assert database._agent_stage_snapshot_enabled() is False, "函数不存在 → 静默 off"
+
+    def boom():
+        raise RuntimeError("env 读坏了")
+
+    monkeypatch.setattr(agent_stage_service, "agent_stage_enabled", boom, raising=False)
+    assert database._agent_stage_snapshot_enabled() is False, "闸门抛异常 → 按 off"
+    assert "[warn]" in capsys.readouterr().out, "异常按 off 处理时必须留痕"
+
+    monkeypatch.setitem(sys.modules, "agent_stage_service", None)   # 模拟模块不可导入
+    assert database._agent_stage_snapshot_enabled() is False, "服务层缺失 → 静默 off"
+
+
+def test_snapshot_gate_emits_no_sql_when_flag_off(monkeypatch, sql_log):
+    """flag off 的「零影响」可验证口径：闸门**一条 SQL 都不发**（连列的 PRAGMA 都不探）。
+
+    说明（避免误解）：延迟 import 只能避免「循环依赖」，**不能避免模块被加载** —— 无论 flag 取值，
+    `database` 都会 import 一次 `agent_stage_service`（纯常量 + 一个 env 判读函数，零 DB、零副作用）。
+    要守的硬指标是「既有链路的执行语句序列逐字节不变」（见 ⑨ 组两条比对用例）与「闸门零 SQL」。
+    """
+    monkeypatch.setenv("AGENT_STAGE_ENABLED", "off")
+    conn = database.get_connection()
+
+    gate = database._agent_stage_snapshot_enabled() and database._drafts_supports_ai_original(conn)
+    conn.close()
+
+    assert gate is False
+    assert _all_calls(sql_log) == [], "flag off 时闸门不得发任何 SQL（短路必须发生在列探测之前）"
+
+
+def test_service_module_never_imports_database():
+    """CTO 提醒的循环依赖红线：`agent_stage_service` 对 `database` **零 import**（含函数级）。
+
+    方向恒为单向 `database → agent_stage_service`（且只在函数内延迟），反向由本用例读源码守住。
+    """
+    import agent_stage_service
+
+    source_path = os.path.join(os.path.dirname(os.path.abspath(database.__file__)), "agent_stage_service.py")
+    with open(source_path, encoding="utf-8") as fh:
+        source = fh.read()
+
+    assert not re.search(r"(?m)^\s*(import\s+database\b|from\s+database\b)", source)
+    assert "import_module(" not in source and "__import__(" not in source
+    assert "database" not in vars(agent_stage_service), "运行期也不得把 database 绑进命名空间"
 

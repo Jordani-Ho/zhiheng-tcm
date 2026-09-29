@@ -651,19 +651,77 @@ def _drafts_supports_template_refs(conn):
     return set(_DRAFT_TEMPLATE_REF_COLUMNS) <= columns
 
 
+# 【Epic 2 §4.2 改 1 / §7.1-①】`drafts.ai_original_content` = AI 原始输出的**不可变快照**，由迁移 0003 添加。
+# 写入条件是**双闸门**（CTO 裁决①）：总闸 flag **on** 且 该列已就位；两者任一为假 → 原 SQL 一字不改。
+_DRAFT_AI_SNAPSHOT_COLUMNS = ("ai_original_content",)
+
+
+def _drafts_supports_ai_original(conn):
+    """`drafts.ai_original_content` 是否就位（迁移 0003 未跑 / drafts 未建 → False）。"""
+    try:
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info('drafts')")}
+    except sqlite3.Error:
+        return False
+    return set(_DRAFT_AI_SNAPSHOT_COLUMNS) <= columns
+
+
+def _agent_stage_snapshot_enabled():
+    """总闸 `AGENT_STAGE_ENABLED`（§5.2 第 5 條，**默认 off**）—— 两个快照列（改 1 / 改 2a）的共用闸门。
+
+    真相源在服务层（CTO 裁决②「方案 B」：`agent_stage_service.agent_stage_enabled()`），此处**函数内延迟
+    import**，两个理由：
+      · `agent_stage_service` 对 `database` 零 import（那条依赖已断）→ 本函数反向延迟取用，**无循环依赖**；
+      · 被延迟取用的模块是「纯常量 + 一个 env 判读函数」（零 DB、零副作用），import 本身不改动任何行为；
+        **flag off 时本函数只读 env、一条 SQL 都不发**（调用方必须把它放在列探测之前以短路）→
+        既有链路的执行语句序列与改动前逐字节一致（§5.5-① 硬门槛，测试有逐字节比对）。
+
+    两态纪律（沿用裁决④）：服务层缺失 / 无该函数 → **静默按 off**（闸门不可知时绝不写新列）；
+    闸门自身抛异常 → 打一行 warn 后按 off，**绝不打断**既有生成 / 签字链路。
+    """
+    try:
+        import agent_stage_service
+    except Exception:
+        return False
+    checker = getattr(agent_stage_service, "agent_stage_enabled", None)
+    if not callable(checker):
+        return False
+    try:
+        return bool(checker())
+    except Exception as exc:
+        print(f"[warn] AGENT_STAGE_ENABLED 闸门读取失败，按 off 处理：{exc}")
+        return False
+
+
 def insert_draft(transcript_id, patient_name, teacher_name, content, template_id=0, template_version=0):
     """新增病历草案，返回 draft_id。
 
     【Epic 1 §12.2 第 1 条】前四个位置参数**不变**：老调用方（`seed_test_data.py` 等）原样可跑，
     新增的 `template_id` / `template_version` 缺省 0 = 未记录（老数据 / 无模板生成）。
+
+    【Epic 2 §4.2 改 1】**只追加一个快照列，签名 / 参数顺序 / 返回值一概不变**：
+    双闸门（flag on 且 `drafts.ai_original_content` 列就位）为真时，把**同一份 `content`** 同时写进
+    快照列（= AI 原始输出 = 落库时刻的 content；此后任何老师编辑只改 `content`，快照不可变，§3.3 / §4.2-1）；
+    任一闸门为假 → 走**改动前逐字节一致**的原 SQL（老库 / flag off 两条路都零变化，§5.5-①）。
     """
     conn = get_connection()
-    if _drafts_supports_template_refs(conn):
+    # 【Epic 2 §4.2 改 1 · 双闸门，CTO 裁决①】flag 先判（廉价、零 SQL），再探列：
+    # flag off 时连列的 PRAGMA 都不发 → 「探测 + INSERT + UPDATE」三条语句与改动前逐字节一致（§5.5-① 硬门槛）。
+    ai_snapshot_enabled = _agent_stage_snapshot_enabled() and _drafts_supports_ai_original(conn)
+    supports_template_refs = _drafts_supports_template_refs(conn)
+    if supports_template_refs and ai_snapshot_enabled:           # ① 模板引用列 + 快照列
+        cursor = conn.execute(
+            "INSERT INTO drafts (transcript_id, patient_name, teacher_name, content, signed, "
+            "template_id, template_version, ai_original_content) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (transcript_id, patient_name, teacher_name, content, 0, template_id or 0, template_version or 0, content))
+    elif supports_template_refs:                                # ② 原 7 列：字面量逐字不变
         cursor = conn.execute(
             "INSERT INTO drafts (transcript_id, patient_name, teacher_name, content, signed, "
             "template_id, template_version) VALUES (?, ?, ?, ?, ?, ?, ?)",
             (transcript_id, patient_name, teacher_name, content, 0, template_id or 0, template_version or 0))
-    else:
+    elif ai_snapshot_enabled:                                   # ③ 只有快照列（无模板引用列）
+        cursor = conn.execute("INSERT INTO drafts (transcript_id, patient_name, teacher_name, content, signed, ai_original_content) VALUES (?, ?, ?, ?, ?, ?)",
+                              (transcript_id, patient_name, teacher_name, content, 0, content))
+    else:                                                       # ④ 原 5 列：字面量逐字不变
         cursor = conn.execute("INSERT INTO drafts (transcript_id, patient_name, teacher_name, content, signed) VALUES (?, ?, ?, ?, ?)",
                               (transcript_id, patient_name, teacher_name, content, 0))
     conn.execute("UPDATE transcriptions SET processed = 1 WHERE id = ?", (transcript_id,))
@@ -1581,6 +1639,8 @@ def get_agent_action_log(teacher_name, limit=20):
 #     `None` 只表示「查询成功但没有行」。
 #   · **flag 闸门（AGENT_STAGE_ENABLED）不在本区段**：阶段门控属服务层
 #     （agent_stage_service.agent_stage_enabled），调用方过了闸门才进这里（裁决②）。
+#     库层唯一与总闸打交道的地方是**快照列双闸门** `_agent_stage_snapshot_enabled()`
+#     （定义在 `insert_draft` 上方；改 1 / 改 2a 共用；**函数内延迟 import** 服务层，断开循环依赖）。
 #   · 审计表 agent_stage_log 只提供 insert + get，**永不提供 update / delete**
 #     → 「只增」由代码层强制，不靠约定（§1.3）。
 #   · 共 8 + 1 个函数：+1 是 insert_agent_action_log —— §4.5-① 已把该函数列为服务层可调用的
