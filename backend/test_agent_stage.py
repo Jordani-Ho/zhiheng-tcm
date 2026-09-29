@@ -57,6 +57,19 @@
        `get_agent_stage_log_stats`（§6.3-27 的 ③ 占位键亦同）属 **3.4-b**，本组**不**断言它们的缺席
        —— 与 ⑬ ⑭ ⑮ 组同一纪律。
 
+    ⑰ 【施工步骤 3.4-b】**判定层**：`evaluate()`（§3.6 `can_recommend` + §3.8 失败方向）+
+       `stage_config_source()`（§3.4 第 4 条）+ 库层只读统计 `database.get_agent_stage_log_stats`
+       （批复 C-2：越权计数 + 推荐冷却）。CTO 八条约束逐条钉住：
+       ① 三块各有契约用例；② `evaluate()` 首行 flag 闸门（off → 零 SQL、零写入）；
+       ③ **绝不向上写 `stage`**（AST 数 `stage=` 关键字实参恰好 1 处、只在 `_ensure_state_row()`、
+       值恒为 `view["stage"]` → 零 delta；另配「有行老师 `stage` / `stage_since` / `stage_source`
+       评估前后逐字节不变」与「无行老师生效阶段 + 权限面不变」两条行为级断言）；
+       ④ 十条判定逐条进 `blockers`（`value=None` / `pending_stage` / 冷却期三条各有专项）；
+       ⑤ `pending_stage` 与 `pending_task_id` **成对**写（先 state 后建单 + 建单抛异常不留半对）；
+       ⑥ `stage_config_source()` 与 `load_stage_config` **同源**（同一层走读 + 调用点唯一守护）；
+       ⑦ `agent_action_log` 只在推荐建单时写（无推荐的评估一行都不写）；⑧ 阈值改了判定就变。
+       本组**不改** ⑬–⑯ 组一行，只复用它们的造数 / 断言助手。
+
 
 运行方式（Windows，串行；见 pytest.ini）：
     cd backend
@@ -3253,4 +3266,761 @@ def test_get_draft_samples_bad_input_is_safe(db):
     assert database.get_draft_samples("", 90, 10) == []
     assert len(database.get_draft_samples(TEACHER, "不是數字", 1)) == 1
     assert len(database.get_draft_samples(TEACHER, None, None)) == 1
+
+
+# ============ ⑰ 【施工步骤 3.4-b】判定层：evaluate / stage_config_source / 审计统计 ============
+#
+# CTO 2026-09-29 放行 step 3.4-b 的八条约束，本组逐条落地（本组即「⑰ 组」）：
+#   ① 施工顺序（库层统计 → 配置来源 → evaluate）→ 三块各有契约用例；
+#   ② `evaluate()` 首行 flag 闸门：flag off → **零 SQL、零写入**（语句级 + 五张表零增量）；
+#   ③ **绝不向上写 `stage`**：AST 数 `stage=` 关键字实参 = 1（只在 `_ensure_state_row()`、
+#      值恒为 `view["stage"]` 的零 delta 形态）+ 两条行为级断言（有行老师逐字节不变 /
+#      无行老师生效阶段与权限面不变）；
+#   ④ `can_recommend` 十条全真才推荐、逐条进 `blockers`（`value=None` / `pending_stage` /
+#      冷却期三条有专项；越权 / 违规 / 最高阶段 / 放宽态各一条）；
+#   ⑤ `pending_stage` / `pending_task_id` **成对写**：先 state 后建单（语句顺序）+ 建单抛异常
+#      → 不留半对（monkeypatch 钉住）；
+#   ⑥ `stage_config_source()` 口径：行存在性 / env 白名单 + 采纳 / 与 `load_stage_config` 同源；
+#   ⑦ `agent_action_log` 写点克制：推荐建单写一行、无推荐的评估**一行都不写**；
+#   ⑧ 阈值改了判定就变（`min_template_match` 0.99 → 0.7）。
+#
+# 本组**不改** ⑬–⑯ 组一行：只复用它们的造数 / 断言助手（`_raw_execute` / `_raw_scalar` /
+# `_put_raw_state_row` / `_drop_table` / `sql_log` / `_all_calls` / `_table_counts` /
+# `_publish_record_template` / `_seed_draft` / `_seed_record` / `_PERFECT_DRAFT` /
+# `_OUT_OF_ORDER_DRAFT`）。造数一律走裸 sqlite3 或库层真实写函数（⑭ 组既有口径）。
+
+# `evaluate()` 返回体的**逐键**契约（18 键快照 + `changed`；短路体同形状）
+_EVALUATE_SNAPSHOT_KEYS = (
+    "teacher_name", "skipped", "reason",
+    "stage", "stage_label", "stage_since", "stage_source", "pending_stage", "pending_task_id",
+    "degraded", "metrics", "metrics_reason", "thresholds", "config_source", "next_stage",
+    "blockers", "evaluated_at", "metrics_ttl_hours",
+)
+
+# 「AI 填了 `teacher` 段」的违规样本（§3.2：该样本 `match = 0`、`violations + 1`）
+_VIOLATING_DRAFT = _PERFECT_DRAFT.replace("（留待老師）", "舌紅苔薄白")
+
+# 内置默认阈值（用例改配置时会显式覆盖；断言优先读返回体的 `thresholds` 回显）
+_MIN_TEMPLATE_MATCH = 0.75
+_MIN_MODIFICATION = 0.80
+
+
+@pytest.fixture
+def stage_gate(monkeypatch):
+    """⑰ 组公共前置：打开总闸（`evaluate()` 的第一道门）+ Epic 1 病歷模板通道（① 的基准）。"""
+    monkeypatch.setenv("AGENT_STAGE_ENABLED", "on")
+    monkeypatch.setenv("TEMPLATE_API_ENABLED", "on")
+
+
+def _seed_ready_for_recommendation(teacher=TEACHER):
+    """造「十条全真」的前置：满分草案 + 满分病历 + `min_samples = 1` 的老师配置行。
+
+    样本只有 1 份（默认 `min_samples = 5` 要 5 份草案 + 5 份病历），本组只关心判定链路，
+    故把门槛调到 1；样本量不足的情形另有专门用例（`samples_below_minimum`）。
+    返回 `(template_id, draft_id, record_id)`。
+    """
+    database.upsert_agent_stage_config(teacher, {"min_samples": 1})
+    template_id = _publish_record_template(teacher=teacher)
+    draft_id = _seed_draft(_PERFECT_DRAFT, template_id, teacher=teacher)
+    record_id = _seed_record(_PERFECT_DRAFT, _PERFECT_DRAFT, template_id, teacher=teacher)
+    return template_id, draft_id, record_id
+
+
+# ---- 闸门 ①：flag 闸门（约束 2）与返回体形状 ----
+
+def test_evaluate_flag_off_is_zero_sql_and_zero_writes(db, sql_log, monkeypatch, capsys):
+    """CTO 约束 2：`evaluate()` **首行**就是总闸 —— flag off → 立即返回（零 SQL、零写入）。
+
+    §5.1 红线① 的语义：开关关了，评估链不许成为「新表还在长」的缺口。
+    """
+    import agent_stage_service
+
+    monkeypatch.delenv("AGENT_STAGE_ENABLED", raising=False)
+    before = _table_counts()
+    marker = len(_all_calls(sql_log))
+
+    result = agent_stage_service.evaluate(TEACHER)
+
+    assert _all_calls(sql_log)[marker:] == [], "flag off 必须零查詢（连一次 SELECT 都不许）"
+    assert _table_counts() == before, "flag off 必须零写入"
+    assert result["skipped"] is True
+    assert result["reason"] == "agent_stage_disabled"
+    assert result["blockers"] == ["agent_stage_disabled"]
+    assert result["changed"] == {"stage_changed": False, "recommended": False, "demoted": False,
+                                 "reason": "agent_stage_disabled"}
+    assert set(result) == set(_EVALUATE_SNAPSHOT_KEYS) | {"changed"}
+    assert result["config_source"] == {"global": False, "teacher_override": False,
+                                       "env_override": []}
+    assert result["thresholds"] == {} and result["evaluated_at"] == ""
+    assert result["metrics_reason"] == {"inquiry_preference_consistency": "deferred_to_epic3"}
+    assert result["metrics"]["template_match"]["blockers"] == ["agent_stage_disabled"]
+    assert "未啟用" in capsys.readouterr().out
+
+
+def test_evaluate_without_teacher_name_is_rejected_with_zero_sql(db, sql_log, monkeypatch):
+    """空 `teacher_name` = 无效调用（接口层本来就 400 `teacher_required`）：直接跳过，
+    **绝不**给状态表写一行 `teacher_name=''` 的垃圾行。"""
+    import agent_stage_service
+
+    monkeypatch.setenv("AGENT_STAGE_ENABLED", "on")
+    before = _table_counts()
+    marker = len(_all_calls(sql_log))
+
+    result = agent_stage_service.evaluate("")
+
+    assert _all_calls(sql_log)[marker:] == []
+    assert _table_counts() == before
+    assert database.get_agent_stage_state("") is None
+    assert result["skipped"] is True and result["reason"] == "teacher_required"
+
+
+def test_evaluate_short_circuit_shape_matches_normal_path(db, monkeypatch):
+    """短路体与正常体**逐键同形**（前端 / 接口层不必为 flag off 或失败分支写第二套渲染）。"""
+    import agent_stage_service
+
+    monkeypatch.delenv("AGENT_STAGE_ENABLED", raising=False)
+    short = agent_stage_service.evaluate(TEACHER)
+
+    monkeypatch.setenv("AGENT_STAGE_ENABLED", "on")
+    _put_raw_state_row(TEACHER, "learning")
+    full = agent_stage_service.evaluate(TEACHER)
+
+    assert set(short) == set(full) == set(_EVALUATE_SNAPSHOT_KEYS) | {"changed"}
+    for key in ("metrics", "metrics_reason", "changed"):
+        assert set(short[key]) == set(full[key]), key
+    assert set(short["metrics"]["template_match"]) == set(full["metrics"]["template_match"])
+    assert set(short["metrics"]["modification_consistency"]) == \
+        set(full["metrics"]["modification_consistency"])
+
+
+def test_evaluate_third_metric_is_null_placeholder(db, stage_gate):
+    """§6.3-27：③ `inquiry_preference_consistency` 恒为 `null` + `reason = deferred_to_epic3`；
+    ①② 的阈值一并回显（`thresholds`），前端据此逐条解释「差多少」。"""
+    import agent_stage_service
+
+    _put_raw_state_row(TEACHER, "learning")
+    _publish_record_template()
+
+    result = agent_stage_service.evaluate(TEACHER)
+
+    assert result["metrics"]["inquiry_preference_consistency"] is None
+    assert result["metrics_reason"] == {"inquiry_preference_consistency": "deferred_to_epic3"}
+    assert set(result["metrics"]) == {"template_match", "modification_consistency",
+                                      "inquiry_preference_consistency"}
+    assert result["thresholds"]["min_template_match"] == _MIN_TEMPLATE_MATCH
+    assert result["thresholds"]["min_modification_consistency"] == _MIN_MODIFICATION
+    assert result["thresholds"]["min_samples"] == 5
+    assert result["metrics"]["template_match"]["value"] is None
+    assert result["metrics"]["template_match"]["blockers"] == ["template_match_no_samples"]
+
+
+# ---- 约束 3：绝不向上写 stage（AST 守护 + 两条行为级断言）----
+
+def test_evaluate_stage_write_point_is_pinned_to_the_zero_delta_helper():
+    """CTO 约束 3 的**精确形态**：服务层的 `stage=` 关键字实参**恰好 1 处**，只在
+    `_ensure_state_row()` 里、值表达式恒为 `view["stage"]`（评估前 `describe_stage()` 已报告的
+    同一个阶段 → 零 delta）。`pending_stage=` / `from_stage=` / `to_stage=` 是别的形参名，
+    AST 精确匹配不计入；3.4-c 落地「唯一向上写路径」后本断言改为 2。
+    """
+    import ast
+    import inspect
+
+    import agent_stage_service
+
+    tree = ast.parse(inspect.getsource(agent_stage_service))
+    keywords = [node for node in ast.walk(tree)
+                if isinstance(node, ast.keyword) and node.arg == "stage"]
+    assert len(keywords) == 1, \
+        "3.4-b 期间 stage= 写入点必须恰好 1 处，实测行号 %r" % [n.lineno for n in keywords]
+
+    lines, start = inspect.getsourcelines(agent_stage_service._ensure_state_row)
+    assert keywords[0].lineno in range(start, start + len(lines)), \
+        "唯一的 stage= 写入点只许在 _ensure_state_row() 里（别处出现就是「向上写」）"
+
+    assert ast.dump(keywords[0].value) == ast.dump(ast.parse('view["stage"]', mode="eval").body), \
+        "写入值必须是「评估前读到的阶段」本身（零 delta），不得是别的表达式"
+
+    for name in ("evaluate", "_evaluate", "_recommend_upgrade", "stage_config_source"):
+        body = ast.parse(inspect.getsource(getattr(agent_stage_service, name)))
+        assert [node.lineno for node in ast.walk(body)
+                if isinstance(node, ast.keyword) and node.arg == "stage"] == [], name
+
+
+def test_evaluate_never_self_upgrades_after_recommendation(db, stage_gate):
+    """§6.1-4 + 约束 3：达标后 `stage` **不变**，只新增 `pending_stage` 与一条 pending 请示；
+    有行老师的 `stage_since` / `stage_source` 逐字节不变（`_ensure_state_row` 一个字段都不碰）。"""
+    import agent_stage_service
+
+    _put_raw_state_row(TEACHER, "learning")
+    _seed_ready_for_recommendation()
+
+    result = agent_stage_service.evaluate(TEACHER)
+
+    row = database.get_agent_stage_state(TEACHER)
+    assert row["stage"] == "learning", "评估绝不自我升阶（§3.6 / §6.1-4）"
+    assert row["stage_since"] == "" and row["stage_source"] == "default"
+    assert result["changed"]["stage_changed"] is False
+    assert result["changed"]["recommended"] is True
+    assert row["pending_stage"] == "apprentice"
+    assert row["pending_task_id"] == result["pending_task_id"] != 0
+    assert result["next_stage"] == "apprentice"
+    assert result["blockers"] == []
+
+
+def test_evaluate_keeps_effective_stage_for_teacher_without_state_row(db, stage_gate):
+    """§1.5 ③（无状态行 = 未初始化）+ 约束 3 的 fail-safe 形态：评估只在**无行时**补一次
+    兜底阶段 → 生效阶段与权限面在评估前后完全一致（不会被状态表的 DDL 默认 `observation`
+    静默降一级、把既有 `generate_draft` 收回）。"""
+    import agent_stage_service
+
+    before = agent_stage_service.current_stage(TEACHER)
+    assert before == "learning", "无行老师的兜底阶段来自配置链的 default_stage"
+    assert database.get_agent_stage_state(TEACHER) is None
+    assert agent_stage_service.require_capability(TEACHER, "generate_draft") is True
+
+    result = agent_stage_service.evaluate(TEACHER)
+
+    row = database.get_agent_stage_state(TEACHER)
+    assert row["stage"] == before, "评估不得改掉未初始化老师的生效阶段（零 delta）"
+    assert row["stage_source"] == "default" and row["stage_since"] == ""
+    assert agent_stage_service.current_stage(TEACHER) == before
+    assert agent_stage_service.require_capability(TEACHER, "generate_draft") is True
+    assert result["stage"] == before and result["degraded"] is False
+
+
+# ---- 约束 4：十条判定逐条进 blockers（空值 / pending / 冷却 各有专项）----
+
+def test_evaluate_null_metrics_block_recommendation(db, stage_gate):
+    """CTO 约束 4 专项（①/② 空值）：`value is None`（**不是 0 分**）阻断推荐 ——
+    原因用「没有证据」表达（`*_no_samples`），并叠加 `samples_below_minimum`。"""
+    import agent_stage_service
+
+    _put_raw_state_row(TEACHER, "learning")
+    _publish_record_template()          # ① 有基准、一份样本都没有
+    database.upsert_agent_stage_config(TEACHER, {"min_samples": 1})
+
+    result = agent_stage_service.evaluate(TEACHER)
+
+    assert result["blockers"] == ["template_match_no_samples",
+                                  "modification_consistency_no_samples",
+                                  "samples_below_minimum"]
+    assert result["metrics"]["template_match"]["value"] is None
+    assert result["metrics"]["modification_consistency"]["value"] is None
+    assert result["changed"]["recommended"] is False
+    assert result["changed"]["reason"] == "blocked"
+    row = database.get_agent_stage_state(TEACHER)
+    assert (row["pending_stage"], row["pending_task_id"]) == ("", 0)
+    assert database.find_pending_upgrade_task(TEACHER) is None
+    assert _raw_scalar("SELECT COUNT(*) FROM agent_tasks") == 0
+
+
+def test_evaluate_without_active_template_reports_basis_not_score(db, stage_gate):
+    """口径 A：此刻没有生效 `record` 模板 → ① 无基准 → `no_active_record_template`
+    （**不是 0 分**：0 分会变成「智能体不守模板」的错误指控）。"""
+    import agent_stage_service
+
+    _put_raw_state_row(TEACHER, "learning")
+
+    result = agent_stage_service.evaluate(TEACHER)
+
+    assert result["blockers"] == ["no_active_record_template",
+                                  "modification_consistency_no_samples",
+                                  "samples_below_minimum"]
+    assert result["metrics"]["template_match"]["value"] is None
+
+
+def test_evaluate_pending_recommendation_blocks_and_is_not_duplicated(db, stage_gate):
+    """CTO 约束 4 专项（`pending_stage`）：已有未确认的推荐 → 阻断（不重复建单），
+    回显的 `pending_*` 仍是**状态行里的那一对**（前端继续显示「⏳ 待你确认」）。"""
+    import agent_stage_service
+
+    _put_raw_state_row(TEACHER, "learning", pending_stage="apprentice", pending_task_id=42)
+    _seed_ready_for_recommendation()
+
+    result = agent_stage_service.evaluate(TEACHER)
+
+    assert result["blockers"] == ["upgrade_pending"]
+    assert result["pending_stage"] == "apprentice" and result["pending_task_id"] == 42
+    row = database.get_agent_stage_state(TEACHER)
+    assert (row["pending_stage"], row["pending_task_id"]) == ("apprentice", 42)
+    assert result["metrics"]["template_match"]["value"] == pytest.approx(1.0), "指标本身是达标的"
+    assert _raw_scalar("SELECT COUNT(*) FROM agent_tasks") == 0
+
+
+def test_evaluate_cooldown_blocks_and_config_clears_it(db, stage_gate):
+    """CTO 约束 4 专项（冷却期）：上次「被拒」未满 `recommend_cooldown_hours` → 阻断；
+    把冷却调到 0 → 立刻不阻断（冷却时长是配置，不是硬编码）。"""
+    import agent_stage_service
+
+    _put_raw_state_row(TEACHER, "learning")
+    _seed_ready_for_recommendation()
+    database.insert_agent_stage_log(TEACHER, "upgrade_declined", from_stage="learning",
+                                    detail="老師拒絕了升級推薦")
+
+    blocked = agent_stage_service.evaluate(TEACHER)
+
+    assert blocked["blockers"] == ["cooldown_active"]
+    assert blocked["metrics"]["template_match"]["value"] == pytest.approx(1.0)
+
+    database.upsert_agent_stage_config(TEACHER, {"min_samples": 1, "recommend_cooldown_hours": 0})
+    allowed = agent_stage_service.evaluate(TEACHER)
+
+    assert allowed["blockers"] == []
+    assert allowed["changed"]["recommended"] is True
+
+
+def test_evaluate_permission_denial_in_window_blocks_upgrade(db, stage_gate):
+    """§6.2-19：窗口内 1 次越权 + 指标全达标 → 不推荐（`blockers` 含 §2.4 的契约名
+    `permission_denied_in_window`）；`max_permission_denials` 调到 1 → 放行。"""
+    import agent_stage_service
+
+    _put_raw_state_row(TEACHER, "learning")
+    _seed_ready_for_recommendation()
+    database.insert_agent_stage_log(TEACHER, "permission_denied", from_stage="learning",
+                                    capability="predict_pattern", detail="智能體越權被拒")
+
+    blocked = agent_stage_service.evaluate(TEACHER)
+
+    assert "permission_denied_in_window" in blocked["blockers"]
+    assert blocked["changed"]["recommended"] is False
+
+    database.upsert_agent_stage_config(TEACHER, {"min_samples": 1, "max_permission_denials": 1})
+    allowed = agent_stage_service.evaluate(TEACHER)
+
+    assert "permission_denied_in_window" not in allowed["blockers"]
+    assert allowed["changed"]["recommended"] is True
+
+
+def test_evaluate_violations_block_and_are_counted(db, stage_gate):
+    """§3.2 铁律违规（AI 填了 `writable_by='teacher'` 的段）→ ① 该样本 `match = 0`、
+    `violations + 1`；`max_violations = 0` 时阻断推荐（§3.7 `rule_reset` 的同一信号）。"""
+    import agent_stage_service
+
+    _put_raw_state_row(TEACHER, "learning")
+    database.upsert_agent_stage_config(TEACHER, {"min_samples": 1})
+    template_id = _publish_record_template()
+    _seed_draft(_VIOLATING_DRAFT, template_id)
+
+    result = agent_stage_service.evaluate(TEACHER)
+
+    assert result["metrics"]["template_match"]["violations"] == 1
+    assert result["metrics"]["template_match"]["value"] == pytest.approx(0.0)
+    assert "violations_exceeded" in result["blockers"]
+    assert "template_match_below_threshold" in result["blockers"]
+    assert result["changed"]["recommended"] is False
+    assert _raw_scalar("SELECT COUNT(*) FROM agent_tasks") == 0
+
+
+def test_evaluate_samples_below_minimum_blocks(db, stage_gate):
+    """口径 E `samples >= min_samples`：指标可以达标（1 份满分），但样本数不够 → 阻断。"""
+    import agent_stage_service
+
+    _put_raw_state_row(TEACHER, "learning")
+    template_id = _publish_record_template()
+    _seed_draft(_PERFECT_DRAFT, template_id)
+    _seed_record(_PERFECT_DRAFT, _PERFECT_DRAFT, template_id)
+
+    result = agent_stage_service.evaluate(TEACHER)      # min_samples 用内置默认 5
+
+    assert result["metrics"]["template_match"]["value"] == pytest.approx(1.0)
+    assert result["metrics"]["modification_consistency"]["value"] == pytest.approx(1.0)
+    assert result["metrics"]["template_match"]["samples"] == 2
+    assert result["metrics"]["modification_consistency"]["samples"] == 1
+    assert result["blockers"] == ["samples_below_minimum"]
+    assert result["changed"]["recommended"] is False
+
+
+def test_evaluate_authorized_teacher_gets_null_next_stage(db, stage_gate):
+    """§3.6：已是最高阶段 → `next_stage = None` + `already_authorized`
+    （不做「还能升到哪」的假设，也不建单）。"""
+    import agent_stage_service
+
+    _put_raw_state_row(TEACHER, "authorized")
+    _seed_ready_for_recommendation()
+
+    result = agent_stage_service.evaluate(TEACHER)
+
+    assert result["stage"] == "authorized"
+    assert result["next_stage"] is None
+    assert result["blockers"] == ["already_authorized"]
+    assert result["changed"]["recommended"] is False
+    assert _raw_scalar("SELECT COUNT(*) FROM agent_tasks") == 0
+
+
+def test_evaluate_matrix_relaxed_never_recommends_upgrade(db, stage_gate):
+    """§2.5：`matrix_enforced=false` 是临时运维闸（放宽方向）→ 该状态下不推荐升级。"""
+    import agent_stage_service
+
+    _put_raw_state_row(TEACHER, "learning")
+    seed = _seed_ready_for_recommendation()
+    database.upsert_agent_stage_config(TEACHER, {"min_samples": 1, "matrix_enforced": False})
+    assert seed, "样本已就绪（指标达标）—— 阻断只可能来自 matrix_relaxed"
+
+    result = agent_stage_service.evaluate(TEACHER)
+
+    assert result["blockers"] == ["matrix_relaxed"]
+    assert result["changed"]["recommended"] is False
+    assert _raw_scalar("SELECT COUNT(*) FROM agent_tasks") == 0
+
+
+def test_evaluate_second_call_is_deduped_by_pending_and_cooldown(db, stage_gate):
+    """§6.1-7：连续两次 `evaluate()` → 请示只有 1 条（第二次被 `pending_stage` + 冷却挡住）。"""
+    import agent_stage_service
+
+    _put_raw_state_row(TEACHER, "learning")
+    _seed_ready_for_recommendation()
+
+    first = agent_stage_service.evaluate(TEACHER)
+    second = agent_stage_service.evaluate(TEACHER)
+
+    assert first["changed"]["recommended"] is True
+    assert second["changed"]["recommended"] is False
+    assert "upgrade_pending" in second["blockers"]
+    assert "cooldown_active" in second["blockers"], "刚推荐过 → 冷却期也必须挡住"
+    assert _raw_scalar("SELECT COUNT(*) FROM agent_tasks WHERE status = 'pending'") == 1
+    assert database.get_agent_stage_state(TEACHER)["pending_task_id"] == first["pending_task_id"]
+
+
+# ---- 约束 5 / 7：推荐建单（先 state 后建单、成对、留痕克制）----
+
+def test_evaluate_recommendation_writes_state_before_task_and_keeps_pair(db, stage_gate, sql_log):
+    """约束 5：**先**写 state（`pending_stage` 一对的一半）→ **后**建请示 → 再把真 `task_id`
+    写回（语句顺序 + 成对断言）；§3.6 step 3 的请示字段与 `action_data` 形状逐项钉住。"""
+    import agent_stage_service
+
+    _put_raw_state_row(TEACHER, "learning")
+    _seed_ready_for_recommendation()
+    marker = len(_all_calls(sql_log))
+
+    result = agent_stage_service.evaluate(TEACHER)
+
+    calls = _all_calls(sql_log)[marker:]
+    pending_writes = [index for index, (sql, _params) in enumerate(calls)
+                      if sql.startswith("INSERT INTO agent_stage_state") and "pending_stage" in sql]
+    task_writes = [index for index, (sql, _params) in enumerate(calls)
+                   if sql.startswith("INSERT INTO agent_tasks")]
+    assert pending_writes and len(task_writes) == 1, calls
+    assert pending_writes[0] < task_writes[0], "约束 5：先写 state（pending_stage）再建单"
+
+    row = database.get_agent_stage_state(TEACHER)
+    assert (row["pending_stage"], row["pending_task_id"]) == \
+        ("apprentice", result["pending_task_id"])
+
+    task = database.find_pending_upgrade_task(TEACHER)
+    assert task["id"] == result["pending_task_id"]
+    assert (task["task_type"], task["category"], task["status"]) == ("request", "agent", "pending")
+    assert task["title"] == "智能體可升入「見習期」"
+    assert "模板匹配度 100%（達標 75%）" in task["content"]
+    assert "病歷修改一致率 100%（達標 80%）" in task["content"]
+    assert "樣本 1 份" in task["content"] and "你可隨時降級" in task["content"]
+
+    action = task["action"]
+    assert action["action"] == "upgrade_agent_stage"
+    assert (action["from"], action["to"]) == ("learning", "apprentice")
+    assert action["config_source"] == result["config_source"]
+    assert set(action["metrics"]) == {"template_match", "modification_consistency",
+                                      "inquiry_preference_consistency"}
+    assert action["metrics"]["inquiry_preference_consistency"] is None
+
+
+def test_evaluate_recommendation_logs_stage_event_and_action_log(db, stage_gate):
+    """§3.6 step 3 的两条痕：`upgrade_recommended`（带 `task_id` 与指标快照）+
+    `agent_action_log`（工作台「行动日志」区块直接显示的人话）；`evaluation` 每次评估都写。"""
+    import agent_stage_service
+
+    _put_raw_state_row(TEACHER, "learning")
+    _seed_ready_for_recommendation()
+
+    result = agent_stage_service.evaluate(TEACHER)
+
+    events = database.get_agent_stage_logs(TEACHER)
+    assert [event["event_type"] for event in events] == ["evaluation", "upgrade_recommended"]
+    evaluation, recommended = events
+    assert evaluation["task_id"] == result["pending_task_id"]
+    assert evaluation["from_stage"] == "learning" and evaluation["to_stage"] == ""
+    assert evaluation["capability"] == ""
+    assert "已推薦升入「見習期」" in evaluation["detail"]
+    assert json.loads(evaluation["metrics_json"])["template_match"]["value"] == pytest.approx(1.0)
+
+    assert recommended["task_id"] == result["pending_task_id"]
+    assert recommended["from_stage"] == "learning"
+    assert "智能體推薦升級至「見習期」" in recommended["detail"]
+
+    actions = database.get_agent_action_log(TEACHER)
+    assert [item["action"] for item in actions] == ["recommend_upgrade"]
+    assert actions[0]["task_id"] == result["pending_task_id"]
+    assert "智能體推薦升級至「見習期」" in actions[0]["detail"]
+
+
+def test_evaluate_without_recommendation_writes_no_action_log(db, stage_gate, sql_log):
+    """约束 7：`agent_action_log` 只在「推荐建单」写 —— 无推荐的评估**一行都不写**；
+    写入面恰好是「指标快照 + `evaluation` 审计」两条。"""
+    import agent_stage_service
+
+    _put_raw_state_row(TEACHER, "learning")
+    _publish_record_template()          # ① 有基准、无样本 → 不推荐
+    marker = len(_all_calls(sql_log))
+
+    result = agent_stage_service.evaluate(TEACHER)
+
+    written = [sql for sql, _params in _all_calls(sql_log)[marker:]
+               if not sql.lstrip().upper().startswith(("SELECT", "PRAGMA"))]
+    assert len(written) == 2, written
+    assert sum(1 for sql in written if sql.startswith("INSERT INTO agent_stage_state")) == 1
+    assert sum(1 for sql in written if sql.startswith("INSERT INTO agent_stage_log")) == 1
+    assert not any("agent_action_log" in sql or "agent_tasks" in sql for sql in written)
+    assert database.get_agent_action_log(TEACHER) == []
+    assert database.find_pending_upgrade_task(TEACHER) is None
+
+    row = database.get_agent_stage_state(TEACHER)
+    assert row["last_evaluated_at"] == result["evaluated_at"] != ""
+    snapshot = json.loads(row["last_metrics_json"])
+    assert "changed" not in snapshot, "口径 D：落库的快照不含 changed（它属于返回体）"
+    assert snapshot["reason"] == "blocked"
+    assert snapshot["metrics"]["template_match"]["value"] is None
+
+
+def test_evaluate_snapshot_matches_returned_body(db, stage_gate):
+    """口径 D：`last_metrics_json` = 返回体去掉 `changed`（逐键一致），`last_evaluated_at` =
+    返回体的 `evaluated_at` → 前端 `GET` 直读快照与刚评估完的返回体**不会两套口径**。"""
+    import agent_stage_service
+
+    _put_raw_state_row(TEACHER, "learning")
+    _seed_ready_for_recommendation()
+
+    result = agent_stage_service.evaluate(TEACHER)
+
+    row = database.get_agent_stage_state(TEACHER)
+    snapshot = json.loads(row["last_metrics_json"])
+    assert set(snapshot) == set(_EVALUATE_SNAPSHOT_KEYS)
+    assert snapshot == {key: value for key, value in result.items() if key != "changed"}
+    assert row["last_evaluated_at"] == result["evaluated_at"]
+    assert result["changed"]["recommended"] is True
+    assert snapshot["pending_stage"] == "apprentice", "落库快照含推荐后的最终状态（只落一次）"
+
+
+def test_evaluate_task_insert_failure_leaves_no_half_pair(db, stage_gate, monkeypatch, capsys):
+    """约束 5（失败分支）：建单抛异常 → 立刻清空 `pending_stage` / `pending_task_id` ——
+    **不留半对**（「有 pending_stage 却查不到请示」会让老师端的 ✅ 永远点不出结果）。"""
+    import agent_stage_service
+
+    _put_raw_state_row(TEACHER, "learning")
+    _seed_ready_for_recommendation()
+
+    def boom(*args, **kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(database, "insert_agent_stage_upgrade_task", boom)
+
+    result = agent_stage_service.evaluate(TEACHER)
+
+    row = database.get_agent_stage_state(TEACHER)
+    assert (row["pending_stage"], row["pending_task_id"]) == ("", 0), "不许留半对"
+    assert row["stage"] == "learning" and row["stage_source"] == "default"
+    assert result["changed"] == {"stage_changed": False, "recommended": False, "demoted": False,
+                                 "reason": "recommend_task_write_failed"}
+    assert result["blockers"] == ["recommend_task_write_failed"]
+    assert (result["pending_stage"], result["pending_task_id"]) == ("", 0)
+    assert _raw_scalar("SELECT COUNT(*) FROM agent_tasks") == 0
+    assert "不留半對" in capsys.readouterr().out
+
+    # 评估本身没失败（指标照落、evaluation 照写），只是「没推荐成」
+    snapshot = json.loads(row["last_metrics_json"])
+    assert snapshot["blockers"] == ["recommend_task_write_failed"]
+    assert [event["event_type"] for event in database.get_agent_stage_logs(TEACHER)] == ["evaluation"]
+    assert database.get_agent_action_log(TEACHER) == []
+
+
+# ---- 约束 8 / §6.4-29：阈值改了判定就变（无硬编码）----
+
+def test_threshold_change_alters_decision(db, stage_gate):
+    """§6.4-29：同一个老师、同一批样本 —— `min_template_match = 0.99` 不推荐，调到 `0.7`
+    就推荐（判定完全跟着生效配置走；`thresholds` 回显当前值）。"""
+    import agent_stage_service
+
+    _put_raw_state_row(TEACHER, "learning")
+    template_id = _publish_record_template()
+    _seed_draft(_OUT_OF_ORDER_DRAFT, template_id)                       # ① = 0.6*1.0 + 0.4*0.4 = 0.76
+    _seed_record(_OUT_OF_ORDER_DRAFT, _OUT_OF_ORDER_DRAFT, template_id)  # ② = 1.0
+
+    database.upsert_agent_stage_config(TEACHER, {"min_samples": 1, "min_template_match": 0.99})
+    strict = agent_stage_service.evaluate(TEACHER)
+
+    assert strict["metrics"]["template_match"]["value"] == pytest.approx(0.76)
+    assert strict["thresholds"]["min_template_match"] == 0.99
+    assert strict["blockers"] == ["template_match_below_threshold"]
+    assert strict["changed"]["recommended"] is False
+
+    database.upsert_agent_stage_config(TEACHER, {"min_samples": 1, "min_template_match": 0.7})
+    lenient = agent_stage_service.evaluate(TEACHER)
+
+    assert lenient["thresholds"]["min_template_match"] == 0.7
+    assert lenient["blockers"] == []
+    assert lenient["changed"]["recommended"] is True
+
+
+# ---- §3.8 失败方向：读不到 / 写不进去都不抛、都不改阶段 ----
+
+def test_evaluate_store_missing_degrades_without_raising(db, stage_gate, monkeypatch, tmp_path,
+                                                         capsys):
+    """§3.8：状态表不可写（0003 未跑 / 库被锁）→ 不抛、不改任何阶段、留一行 `evaluation` 审计
+    （`detail` 以「評估失敗」开头，运维据此定位）。
+
+    在**副本库**上做（⑬ 组口径）：库层函数不吞 `sqlite3.Error` 时会漏掉 `conn.close()`，
+    在真 test.db 上砸坏表会连累下一个用例的 `db` fixture（Windows 文件锁）。
+    """
+    import agent_stage_service
+
+    _put_raw_state_row(TEACHER, "learning")
+    target = _copy_tested_db(monkeypatch, tmp_path, "evaluate_store_missing.db")
+    _drop_table(target, "agent_stage_state")
+
+    result = agent_stage_service.evaluate(TEACHER)
+
+    assert result["skipped"] is False
+    assert result["reason"] == "evaluate_failed"
+    assert result["blockers"] == ["evaluate_failed"]
+    assert result["changed"]["stage_changed"] is False
+    assert "評估流程異常" in capsys.readouterr().out
+    events = database.get_agent_stage_logs(TEACHER)
+    assert [event["event_type"] for event in events] == ["evaluation"]
+    assert events[0]["detail"].startswith("評估失敗")
+
+
+def test_evaluate_audit_table_missing_is_best_effort(db, stage_gate, monkeypatch, tmp_path, capsys):
+    """审计表不可写 → 判定与指标快照照旧（§3.8：审计是旁路，不许把「评估成功」变成「评估失败」）。
+
+    同样在**副本库**上做：读审计表抛异常时库层的连接会漏在打开的句柄里（库层既有行为）。
+    """
+    import agent_stage_service
+
+    _put_raw_state_row(TEACHER, "learning")
+    _publish_record_template()
+    target = _copy_tested_db(monkeypatch, tmp_path, "evaluate_audit_missing.db")
+    _drop_table(target, "agent_stage_log")
+
+    result = agent_stage_service.evaluate(TEACHER)
+
+    assert result["skipped"] is False and result["reason"] == "blocked"
+    assert "寫入階段審計失敗" in capsys.readouterr().out
+    snapshot = json.loads(database.get_agent_stage_state(TEACHER)["last_metrics_json"])
+    assert snapshot["reason"] == "blocked"
+
+
+# ---- 约束 6：stage_config_source（§3.4 第 4 条）----
+
+def test_stage_config_source_answers_rows_and_env(db, monkeypatch):
+    """约束 6：`global` / `teacher_override` = 该行是否存在；`env_override` = 能解析 +
+    在白名单内 + **本次真被采纳**的键（白名单外 / 解析失败 / 总闸一律不入列）。"""
+    import agent_stage_service
+
+    _clear_stage_config_rows()
+    assert agent_stage_service.stage_config_source(TEACHER) == {
+        "global": False, "teacher_override": False, "env_override": []}
+
+    database.upsert_agent_stage_config("", {"min_samples": 3})
+    source = agent_stage_service.stage_config_source(TEACHER)
+    assert source == {"global": True, "teacher_override": False, "env_override": []}
+    assert agent_stage_service.load_stage_config(TEACHER)["min_samples"] == 3
+
+    database.upsert_agent_stage_config(TEACHER, {"min_samples": 4})
+    monkeypatch.setenv("AGENT_STAGE_MIN_TEMPLATE_MATCH", "0.9")
+    monkeypatch.setenv("AGENT_STAGE_WINDOWDAYS", "7")             # typo：不在白名单
+    monkeypatch.setenv("AGENT_STAGE_MAX_SAMPLES", "不是數字")      # 能看见、解析不了
+    monkeypatch.setenv("AGENT_STAGE_ENABLED", "on")               # 总闸：静默跳过
+
+    source = agent_stage_service.stage_config_source(TEACHER)
+    assert source["global"] is True and source["teacher_override"] is True
+    assert source["env_override"] == ["min_template_match"], "只列真正生效的 env 键"
+
+    cfg = agent_stage_service.load_stage_config(TEACHER)
+    assert cfg["min_template_match"] == 0.9, "同源：环境覆盖确实生效了"
+    assert cfg["min_samples"] == 4, "老师专属行赢过全局行"
+    assert cfg["window_days"] == 90, "白名单外的 typo 不得生效"
+
+
+def test_stage_config_source_drops_env_when_config_falls_back(db, monkeypatch):
+    """口径：合并结果非法 → 整份回落内置默认（§3.4 第 5 条）→ 那一刻 env 一个键都没被采纳
+    → `env_override` 如实清空（「列出来却没生效」比不列更误导）。"""
+    import agent_stage_service
+
+    monkeypatch.setenv("AGENT_STAGE_WINDOW_DAYS", "99999")        # 越界 → 整份回落
+
+    source = agent_stage_service.stage_config_source(TEACHER)
+
+    assert source["env_override"] == []
+    assert agent_stage_service.load_stage_config(TEACHER)["window_days"] == 90
+
+
+def test_stage_config_source_shares_the_only_layer_walk():
+    """约束 6「层判定与 load_stage_config 同源」的源码级守护：读取链只经
+    `_resolve_stage_config()`（层判定不可能分叉），两个公开入口都经它。"""
+    import inspect
+
+    import agent_stage_service
+
+    source = inspect.getsource(agent_stage_service)
+    assert source.count("database.get_agent_stage_config_row(") == 1, \
+        "配置行的读取点只许有一处（否则层判定会分叉）"
+    assert source.count("def _resolve_stage_config(") == 1
+    assert "_resolve_stage_config(" in inspect.getsource(agent_stage_service.load_stage_config)
+    assert "_resolve_stage_config(" in inspect.getsource(agent_stage_service.stage_config_source)
+
+
+# ---- 批复 C-2：库层只读统计 database.get_agent_stage_log_stats ----
+
+def test_get_agent_stage_log_stats_counts_and_latest_moment(db):
+    """契约（6 键）：`counts` 含请求过的全部事件名（没有的记 0）、`last_at` = 最新一条的时刻
+    （§3.6 冷却判定用）、`since` = 时间下界、`total` = 计数和、`limit` = 行上限。"""
+    database.insert_agent_stage_log(TEACHER, "permission_denied", created_at="2026-01-01T00:00:00")
+    database.insert_agent_stage_log(TEACHER, "upgrade_recommended", created_at="2026-01-02T00:00:00")
+    database.insert_agent_stage_log(TEACHER, "permission_denied", created_at="2026-01-03T00:00:00")
+    database.insert_agent_stage_log(OTHER_TEACHER, "permission_denied",
+                                    created_at="2026-01-04T00:00:00")
+
+    stats = database.get_agent_stage_log_stats(
+        TEACHER, ("permission_denied", "upgrade_declined"), "")
+
+    assert stats == {
+        "since": "",
+        "counts": {"permission_denied": 2, "upgrade_declined": 0},
+        "total": 2,
+        "last_at": "2026-01-03T00:00:00",
+        "truncated": False,
+        "limit": 200,
+    }
+
+    windowed = database.get_agent_stage_log_stats(TEACHER, ("permission_denied",),
+                                                 "2026-01-02T00:00:00")
+    assert windowed["counts"] == {"permission_denied": 1}
+    assert windowed["last_at"] == "2026-01-03T00:00:00"
+    assert windowed["since"] == "2026-01-02T00:00:00"
+
+
+def test_get_agent_stage_log_stats_is_read_only_and_limited(db, sql_log):
+    """批复 C：**只读**（一条 SELECT、无任何写语句）+ **必带 LIMIT**（上限是内部常量 200）。"""
+    database.insert_agent_stage_log(TEACHER, "evaluation", created_at="2026-01-01T00:00:00")
+    marker = len(_all_calls(sql_log))
+
+    stats = database.get_agent_stage_log_stats(TEACHER, ("evaluation",), "")
+
+    calls = _all_calls(sql_log)[marker:]
+    assert len(calls) == 1, calls
+    sql, params = calls[0]
+    assert sql.lstrip().upper().startswith("SELECT") and "LIMIT ?" in sql
+    assert params[0] == TEACHER and params[-1] == 200
+    assert stats["limit"] == 200 and stats["counts"] == {"evaluation": 1}
+
+
+def test_get_agent_stage_log_stats_bad_input_is_safe(db):
+    """坏入参不炸、不发无用 SQL：空老师名 → 空统计；`event_types=None` → 空 counts；
+    单个字符串按「一个事件名」处理；`since` 非字符串 → 不过滤。"""
+    database.insert_agent_stage_log(TEACHER, "evaluation", created_at="2026-01-01T00:00:00")
+
+    assert database.get_agent_stage_log_stats("", ("evaluation",), "") == {
+        "since": "", "counts": {"evaluation": 0}, "total": 0, "last_at": "",
+        "truncated": False, "limit": 200}
+    assert database.get_agent_stage_log_stats(TEACHER, None, None)["counts"] == {}
+    single = database.get_agent_stage_log_stats(TEACHER, "evaluation", None)
+    assert single["counts"] == {"evaluation": 1} and single["since"] == ""
 

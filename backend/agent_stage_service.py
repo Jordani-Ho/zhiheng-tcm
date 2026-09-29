@@ -39,6 +39,7 @@ import difflib
 import json
 import os
 import sqlite3
+from datetime import datetime, timedelta
 
 # ---------------------------------------------------------------------------
 # 五阶段枚举（§0.4）：顺序固定，**不可跳级**（§1.1：只允许 to_rank - from_rank == 1 的升级）
@@ -543,6 +544,9 @@ def validate_stage_config(cfg):
 #   · 逐键**浅合并**；未知键原样保留（前向兼容）；缺失键回落上一级；
 #   · **每次现读、不缓存**（灰度调参不必重启 uvicorn）；
 #   · **只发 SELECT**（读数零写入 —— ⑭ 组有语句级断言）：脏行不修、审计不写。
+# 【3.4-b】层判定（哪几层命中）与合并结果由 `_resolve_stage_config()` **同一份代码**产出
+#   → `load_stage_config()`（取合并结果）与 `stage_config_source()`（取来源回答）不可能分叉
+#   （CTO 3.4-b 约束 6「层判定与 load_stage_config 同源」）。
 # ---------------------------------------------------------------------------
 def _copy_config(config):
     """配置对象的**深拷贝**（JSON 往返）：`load_stage_config` 每次返回新对象，调用方改它
@@ -620,7 +624,12 @@ def _apply_env_overrides(merged):
       · 在白名单但值无法解析 → 告警「無法解析」并**只忽略该键**，其余层照常；
       · `AGENT_STAGE_ENABLED`（总闸）→ **静默跳过**（CTO 裁决 C：它是 `agent_stage_enabled()` 的
         真相源、不是配置键，混进「未知」告警会误导运维去「配」它）。
+
+    【3.4-b 追加】返回**被采纳的键名列表**（顺序 = 环境变量名的字典序），供 `stage_config_source()`
+    如实回答「env 到底改了哪几个键」：能解析 + 在白名单内 + 这次真被写进 `merged` 三者齐备才算；
+    白名单外 / 解析失败 / 总闸三种情况一律**不入列**（它们本来就没生效）。
     """
+    adopted = []
     for name in sorted(os.environ):
         if not name.startswith(_ENV_CONFIG_PREFIX):
             continue
@@ -636,6 +645,48 @@ def _apply_env_overrides(merged):
             _config_warn("無法解析環境變量 %s 的值 %r（已忽略該鍵，其餘層照常）" % (name, raw))
             continue
         merged[key] = value
+        adopted.append(key)
+    return adopted
+
+
+def _resolve_stage_config(teacher_name):
+    """§3.4 第 1–3 条的**唯一**一层层读取实现：返回 `(merged, source)`。
+
+    · `merged` = 内置默认 ← 全局行 ← 老师专属行 ← env 白名单 的逐键浅合并结果（**尚未校验**，
+      校验与「非法整份回落」由调用方 `load_stage_config()` 负责）；
+    · `source` = §3.4 第 4 条要的「来源回答」（3 键，形状即契约）：
+        - `global` / `teacher_override` = **该层配置行是否存在**（CTO 3.4-b 约束 6 的口径）。
+          「行存在但 JSON 损坏」也算存在：损坏那层按无覆盖处理 + 告警（3.2 口径），但行的存在性
+          如实回答 —— 否则运维看到「全局=false」会以为行没写，而真正的原因（JSON 坏了）被埋掉；
+        - `env_override` = 本次**真正被采纳**的 env 键名列表（能解析 + 在白名单内 + 写进 `merged`）。
+
+    本函数是 `load_stage_config()` 与 `stage_config_source()` 的**共同底座**（CTO 3.4-b 约束 6
+    「层判定与 load_stage_config 同源」）：两处都只经这里走一遍读取链，层判定不可能分叉。
+
+    三态降级与告警口径与 3.2 逐字一致：行缺失 → 零告警；JSON 损坏 → 只丢坏的那层 + 告警；
+    `sqlite3.Error` → 只丢该层 + 告警。**全程只发 SELECT**。
+    """
+    import database      # 只在**函数体内**延迟 import（§4.5-①；方向守护见 ⑩ 组）
+
+    merged = _copy_config(DEFAULT_STAGE_CONFIG)
+    source = _blank_config_source()
+
+    for layer, name, flag in ((_CONFIG_LAYER_GLOBAL, "", "global"),
+                              (_CONFIG_LAYER_TEACHER, teacher_name, "teacher_override")):
+        if flag == "teacher_override" and not teacher_name:
+            continue        # 全局行就是这一行，不重复读
+        try:
+            row = database.get_agent_stage_config_row(name)
+        except sqlite3.Error as exc:
+            _config_warn("讀取%s配置失敗（%s），該層按無覆蓋處理（改用內置默認）" % (layer, exc))
+            continue
+        if row is None:
+            continue
+        source[flag] = True
+        _merge_config_layer(merged, row, layer)
+
+    source["env_override"] = _apply_env_overrides(merged)
+    return merged, source
 
 
 def load_stage_config(teacher_name):
@@ -654,25 +705,12 @@ def load_stage_config(teacher_name):
     `schema_version` 口径（CTO 裁决②）：读到未知版本 → 校验层报 `schema_version` → **整份回落
     内置默认 + 告警、不抛**（§3.5）；需要「直接拿到错误清单」的写入路径走 `validate_stage_config`。
 
+    【3.4-b】四层读取链的实现已抽成 `_resolve_stage_config()`：本函数只负责「校验 + 非法整份回落」，
+    与 `stage_config_source()` **同源**（层判定不可能分叉，CTO 3.4-b 约束 6）。
+
     本函数**只读**：全程只发 SELECT（⑭ 组 `sql_log` 语句级断言），不建行 / 不改行 / 不写审计。
     """
-    import database      # 只在**函数体内**延迟 import（§4.5-①；方向守护见 ⑩ 组）
-
-    merged = _copy_config(DEFAULT_STAGE_CONFIG)
-
-    for layer, name in ((_CONFIG_LAYER_GLOBAL, ""), (_CONFIG_LAYER_TEACHER, teacher_name)):
-        if layer == _CONFIG_LAYER_TEACHER and not teacher_name:
-            continue        # 全局行就是这一行，不重复读
-        try:
-            row = database.get_agent_stage_config_row(name)
-        except sqlite3.Error as exc:
-            _config_warn("讀取%s配置失敗（%s），該層按無覆蓋處理（改用內置默認）" % (layer, exc))
-            continue
-        if row is None:
-            continue
-        _merge_config_layer(merged, row, layer)
-
-    _apply_env_overrides(merged)
+    merged, _source = _resolve_stage_config(teacher_name)
 
     ok, errors = validate_stage_config(merged)
     if not ok:
@@ -1443,4 +1481,652 @@ def compute_modification_consistency(teacher_name, cfg):
     result["min"] = min(similarities)
     return result
 _NON_CONTENT_CHARS = " \t\u3000\r\n（）()[]［］【】<>《》←→-—*·:：、,，。.。;；|丨"
+
+
+# ============================================================================
+# 【施工步骤 3.4-b】判定层：配置来源 + `evaluate()`（§3.4 第 4 条 / §3.6 / §3.7 / §3.8）
+# ----------------------------------------------------------------------------
+# CTO 2026-09-29 放行 step 3.4-b 的八条约束，本段逐条对应：
+#   约束 1「施工顺序」→ 库层 `database.get_agent_stage_log_stats()`（批复 C-2，已先落地）→
+#     `stage_config_source()`（本段）→ `evaluate()`（本段末尾）；
+#   约束 2「evaluate 首行 flag 闸门」→ `evaluate()` 的**第一条语句**就是 `agent_stage_enabled()`：
+#     flag off → 立即 `return`（**零 SQL、零写入**，返回体全部由纯常量拼出；⑰ 组有语句级断言）；
+#   约束 3「evaluate 绝不向上写 stage」→ 服务层的 `stage=` 关键字实参**恰好 1 处**，且只在
+#     `_ensure_state_row()` 里、值恒为 `view["stage"]`（= 评估前 `describe_stage()` 已报告的
+#     **同一个**阶段 → 零 delta、不改变任何权限面）。为什么这一处不能省，见 `_ensure_state_row()`
+#     的 docstring（状态表 DDL 默认 `stage='observation'`，会静默把未初始化老师降一级）；⑰ 组有 AST 守护；
+#   约束 4「can_recommend 10 条全真才推荐、逐条进 blockers」→ `_evaluate_blockers()` **无短路**
+#     逐条判定（顺序与 §3.6 伪码对齐）；`value is None` / `pending_stage` / 冷却期三条各有专项用例；
+#   约束 5「pending_stage / pending_task_id 成对写」→ `_recommend_upgrade()`：**先**写 state
+#     （`pending_stage` + `pending_task_id=0`）→ **后**建请示 → 再把真 task_id 写回；建单或写回
+#     任一步失败 → 立刻清空这一对（**不留半对**；⑰ 组 monkeypatch 钉住）；
+#   约束 6「stage_config_source() 口径钉死」→ 层判定与 `load_stage_config` **同一份代码**
+#     （`_resolve_stage_config()`）：`global` / `teacher_override` = 该行是否存在；
+#     `env_override` = 能解析 + 在白名单内 + **本次真被采纳**（合并结果非法而整份回落默认时为空列表）；
+#   约束 7「agent_action_log 写点克制」→ 本段唯一写点 `_action_log()` 只在「推荐建单」被调用
+#     （升阶 / 降级两个写点属 3.4-c）；`evaluate()` 每次调用**不写**；
+#   约束 8「⑰ 组六项覆盖」→ 见 `backend/test_agent_stage.py` ⑰ 组。
+#
+# 三条本段自行钉死的口径（汇报里列清，⑰ 组逐条覆盖）：
+#   口径 D「快照 = 落库的那一份」：`last_metrics_json` 存**不含** `changed` 的快照（`changed` 是
+#     本次调用的动作结果，属返回体而非快照）；返回体 = 快照 + `changed`。快照在判定与推荐**都跑完
+#     之后**只落一次 → 落库的就是最终那一份（不会出现「两种口径的快照」）。
+#   口径 E「样本数要两个指标都够」：`samples >= min_samples` 对 ①② **各自**成立才通过
+#     （升阶要有两条独立证据；任一不足 → `samples_below_minimum`，两个指标各自的 `samples` 都在快照里）。
+#   口径 F「冷却期读不懂时刻 → 不阻断」：库层给不出可解析的 `last_at` → 只告警、不阻断
+#     （「读不懂脏时间」≠「确实在冷却中」；且推荐仍需老师确认，不构成放权方向的风险）。
+#
+# 本段写点清单（**四类，无第五类**）：`_ensure_state_row()`（仅无行时补 `stage` 一次，零 delta）、
+# 指标快照（`last_evaluated_at` / `last_metrics_json`）、推荐时的 `pending_stage` 一对、
+# 两类日志（`evaluation` 每次 + 推荐时的 `upgrade_recommended` 与 `agent_action_log`）。
+# **不动 `stage`**（口径见约束 3）。降级（`rule_demote` / `rule_reset`）与三个钩子属 3.4-c。
+# ============================================================================
+
+# 评估相关的审计事件名（§1.3 契约名 10 类里的 3 类；`permission_denied` 复用 3.3 段已落的常量）
+_LOG_EVENT_EVALUATION = "evaluation"
+_LOG_EVENT_UPGRADE_RECOMMENDED = "upgrade_recommended"
+_LOG_EVENT_UPGRADE_DECLINED = "upgrade_declined"
+
+# 推荐链路的两套动作名（**不得混用**）：
+#   · `agent_tasks.action_data["action"]` = `upgrade_agent_stage`（§4.2 钉死；3.4-c 的确认钩子按它分派）
+#   · `agent_action_log.action` = §1.6 的状态转移名 `recommend_upgrade`（工作台「行动日志」展示用）
+_ACTION_UPGRADE = "upgrade_agent_stage"
+_ACTION_RECOMMEND = "recommend_upgrade"
+
+# `blockers` 文案（§3.6 十条判定 + §2.4；英文键，前端逐条翻译展示）
+_BLOCKER_DISABLED = "agent_stage_disabled"                       # flag off（约束 2 的短路原因）
+_BLOCKER_MATRIX_RELAXED = "matrix_relaxed"                       # §2.5：放宽态不推荐升级
+_BLOCKER_ALREADY_AUTHORIZED = "already_authorized"               # 已是最高阶段（`next_stage = None`）
+_BLOCKER_UPGRADE_PENDING = "upgrade_pending"                     # 已有待确认推荐（含「状态行没记、请示还在」）
+_BLOCKER_COOLDOWN = "cooldown_active"                            # 距上次推荐 / 被拒未满冷却
+_BLOCKER_TEMPLATE_MATCH_BELOW = "template_match_below_threshold"
+_BLOCKER_MODIFICATION_BELOW = "modification_consistency_below_threshold"
+_BLOCKER_SAMPLES_BELOW = "samples_below_minimum"
+_BLOCKER_VIOLATIONS = "violations_exceeded"                      # 铁律违规（§3.2 / §3.7 的同一信号）
+_BLOCKER_PERMISSION_DENIED = "permission_denied_in_window"       # §2.4 / §6.2-19 契约名
+_BLOCKER_RECOMMEND_WRITE_FAILED = "recommend_task_write_failed"  # 建单 / 写回失败（约束 5）
+_BLOCKER_EVALUATE_FAILED = "evaluate_failed"                     # §3.8：评估整体失败（不改任何阶段状态）
+_BLOCKER_TEACHER_REQUIRED = "teacher_required"                   # 空 teacher_name（无效调用；与接口层错误码同名）
+
+# 返回体 `reason` 取值（顶层 `reason` 与 `changed.reason` 共用同一套字面量）
+_REASON_BLOCKED = "blocked"
+_REASON_RECOMMENDED = "upgrade_recommended"
+
+# ③ 问诊偏好一致性的占位口径（§3.1 / §6.3-27：Epic 2 恒为 `null` + `reason`；Epic 3 只把 null 变成对象）
+_METRICS_DEFERRED = {"inquiry_preference_consistency": "deferred_to_epic3"}
+
+# 快照里回显的阈值键（「改阈值判定就变」的可审计证据；值取生效配置，缺失键回落内置默认）
+_THRESHOLD_KEYS = (
+    "window_days", "max_samples", "min_samples", "min_template_match",
+    "min_modification_consistency", "max_violations", "max_permission_denials",
+    "recommend_cooldown_hours", "demote_consistency_floor", "demote_streak",
+    "truncate_chars", "metrics_ttl_hours", "matrix_enforced",
+)
+
+
+def _blank_config_source():
+    """§3.4 第 4 条的来源回答骨架（**纯常量**；flag off 的短路返回体也用它 → 零 SQL）。"""
+    return {"global": False, "teacher_override": False, "env_override": []}
+
+
+def _blank_metrics_snapshot(blocker):
+    """三个指标键的骨架：①② 用 3.4-a 的空骨架 + 一个原因 blocker，③ 恒为 `None` 占位。
+
+    短路路径（flag off / 评估失败）用它 → 返回体形状与正常路径**完全一致**，前端不必分支。
+    """
+    template_match = _blank_template_match()
+    consistency = _blank_modification_consistency()
+    template_match["blockers"].append(blocker)
+    consistency["blockers"].append(blocker)
+    return {
+        "template_match": template_match,
+        "modification_consistency": consistency,
+        "inquiry_preference_consistency": None,
+    }
+
+
+def stage_config_source(teacher_name):
+    """§3.4 第 4 条「来源必须可回答」的实现（口径按 CTO 3.4-b 约束 6 钉死）。
+
+    返回 3 键（形状即契约；接口层 `GET /api/agent/stage/config` 直出）：
+      · `global` / `teacher_override` = **该层配置行是否存在**；
+      · `env_override` = 本次**真正被采纳**的 env 键名列表。
+
+    与 `load_stage_config()` **同源**：两者都只经 `_resolve_stage_config()` 走一遍读取链
+    （源码级守护：服务层里配置行的读取函数只允许有**一个**调用点）。
+
+    两处口径说明（汇报里有专项）：
+      1. **行存在性优先于「是否被采纳」**：全局行 JSON 损坏时 `global` 仍为 `True`（行确实在），
+         损坏本身由 3.2 的告警回答 —— 两个问题分开答，运维才不会拿着一个布尔值去猜；
+      2. **合并结果非法、整份回落内置默认时，`env_override` 清空为 `[]`**：那一刻 env 的值
+         一个都没进生效配置，如实回答「没采纳」比「列出来却没生效」更不容易误导
+         （这里复用与 `load_stage_config()` 同一段校验判定，不另写一套）。
+
+    本函数**只读**（与 3.2 同款：全程只发 SELECT，不建行 / 不改行 / 不写审计）。
+    """
+    merged, source = _resolve_stage_config(teacher_name)
+    ok, _errors = validate_stage_config(merged)
+    if not ok:
+        source["env_override"] = []
+    return source
+
+
+def _next_stage(stage):
+    """下一阶段（§1.1「不可跳级」→ 只 +1）；已是最高阶段 / 未知阶段 → `None`（§3.6：`next = null`）。"""
+    rank = STAGE_RANK.get(stage)
+    if rank is None or rank + 1 >= len(STAGES):
+        return None
+    return STAGES[rank + 1]
+
+
+def _percent(value):
+    """比率 → 百分比整数（展示用；`int(round())` 与 §3.6 的「82%」写法一致）。"""
+    return int(round(_metric_float(value, 0.0) * 100))
+
+
+def _thresholds_snapshot(cfg):
+    """本次判定实际用到的阈值回显（键序固定 → 返回体可逐键对比；① 的内部权重不在此表，见 `metrics`）。"""
+    config = cfg if isinstance(cfg, dict) else {}
+    return {key: config[key] if key in config else DEFAULT_STAGE_CONFIG[key]
+            for key in _THRESHOLD_KEYS}
+
+
+def _metric_line(metric):
+    """单指标的一行人话（繁体）：有值 → `82%（樣本 7）`；空值 → `—（原因）`（空值 ≠ 0 分）。"""
+    metric = metric if isinstance(metric, dict) else {}
+    value = metric.get("value")
+    if value is None:
+        return "—（%s）" % "、".join(metric.get("blockers") or ["無樣本"])
+    return "%d%%（樣本 %d）" % (_percent(value), _metric_int(metric.get("samples"), 0))
+
+
+def _metrics_line(metrics):
+    """两个指标的合并人话（`evaluation` 审计 / 请示正文 / 行动日志共用，避免三处文案漂移）。"""
+    metrics = metrics if isinstance(metrics, dict) else {}
+    return "模板匹配度 %s、病歷修改一致率 %s" % (
+        _metric_line(metrics.get("template_match")),
+        _metric_line(metrics.get("modification_consistency")),
+    )
+
+
+def _log_window_since(cfg):
+    """指标窗口的时间下界（ISO 串）= `now - window_days`；非正整数 → `''`（不过滤）。
+
+    与库层同一套时间口径（全库 TEXT 时间、`datetime.now().isoformat()`）→ 字符串比较即时间比较；
+    时间算术只在这一层做，库层 `get_agent_stage_log_stats()` 只认「下界字符串」。
+    """
+    config = cfg if isinstance(cfg, dict) else {}
+    days = _metric_int(config.get("window_days"), DEFAULT_STAGE_CONFIG["window_days"])
+    if days <= 0:
+        return ""
+    return (datetime.now() - timedelta(days=days)).isoformat()
+
+
+def _permission_denials_in_window(teacher_name, cfg):
+    """§2.4：窗口内 `permission_denied` 的条数（判定用的**原始计数**，不是布尔）。
+
+    读库异常 → `0` + 告警：越权计数属「限制方向」的证据，读不到时按「没有越权记录」处理 ——
+    不因读数失败给老师凭空加一条越权（§3.7「不能因为数据不够惩罚老师」的同一方向）。
+    """
+    import database
+
+    try:
+        stats = database.get_agent_stage_log_stats(
+            teacher_name, (_LOG_EVENT_PERMISSION_DENIED,), _log_window_since(cfg))
+    except sqlite3.Error as exc:
+        _config_warn("讀取窗口內越權次數失敗（%s），本輪按 0 次處理" % (exc,))
+        return 0
+    counts = stats.get("counts") if isinstance(stats, dict) else None
+    return _metric_int((counts or {}).get(_LOG_EVENT_PERMISSION_DENIED), 0)
+
+
+def _cooldown_blocks(teacher_name, cfg):
+    """§3.6 can_recommend 第 5 条：距上次「推荐 / 被拒」是否仍在冷却期 → `(blocked, last_at)`。
+
+    · `recommend_cooldown_hours <= 0` → 显式关掉冷却（不再看审计）；
+    · 只看 `upgrade_recommended` / `upgrade_declined` 两类事件（§3.6「上次推荐或被拒」）；
+    · 口径 F：读不到 / 解析不了时刻 → **不阻断** + 告警（「读不懂脏时间」≠「确实在冷却中」；
+      且推荐仍需老师确认，不存在「放权」方向的风险）。
+    """
+    import database
+
+    config = cfg if isinstance(cfg, dict) else {}
+    hours = _metric_int(config.get("recommend_cooldown_hours"),
+                        DEFAULT_STAGE_CONFIG["recommend_cooldown_hours"])
+    if hours <= 0:
+        return False, ""
+    try:
+        stats = database.get_agent_stage_log_stats(
+            teacher_name, (_LOG_EVENT_UPGRADE_RECOMMENDED, _LOG_EVENT_UPGRADE_DECLINED), "")
+    except sqlite3.Error as exc:
+        _config_warn("讀取上次推薦 / 被拒的時刻失敗（%s），本輪冷卻判定按「不在冷卻期」處理" % (exc,))
+        return False, ""
+    last_at = (stats or {}).get("last_at") or ""
+    if not last_at:
+        return False, ""
+    try:
+        moment = datetime.fromisoformat(last_at)
+    except ValueError:
+        _config_warn("上次推薦 / 被拒的時刻無法解析：%r，本輪冷卻判定按「不在冷卻期」處理" % (last_at,))
+        return False, ""
+    return (datetime.now() - moment).total_seconds() < hours * 3600, last_at
+
+
+def _append_metric_blockers(blockers, metric, cfg, threshold_key, below_key):
+    """把一个指标的判定结果折进 `blockers`（§3.6 第 6 / 7 条）：
+
+    · `value is None`（空集 / 无生效模板）→ 搬该指标**自己的** blockers（`*_no_samples` /
+      `no_active_record_template`）：空值**不是 0 分**，用「没有证据」解释比用「分不够」解释准确，
+      也正好兑现 3.4-a 钉下的「`None` 与阈值比较抛 `TypeError`」不变量（只能显式判 `is None`）；
+    · `value < 阈值` → `below_key`（阈值读生效配置，缺失键回落内置默认 → 不硬编码）。
+    """
+    config = cfg if isinstance(cfg, dict) else {}
+    metric = metric if isinstance(metric, dict) else {}
+    value = metric.get("value")
+    if value is None:
+        for item in metric.get("blockers") or []:
+            if item not in blockers:
+                blockers.append(item)
+        return
+    threshold = _metric_float(config.get(threshold_key), DEFAULT_STAGE_CONFIG[threshold_key])
+    if value < threshold:
+        blockers.append(below_key)
+
+
+def _evaluate_blockers(teacher_name, cfg, view, template_match, consistency):
+    """§3.6 的 `can_recommend` 判定 —— **无短路**逐条跑，任一不满足就进 `blockers`。
+
+    条文与 §3.6 伪码逐条对齐（顺序也照它排）：矩阵放宽 / 已最高阶段 / 有待确认推荐 / 冷却 /
+    ① 达标 / ② 达标 / 样本数 / 违规数 / 越权次数。**flag 那一条由 `evaluate()` 的闸门负责**
+    （flag off 根本走不到这里），故本函数从「矩阵放宽」开始。
+    返回空列表 ⟺ 十条全真 ⟺ 可以推荐。
+    """
+    import database
+
+    config = cfg if isinstance(cfg, dict) else {}
+    blockers = []
+
+    if not config.get("matrix_enforced", True):
+        blockers.append(_BLOCKER_MATRIX_RELAXED)        # §2.5：放宽态不推荐升级
+
+    if _next_stage(view.get("stage")) is None:
+        blockers.append(_BLOCKER_ALREADY_AUTHORIZED)    # 已是最高阶段 → `next_stage = None`
+
+    if view.get("pending_stage"):
+        blockers.append(_BLOCKER_UPGRADE_PENDING)       # 无待确认推荐
+    else:
+        # 状态行没记 pending、但请示还在 pending（人手 SQL / 历史残渣）→ 也按「有待确认」处理，
+        # 不重复建单（§3.6 step 3 的去重条款）；查询失败按「无待确认」继续（不惩罚老师）
+        try:
+            pending_task = database.find_pending_upgrade_task(teacher_name)
+        except sqlite3.Error as exc:
+            _config_warn("查詢待確認的升級請示失敗（%s），本輪按「無待確認」繼續" % (exc,))
+            pending_task = None
+        if pending_task:
+            blockers.append(_BLOCKER_UPGRADE_PENDING)
+
+    cooldown, _last_at = _cooldown_blocks(teacher_name, config)
+    if cooldown:
+        blockers.append(_BLOCKER_COOLDOWN)
+
+    _append_metric_blockers(blockers, template_match, config,
+                            "min_template_match", _BLOCKER_TEMPLATE_MATCH_BELOW)
+    _append_metric_blockers(blockers, consistency, config,
+                            "min_modification_consistency", _BLOCKER_MODIFICATION_BELOW)
+
+    min_samples = _metric_int(config.get("min_samples"), DEFAULT_STAGE_CONFIG["min_samples"])
+    if min(_metric_int(template_match.get("samples"), 0),
+           _metric_int(consistency.get("samples"), 0)) < min_samples:
+        blockers.append(_BLOCKER_SAMPLES_BELOW)         # 口径 E：两个指标都要够
+
+    max_violations = _metric_int(config.get("max_violations"), DEFAULT_STAGE_CONFIG["max_violations"])
+    if _metric_int(template_match.get("violations"), 0) > max_violations:
+        blockers.append(_BLOCKER_VIOLATIONS)
+
+    max_denials = _metric_int(config.get("max_permission_denials"),
+                              DEFAULT_STAGE_CONFIG["max_permission_denials"])
+    if _permission_denials_in_window(teacher_name, config) > max_denials:
+        blockers.append(_BLOCKER_PERMISSION_DENIED)
+
+    return blockers
+
+
+def _upgrade_task_title(to_stage):
+    """请示标题（§3.6 step 3 的字面形状：`智能體可升入「見習期」`）。"""
+    return "智能體可升入「%s」" % STAGE_LABELS.get(to_stage, to_stage)
+
+
+def _upgrade_task_content(to_stage, metrics, cfg):
+    """请示正文（§3.6 step 3 的四段结构：两个指标 → 各自阈值 → 样本数 → 老师可控的承诺）。"""
+    config = cfg if isinstance(cfg, dict) else {}
+    metrics = metrics if isinstance(metrics, dict) else {}
+    template_match = metrics.get("template_match") or {}
+    consistency = metrics.get("modification_consistency") or {}
+    samples = min(_metric_int(template_match.get("samples"), 0),
+                  _metric_int(consistency.get("samples"), 0))
+    return ("模板匹配度 %d%%（達標 %d%%）、病歷修改一致率 %d%%（達標 %d%%），樣本 %d 份；"
+            "確認後生效，你可隨時降級。"
+            % (_percent(template_match.get("value")),
+               _percent(config.get("min_template_match", DEFAULT_STAGE_CONFIG["min_template_match"])),
+               _percent(consistency.get("value")),
+               _percent(config.get("min_modification_consistency",
+                                   DEFAULT_STAGE_CONFIG["min_modification_consistency"])),
+               samples))
+
+
+def _upgrade_action_data(from_stage, to_stage, metrics, source):
+    """`agent_tasks.action_data`（§4.2 / §3.6 的 5 键形状：`action` / `from` / `to` / `metrics` / `config_source`）。
+
+    目标阶段的键名是 **`to`**（不是 `to_stage`）：3.4-c 的确认钩子按 `action == 'upgrade_agent_stage'`
+    与 `to` 分派 —— 形状一改，老师点 ✅ 就升不上去，故这里是契约而非实现细节。
+    """
+    return {
+        "action": _ACTION_UPGRADE,
+        "from": from_stage,
+        "to": to_stage,
+        "metrics": metrics,
+        "config_source": source,
+    }
+
+
+def _stage_event(event_type, teacher_name, stage, detail, metrics=None, task_id=0):
+    """阶段审计的 best-effort 单条写入（比 3.3 段的 `_stage_audit()` 多两列：`task_id` 与 `metrics_json`）。
+
+    3.4-b 要写的是 `evaluation` 与 `upgrade_recommended` 两类事件：前者带指标快照、后者带请示 id
+    （§1.3 / §3.6 step 3）。字段口径照 §1.3：`from_stage` = 当前阶段、`to_stage=''`（本函数不写
+    变更类事件）、`capability=''`、`created_at` 由库层补。
+    **写失败不得改变判定结果**：`sqlite3.Error` 与任何载荷异常都在此吞掉 + 一条繁体告警，返回 `None`。
+    """
+    try:
+        import database      # 只在**函数体内**延迟 import（§4.5-①；方向守护见 ⑩ 组）
+        return database.insert_agent_stage_log(
+            teacher_name, event_type,
+            from_stage=stage, to_stage="", capability="", task_id=task_id,
+            metrics_json=metrics if metrics is not None else {}, detail=detail,
+        )
+    except Exception as exc:
+        _config_warn("寫入階段審計失敗（%s）：event_type=%r task_id=%r，判定結果不受影響"
+                     % (exc, event_type, task_id))
+        return None
+
+
+def _action_log(teacher_name, task_id, action, detail):
+    """`agent_action_log` 的 best-effort 单条写入（工作台「📜 行动日志」区块直接读这张表）。
+
+    **写点克制**（CTO 3.4-b 约束 7）：本函数是 3.4-b 里**唯一**的 `agent_action_log` 写点，
+    且只在「推荐建单」（§1.6 的 `recommend_upgrade`）被调用 —— 升阶 / 降级两个写点属 3.4-c；
+    `evaluate()` 每次调用**不写**（没有推荐就没有这一行）。
+    失败只留告警：行动日志是展示旁路，不许把「推荐成功」变成「评估失败」。
+    """
+    try:
+        import database
+        return database.insert_agent_action_log(teacher_name, action, detail, task_id)
+    except Exception as exc:
+        _config_warn("寫入行動日誌失敗（%s）：action=%r task_id=%r，評估結果不受影響"
+                     % (exc, action, task_id))
+        return None
+
+
+def _ensure_state_row(teacher_name, view):
+    """无状态行时**先把兜底阶段落下**（§1.5 ③ 的落库化）；返回「是否新建」。
+
+    为什么必须有这一步（本段唯一一处 `stage=` 写入，CTO 约束 3 的精确形态）：
+      状态表的 DDL 默认是 `stage = 'observation'`（§1.2），而未初始化老师的生效阶段取配置链的
+      `default_stage`（默认 `learning`；§7.1-② 存量不降级）。若直接 upsert 一行「只有指标快照」，
+      `stage` 会被建表默认值落成 `observation` → 老师**什么都没做**，`generate_draft` 却被静默
+      收回（观察期只剩本地骨架，§5.3）—— 那是评估链把老师降了一级，违反 §5.2「不降级、不破坏」。
+
+    安全边界（三条一起看才完整）：
+      1. 只写 `view["stage"]`：它正是评估前 `describe_stage()` 已经报告的**同一个**阶段（零 delta），
+         于是写前写后的生效阶段与权限面完全一致；
+      2. **有行时一个字段都不碰**（直接 `return False`）：老师的 `stage` / `stage_since` /
+         `stage_source` 在评估前后逐字节不变（⑰ 组行为级断言）；
+      3. `get_agent_stage_state()` 的 `sqlite3.Error` **不吞**（裁决⑤）→ 冒泡给 `evaluate()` 的
+         §3.8 失败短路：读不到状态行时评估不会再往下写任何东西。
+
+    3.4-c 落地「唯一向上写路径」后，服务层的 `stage=` 写入点由 1 变 2（+ `apply_upgrade_confirmation`）。
+    """
+    import database
+
+    if database.get_agent_stage_state(teacher_name) is not None:
+        return False
+    database.upsert_agent_stage_state(teacher_name, stage=view["stage"])
+    return True
+
+
+def _recommend_upgrade(teacher_name, to_stage, view, cfg, metrics, source):
+    """§3.6 step 3：写推荐（**先 state、后建单**）→ 返回 `(ok, task_id, failure)`。
+
+    顺序即契约（CTO 3.4-b 约束 5）：
+      ① `agent_stage_state`：`pending_stage = to_stage` + `pending_task_id = 0`（先占位）；
+      ② 建 `agent_tasks` 请示（§3.6 的形状：`request` / `agent` / `pending`）；
+      ③ 把真 `task_id` 写回状态行（这一对到此闭合）；
+      ④ 留两条痕：`agent_stage_log(upgrade_recommended, task_id=…)` + `agent_action_log(recommend_upgrade)`。
+    ①②③ 任一步失败 → **立刻清空这一对**并返回失败：「有 pending_stage 却查不到请示」会让老师端
+    的 ✅ 永远点不出结果，比「不推荐」更坏（**不留半对**）。④ 的两条痕是 best-effort
+    （推荐已落盘，日志写失败不改结论）。
+
+    调用前提：`_evaluate_blockers()` 已返回空列表（十条全真）→ 本函数**不重复判定**，只执行。
+    """
+    import database
+
+    metrics = metrics if isinstance(metrics, dict) else {}
+    from_stage = view.get("stage")
+    database.upsert_agent_stage_state(teacher_name, pending_stage=to_stage, pending_task_id=0)
+
+    try:
+        task_id = database.insert_agent_stage_upgrade_task(
+            teacher_name,
+            _upgrade_task_title(to_stage),
+            _upgrade_task_content(to_stage, metrics, cfg),
+            _upgrade_action_data(from_stage, to_stage, metrics, source),
+        )
+        database.upsert_agent_stage_state(teacher_name, pending_task_id=task_id)
+    except Exception as exc:
+        _config_warn("建立升級請示失敗（%s）：已清空 pending_stage / pending_task_id，不留半對" % (exc,))
+        try:
+            database.upsert_agent_stage_state(teacher_name, pending_stage="", pending_task_id=0)
+        except Exception as cleanup_exc:
+            _config_warn("回滾 pending_stage 也失敗（%s）—— 狀態行可能殘留半對，請人工核對"
+                         % (cleanup_exc,))
+        return False, 0, _BLOCKER_RECOMMEND_WRITE_FAILED
+
+    samples = min(_metric_int((metrics.get("template_match") or {}).get("samples"), 0),
+                  _metric_int((metrics.get("modification_consistency") or {}).get("samples"), 0))
+    detail = ("智能體推薦升級至「%s」：%s，樣本 %d 份；等待老師確認。"
+              % (STAGE_LABELS.get(to_stage, to_stage), _metrics_line(metrics), samples))
+    _stage_event(_LOG_EVENT_UPGRADE_RECOMMENDED, teacher_name, from_stage, detail,
+                 metrics=metrics, task_id=task_id)
+    _action_log(teacher_name, task_id, _ACTION_RECOMMEND, detail)
+    return True, task_id, ""
+
+
+def _snapshot_short_circuit(teacher_name, blocker, skipped):
+    """短路返回体（flag off / 评估失败）：**零 SQL** —— 每个值都由常量拼出。
+
+    形状与正常路径**逐键一致**（18 键）：前端 / 接口层不必为短路分支写第二套渲染。
+    `stage` 一族的空串是诚实的：短路路径**没有**读状态行（flag off 不许读库），
+    故不编造阶段；接口层在 flag off 时本来就 404 `agent_stage_disabled`。
+    """
+    return {
+        "teacher_name": teacher_name,
+        "skipped": skipped,
+        "reason": blocker,
+        "stage": "",
+        "stage_label": "",
+        "stage_since": "",
+        "stage_source": "",
+        "pending_stage": "",
+        "pending_task_id": 0,
+        "degraded": False,
+        "metrics": _blank_metrics_snapshot(blocker),
+        "metrics_reason": dict(_METRICS_DEFERRED),
+        "thresholds": {},
+        "config_source": _blank_config_source(),
+        "next_stage": None,
+        "blockers": [blocker],
+        "evaluated_at": "",
+        "metrics_ttl_hours": None,
+        "changed": {
+            "stage_changed": False,
+            "recommended": False,
+            "demoted": False,
+            "reason": blocker,
+        },
+    }
+
+
+def _evaluation_detail(snapshot):
+    """`evaluation` 审计的结论人话（繁体）：结论 + 卡在哪 + 两个指标 + 样本数，一次说清。
+
+    §3.6 / §2.4 要的是「可解释」：老师在工作台看到一行字就知道这轮为什么没推荐，
+    运维在同一行里能看到当时用的样本数与阶段（`from_stage` 列）。
+    """
+    label = snapshot.get("stage_label") or snapshot.get("stage") or "—"
+    metrics_line = _metrics_line(snapshot.get("metrics"))
+    note = "（階段真值讀取降級，暫按兜底階段判定）" if snapshot.get("degraded") else ""
+    if snapshot.get("reason") == _REASON_RECOMMENDED:
+        to_stage = snapshot.get("next_stage")
+        return ("評估完成：當前「%s」，%s，已推薦升入「%s」（等待老師確認）。%s"
+                % (label, metrics_line, STAGE_LABELS.get(to_stage, to_stage), note))
+    if snapshot.get("blockers"):
+        return ("評估完成：當前「%s」，本輪不推薦升級（%s）。%s%s"
+                % (label, "、".join(snapshot["blockers"]), metrics_line, note))
+    return "評估完成：當前「%s」，本輪不推薦升級。%s%s" % (label, metrics_line, note)
+
+
+def _evaluate_failed(teacher_name, exc):
+    """§3.8 失败处理：评估整体包一层 `try/except` —— 异常 → 告警 + `evaluation` 审计（best-effort）
+    + **不改变任何阶段状态** + 返回形状一致的降级体（接口层照样有体可回，绝不给既有链路抛异常）。"""
+    _config_warn("評估流程異常（%s）：本次不改動任何階段狀態（§3.8）" % (exc,))
+    _stage_event(_LOG_EVENT_EVALUATION, teacher_name, "", "評估失敗：%s" % (exc,))
+    return _snapshot_short_circuit(teacher_name, _BLOCKER_EVALUATE_FAILED, False)
+
+
+def _evaluate(teacher_name):
+    """`evaluate()` 的实体（flag 闸门已由调用方过掉）：读 → 算 → 判 → 落快照 → 留痕 → 返回。
+
+    写入顺序（口径 D + 约束 5）：
+      ① `_ensure_state_row()`：无行老师先把兜底阶段落下（零 delta，见其 docstring）；
+      ② 十条全真 → `_recommend_upgrade()`（内部**先写 pending 对、后建单**）；
+      ③ 指标快照 `last_evaluated_at` / `last_metrics_json`：判定与推荐**都跑完之后只落一次**
+         → 落库的就是最终那一份（含推荐后的 `pending_stage`，不会出现「两种口径的快照」）；
+      ④ `evaluation` 审计一行（`metrics_json` = 指标快照、`task_id` = 本次请示 id、`detail` = 结论人话）。
+
+    快照 = 返回体去掉 `changed`（口径 D）：`changed` 是「本次调用做了什么」，属调用结果而非快照。
+    """
+    import database
+
+    cfg = load_stage_config(teacher_name)
+    source = stage_config_source(teacher_name)
+    view = describe_stage(teacher_name)          # §1.5 真值读取（fail-closed，绝不抛）
+
+    template_match = compute_template_match(teacher_name, cfg)
+    consistency = compute_modification_consistency(teacher_name, cfg)
+    metrics = {
+        "template_match": template_match,
+        "modification_consistency": consistency,
+        "inquiry_preference_consistency": None,   # ③ 占位键（§3.1：Epic 2 恒为 null）
+    }
+
+    blockers = _evaluate_blockers(teacher_name, cfg, view, template_match, consistency)
+    next_stage = _next_stage(view.get("stage"))
+
+    _ensure_state_row(teacher_name, view)
+
+    task_id = 0
+    pending_stage = view.get("pending_stage") or ""
+    reason = _REASON_BLOCKED
+    if not blockers:
+        ok, task_id, failure = _recommend_upgrade(teacher_name, next_stage, view, cfg, metrics, source)
+        if ok:
+            pending_stage = next_stage
+            reason = _REASON_RECOMMENDED
+        else:
+            task_id = 0
+            blockers.append(failure)             # 建单失败：结论是「本该推荐但没推荐成」
+            reason = failure
+
+    evaluated_at = datetime.now().isoformat()
+    snapshot = {
+        "teacher_name": teacher_name,
+        "skipped": False,
+        "reason": reason,
+        "stage": view.get("stage"),
+        "stage_label": view.get("stage_label"),
+        "stage_since": view.get("stage_since") or "",
+        "stage_source": view.get("stage_source") or "",
+        "pending_stage": pending_stage,
+        "pending_task_id": task_id or _metric_int(view.get("pending_task_id"), 0),
+        "degraded": bool(view.get("degraded")),
+        "metrics": metrics,
+        "metrics_reason": dict(_METRICS_DEFERRED),
+        "thresholds": _thresholds_snapshot(cfg),
+        "config_source": source,
+        "next_stage": next_stage,
+        "blockers": blockers,
+        "evaluated_at": evaluated_at,
+        "metrics_ttl_hours": _metric_int(cfg.get("metrics_ttl_hours"),
+                                         DEFAULT_STAGE_CONFIG["metrics_ttl_hours"]),
+    }
+
+    database.upsert_agent_stage_state(teacher_name, last_evaluated_at=evaluated_at,
+                                      last_metrics_json=snapshot)
+    _stage_event(_LOG_EVENT_EVALUATION, teacher_name, view.get("stage"),
+                 _evaluation_detail(snapshot), metrics=metrics, task_id=task_id)
+
+    result = dict(snapshot)
+    result["changed"] = {
+        "stage_changed": False,       # 约束 3：本步恒 False（升阶只走 3.4-c 的老师确认路径）
+        "recommended": reason == _REASON_RECOMMENDED,
+        "demoted": False,             # §3.7 的规则降级属 3.4-c
+        "reason": reason,
+    }
+    return result
+
+
+def evaluate(teacher_name):
+    """【§3.6 / §3.7 / §3.8】一次评估：读配置 → 算 ①② → 判定 `can_recommend` → （达标则）推荐升级
+    → 落指标快照 + 留痕。**接口层 / 钩子**的公共入口（`agent_stage_api` 的 POST evaluate、
+    3.4-c 的两个既有链路钩子都调它）。
+
+    **第一条语句就是总闸**（CTO 3.4-b 约束 2）：`AGENT_STAGE_ENABLED` off → 立即返回 `skipped=True`
+    的静态体（**零 SQL、零写入**）。flag off 的逐字节语义是 §5.1 红线①，评估链绝不能成为
+    「开关关了、新表却还在长」的缺口；接口层在 flag off 时本来就 404 `agent_stage_disabled`，
+    这个短路体服务于既有链路调用方与守护测试。
+
+    **绝不向上写 `stage`**（约束 3）：本函数只写 `pending_stage` 一对、指标快照与两类日志；
+    `stage` 的向上变化只有 3.4-c 的老师确认一条路径（`apply_upgrade_confirmation`）。
+    3.4-b 期间源码级 `stage=` 写入点被钉在 `_ensure_state_row()` **一处**（零 delta，见其 docstring）。
+
+    返回体（**18 键快照 + `changed`**，形状即契约；接口层直出）：
+      `teacher_name` / `skipped` / `reason`
+      `stage` / `stage_label` / `stage_since` / `stage_source` / `pending_stage` /
+      `pending_task_id` / `degraded`（= 评估时刻 `describe_stage()` 的 8 键视图）
+      `metrics`（三键：①② 为对象、③ 恒为 `None`）/ `metrics_reason`（③ 的 `deferred_to_epic3`）
+      `thresholds`（本次判定用的 13 个阈值回显）/ `config_source`（§3.4 第 4 条三键）
+      `next_stage`（`str` / `None`）/ `blockers`（`list[str]`，逐条可解释）
+      `evaluated_at`（本次评估时刻，已写进状态行）/ `metrics_ttl_hours`（前端算 `stale` 用）
+      `changed` = `{stage_changed, recommended, demoted, reason}`（本次调用做了什么；**不落库**）
+
+    `reason` 取值：`upgrade_recommended`（已推荐）/ `blocked`（十条里至少一条不满足）/
+    `recommend_task_write_failed`（本该推荐但建单失败）/ `agent_stage_disabled`（flag off）/
+    `teacher_required`（空 `teacher_name`）/ `evaluate_failed`（§3.8 整体失败）。
+    **本函数永不抛**（异常 → 降级体 + 审计）。
+    """
+    name = teacher_name or ""
+    if not agent_stage_enabled():
+        _config_warn("智能體階段功能未啟用（AGENT_STAGE_ENABLED off）：本次評估直接跳過"
+                     "（零查詢、零寫入）")
+        return _snapshot_short_circuit(name, _BLOCKER_DISABLED, True)
+    if not name:
+        # 空名 = 无效调用（接口层本来就 400 `teacher_required`）：这里也必须挡住 ——
+        # 否则 `upsert_agent_stage_state('')` 会给状态表写一行 `teacher_name=''` 的垃圾行。
+        _config_warn("評估缺少 teacher_name（無效調用）：本次評估直接跳過（零查詢、零寫入）")
+        return _snapshot_short_circuit(name, _BLOCKER_TEACHER_REQUIRED, True)
+    try:
+        return _evaluate(name)
+    except Exception as exc:
+        return _evaluate_failed(name, exc)
+
 

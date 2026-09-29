@@ -1854,7 +1854,7 @@ def upsert_agent_stage_state(teacher_name, **fields):
 def insert_agent_stage_log(teacher_name, event_type, **fields):
     """【只增审计】往 agent_stage_log 追加一条事件，返回新 log_id（§1.3）。
 
-    · `event_type` 的取值白名单属服务层（§1.3 共 9 类），本函数只校验非空；
+    · `event_type` 的取值白名单属服务层（§1.3 共 **10 类**：补 `permission_relaxed` 后），本函数只校验非空；
     · 白名单外字段 → `ValueError`；`created_at` 未传时自动补当前时间；
     · 本区段永不提供 update / delete —— 「只增」由代码层强制。
     """
@@ -2131,6 +2131,88 @@ def get_draft_samples(teacher_name, window_days, limit):
             "at": "",
         })
     return samples
+
+
+# ---------- 【施工步骤 3.4-b】阶段审计的**只读统计**（§2.4 越权计数 + §3.6 冷却判定；批复 C-2）----------
+# 评估判定链需要两样「按事件类型的统计」，两者都只读 `agent_stage_log`（只增审计）：
+#   · §2.4 / §3.6 can_recommend 第 10 条：窗口内 `permission_denied` 次数 > max_permission_denials → 阻断；
+#   · §3.6 can_recommend 第 5 条：距上次「推荐 / 被拒」不足 recommend_cooldown_hours → 阻断。
+# 批复 C 的四条约束逐条落地：**只读** / **不改现有签名** / **不动表结构** / **必带 LIMIT**。
+# 行上限沿用 `get_agent_stage_logs()` 的 200（同为「倒序取最近 N 条」口径），落成**内部常量**：
+# 批复 C-2 已把签名钉死为 `(teacher_name, event_types, since)` 三个参数 → 不新增公开入参。
+
+_STAGE_LOG_STATS_LIMIT = 200
+
+
+def get_agent_stage_log_stats(teacher_name, event_types, since):
+    """【§2.4 / §3.6】按事件类型统计窗口内的阶段审计条数 —— 只读、必带 LIMIT（批复 C-2）。
+
+    入参（签名与批复逐字一致）：
+      · `teacher_name` 空 → 直接返回空统计（**连 SQL 都不发**，与 `get_draft_samples` 同款）；
+      · `event_types` = 要统计的事件名序列（单个 `str` 按「一个事件名」处理；`None` / 空 → 空统计）；
+      · `since` = 时间下界（ISO 串，**含边界**）；空 / 非字符串 → 不过滤（全历史，仍受 LIMIT 约束）。
+
+    返回固定 6 键（形状即契约）：
+      `since`     归一化后的时间下界（`''` = 未过滤）
+      `counts`    {事件名: 条数}；**请求了但一条都没有的事件名也在，值为 0** → 调用方不必兜 KeyError，
+                  也看得见「名字拼错」（值恒为 0）而不是静默通过
+      `total`     命中条数（`sum(counts.values())`）
+      `last_at`   命中行里最新的 `created_at`（无命中 → `''`）—— §3.6 冷却判定用
+      `truncated` 是否撞上行上限（`True` = 更早的行没扫到 → 计数是「最近 N 条内」的下界）
+      `limit`     本次生效的行上限（`_STAGE_LOG_STATS_LIMIT`）
+
+    三条口径：
+      1. **只读 + 必带 LIMIT**：只发**一条** `SELECT ... LIMIT ?`；不写任何表（不发 INSERT / UPDATE /
+         DELETE，不建索引、不改表结构）；
+      2. **倒序扫描**：`ORDER BY created_at DESC, id DESC`（与 `get_agent_stage_logs` 同款；`created_at`
+         是 TEXT、同秒靠 `id` 兜底）→ `last_at` 恒为真正的「最近一次」，与是否被截断无关；
+      3. **不做时间算术**：`since` 由调用方（服务层按 `window_days`）算好传入 —— 本函数不认识
+         「窗口」语义，只做字符串下界比较（全库 TEXT 时间惯例）。
+
+    `sqlite3.Error` **不吞**（裁决⑤：表未就绪 → 503 / 由服务层降级成「按 0 次处理」）。
+    """
+    types = []
+    source = event_types if isinstance(event_types, (list, tuple, set, frozenset)) else \
+        ([event_types] if event_types else [])
+    for item in source:
+        if isinstance(item, str) and item and item not in types:
+            types.append(item)
+    since_text = since if isinstance(since, str) else ""
+
+    stats = {
+        "since": since_text,
+        "counts": {name: 0 for name in types},
+        "total": 0,
+        "last_at": "",
+        "truncated": False,
+        "limit": _STAGE_LOG_STATS_LIMIT,
+    }
+    if not teacher_name or not types:
+        return stats
+
+    placeholders = ", ".join("?" for _ in types)
+    sql = ("SELECT event_type, created_at FROM agent_stage_log "
+           "WHERE teacher_name = ? AND event_type IN (%s)" % placeholders)
+    params = [teacher_name] + types
+    if since_text:
+        sql += " AND created_at >= ?"
+        params.append(since_text)
+    sql += " ORDER BY created_at DESC, id DESC LIMIT ?"
+    params.append(_STAGE_LOG_STATS_LIMIT)
+
+    conn = get_connection()
+    rows = conn.execute(sql, tuple(params)).fetchall()
+    conn.close()
+
+    stats["truncated"] = len(rows) >= _STAGE_LOG_STATS_LIMIT
+    if rows:
+        stats["last_at"] = rows[0]["created_at"] or ""
+    for row in rows:
+        name = row["event_type"]
+        if name in stats["counts"]:
+            stats["counts"][name] += 1
+    stats["total"] = sum(stats["counts"].values())
+    return stats
 
 
 # ============ 【第75天新增】施治方案模板（老师维度的模板记忆） ============
