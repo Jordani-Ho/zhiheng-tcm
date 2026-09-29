@@ -15,7 +15,11 @@
     ⑨ 【§4.2 改 1】insert_draft 快照写入：四分支逐条 + **flag off 逐字节比对**（基线 = 改动前实测捕获，
        非手抄）+ 快照对老师编辑不可变；
     ⑩ 总闸契约：`agent_stage_service.agent_stage_enabled()` 的取值语义（默认 off）、闸门两态降级，
-       以及「服务层对 database 零 import」的源码级守护（CTO 提醒的循环依赖红线）。
+       以及「服务层对 database 零 import」的源码级守护（CTO 提醒的循环依赖红线）；
+    ⑪ 【§4.2 改 2 / 施工步骤 2.3】`sign_draft` 快照进历史表（双闸门 + 空快照回落 content）+ **改动前
+       逐字节基线**守护 + best-effort 钩子 `on_draft_signed` 三态（不存在→静默 / 存在→调用一次 /
+       抛异常→只打 warn）+「同一个 flag 闸门与同一个列探测只许一份实现」的行为级与源码级守护
+       （CTO step 2.3 追加要求 1–3）。
 
 运行方式（Windows，串行；见 pytest.ini）：
     cd backend
@@ -589,7 +593,7 @@ def test_snapshot_survives_teacher_edit(db, monkeypatch):
 # ============ ⑩ 总闸契约：取值语义 / 两态降级 / 零循环依赖 ============
 
 def test_agent_stage_flag_semantics(monkeypatch):
-    """§5.2 第 5 條：默认 **off**，取值语义与 `TEMPLATE_API_ENABLED` 逐字同款（去空格 + 小写）。"""
+    """§4.5-① flag 判定：默认 **off**，取值语义与 `TEMPLATE_API_ENABLED` 逐字同款（去空格 + 小写）。"""
     import agent_stage_service
 
     monkeypatch.delenv("AGENT_STAGE_ENABLED", raising=False)
@@ -660,4 +664,270 @@ def test_service_module_never_imports_database():
     assert not re.search(r"(?m)^\s*(import\s+database\b|from\s+database\b)", source)
     assert "import_module(" not in source and "__import__(" not in source
     assert "database" not in vars(agent_stage_service), "运行期也不得把 database 绑进命名空间"
+
+# ============ ⑪ 【§4.2 改 2】sign_draft：快照进历史表 + best-effort 钩子 ============
+#
+# 基线来源（＝ CTO 要求 3 的「专门用例」）：本步改动**之前**用同一套 Recorder 实测捕获，两种库形态
+# （老 `patient_records` / 已迁 `patient_records`）捕获结果**逐字节相同**，留档于
+# %TEMP%\epic2_sign_baseline_before.txt。断言口径同 ⑨：把 sign_draft 实际发给 SQLite 的
+# (SQL 文本, 参数) 全序列逐字节比对 —— 唯一非确定性参数 `datetime.now().isoformat()` 归一为 "<NOW>"。
+
+_ISO_NOW_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?$")
+_TRANSCRIPT_ID = 77
+
+
+def _sign_fixture_draft(db):
+    """造一条待签字草案（transcript_id 固定 77，便于与基线逐字节比对）。"""
+    return db.insert_draft(_TRANSCRIPT_ID, "张三", TEACHER, "AI 原稿")
+
+
+def _normalized_calls(connections):
+    """录制到的 (SQL, 参数) 全序列；时间戳参数归一为 "<NOW>"。"""
+    return [
+        (sql, tuple("<NOW>" if isinstance(p, str) and _ISO_NOW_RE.match(p) else p for p in params))
+        for sql, params in _all_calls(connections)
+    ]
+
+
+def _sign_draft_baseline(draft_id):
+    """改动前实测捕获的 sign_draft 语句序列（flag off）。"""
+    return [
+        ("SELECT * FROM drafts WHERE id = ?", (draft_id,)),
+        ("INSERT INTO patient_records (patient_name, teacher_name, ai_draft, final_plan, doctor, visit_at) "
+         "VALUES (?, ?, ?, ?, ?, ?)",
+         ("张三", TEACHER, "AI 原稿", "完整病历", TEACHER, "<NOW>")),
+        ("INSERT INTO homework (patient_name, teacher_name, task, detail, status, created_at) "
+         "VALUES (?, ?, ?, ?, ?, ?)",
+         ("张三", TEACHER, "今日医嘱：最终方案", "请严格遵医嘱执行", "pending", "2026-09-19")),
+        ("DELETE FROM transcriptions WHERE id = ?", (_TRANSCRIPT_ID,)),
+        ("DELETE FROM drafts WHERE id = ?", (draft_id,)),
+    ]
+
+
+def _patient_record_insert_call(connections):
+    """取出记录里的那条 patient_records INSERT（用于断言分支列集）。"""
+    return [c for c in _all_calls(connections) if c[0].startswith("INSERT INTO patient_records")][0]
+
+
+def test_sign_draft_flag_off_is_byte_identical(db, sql_log, monkeypatch):
+    """【要求 3】flag off：sign_draft 的语句序列 + 参数与改动前**逐字节一致**（基线 = 实测捕获）。
+
+    这是 §5.1 红线①（flag off = 逐字节 1:1 / 零副作用）在签字链路上的硬门槛：既有 6 列 INSERT 的
+    SQL 文本、参数顺序、`UPDATE transcriptions` / `DELETE` 两条收尾语句、以及返回值全部不变。
+    """
+    monkeypatch.setenv("AGENT_STAGE_ENABLED", "off")
+    draft_id = _sign_fixture_draft(db)
+    sql_log.clear()                                   # 只录「签字」这一段
+
+    got = db.sign_draft(draft_id, "最终方案", "完整病历")
+
+    assert got == "张三", "返回值语义不变（§5.1 红线③）"
+    assert _normalized_calls(sql_log) == _sign_draft_baseline(draft_id)
+
+    conn = db.get_connection()
+    drafts_left = conn.execute("SELECT COUNT(*) AS c FROM drafts WHERE id = ?", (draft_id,)).fetchone()["c"]
+    row = conn.execute("SELECT * FROM patient_records ORDER BY id DESC LIMIT 1").fetchone()
+    conn.close()
+    assert drafts_left == 0, "草案行照样被删（既有行为不变）"
+    assert row["ai_original_text"] == "", "flag off 不写快照列，保持迁移默认值 ''（§5.5-①）"
+    assert row["ai_draft"] == "AI 原稿" and row["final_plan"] == "完整病历", "既有字段语义不变"
+
+
+def test_sign_draft_flag_on_writes_ai_original_text(db, sql_log, monkeypatch):
+    """改 2a 正路：flag on 且 `patient_records.ai_original_text` 就位 → 快照随签字进历史表。
+
+    守护的是**不回落 content**（CTO 裁决③）：草案落库后老师把 `content` 改成终稿，进历史表的
+    `ai_original_text` 必须仍是**生成时刻的快照**（否则学习轨迹 ① 会把「改过」误记成「零修改」）。
+    """
+    monkeypatch.setenv("AGENT_STAGE_ENABLED", "on")
+    draft_id = _sign_fixture_draft(db)                       # 快照 = "AI 原稿"
+    db.update_draft_content(draft_id, "老师改过的终稿")       # 只动 content，快照不可变
+    sql_log.clear()
+
+    assert db.sign_draft(draft_id, "最终方案", "完整病历") == "张三"
+
+    sql, _params = _patient_record_insert_call(sql_log)
+    assert "ai_original_text" in sql, "列就位 + flag on → 追加写快照列"
+
+    conn = db.get_connection()
+    row = conn.execute("SELECT * FROM patient_records ORDER BY id DESC LIMIT 1").fetchone()
+    conn.close()
+    assert row["ai_original_text"] == "AI 原稿", "历史表拿到的必须是快照，不是老师改后的 content"
+    assert row["ai_draft"] == "老师改过的终稿", "既有字段 ai_draft 仍是签字时刻的 content"
+
+
+def test_sign_draft_falls_back_to_content_when_snapshot_empty(db, monkeypatch):
+    """快照为空 → 回落 `content`（设计 §4.2 改 2a 原文；「无快照」时才借用，绝不用它顶替真快照）。
+
+    空快照的现实来源：该草案落库时 flag 关（或迁移前的老草案，§1.4 不删列）。此时落 content 优于
+    留空 —— 留空会让历史表永久丢掉这条学习样本。
+    """
+    monkeypatch.setenv("AGENT_STAGE_ENABLED", "off")
+    draft_id = _sign_fixture_draft(db)                       # 快照保持 ''
+
+    conn = db.get_connection()
+    snapshot = conn.execute("SELECT ai_original_content FROM drafts WHERE id = ?", (draft_id,)).fetchone()["ai_original_content"]
+    conn.close()
+    assert snapshot == "", "前置条件：草案快照为空（flag off 时落库）"
+
+    monkeypatch.setenv("AGENT_STAGE_ENABLED", "on")          # 签字时 flag 已打开
+    db.sign_draft(draft_id, "最终方案", "完整病历")
+
+    conn = db.get_connection()
+    row = conn.execute("SELECT * FROM patient_records ORDER BY id DESC LIMIT 1").fetchone()
+    conn.close()
+    assert row["ai_original_text"] == "AI 原稿", "快照为空 → 回落 content"
+
+
+_LEGACY_PATIENT_RECORDS_DDL = (
+    "CREATE TABLE patient_records (id INTEGER PRIMARY KEY AUTOINCREMENT, patient_name TEXT, teacher_name TEXT, "
+    "ai_draft TEXT, final_plan TEXT, doctor TEXT, visit_at TEXT DEFAULT '')"
+)
+
+
+@pytest.fixture
+def legacy_full_db(monkeypatch, tmp_path):
+    """老库形态：`drafts` 只有 5 列 + `patient_records` 没有 `ai_original_text`（迁移 0002 / 0003 都没跑）。"""
+    path = tmp_path / "legacy_full.db"
+    conn = sqlite3.connect(str(path))
+    conn.execute(_LEGACY_DRAFTS_DDL)
+    conn.execute(_LEGACY_PATIENT_RECORDS_DDL)
+    conn.execute("CREATE TABLE transcriptions (id INTEGER PRIMARY KEY, processed INTEGER DEFAULT 0)")
+    conn.execute("CREATE TABLE homework (id INTEGER PRIMARY KEY AUTOINCREMENT, patient_name TEXT, "
+                 "teacher_name TEXT, task TEXT, detail TEXT, status TEXT, created_at TEXT DEFAULT '')")
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(database, "DB_PATH", str(path))
+    return database
+
+
+def test_sign_draft_flag_on_legacy_db_still_uses_original_sql(legacy_full_db, sql_log, monkeypatch):
+    """双闸门的第二道：flag 已 on 但列未就位（老库）→ 仍走原 6 列 SQL，序列与 flag off 基线一致。"""
+    monkeypatch.setenv("AGENT_STAGE_ENABLED", "on")
+    draft_id = _sign_fixture_draft(legacy_full_db)
+    sql_log.clear()
+
+    assert legacy_full_db.sign_draft(draft_id, "最终方案", "完整病历") == "张三"
+
+    sql, _params = _patient_record_insert_call(sql_log)
+    assert "ai_original_text" not in sql, "列未就位 → 必须走原 6 列 SQL"
+
+    calls = _normalized_calls(sql_log)
+    assert calls[1] == ("PRAGMA table_info('patient_records')", ()), "flag on 时必须真的探到列（第二道闸门）"
+    assert [c for c in calls if not c[0].startswith("PRAGMA")] == _sign_draft_baseline(draft_id), \
+        "除那一次列探测外，语句序列与 flag off 基线逐字节一致"
+
+
+def test_sign_draft_hook_absent_is_silent_noop(db, monkeypatch, capsys):
+    """【要求 2 · 态一】`on_draft_signed` 不存在（step 2.3 的今天）→ **静默** no-op：零输出、零影响。"""
+    import agent_stage_service
+
+    monkeypatch.setenv("AGENT_STAGE_ENABLED", "on")           # 即使 flag on，函数不存在也必须静默
+    monkeypatch.delattr(agent_stage_service, "on_draft_signed", raising=False)
+    draft_id = _sign_fixture_draft(db)
+
+    assert db.sign_draft(draft_id, "最终方案") == "张三"
+    assert database._call_agent_stage_hook("on_draft_signed", TEACHER) is False
+    monkeypatch.setitem(sys.modules, "agent_stage_service", None)     # 服务层整个不可导入
+    assert database._call_agent_stage_hook("on_draft_signed", TEACHER) is False
+    assert capsys.readouterr().out == "", "「无该函数 / 模块不可导入」必须完全静默（不得打 warn）"
+
+
+def test_sign_draft_hook_present_is_called_once_with_teacher_name(db, monkeypatch):
+    """【要求 2 · 态二】钩子存在 → 以 `draft["teacher_name"]` 调用**一次**；返回值仍不变。
+
+    注意（step 3 交接）：调用点**不判 flag** —— 设计 §4.2 改 2b 的代码形状就是无条件 try 调用，
+    「flag off → 不算指标」由钩子自身首行闸门负责（见 `agent_stage_enabled()` docstring 的交接说明）。
+    """
+    import agent_stage_service
+
+    seen = []
+    monkeypatch.setenv("AGENT_STAGE_ENABLED", "off")           # 故意 flag off：转发照发，闸门在服务层
+    monkeypatch.setattr(agent_stage_service, "on_draft_signed", seen.append, raising=False)
+    draft_id = _sign_fixture_draft(db)
+
+    assert db.sign_draft(draft_id, "最终方案") == "张三"
+    assert seen == [TEACHER]
+
+
+def test_sign_draft_hook_exception_only_warns(db, monkeypatch, capsys):
+    """【要求 2 · 态三】钩子存在但抛异常 → 打一行 warn、**绝不冒泡**；签字已提交、返回值不变。"""
+    import agent_stage_service
+
+    def boom(teacher_name):
+        raise RuntimeError("评估炸了")
+
+    monkeypatch.setenv("AGENT_STAGE_ENABLED", "off")          # 本用例与 flag 取值无关：显式固定，不依赖环境
+    monkeypatch.setattr(agent_stage_service, "on_draft_signed", boom, raising=False)
+    draft_id = _sign_fixture_draft(db)
+
+    assert db.sign_draft(draft_id, "最终方案", "完整病历") == "张三", "异常不得冒泡、返回值不变"
+
+    out = capsys.readouterr().out
+    assert "[warn]" in out and "on_draft_signed" in out, "失败必须留痕且留名"
+
+    conn = db.get_connection()
+    drafts_left = conn.execute("SELECT COUNT(*) AS c FROM drafts WHERE id = ?", (draft_id,)).fetchone()["c"]
+    records = conn.execute("SELECT COUNT(*) AS c FROM patient_records").fetchone()["c"]
+    conn.close()
+    assert drafts_left == 0 and records >= 1, "钩子失败不影响签字落库 / 删草案"
+
+
+def test_sign_draft_hook_runs_after_commit(db, monkeypatch):
+    """改 2b 的位置纪律：钩子在 **commit + close 之后**调用（评估失败不可能回滚签字）。"""
+    import agent_stage_service
+
+    seen = {}
+
+    def hook(teacher_name):
+        conn = db.get_connection()                            # 另开一条连接观察「已提交」状态
+        seen["drafts"] = conn.execute(
+            "SELECT COUNT(*) AS c FROM drafts WHERE patient_name = ?", ("张三",)).fetchone()["c"]
+        seen["records"] = conn.execute("SELECT COUNT(*) AS c FROM patient_records").fetchone()["c"]
+        conn.close()
+
+    monkeypatch.setenv("AGENT_STAGE_ENABLED", "off")          # 本用例与 flag 取值无关：显式固定，不依赖环境
+    monkeypatch.setattr(agent_stage_service, "on_draft_signed", hook, raising=False)
+    draft_id = _sign_fixture_draft(db)
+    db.sign_draft(draft_id, "最终方案")
+
+    assert seen["drafts"] == 0, "钩子执行时草案行已被提交删除"
+    assert seen["records"] >= 1, "钩子执行时病历已提交落库"
+
+
+def test_single_flag_gate_and_probe_helpers_are_shared(db, monkeypatch):
+    """【要求 1】两个快照写入点必须共用**同一个**闸门函数与**同一个**列探测实现（不得各写一份）。"""
+    calls = []
+    real_gate = database._agent_stage_snapshot_enabled
+    real_probe = database._table_has_columns
+
+    def gate_spy():
+        calls.append("gate")
+        return real_gate()
+
+    def probe_spy(conn, table, columns):
+        calls.append(f"probe:{table}")
+        return real_probe(conn, table, columns)
+
+    monkeypatch.setenv("AGENT_STAGE_ENABLED", "on")
+    monkeypatch.setattr(database, "_agent_stage_snapshot_enabled", gate_spy)
+    monkeypatch.setattr(database, "_table_has_columns", probe_spy)
+
+    draft_id = _sign_fixture_draft(db)                        # insert_draft：闸门 1 次 + 草案列探测 1 次
+    db.sign_draft(draft_id, "最终方案")                        # sign_draft：闸门 1 次 + 历史表列探测 1 次
+
+    assert calls.count("gate") == 2, "两个写入点各过一次**同一个**闸门（不得存在第二份 flag 判断）"
+    assert calls.count("probe:drafts") == 1 and calls.count("probe:patient_records") == 1, \
+        "两个快照列探测共用唯一实现 _table_has_columns"
+
+
+def test_database_module_never_imports_agent_stage_service_at_module_level():
+    """【要求 1 · 源码级】`database.py` 对服务层的依赖恒为**函数内延迟 import**（模块级 = 循环依赖）。"""
+    source_path = os.path.join(os.path.dirname(os.path.abspath(database.__file__)), "database.py")
+    with open(source_path, encoding="utf-8") as fh:
+        source = fh.read()
+
+    assert not re.search(r"(?m)^(?:import|from)\s+agent_stage_service", source), "模块级 import = 循环依赖"
+    lazy = re.findall(r"(?m)^(\s+)import agent_stage_service\s*$", source)
+    assert len(lazy) >= 2, "延迟 import 至少两处：闸门 `_agent_stage_snapshot_enabled` + 钩子转发 `_call_agent_stage_hook`"
 

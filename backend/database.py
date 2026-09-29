@@ -651,22 +651,42 @@ def _drafts_supports_template_refs(conn):
     return set(_DRAFT_TEMPLATE_REF_COLUMNS) <= columns
 
 
+def _table_has_columns(conn, table, columns):
+    """表列探测的**唯一实现**（Epic 2 两个快照列共用；迁移未跑 / 表未建 → False，不抛异常）。
+
+    · 施工步骤 2.3 起由 `_drafts_supports_ai_original()` 与 `_patient_records_supports_ai_original()`
+      共用 —— CTO step 2.3 追加要求 1 的同一条纪律：**同一个判断只许有一份实现**。
+    · `table` 只接受本模块内写死的表名常量，**不是**用户输入（故 f-string 拼接无注入面）；
+      探测语句的形状（`PRAGMA table_info('drafts')`）是 Epic 1 / step 2.2 既有基线依赖的，改不得。
+    """
+    try:
+        existing = {row["name"] for row in conn.execute(f"PRAGMA table_info('{table}')")}
+    except sqlite3.Error:
+        return False
+    return set(columns) <= existing
+
+
 # 【Epic 2 §4.2 改 1 / §7.1-①】`drafts.ai_original_content` = AI 原始输出的**不可变快照**，由迁移 0003 添加。
 # 写入条件是**双闸门**（CTO 裁决①）：总闸 flag **on** 且 该列已就位；两者任一为假 → 原 SQL 一字不改。
 _DRAFT_AI_SNAPSHOT_COLUMNS = ("ai_original_content",)
 
+# 【Epic 2 §4.2 改 2a】`patient_records.ai_original_text` = 签字时从草案带过来的**同一份快照**（迁移 0003 添加）。
+# 写入条件同款双闸门：flag **on** 且 该列已就位；任一为假 → 改动前的 6 列 INSERT 一字不改（§5.1 红线①）。
+_PATIENT_RECORD_AI_SNAPSHOT_COLUMNS = ("ai_original_text",)
+
 
 def _drafts_supports_ai_original(conn):
     """`drafts.ai_original_content` 是否就位（迁移 0003 未跑 / drafts 未建 → False）。"""
-    try:
-        columns = {row["name"] for row in conn.execute("PRAGMA table_info('drafts')")}
-    except sqlite3.Error:
-        return False
-    return set(_DRAFT_AI_SNAPSHOT_COLUMNS) <= columns
+    return _table_has_columns(conn, "drafts", _DRAFT_AI_SNAPSHOT_COLUMNS)
+
+
+def _patient_records_supports_ai_original(conn):
+    """`patient_records.ai_original_text` 是否就位（迁移 0003 未跑 / patient_records 未建 → False）。"""
+    return _table_has_columns(conn, "patient_records", _PATIENT_RECORD_AI_SNAPSHOT_COLUMNS)
 
 
 def _agent_stage_snapshot_enabled():
-    """总闸 `AGENT_STAGE_ENABLED`（§5.2 第 5 條，**默认 off**）—— 两个快照列（改 1 / 改 2a）的共用闸门。
+    """总闸 `AGENT_STAGE_ENABLED`（§4.5-① flag 判定，**默认 off**）—— 两个快照列（改 1 / 改 2a）的共用闸门。
 
     真相源在服务层（CTO 裁决②「方案 B」：`agent_stage_service.agent_stage_enabled()`），此处**函数内延迟
     import**，两个理由：
@@ -689,6 +709,57 @@ def _agent_stage_snapshot_enabled():
         return bool(checker())
     except Exception as exc:
         print(f"[warn] AGENT_STAGE_ENABLED 闸门读取失败，按 off 处理：{exc}")
+        return False
+
+
+def _draft_ai_snapshot(draft):
+    """【Epic 2 §4.2 改 2a】要落进 `patient_records.ai_original_text` 的值 = 草案的不可变快照。
+
+    真相源是 `drafts.ai_original_content`（改 1 落库时写下的**生成时刻** content）；只在下面两种
+    「根本拿不到快照」的情形才回落 `content`（设计 §4.2 改 2a 原文：「为空则回落 content」）：
+      ① 快照是空串 —— 该草案落库时 flag 关（或迁移前的老草案），§1.4「不删列」的既有数据；
+      ② 快照列不存在 —— 迁移 0003 未跑的老库（`sqlite3.Row` 取未知键抛 IndexError）。
+
+    边界（与 CTO 裁决③「不回落 content」不冲突）：**快照非空时永远以快照为准**，老师编辑后的
+    `content` 绝不覆盖它 —— 否则学习轨迹会把「有快照」污成「零修改」。也就是说本函数只会
+    在「无快照」时借用 content，不会在「有快照」时用 content 顶替。
+    """
+    try:
+        snapshot = draft["ai_original_content"]
+    except (IndexError, KeyError):
+        return draft["content"]
+    return snapshot or draft["content"]
+
+
+def _call_agent_stage_hook(hook_name, *args):
+    """【Epic 2 §4.2 改 2b】签字 / 请示落定后**best-effort** 通知服务层（延迟 import，两态显式）。
+
+    库层只做转发：一行延迟 import + 一次 `getattr` 调用；flag 判定、样本、指标全在服务层
+    （§5.1 红线①「flag off → 不算指标」由钩子自身首行闸门负责，库层不替它判 —— 否则就会出现
+    第二个 flag 判断，违背 CTO step 2.3 追加要求 1）。延迟 import 与 `save_plan_template()`
+    里 `import template_service`（§4.2 改 2 引注）同款，回避循环引用。
+
+    两态纪律（CTO step 2.3 追加要求 2，与 `_agent_stage_snapshot_enabled()` 逐字同款）：
+      · 服务层不可导入 / 该属性不存在 → `getattr(..., None)` + `callable()` 判 false →
+        **静默 no-op**（不留任何输出）。`on_draft_signed` 属施工步骤 3，本步落地时**尚不存在**，
+        走的正是这一态 —— 因此今天的 `sign_draft()` 与改动前行为一致（§5.1 红线③）。
+      · 钩子存在但抛异常 → `print` 一行 warn，**绝不冒泡**：签字已经 commit，不得因评估失败
+        而让老师看到失败（红线③「返回值 / 删除草案 / signed 语义不变」）。
+
+    返回「是否真的调用了钩子」（仅供测试断言用，生产调用方一律忽略）。
+    """
+    try:
+        import agent_stage_service
+    except Exception:
+        return False
+    hook = getattr(agent_stage_service, hook_name, None)
+    if not callable(hook):
+        return False
+    try:
+        hook(*args)
+        return True
+    except Exception as exc:
+        print(f"[warn] agent_stage_service.{hook_name} 调用失败（已忽略，签字结果不受影响）：{exc}")
         return False
 
 
@@ -764,6 +835,14 @@ def sign_draft(draft_id, final_plan, final_content=None):
 
     【第77天新增】落库时一并写入 visit_at = 当前时间（ISO 时间戳）—— 这是「复诊提醒」唯一可靠的
     就诊时间基准（以前只能从病历文本的签字行「李老师 · 2026年9月23日」里猜，漏签字行就失效）。
+
+    【Epic 2 §4.2 改 2】**只追加两件事，既有语义零变化**（§5.1 红线③）：
+      · 改动 a：`patient_records.ai_original_text` 落「草案的 AI 原始快照」（空则回落 `content`）——
+        **双闸门**（CTO 裁决①：flag on 且该列就位）任一为假 → 走**改动前逐字节一致**的原 6 列 SQL；
+        原因：草案行签字后会被 `DELETE`，快照不落历史表就永久丢失（§1.4 / §4.2-2a）。
+      · 改动 b：函数末尾 best-effort 调服务层 `on_draft_signed(teacher_name)`（延迟 import + 两态，
+        见 `_call_agent_stage_hook`）—— **在 commit 之后**调用，评估失败绝不回滚签字。
+    返回值（`draft["patient_name"]`）、删除草案、`signed` 语义、`patient_records` 既有字段全部不变。
     """
     conn = get_connection()
     draft = conn.execute("SELECT * FROM drafts WHERE id = ?", (draft_id,)).fetchone()
@@ -774,11 +853,21 @@ def sign_draft(draft_id, final_plan, final_content=None):
     # 完整病历（如果传了）或退回到最终方案
     patient_record_content = final_content if final_content else final_plan
 
+    # 【Epic 2 §4.2 改 2a · 双闸门，CTO 裁决①】flag 先判（廉价、零 SQL），再探列：
+    # 任一为假 → 下面走**改动前逐字节一致**的原 6 列 INSERT（§5.1 红线① / §5.5-① 硬门槛，有专项用例）。
+    ai_snapshot_enabled = _agent_stage_snapshot_enabled() and _patient_records_supports_ai_original(conn)
+
     # 【第77天新增】visit_at = 签字时刻（本机时间，ISO 格式）：agent.check_recall_alerts 按它判断该生多久没复诊
-    conn.execute(
-        "INSERT INTO patient_records (patient_name, teacher_name, ai_draft, final_plan, doctor, visit_at) VALUES (?, ?, ?, ?, ?, ?)",
-        (draft["patient_name"], draft["teacher_name"], draft["content"], patient_record_content, draft["teacher_name"], datetime.now().isoformat())
-    )
+    if ai_snapshot_enabled:                                     # 7 列：+ AI 原始快照（改 2a）
+        conn.execute(
+            "INSERT INTO patient_records (patient_name, teacher_name, ai_draft, final_plan, doctor, visit_at, ai_original_text) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (draft["patient_name"], draft["teacher_name"], draft["content"], patient_record_content, draft["teacher_name"], datetime.now().isoformat(), _draft_ai_snapshot(draft))
+        )
+    else:                                                       # 原 6 列：SQL 与参数逐字不变（仅缩进 +4 空格）
+        conn.execute(
+            "INSERT INTO patient_records (patient_name, teacher_name, ai_draft, final_plan, doctor, visit_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (draft["patient_name"], draft["teacher_name"], draft["content"], patient_record_content, draft["teacher_name"], datetime.now().isoformat())
+        )
     conn.execute(
         "INSERT INTO homework (patient_name, teacher_name, task, detail, status, created_at) VALUES (?, ?, ?, ?, ?, ?)",
         (draft["patient_name"], draft["teacher_name"], f"今日医嘱：{final_plan}", "请严格遵医嘱执行", "pending", "2026-09-19")
@@ -788,6 +877,11 @@ def sign_draft(draft_id, final_plan, final_content=None):
 
     conn.commit()
     conn.close()
+
+    # 【Epic 2 §4.2 改 2b】签字已落库 → best-effort 通知服务层（延迟 import + 两态见 `_call_agent_stage_hook`）。
+    # 放在 commit/close 之后：评估失败绝不回滚签字；返回值一字不改（§5.1 红线③）。
+    _call_agent_stage_hook("on_draft_signed", draft["teacher_name"])
+
     return draft["patient_name"]
 
     conn.execute("INSERT INTO patient_records (patient_name, teacher_name, ai_draft, final_plan, doctor) VALUES (?, ?, ?, ?, ?)",

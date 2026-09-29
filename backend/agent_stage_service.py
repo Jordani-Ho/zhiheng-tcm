@@ -4,8 +4,9 @@
   - §0.4 枚举与命名对照表（唯一口径，全栈共用）：五阶段枚举 / rank / 繁体徽章 / 能力键
   - §2.3 能力 → 阶段矩阵（L2 判定表，唯一真相源）
   - §4.5-① 本文件的公开符号清单（`STAGES` / `STAGE_RANK` / `STAGE_LABELS` /
-    `CAPABILITIES` / `CAPABILITY_MIN_STAGE`）+ §5.2 第 5 條的总闸
-    （`AGENT_STAGE_ENABLED_VALUES` / `agent_stage_enabled`，施工步骤 2.2 追加）
+    `CAPABILITIES` / `CAPABILITY_MIN_STAGE`）+ 总闸 flag 判定
+    （`AGENT_STAGE_ENABLED_VALUES` / `agent_stage_enabled`，施工步骤 2.2 追加；
+    默认 off 的口径见 §4.5-①，flag off 的逐字节语义见 §5.1 红线 ①）
 
 **本步骤（施工步骤 1：数据底座）的边界**
   - 本文件目前**只放常量数据**：阶段枚举、等级、繁体徽章、能力枚举、能力→阶段矩阵，
@@ -117,7 +118,7 @@ CAPABILITY_MATRIX = {
 }
 
 # ---------------------------------------------------------------------------
-# 【§5.2 第 5 條 / §4.2 改 1】总闸 flag —— CTO 裁决②「方案 B」：真相源放服务层
+# 【§4.5-① / §4.2 改 1】总闸 flag —— CTO 裁决②「方案 B」：真相源放服务层
 # ---------------------------------------------------------------------------
 # 与 `template_service.TEMPLATE_API_ENABLED_VALUES` / `template_api_enabled()` 逐字同款
 # （`template_service.py:897-909`），**默认 off**。
@@ -134,6 +135,10 @@ def agent_stage_enabled():
       · `database.insert_draft()` / `database.sign_draft()` 的**快照列双闸门**
         （经 `database._agent_stage_snapshot_enabled()` 函数内延迟 import 取用，方向单向）；
       · 接口层 `/api/agent/stage*` 的 404 闸门（施工步骤 4）。
+      · 【施工步骤 2.3 起】**反向**：`database.sign_draft()` 末尾会 best-effort 调用本模块的
+        `on_draft_signed(teacher_name)`（§4.2 改 2b）。它是施工步骤 3 的符号；落地时**首行必须自闸门**
+        （`if not agent_stage_enabled(): return`）—— 库层只转发、**不替它判 flag**（否则会出现第二个
+        flag 判断）。总闸语义因此仍然成立：flag off → 钩子立即返回 → 不算指标、不写新表（§5.1 红线 ①）。
 
     **本函数只读环境变量**：不读库、不打日志、不抛异常、不缓存（读到的永远是当前 env）。
     """
