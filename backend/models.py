@@ -98,3 +98,56 @@ class StudentLineageInput(_LineageBody):
     student_name: str = ""
     lineage_id: str = ""
     teacher_name: str = ""
+
+
+# ---------- Epic 2 §4.5-② / §4.6：智能體階段請求體（`agent_stage_api.py` 專用，施工步驟 4b-1） ----------
+# 欄位**一律給默認值**（`str = ""` / `int = 0` / `Any = None`），理由與上方 `_LineageBody` 段逐字相同：
+#   §5.1 红线 ① 要求「flag off → `/api/agent/stage*` 全部 404 `agent_stage_disabled`」，而 FastAPI 的
+#   body 校驗發生在**函數體之前** —— 欄位必填的話，「缺欄位 + flag off」會先被框架回 422，蓋掉 flag 門
+#   （前端也解不出 422 裡的 `detail.error`）；故 body 校驗刻意留給接口層 / 服務層（統一錯誤體 400 / 404）。
+#   （完全不帶 body 的請求仍由 FastAPI 回 422，這點與 Epic 1 / Epic 4 相同。）
+# 與 §4.6 接口表的對應（7 個端點的入參）：
+#   AgentStageConfigInput  → #4 PUT /config；AgentStageActionInput → #2 POST /evaluate、#5 POST /demote；
+#   AgentStageSuggestInput → #6 POST /suggest（#7 POST /predraft 只多一個可選 `formula_name`）。
+
+
+class AgentStageConfigInput(BaseModel):
+    """`PUT /api/agent/stage/config`（§4.6-④）：`config` **全量替換**。
+
+    `config` 故意用 `Any = None`（同 `TemplateCreateInput.template_schema` 的口徑）：配置結構不合法
+    由服務層 `validate_stage_config()` 逐條回報 400 `stage_config_invalid` + `errors:[{path,msg}]`，
+    而不是 FastAPI 自動回 422 —— 前端只認統一錯誤體（設計 §0.3）。
+    """
+
+    teacher_name: str = ""
+    teacher_id: str = ""
+    config: Any = None
+
+
+class AgentStageActionInput(BaseModel):
+    """`POST /api/agent/stage/evaluate`（§4.6-②）與 `POST /api/agent/stage/demote`（§4.6-⑤）共用。
+
+    · `evaluate` 只讀兩個鑑權欄位（`to_stage` / `reason` 留空不用）；
+    · `demote` 用 `to_stage`（空串 / 非法值 → 400 `stage_invalid_value`；同階段 / 高於當前 →
+      409 `stage_transition_invalid`）+ `reason`（缺省文案由接口層兜底）。
+    """
+
+    teacher_name: str = ""
+    teacher_id: str = ""
+    to_stage: str = ""
+    reason: str = ""
+
+
+class AgentStageSuggestInput(BaseModel):
+    """`POST /api/agent/stage/suggest`（§4.6-⑥）：`kind ∈ {'pattern','formula'}`，非法 → 400
+    `stage_kind_invalid`；`draft_id` 反查不到 → 404 `stage_draft_not_found`。
+
+    `draft_id` 用 `int = 0` 而不是 `Optional[int] = None`：缺鍵同樣**不**被 FastAPI 攔成 422（同上理由），
+    由服務層按「查不到該草案」統一落 404，避免校驗層多一個 `None` / `0` 的分叉語義。
+    """
+
+    teacher_name: str = ""
+    teacher_id: str = ""
+    draft_id: int = 0
+    kind: str = ""
+    formula_name: str = ""

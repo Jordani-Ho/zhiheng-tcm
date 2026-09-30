@@ -10,6 +10,8 @@ import agent
 import template_api
 import lineage_api
 import lineage_service
+import agent_stage_api
+import agent_stage_service
 import os
 import shutil
 import uuid
@@ -60,6 +62,20 @@ app.add_exception_handler(database.TemplateError, template_api.template_error_ha
 #   · flag `LINEAGE_ENABLED` **默认 off**（§4.4）→ 老師端讀接口既有行為逐字節不變。
 app.include_router(lineage_api.router)
 app.add_exception_handler(lineage_service.LineageError, lineage_api.lineage_error_handler)
+
+# 【Epic 2 新增】智能體階段（agent stage）接口與錯誤碼契約（設計 §4.5-② / §4.6；施工步驟 4b-1）：
+#   · `agent_stage_service.AgentStageError` → 真實 HTTP 狀態碼 + 統一錯誤體
+#     （403 `stage_forbidden` / 400 `stage_kind_invalid` / 400 `stage_invalid_value` /
+#      409 `stage_transition_invalid` / 404 `stage_draft_not_found` / 400 `stage_config_invalid`，
+#      未列的碼兜底 400，见 agent_stage_api.agent_stage_error_handler）；
+#   · router 前缀 `/api/agent/stage`（与既有 `/api/agent/tasks*`、`/api/agent/scan` 无重叠前缀）；
+#   · flag `AGENT_STAGE_ENABLED` **默认 off**（§4.5-① / §5.1 红线 ①）→ `/api/agent/stage*` 全部
+#     404 `agent_stage_disabled`，既有链路一字不改；迁移未跑（三张新表缺失）→ 503
+#     `agent_stage_store_unavailable`（`_guard()` 第二道，§7.1-⑫）。
+#   · 4b-1 只落「骨架 + 挂载」：7 个 endpoint 属 4b-2（本步挂载后 `/api/agent/stage*` 仍是
+#     FastAPI 默认 404，无任何行为变化）。
+app.include_router(agent_stage_api.router)
+app.add_exception_handler(agent_stage_service.AgentStageError, agent_stage_api.agent_stage_error_handler)
 
 class TranscriptionInput(BaseModel):
     patient_name: str

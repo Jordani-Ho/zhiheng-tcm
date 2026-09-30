@@ -389,7 +389,13 @@ def test_upgrade_task_row_is_compatible_with_existing_channel(db):
     assert tasks[0]["action"]["to"] == "apprentice"
 
 
-def test_find_pending_upgrade_task_ignores_resolved_tasks(db):
+def test_find_pending_upgrade_task_ignores_resolved_tasks(db, monkeypatch):
+    """本用例的断言口径是**既有决策留痕行为不变**（§5.5-②）→ 显式关总闸：
+
+    flag on 时 `resolve_agent_task` 的升级钩子会按结果**再补一行** `confirm_upgrade` /
+    `decline_upgrade` 行动日志（钩子转发段本身**不判 flag**，CTO 批复①），`[0]` 就不再是 `approve`。
+    """
+    monkeypatch.delenv("AGENT_STAGE_ENABLED", raising=False)
     task_id = db.insert_agent_stage_upgrade_task(TEACHER, "建议升级：见习期", "各指标已达标", ACTION_DATA)
     db.resolve_agent_task(task_id, "approved")            # 既有函数：处理后不再是 pending
 
