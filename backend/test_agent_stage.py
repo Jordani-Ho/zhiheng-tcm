@@ -5203,3 +5203,973 @@ def test_api_module_never_imports_database_or_forbidden_symbols():
     assert attributes == set(), "接口层不得访问 database.<任何东西>"
     for symbol in _FORBIDDEN_SERVICE_IMPORTS:
         assert symbol not in imported, "接口层不得 import 禁忌符号 %s" % symbol
+
+
+# ===========================================================================
+# ㉑ 【施工步骤 4c-1】AI 层三个能力 + 服务层 build_suggestion / build_predraft
+#
+# 本组钉住 4c-1 的两个新增面（4c-2 的接口层 #6/#7 只做 HTTP 投影，不在本组范围）：
+#   ① `agent.py` 尾部的追加块：三个公开能力入口（`predict_pattern_candidates` /
+#      `suggest_formula` / `generate_predraft`）+ 三段提示词 + 契约常量（三份 `*_DISCLAIMER` /
+#      `FORMULA_USAGE` / `PATTERN_CONFIDENCE_LEVELS` / `MAX_*` / `PROMPT_TEXT_LIMIT` / `PARSE_FAILED`）
+#      —— `generate_medical_draft()` 仍是**唯一**生成路径，本块零 `database.*`、零新增 import、零落库；
+#   ② `agent_stage_service.py` 的 4c-1 追加段：`build_suggestion()`（12 键）与 `build_predraft()`
+#      （12 键）—— 六条纪律逐条钉住：flag 先行（零 SQL）/ 空名短路 / 唯一闸门（`stage_forbidden`）/
+#      草案反查 fail-closed（`stage_draft_not_found`）/ 唯一写点是一行审计 / **永不抛**
+#      （`suggestion_failed` / `predraft_failed` 是故障，`parse_failed` 是**成功**的空结果）。
+# 本组**不改** ⑬–⑳ 组一行：造数 / 断言助手全部复用（`_raw_execute` / `_put_raw_state_row` /
+# `_seed_draft` / `_table_counts` / `_stage_log_events` / `_all_calls` / `_service_source` /
+# `_service_imports_and_database_attrs` / `_FORBIDDEN_SERVICE_IMPORTS` / `_GATE_CAPS`）。
+# **模型一律桩掉**（`agent.<能力函数>` 或 `agent.llm` 换成本地假回包）：本组不打真 LLM。
+# ===========================================================================
+
+# 两个返回体的**逐键**契约（成功体 / 短路体 / 解析失败体三条路径同形 = §4.6-⑥⑦ 的出参）
+_SUGGESTION_KEYS = ("teacher_name", "kind", "draft_id", "patient_name", "skipped", "applied",
+                    "reason", "payload", "disclaimer", "generated_at", "warnings", "errors")
+_PREDRAFT_KEYS = ("teacher_name", "draft_id", "patient_name", "skipped", "applied", "reason",
+                  "predraft", "disclaimer", "note", "generated_at", "warnings", "errors")
+# `predraft` 内层三键（成功 / 解析失败 / 短路三条路径**恒在场**：前端一套取值路径）
+_PREDRAFT_INNER_KEYS = ("formula_name", "items", "decoction")
+
+# 草案正文：`_complaint_text()` 能从「主訴」段切出内容（取数链第一段 = 工作副本正文）
+_SUGGESTION_DRAFT = ("【主訴】反覆胃脘脹痛 3 個月，食後加重。\n"
+                     "【現病史】無噯氣泛酸，納可，二便調。\n"
+                     "【舌脈】（留待老師）\n")
+_SUGGESTION_COMPLAINT = "反覆胃脘脹痛 3 個月，食後加重。"
+
+# 造假回包（形状 = §4.3 契约；`confidence` 故意大写、`basis` 故意缺一条 → 验规范化）
+_PATTERN_REPLY = ('```json\n{"candidates": ['
+                  '{"name": "肝胃不和證", "basis": ["反覆胃脘脹痛 3 個月"], "confidence": "HIGH",'
+                  ' "note": "與情志相關"},'
+                  '{"name": "", "basis": ["襯托項"], "confidence": "high"},'
+                  '{"name": "無依據項", "basis": [], "confidence": "high"}]}\n```')
+_FORMULA_REPLY = ('{"formulas": [{"name": "柴胡桂枝湯", "modification": "痛甚加元胡",'
+                  ' "composition": ["柴胡 9g", "桂枝(去皮)", "甘草"], "usage": "日一劑，水煎服"}]}')
+_PREDRAFT_REPLY = ('{"predraft": {"formula_name": "柴胡桂枝湯",'
+                   ' "items": [{"herb": "柴胡", "dose": "9g", "role": "君"},'
+                   ' {"herb": "", "dose": "3g"}, {"herb": "甘草", "dose": "6g", "role": "使"}],'
+                   ' "decoction": "日一劑，分二次溫服"}}')
+
+# 只读旁路的桩（`_past_records_text()` / `_teacher_skeleton_text()` 是**增强**材料）
+_PAST_RECORD_PLAN = "健脾和胃，柴胡桂枝湯加減（既往）"
+_SKELETON_TEXT = "【主訴】（留待老師）\n【舌脈】（留待老師）"
+
+# 两个追加块的**首常量**（块边界：该常量所在顶层语句 → 文件尾 = 本步全部新增面）
+_AGENT_BLOCK_FIRST = "PATTERN_CANDIDATE_PROMPT"
+_SERVICE_BLOCK_FIRST = "SUGGESTION_KINDS"
+
+
+def _agent_source():
+    """AI 层源码（源码级守护用；路径由 `database.__file__` 反推，不硬编码盘符）。"""
+    path = os.path.join(os.path.dirname(os.path.abspath(database.__file__)), "agent.py")
+    with open(path, encoding="utf-8") as fh:
+        return fh.read()
+
+
+def _block_from(source, first_constant):
+    """源码里从 `first_constant`（顶层赋值）起、到文件尾的片段（追加块的**唯一**边界口径）。"""
+    import ast
+
+    for node in ast.parse(source).body:
+        if isinstance(node, ast.Assign) and any(
+                isinstance(target, ast.Name) and target.id == first_constant
+                for target in node.targets):
+            return "\n".join(source.splitlines()[node.lineno - 1:])
+    raise AssertionError("源码缺少 4c-1 追加块的首常量：%s" % first_constant)
+
+
+def _top_level_functions(source):
+    """顶层函数定义的名字（按出现次序）—— 追加块「到底加了几个函数」的源码级口径。"""
+    import ast
+
+    return [node.name for node in ast.parse(source).body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))]
+
+
+def _imports_outside_functions(source):
+    """不在任何函数体内的 import 行号（4c-1 的「延迟 import」纪律）。"""
+    import ast
+
+    tree = ast.parse(source)
+    inside = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for child in ast.walk(node):
+                inside.add(id(child))
+    return [node.lineno for node in ast.walk(tree)
+            if isinstance(node, (ast.Import, ast.ImportFrom)) and id(node) not in inside]
+
+
+def _blank_predraft_shape():
+    """`predraft` 内层空壳（三键恒在场）：短路 / 解析失败两条路径都用它。"""
+    return {"formula_name": "", "items": [], "decoction": ""}
+
+
+def _writes(connections, since=0):
+    """本次被测代码发出的**写语句**（`SELECT` / `PRAGMA` 属只读，不算写）。"""
+    return [sql for sql, _ in _all_calls(connections)[since:]
+            if not sql.lstrip().upper().startswith(("SELECT", "PRAGMA"))]
+
+
+def _mark(connections):
+    """记录当前语句水位（`_writes()` 据此只看被测那一段）。"""
+    return len(_all_calls(connections))
+
+
+def _stub_model(monkeypatch, name, result):
+    """把 `agent.<name>` 换成本地假回包 → 返回调用参数清单（服务层一律**关键字**调用，故收 `**kwargs`）。"""
+    import agent
+
+    calls = []
+
+    def fake(**kwargs):
+        calls.append(kwargs)
+        return dict(result) if isinstance(result, dict) else result
+
+    monkeypatch.setattr(agent, name, fake)
+    return calls
+
+
+def _stub_model_raising(monkeypatch, name, message="模型連線中斷"):
+    """把 `agent.<name>` 换成抛异常的桩（验「永不抛」的故障出口）。"""
+    import agent
+
+    def boom(**kwargs):
+        raise RuntimeError(message)
+
+    monkeypatch.setattr(agent, name, boom)
+
+
+def _stub_reads(monkeypatch):
+    """把两条只读旁路桩成确定值（既往病历 / 段落骨架），免得用例依赖模板表内容。"""
+    import agent_stage_service
+
+    monkeypatch.setattr(database, "get_patient_records",
+                        lambda patient_name, teacher_name=None: [{"final_plan": _PAST_RECORD_PLAN}])
+    monkeypatch.setattr(agent_stage_service, "_teacher_skeleton_text",
+                        lambda teacher_name: _SKELETON_TEXT)
+
+
+def _seed_suggestion_draft(text=_SUGGESTION_DRAFT, teacher=TEACHER):
+    """造「该老师名下最新的未签草案」→ 返回 draft id（`_seed_draft` 的患者名恒为 张三）。"""
+    return _seed_draft(text, 0, teacher=teacher)
+
+
+def _set_stage(stage, teacher=TEACHER):
+    """原文照写阶段行（能力闸门唯一的真相源）。"""
+    _put_raw_state_row(teacher, stage)
+
+
+def _audit_detail(teacher=TEACHER):
+    """最近一条审计的 `detail`（本族「产出几条 / 未落库」的可核对事实）。"""
+    rows = database.get_agent_stage_logs(teacher)
+    return rows[0]["detail"] if rows else ""
+
+
+# ---- 纪律一 / 二：flag 先行（零 SQL）+ 无效调用短路 ----
+
+def test_suggestion_and_predraft_flag_off_are_zero_sql_and_same_shape(db, sql_log, monkeypatch, capsys):
+    """纪律一（flag 先行，同 `evaluate()`）：`AGENT_STAGE_ENABLED` off → 两个入口**立即**返回
+    （零查询 / 零写入 / 零审计），且短路体仍与成功体**逐键同形**、`payload` / `predraft` 摆空值
+    —— 绝不摆一份看起来像结果的字段（4c-2 的接口层据 `reason` 翻 404 `agent_stage_disabled`）。"""
+    import agent_stage_service
+
+    monkeypatch.delenv("AGENT_STAGE_ENABLED", raising=False)
+    _set_stage("authorized")                                  # 阶段给到最高也一样：flag 先行
+    draft_id = _seed_suggestion_draft()
+
+    suggestion = agent_stage_service.build_suggestion(TEACHER, draft_id, "pattern")
+    predraft = agent_stage_service.build_predraft(TEACHER, draft_id)
+
+    assert set(suggestion) == set(_SUGGESTION_KEYS)
+    assert set(predraft) == set(_PREDRAFT_KEYS)
+    assert suggestion["reason"] == "agent_stage_disabled"
+    assert predraft["reason"] == "agent_stage_disabled"
+    assert (suggestion["skipped"], suggestion["applied"]) == (True, False)
+    assert (predraft["skipped"], predraft["applied"]) == (True, False)
+    assert suggestion["payload"] == {} and suggestion["disclaimer"] == ""
+    assert (suggestion["generated_at"], suggestion["errors"], suggestion["warnings"]) == ("", [], [])
+    assert suggestion["draft_id"] == draft_id and suggestion["kind"] == "pattern"
+    assert predraft["predraft"] == _blank_predraft_shape()
+    assert (predraft["disclaimer"], predraft["generated_at"]) == ("", "")
+    assert predraft["note"] == agent_stage_service.PREDRAFT_NOTE, \
+        "`note` 是恒定契约文案（§4.6-⑦ 逐字）：无论走哪条路径都随预填一起回到前端"
+    assert predraft["draft_id"] == draft_id
+
+    out = capsys.readouterr().out
+    assert "[warn]" in out and "未啟用" in out
+    assert _all_calls(sql_log) == [], "flag off 必须零 SQL（含零审计）"
+
+
+def test_suggestion_and_predraft_empty_teacher_short_circuit_before_store_read(db, sql_log, monkeypatch):
+    """无效调用：空 / `None` 老师名 → `teacher_required` 短路（接口层 400），**先于**任何读库
+    —— 零 SQL 是硬断言（连阶段行都不查）。"""
+    import agent_stage_service
+
+    monkeypatch.setenv("AGENT_STAGE_ENABLED", "on")
+
+    for name in ("", None):
+        suggestion = agent_stage_service.build_suggestion(name, 7, "pattern")
+        predraft = agent_stage_service.build_predraft(name, 7, "柴胡桂枝湯")
+
+        assert set(suggestion) == set(_SUGGESTION_KEYS) and set(predraft) == set(_PREDRAFT_KEYS)
+        assert suggestion["reason"] == "teacher_required" and predraft["reason"] == "teacher_required"
+        assert suggestion["teacher_name"] == "" and predraft["teacher_name"] == ""
+        assert (suggestion["skipped"], suggestion["applied"]) == (True, False)
+        assert (predraft["skipped"], predraft["applied"]) == (True, False)
+        assert (suggestion["payload"], predraft["predraft"]) == ({}, _blank_predraft_shape())
+
+    assert _all_calls(sql_log) == [], "空老师名必须零 SQL"
+
+
+def test_suggestion_invalid_kind_is_rejected_without_store_or_model(db, sql_log, monkeypatch):
+    """入参闸门：`kind` 只认 `pattern` / `formula`（§4.3）—— 枚举外**不读库、不调模型、不写审计**，
+    `reason='stage_kind_invalid'`（接口层 400），`skipped=False`（这是拒绝，不是「跳过」）。"""
+    import agent_stage_service
+
+    monkeypatch.setenv("AGENT_STAGE_ENABLED", "on")
+    calls = _stub_model(monkeypatch, "predict_pattern_candidates", {"candidates": []})
+    _set_stage("authorized")
+    draft_id = _seed_suggestion_draft()
+
+    for kind in ("", None, "PATTERN", "diagnose", 12):
+        result = agent_stage_service.build_suggestion(TEACHER, draft_id, kind)
+
+        assert set(result) == set(_SUGGESTION_KEYS)
+        assert result["reason"] == "stage_kind_invalid"
+        assert (result["skipped"], result["applied"]) == (False, False)
+        assert result["kind"] == kind
+        assert result["payload"] == {} and result["disclaimer"] == ""
+        assert result["errors"][0]["path"] == "kind"
+        assert "pattern" in result["errors"][0]["msg"] and "formula" in result["errors"][0]["msg"]
+
+    assert calls == [], "非法 kind 不得调模型"
+    assert _all_calls(sql_log) == [], "非法 kind 不得读库 / 写审计（连阶段行都不查）"
+
+
+# ---- 纪律三：唯一能力闸门（阶段不足 → 403 语义，草案一行都不许查）----
+
+def test_suggestion_and_predraft_capability_gate_denies_before_draft_lookup(db, sql_log, monkeypatch):
+    """纪律三（唯一闸门）：阶段不足 → `stage_forbidden`（接口层 403）+ `errors[0].path='capability'`，
+    文案由 §2.4 的 `_permission_denied_detail()` 拼出（与闸门自己写的 `[warn]` / 审计同源）；
+    **草案一行都不查**（越权比 404 更靠前：不许用「草案在不在」当信息侧信道）；唯一写入是闸门
+    自己那段 `permission_denied`（服务层不重复告警）。"""
+    import agent_stage_service
+
+    monkeypatch.setenv("AGENT_STAGE_ENABLED", "on")
+    calls = _stub_model(monkeypatch, "predict_pattern_candidates", {"candidates": []})
+    _set_stage("learning")                                    # 学习期：三个新能力全未解锁
+    draft_id = _seed_suggestion_draft()
+    since = _mark(sql_log)
+
+    pattern = agent_stage_service.build_suggestion(TEACHER, draft_id, "pattern")
+    formula = agent_stage_service.build_suggestion(TEACHER, draft_id, "formula")
+    predraft = agent_stage_service.build_predraft(TEACHER, draft_id)
+
+    cases = ((pattern, _SUGGESTION_KEYS, "predict_pattern", "見習期"),
+             (formula, _SUGGESTION_KEYS, "suggest_prescription", "助手期"),
+             (predraft, _PREDRAFT_KEYS, "generate_predraft", "授權期"))
+    for result, keys, capability, need_label in cases:
+        assert set(result) == set(keys), capability
+        assert result["reason"] == "stage_forbidden", capability
+        assert (result["skipped"], result["applied"]) == (False, False), capability
+        assert result["errors"][0]["path"] == "capability", capability
+        assert capability in result["errors"][0]["msg"], "拒绝文案必须点名能力键"
+        assert need_label in result["errors"][0]["msg"] and "學習期" in result["errors"][0]["msg"], \
+            "拒绝文案必须写清「差多少」（当前阶段 + 所需阶段）"
+
+    assert pattern["payload"] == {} and predraft["predraft"] == _blank_predraft_shape()
+    assert calls == [], "越权不得调模型"
+
+    seen = _all_calls(sql_log)[since:]
+    assert not any("drafts" in sql.lower() for sql, _ in seen), "越权先于草案反查：不许查草案"
+    writes = _writes(sql_log, since)
+    assert len(writes) == 3 and all("INSERT INTO agent_stage_log" in sql for sql in writes)
+    assert _stage_log_events() == ["permission_denied"] * 3, "拒绝留痕由闸门自己写（恰好三条）"
+
+
+# ---- 成功路径：12 键 + 白名单投影 + 唯一写点 ----
+
+def test_suggestion_pattern_success_projects_only_contract_keys(db, sql_log, monkeypatch):
+    """见习期 `predict_pattern` 成功路径：`payload` **只**投影契约里的 `candidates`（模型多给的
+    `disclaimer` / 任何字段一律不带出 = §4.3 白名单）；`disclaimer` 取**服务层常量**（不信回包）；
+    入参一律**关键字**取自草案工作副本 + 只读旁路；唯一写点是一行 `suggestion_generated`。"""
+    import agent, agent_stage_service
+
+    monkeypatch.setenv("AGENT_STAGE_ENABLED", "on")
+    _stub_reads(monkeypatch)
+    candidates = [{"name": "肝胃不和證", "confidence": "high", "basis": ["反覆胃脘脹痛 3 個月"],
+                   "note": "與情志相關"},
+                  {"name": "脾虛濕困證", "confidence": "medium", "basis": ["食後加重"], "note": ""}]
+    calls = _stub_model(monkeypatch, "predict_pattern_candidates",
+                        {"candidates": candidates, "disclaimer": "模型自己寫的免責聲明"})
+    _set_stage("apprentice")                                  # 見習期解锁 `predict_pattern`
+    draft_id = _seed_suggestion_draft()
+    since = _mark(sql_log)
+
+    result = agent_stage_service.build_suggestion(TEACHER, draft_id, "pattern")
+
+    assert set(result) == set(_SUGGESTION_KEYS)
+    assert (result["teacher_name"], result["kind"], result["draft_id"], result["patient_name"]) == \
+        (TEACHER, "pattern", draft_id, "张三")
+    assert (result["skipped"], result["applied"]) == (False, False)
+    assert result["reason"] == "suggestion_generated"
+    assert result["payload"] == {"candidates": candidates}, "白名单：模型多给的键不许带出"
+    assert result["disclaimer"] == agent_stage_service.DISCLAIMER_PATTERN == agent.PATTERN_DISCLAIMER
+    assert result["generated_at"] and (result["warnings"], result["errors"]) == ([], [])
+
+    assert len(calls) == 1, "一次请求只调一次模型"
+    assert calls[0]["patient_name"] == "张三"
+    assert calls[0]["transcript"] == _SUGGESTION_DRAFT.strip()
+    assert calls[0]["complaint"] == _SUGGESTION_COMPLAINT, "「主訴」段必须被切出来单独喂"
+    assert calls[0]["past_records"] == "- %s" % _PAST_RECORD_PLAN
+    assert calls[0]["teacher_skeleton"] == _SKELETON_TEXT
+
+    writes = _writes(sql_log, since)
+    assert len(writes) == 1 and "INSERT INTO agent_stage_log" in writes[0], \
+        "服务层唯一写点：一行审计（零业务表写入）"
+    assert _stage_log_events() == ["suggestion_generated"]
+    detail = _audit_detail()
+    assert "候選 2 條" in detail and "非診斷" in detail and "张三" in detail
+
+
+def test_suggestion_formula_needs_assistant_stage_and_uses_its_own_disclaimer(db, sql_log, monkeypatch):
+    """方剂建议（助手期能力 `suggest_prescription`）与证型候选是**同一入口的两个分支**：阶段门槛
+    各按 §2.3（见习期 / 助手期），`payload` 的键与 `disclaimer` 文案各按 `kind` 而变 —— 交叉钉住
+    `agent.FORMULA_DISCLAIMER`；助手期两种 `kind` 都放行（能力矩阵单调：助手期 ⊇ 见习期）。"""
+    import agent, agent_stage_service
+
+    monkeypatch.setenv("AGENT_STAGE_ENABLED", "on")
+    _stub_reads(monkeypatch)
+    formulas = [{"name": "柴胡桂枝湯", "modification": "痛甚加元胡",
+                 "composition": ["柴胡", "桂枝", "甘草"], "usage": "僅供參考"}]
+    formula_calls = _stub_model(monkeypatch, "suggest_formula",
+                                {"formulas": formulas, "disclaimer": "模型自己寫的免責聲明",
+                                 "note": "多給的頂層鍵"})
+    pattern_calls = _stub_model(monkeypatch, "predict_pattern_candidates",
+                                {"candidates": [{"name": "肝胃不和證", "confidence": "low",
+                                                 "basis": ["反覆胃脘脹痛"], "note": ""}]})
+    _set_stage("assistant")                                   # 助手期解锁 `suggest_prescription`
+    draft_id = _seed_suggestion_draft()
+
+    result = agent_stage_service.build_suggestion(TEACHER, draft_id, "formula")
+
+    assert set(result) == set(_SUGGESTION_KEYS)
+    assert result["kind"] == "formula" and result["reason"] == "suggestion_generated"
+    assert result["payload"] == {"formulas": formulas}, \
+        "白名单：模型多给的顶层键（`disclaimer` / `note`）一个都不带出；`error` 只在等于解析失败常量时才带出"
+    assert result["disclaimer"] == agent_stage_service.DISCLAIMER_FORMULA == agent.FORMULA_DISCLAIMER
+    assert len(formula_calls) == 1 and formula_calls[0]["patient_name"] == "张三"
+    assert "方劑 1 個" in _audit_detail() and "非處方" in _audit_detail()
+
+    again = agent_stage_service.build_suggestion(TEACHER, draft_id, "pattern")
+    assert again["reason"] == "suggestion_generated" and again["kind"] == "pattern"
+    assert len(pattern_calls) == 1 and pattern_calls[0]["complaint"] == _SUGGESTION_COMPLAINT
+    assert _stage_log_events() == ["suggestion_generated", "suggestion_generated"]
+
+
+def test_predraft_stage_boundary_and_success_never_persists(db, sql_log, monkeypatch):
+    """预处方预填是**授权期专属**（§2.3 最后一格）：助手期仍拒（`stage_forbidden`），授权期放行；
+    成功体 12 键 + `note` 逐字 + `applied=False`，`predraft` 内层三键恒在场，唯一写点是一行
+    `predraft_generated`，两张业务表与草案正文一个字都不动（§4.6-⑦「AI 永不开方」）。"""
+    import agent, agent_stage_service
+
+    monkeypatch.setenv("AGENT_STAGE_ENABLED", "on")
+    _stub_reads(monkeypatch)
+    items = [{"herb": "柴胡", "dose": "9g", "role": "君"}, {"herb": "甘草", "dose": "6g", "role": "使"}]
+    calls = _stub_model(monkeypatch, "generate_predraft",
+                        {"predraft": {"formula_name": "柴胡桂枝湯", "items": items,
+                                      "decoction": "日一劑，分二次溫服", "extra": "多給的鍵"},
+                         "disclaimer": "模型自己寫的免責聲明"})
+    draft_id = _seed_suggestion_draft()
+    _set_stage("assistant")
+    before = _table_counts()
+    content_before = _raw_scalar("SELECT content FROM drafts WHERE id = ?", (draft_id,))
+    since = _mark(sql_log)
+
+    blocked = agent_stage_service.build_predraft(TEACHER, draft_id, "柴胡桂枝湯")
+
+    assert set(blocked) == set(_PREDRAFT_KEYS)
+    assert blocked["reason"] == "stage_forbidden" and blocked["errors"][0]["path"] == "capability"
+    assert blocked["predraft"] == _blank_predraft_shape()
+
+    _set_stage("authorized")
+    result = agent_stage_service.build_predraft(TEACHER, draft_id, "柴胡桂枝湯")
+
+    assert set(result) == set(_PREDRAFT_KEYS)
+    assert (result["teacher_name"], result["draft_id"], result["patient_name"]) == \
+        (TEACHER, draft_id, "张三")
+    assert (result["skipped"], result["applied"]) == (False, False), "`applied` 恒 False：预填没有落库"
+    assert result["reason"] == "predraft_generated"
+    assert set(result["predraft"]) == set(_PREDRAFT_INNER_KEYS)
+    assert result["predraft"] == {"formula_name": "柴胡桂枝湯", "items": items,
+                                 "decoction": "日一劑，分二次溫服"}, "白名单：多给的键不许带出"
+    assert result["disclaimer"] == agent_stage_service.DISCLAIMER_PREDRAFT == agent.PREDRAFT_DISCLAIMER
+    assert result["note"] == agent_stage_service.PREDRAFT_NOTE == "僅供預填，儲存處方仍須老師操作"
+    assert result["generated_at"] and (result["warnings"], result["errors"]) == ([], [])
+
+    assert len(calls) == 1 and calls[0]["formula_name"] == "柴胡桂枝湯"
+    assert calls[0]["patient_name"] == "张三" and calls[0]["complaint"] == _SUGGESTION_COMPLAINT
+
+    writes = _writes(sql_log, since)
+    assert len(writes) == 2 and all(sql.startswith("INSERT INTO agent_stage_log") for sql in writes), \
+        "两次调用只该有「闸门拒绝 + 成功」两条审计，没有任何业务写入"
+    after = _table_counts()
+    assert (after["drafts"], after["patient_records"], after["agent_stage_state"],
+            after["agent_stage_config"]) == (before["drafts"], before["patient_records"],
+                                             before["agent_stage_state"],
+                                             before["agent_stage_config"]), \
+        "两张业务表与阶段状态 / 配置表行数必须不变（预填一个字都没落库）"
+    assert after["agent_stage_log"] == before["agent_stage_log"] + 2, \
+        "新增的只有两条审计（「闸门拒绝」+「预填已产出」）"
+    assert _raw_scalar("SELECT content FROM drafts WHERE id = ?", (draft_id,)) == content_before
+
+    detail = _audit_detail()
+    assert "預處方預填已產出" in detail and "藥味 2 項" in detail and "柴胡桂枝湯" in detail
+    assert "未落庫、未發送、未簽字" in detail
+
+
+def test_suggestion_and_predraft_draft_lookup_is_fail_closed(db, sql_log, monkeypatch):
+    """纪律四（草案反查 fail-closed）：`draft_id` 必须命中**该老师名下最新的未签草案** ——
+    别人的草案 / 已签字草案 / 被新草案取代的旧 id / 不存在的 id / 非整数 id 一律
+    `stage_draft_not_found`（接口层 404）且**绝不调模型**（拿别人或已签字的草案喂 LLM 就是越权）；
+    读库异常（库被锁 / flag on 缺 lineage）同样 fail-closed，不退化成全量查询。"""
+    import agent_stage_service
+
+    monkeypatch.setenv("AGENT_STAGE_ENABLED", "on")
+    pattern_calls = _stub_model(monkeypatch, "predict_pattern_candidates", {"candidates": []})
+    predraft_calls = _stub_model(monkeypatch, "generate_predraft", {"predraft": {}})
+    _stub_model(monkeypatch, "suggest_formula", {"formulas": []})
+    _set_stage("authorized")
+
+    other_id = _seed_suggestion_draft(teacher=OTHER_TEACHER)     # 别人的草案（患者 张三）
+    superseded_id = _seed_suggestion_draft(teacher=TEACHER)      # 同一学生再有新草案 → 旧 id 不可见
+    latest_id = _seed_suggestion_draft(teacher=TEACHER)          # 该学生名下**最新**的未签草案
+    signed_id = _seed_suggestion_draft(teacher=TEACHER)
+    # 三份草案各自换到独立学生名下（`get_drafts()` 的口径是「每个学生的最新未签草案」，
+    # 名字相同会互相掩盖）：甲 = superseded + latest（最新的才可见）、乙 = signed（已签字即不可见）
+    _raw_execute("UPDATE drafts SET patient_name = '甲' WHERE id IN (?, ?)", (superseded_id, latest_id))
+    _raw_execute("UPDATE drafts SET patient_name = '乙' WHERE id = ?", (signed_id,))
+    # 直接标已签字（裸 SQL 造数：`sign_draft()` 会顺带触发 3.4-c 的钩子，本组只关心草案可见性）
+    _raw_execute("UPDATE drafts SET signed = 1 WHERE id = ?", (signed_id,))
+    events_before = _stage_log_events()
+    since = _mark(sql_log)
+
+    bad_ids = [None, "", "abc", 0, 999999, superseded_id, other_id, signed_id]
+    for bad in bad_ids:
+        suggestion = agent_stage_service.build_suggestion(TEACHER, bad, "pattern")
+        predraft = agent_stage_service.build_predraft(TEACHER, bad, "柴胡桂枝湯")
+
+        assert set(suggestion) == set(_SUGGESTION_KEYS), bad
+        assert set(predraft) == set(_PREDRAFT_KEYS), bad
+        assert suggestion["reason"] == "stage_draft_not_found", bad
+        assert predraft["reason"] == "stage_draft_not_found", bad
+        assert (suggestion["skipped"], predraft["skipped"]) == (False, False), bad
+        assert suggestion["errors"][0]["path"] == "draft_id", bad
+        assert suggestion["payload"] == {} and predraft["predraft"] == _blank_predraft_shape(), bad
+
+    real_get_drafts = database.get_drafts
+
+    def _boom(teacher_name=None, lineage_id=None):
+        raise RuntimeError("庫被鎖了")
+
+    monkeypatch.setattr(database, "get_drafts", _boom)
+
+    suggestion = agent_stage_service.build_suggestion(TEACHER, 1, "pattern")
+    predraft = agent_stage_service.build_predraft(TEACHER, 1, "柴胡桂枝湯")
+
+    assert suggestion["reason"] == "stage_draft_not_found" and predraft["reason"] == \
+        "stage_draft_not_found", "读库异常必须 fail-closed 当「找不到」"
+    assert "庫被鎖了" in suggestion["errors"][0]["msg"] and "庫被鎖了" in predraft["errors"][0]["msg"]
+
+    assert pattern_calls == [] and predraft_calls == [], "草案没命中就一个字都不许喂给模型"
+    assert _writes(sql_log, since) == [], "404 路径不写审计（拒绝留痕只属于闸门）"
+    assert _stage_log_events() == events_before
+
+    # 对照组：**最新**未签草案（甲）必须命中 —— 证明上面的 404 不是「一律拒绝」
+    monkeypatch.setattr(database, "get_drafts", real_get_drafts)
+    ok = agent_stage_service.build_suggestion(TEACHER, latest_id, "pattern")
+
+    assert ok["reason"] == "suggestion_generated" and ok["payload"] == {"candidates": []}, \
+        "同一学生的最新未签草案才是唯一可见的那一份（latest_id=%s）" % latest_id
+    assert len(pattern_calls) == 1, "整条用例只有对照组这一次调了模型"
+    assert _stage_log_events() == events_before + ["suggestion_generated"], "成功路径照常留痕一行"
+
+
+# ---- 解析失败 = 成功（空结果）↔ 故障 = reason 变（严格分开）----
+
+def test_suggestion_parse_failure_is_success_with_empty_payload(db, sql_log, monkeypatch, capsys):
+    """§4.3 的关键分界：【解析失败】**是成功**（200 + 空 `payload` + `error='parse_failed'` + 一条
+    `warnings`）—— 与「我们没跑通」（`suggestion_failed` → 5xx）**严格分开**：前者是「模型没给出可用
+    内容」（老师自己判断），后者是「该重试」。两类都仍然留痕一行 `suggestion_generated`。"""
+    import agent, agent_stage_service
+
+    monkeypatch.setenv("AGENT_STAGE_ENABLED", "on")
+    _stub_reads(monkeypatch)
+    pattern = _stub_model(monkeypatch, "predict_pattern_candidates",
+                          {"candidates": [], "error": agent.PARSE_FAILED,
+                           "disclaimer": agent.PATTERN_DISCLAIMER})
+    formula = _stub_model(monkeypatch, "suggest_formula",
+                          {"formulas": [], "error": agent.PARSE_FAILED,
+                           "disclaimer": agent.FORMULA_DISCLAIMER})
+    _set_stage("authorized")
+    draft_id = _seed_suggestion_draft()
+    since = _mark(sql_log)
+
+    results = {"pattern": agent_stage_service.build_suggestion(TEACHER, draft_id, "pattern"),
+               "formula": agent_stage_service.build_suggestion(TEACHER, draft_id, "formula")}
+
+    assert agent.PARSE_FAILED == "parse_failed"
+    for kind, result in results.items():
+        empty_key = "candidates" if kind == "pattern" else "formulas"
+        assert set(result) == set(_SUGGESTION_KEYS), kind
+        assert result["reason"] == "suggestion_generated", "解析失败仍是成功"
+        assert (result["skipped"], result["applied"]) == (False, False), kind
+        assert result["payload"] == {empty_key: [], "error": agent.PARSE_FAILED}, kind
+        assert result["errors"] == [] and len(result["warnings"]) == 1, kind
+        assert ("候選證型" if kind == "pattern" else "方劑建議") in result["warnings"][0], kind
+        assert "絕不編造" in result["warnings"][0], kind
+
+    assert len(pattern) == 1 and len(formula) == 1, "空结果也是调了一次模型换来的"
+    assert _stage_log_events() == ["suggestion_generated", "suggestion_generated"]
+    assert len(_writes(sql_log, since)) == 2
+    assert "解析失敗" in capsys.readouterr().out
+
+
+def test_predraft_parse_failure_keeps_three_keys_and_stays_success(db, sql_log, monkeypatch):
+    """预填的解析失败**不往 `predraft` 里塞标记**：内层三键恒定（多一个 `error` 会给前端多一个判别
+    维度），标记只落 `warnings`；`reason` 仍是成功、`applied=False`、仍留痕一行审计。
+    另配一条「回包既没 predraft 也没标记」的宽松态：三键恒在场 + `warnings` 为空 + 仍是成功。"""
+    import agent, agent_stage_service
+
+    monkeypatch.setenv("AGENT_STAGE_ENABLED", "on")
+    _stub_reads(monkeypatch)
+    calls = _stub_model(monkeypatch, "generate_predraft",
+                        {"predraft": {}, "error": agent.PARSE_FAILED,
+                         "disclaimer": agent.PREDRAFT_DISCLAIMER})
+    _set_stage("authorized")
+    draft_id = _seed_suggestion_draft()
+
+    failed = agent_stage_service.build_predraft(TEACHER, draft_id, "柴胡桂枝湯")
+
+    assert set(failed) == set(_PREDRAFT_KEYS)
+    assert failed["reason"] == "predraft_generated" and (failed["skipped"], failed["applied"]) == (False, False)
+    assert failed["predraft"] == _blank_predraft_shape()
+    assert set(failed["predraft"]) == set(_PREDRAFT_INNER_KEYS) and "error" not in failed["predraft"]
+    assert failed["errors"] == [] and len(failed["warnings"]) == 1
+    assert "預處方預填" in failed["warnings"][0] and "絕不編造" in failed["warnings"][0]
+    assert failed["disclaimer"] == agent_stage_service.DISCLAIMER_PREDRAFT
+
+    calls.clear()
+    monkeypatch.setattr(agent, "generate_predraft", lambda **kwargs: {"predraft": {"items": "壞形狀"}})
+    loose = agent_stage_service.build_predraft(TEACHER, draft_id)
+
+    assert loose["reason"] == "predraft_generated" and loose["predraft"] == _blank_predraft_shape()
+    assert loose["warnings"] == [] and loose["errors"] == []
+
+    assert _stage_log_events() == ["predraft_generated", "predraft_generated"]
+
+
+# ---- 纪律六：永不抛（故障折成返回体）----
+
+def test_suggestion_and_predraft_failures_are_reported_and_never_raise(db, sql_log, monkeypatch, capsys):
+    """纪律六（口径 B：**永不抛**）：LLM / 装配异常一律折成 `errors[{path}]` 的返回体
+    （`suggestion_failed` / `predraft_failed` → 接口层 5xx），**不写审计**（没产出就没得记），
+    而只读旁路自己炸掉时连 `reason` 都不变 —— 增强材料缺一块不该让「产一条建议」变成 500。"""
+    import agent_stage_service
+
+    monkeypatch.setenv("AGENT_STAGE_ENABLED", "on")
+    _stub_reads(monkeypatch)
+    _set_stage("authorized")
+    draft_id = _seed_suggestion_draft()
+    events_before = _stage_log_events()
+    since = _mark(sql_log)
+
+    _stub_model_raising(monkeypatch, "predict_pattern_candidates")
+    _stub_model_raising(monkeypatch, "generate_predraft")
+
+    failed = agent_stage_service.build_suggestion(TEACHER, draft_id, "pattern")
+
+    assert set(failed) == set(_SUGGESTION_KEYS)
+    assert failed["reason"] == "suggestion_failed", "我们没跑通 → 故障码（与解析失败严格分开）"
+    assert (failed["skipped"], failed["applied"]) == (False, False), "故障不是「跳过」"
+    assert (failed["payload"], failed["disclaimer"], failed["generated_at"]) == ({}, "", "")
+    assert failed["warnings"] == [] and len(failed["errors"]) == 1
+    assert failed["errors"][0]["path"] == "payload" and "模型連線中斷" in failed["errors"][0]["msg"]
+
+    predraft = agent_stage_service.build_predraft(TEACHER, draft_id, "柴胡桂枝湯")
+
+    assert set(predraft) == set(_PREDRAFT_KEYS)
+    assert predraft["reason"] == "predraft_failed" and predraft["skipped"] is False
+    assert predraft["predraft"] == _blank_predraft_shape() and predraft["generated_at"] == ""
+    assert predraft["errors"][0]["path"] == "predraft" and "模型連線中斷" in predraft["errors"][0]["msg"]
+
+    assert _writes(sql_log, since) == [], "故障路径没有产出 → 不该留痕「已產出」"
+    assert _stage_log_events() == events_before
+    assert "流程異常" in capsys.readouterr().out
+
+    # 取数侧炸掉：只读旁路各自兜异常 → 仍是**成功**，只是少一块增强材料
+    monkeypatch.setattr(database, "get_patient_records",
+                        lambda patient_name, teacher_name=None: 1 / 0)
+    _stub_model(monkeypatch, "predict_pattern_candidates", {"candidates": [{"name": "肝胃不和證"}]})
+
+    rescued = agent_stage_service.build_suggestion(TEACHER, draft_id, "pattern")
+
+    assert rescued["reason"] == "suggestion_generated" and rescued["errors"] == []
+    assert rescued["payload"] == {"candidates": [{"name": "肝胃不和證"}]}
+
+    # 服务层装配自己出岔子（取数助手抛）→ 仍然折成故障码，绝不冒泡给接口层
+    monkeypatch.setattr(agent_stage_service, "_complaint_text",
+                        lambda content: (_ for _ in ()).throw(RuntimeError("切段爆了")))
+
+    broken = agent_stage_service.build_suggestion(TEACHER, draft_id, "formula")
+
+    assert broken["reason"] == "suggestion_failed" and "切段爆了" in broken["errors"][0]["msg"]
+
+
+def test_suggestion_and_predraft_repeat_calls_only_write_audit_rows(db, sql_log, monkeypatch):
+    """重复调用：本族**只读** —— 3 × 3 次调用只写 9 行 `agent_stage_log`，两张业务表行数与草案
+    正文**一个字不变**，且从不写 `agent_action_log`（「建议」不是「动作」：`applied` 恒 False 的
+    物证，§4.6-⑦「AI 永不开方」）。"""
+    import agent_stage_service
+
+    monkeypatch.setenv("AGENT_STAGE_ENABLED", "on")
+    _stub_reads(monkeypatch)
+    _stub_model(monkeypatch, "predict_pattern_candidates", {"candidates": [{"name": "肝胃不和證"}]})
+    _stub_model(monkeypatch, "suggest_formula", {"formulas": [{"name": "柴胡桂枝湯"}]})
+    _stub_model(monkeypatch, "generate_predraft",
+                {"predraft": {"formula_name": "柴胡桂枝湯", "items": [{"herb": "柴胡"}],
+                              "decoction": "日一劑"}})
+    _set_stage("authorized")
+    draft_id = _seed_suggestion_draft()
+    before = _table_counts()
+    content_before = _raw_scalar("SELECT content FROM drafts WHERE id = ?", (draft_id,))
+    signed_before = _raw_scalar("SELECT signed FROM drafts WHERE id = ?", (draft_id,))
+    since = _mark(sql_log)
+
+    for _ in range(3):
+        outcomes = (agent_stage_service.build_suggestion(TEACHER, draft_id, "pattern"),
+                    agent_stage_service.build_suggestion(TEACHER, draft_id, "formula"),
+                    agent_stage_service.build_predraft(TEACHER, draft_id, "柴胡桂枝湯"))
+        for result in outcomes:
+            assert (result["skipped"], result["applied"]) == (False, False)
+
+    writes = _writes(sql_log, since)
+    assert len(writes) == 9 and all(sql.startswith("INSERT INTO agent_stage_log") for sql in writes), \
+        "九次调用 = 九行审计，别无他写"
+    assert _stage_log_events() == ["predraft_generated", "suggestion_generated",
+                                   "suggestion_generated"] * 3, "九行审计（`id` 倒序读出，一轮三行）"
+    after = _table_counts()
+    assert (after["drafts"], after["patient_records"]) == (before["drafts"], before["patient_records"])
+    assert _raw_scalar("SELECT content FROM drafts WHERE id = ?", (draft_id,)) == content_before
+    assert _raw_scalar("SELECT signed FROM drafts WHERE id = ?", (draft_id,)) == signed_before == 0
+    assert _stage_actions() == [], "本族不写行动日志（没有任何「已生效」的动作）"
+
+
+# ---- 取数助手：纯函数（零 SQL / 零写入 / 不抛）----
+
+def test_suggestion_inputs_helpers_are_pure_and_shape_tolerant(monkeypatch):
+    """4c-1 的取数助手是**纯函数**：`_complaint_text()` 只用字符串规则（简繁两种「主訴」标题、
+    「（學生原話）」尾巴、跨行取值、遇下一个「【…】」标题即停不越段）；`_suggestion_inputs()`
+    对坏草案行（缺键 / 非字符串 / 非 dict / None）一律收敛成空串，**一个字段都不编**；
+    既往病历只留非空 `final_plan`、最多 3 条、读不到/读炸都按「无」处理。
+    本用例**不挂 `db` fixture**：全程不碰库（旁路一律桩掉）。"""
+    import agent_stage_service
+
+    monkeypatch.setattr(agent_stage_service, "_teacher_skeleton_text", lambda teacher_name: "")
+
+    assert agent_stage_service._complaint_text(_SUGGESTION_DRAFT) == _SUGGESTION_COMPLAINT
+    assert agent_stage_service._complaint_text("主诉：頭痛 2 週\n【舌脈】x") == "頭痛 2 週"
+    assert agent_stage_service._complaint_text("【主訴（學生原話）】\n胃痛 3 個月") == "胃痛 3 個月"
+    assert agent_stage_service._complaint_text("【主訴】\n【現病史】無") == "", "遇下一个标题即停"
+    assert agent_stage_service._complaint_text("【現病史】無噯氣") == ""
+    assert agent_stage_service._complaint_text(None) == "" and \
+        agent_stage_service._complaint_text("") == ""
+    assert agent_stage_service._draft_text({"content": 5}, "content") == "" and \
+        agent_stage_service._draft_text("不是 dict", "content") == ""
+
+    blank = agent_stage_service._blank_predraft()
+    assert blank == _blank_predraft_shape() and set(blank) == set(_PREDRAFT_INNER_KEYS)
+    assert agent_stage_service._result_list(None) == [] and agent_stage_service._result_list("abc") == []
+    assert agent_stage_service._result_list([{"name": "x"}]) == [{"name": "x"}]
+
+    rows = [{"final_plan": _PAST_RECORD_PLAN}, {"final_plan": "  "}, {"plan": "缺 final_plan"},
+            {"final_plan": "第四條（超出上限，不该带出）"}]
+    monkeypatch.setattr(database, "get_patient_records",
+                        lambda patient_name, teacher_name=None: rows)
+
+    healthy = agent_stage_service._suggestion_inputs(
+        TEACHER, {"id": 7, "patient_name": "张三", "content": _SUGGESTION_DRAFT})
+
+    assert set(healthy) == {"patient_name", "complaint", "transcript", "past_records",
+                            "teacher_skeleton"}, "5 个纯文本入参（多一个都不给 AI 层）"
+    assert (healthy["patient_name"], healthy["transcript"], healthy["complaint"]) == \
+        ("张三", _SUGGESTION_DRAFT.strip(), _SUGGESTION_COMPLAINT)
+    assert healthy["past_records"] == "- %s" % _PAST_RECORD_PLAN, "只留非空 final_plan，最多 3 条"
+    assert healthy["teacher_skeleton"] == ""
+
+    monkeypatch.setattr(database, "get_patient_records",
+                        lambda patient_name, teacher_name=None: [])
+    assert agent_stage_service._suggestion_inputs(TEACHER, {"patient_name": "张三"})["past_records"] \
+        == "暂无过往病历"
+
+    def _boom(patient_name, teacher_name=None):
+        raise RuntimeError("讀不到")
+
+    monkeypatch.setattr(database, "get_patient_records", _boom)
+    assert agent_stage_service._suggestion_inputs(TEACHER, {"patient_name": "张三"})["past_records"] \
+        == "暂无过往病历", "读库异常按「无既往病历」处理（不阻断建议生成）"
+
+    for bad in ({}, {"patient_name": None, "content": ["不是字符串"]}, {"content": ""}, None,
+                "不是 dict", 42):
+        inputs = agent_stage_service._suggestion_inputs(TEACHER, bad)
+        assert (inputs["patient_name"], inputs["complaint"], inputs["transcript"]) == ("", "", ""), bad
+        assert inputs["past_records"] == "暂无过往病历" and inputs["teacher_skeleton"] == "", bad
+
+
+# ---- 源码级守护：4c-1 追加块只能长成这些形状（AST 口径，一个不多一个不少）----
+
+# 两个追加块的**顶层函数清单**（口径：从块首常量到文件尾；顺序 = 文件内出现次序）
+_SERVICE_BLOCK_FUNCTIONS = (
+    "_draft_text", "_suggestion_draft", "_complaint_text", "_past_records_text",
+    "_teacher_skeleton_text", "_suggestion_inputs", "_blank_predraft", "_result_names",
+    "_names_suffix", "_suggestion_short_circuit", "_predraft_short_circuit", "_suggestion_detail",
+    "_predraft_detail", "_suggestion_disclaimer", "build_suggestion", "_result_list",
+    "_build_suggestion", "build_predraft", "_predraft_payload", "_build_predraft",
+)
+_AGENT_BLOCK_FUNCTIONS = (
+    "_clip_text", "_plain_text", "_load_json_object", "_text_list", "_dose_free", "_herb_name",
+    "_blank_predraft", "_normalize_pattern_candidates", "_normalize_formula_suggestions",
+    "_normalize_predraft", "predict_pattern_candidates", "suggest_formula", "generate_predraft",
+)
+
+
+def _block_line(source, block):
+    """追加块首行行号（配合 `_imports_outside_functions()` 做「import 全在块之前」的断言）。"""
+    return len(source.splitlines()) - len(block.splitlines()) + 1
+
+
+def _call_names(node):
+    """一个 `ast.Call` 的被调名（裸调用与 `模块.调用` 都算）。"""
+    import ast
+
+    assert isinstance(node, ast.Call)
+    return node.func.id if isinstance(node.func, ast.Name) else getattr(node.func, "attr", "")
+
+
+def _calls_of(tree, names):
+    """`tree` 里指定名字的 `ast.Call` 节点（按行号升序）。"""
+    import ast
+
+    return sorted((node for node in ast.walk(tree)
+                   if isinstance(node, ast.Call) and _call_names(node) in names),
+                  key=lambda node: node.lineno)
+
+
+def test_service_block_is_append_only_with_single_write_point():
+    """服务层追加块的**源码级守护**（口径：从 `SUGGESTION_KINDS` 到文件尾 = 本步全部新增面）：
+    顶层函数**恰好**是那 20 个（一个不多、一个不少）；块内**没有模块级 import**（延迟 import 纪律）、
+    **没有一句 SQL 写语句**（`INSERT` / `UPDATE` / `DELETE` / `commit()` / `execute(` 一律不出现）
+    —— 唯一写点是 `_stage_event()`（两个入口各一次）；能力闸门 `require_capability()` 也恰好两次
+    （服务层绝不自己读阶段做判定 = §2.2 单一收口点）；调 AI 层一律**关键字**（无位置参数、无 `**` 展开：
+    参数错位是静默事故，`formula_name` 更是第二个参数）。"""
+    import ast
+
+    source = _service_source()
+    block = _block_from(source, _SERVICE_BLOCK_FIRST)
+    tree = ast.parse(block)
+
+    assert tuple(_top_level_functions(block)) == _SERVICE_BLOCK_FUNCTIONS
+    assert not re.search(r"(?m)^(?:import|from)\s", block), "块内不许有模块级 import（一律延迟到函数体）"
+    for keyword in ("INSERT", "UPDATE ", "DELETE ", "commit()", "execute("):
+        assert keyword not in block, "本族不得出现 SQL 写语句：%s" % keyword
+    assert block.count("import agent") == 2, "AI 层只在两个实体函数里延迟 import"
+
+    assert len(_calls_of(tree, ("_stage_event",))) == 2, "唯一写点：两个入口各留痕一次"
+    assert len(_calls_of(tree, ("require_capability",))) == 2, "唯一能力闸门：两个入口各过一次"
+    assert len(_calls_of(tree, ("current_stage",))) == 4, \
+        "`current_stage()` 只用于文案 / 留痕（每入口两次：拒绝说明 + 审计行），一次都不参与放行判定"
+
+    for name in ("predict_pattern_candidates", "suggest_formula", "generate_predraft"):
+        (call,) = _calls_of(tree, (name,))
+        assert call.args == [], "%s 必须全部用关键字调用（位置参数错位是静默事故）" % name
+        assert all(keyword.arg for keyword in call.keywords), "不得用 ** 展开调 AI 层"
+
+    for entry in ("build_suggestion", "build_predraft"):
+        (body,) = [node for node in tree.body
+                   if isinstance(node, ast.FunctionDef) and node.name == entry]
+        order = [_call_names(call) for call in _calls_of(
+            body, ("agent_stage_enabled", "require_capability", "_suggestion_draft"))]
+        assert order == ["agent_stage_enabled", "require_capability", "_suggestion_draft"], \
+            "%s：flag 先行 → 唯一闸门 → 草案反查，顺序就是纪律本身" % entry
+
+
+def test_agent_block_is_append_only_and_never_touches_database():
+    """AI 层追加块的**源码级守护**：顶层函数**恰好**那 13 个；块内零模块级 import（且全文件的模块级
+    import 行号全在块之前）、零 `database` 引用（AI 层不碰库）、零 `print(`；三个能力入口的**签名
+    逐字**就是 §4.3 契约（服务层按关键字调它们 —— 参数名一改就是静默事故）；能力键 ←→ 函数名的对照、
+    提示词占位符与契约常量都在。"""
+    import inspect
+
+    import agent
+
+    source = _agent_source()
+    block = _block_from(source, _AGENT_BLOCK_FIRST)
+
+    assert tuple(_top_level_functions(block)) == _AGENT_BLOCK_FUNCTIONS
+    assert not re.search(r"(?m)^(?:import|from)\s", block), "块内不许有模块级 import"
+    code = re.sub(r"#[^\n]*", "", block)   # 注释里可以提「零 database 引用」，代码里一名都不许有
+    assert "database" not in code, "AI 层不得碰库（代码里零 database.* 引用）"
+    assert "print(" not in code, "AI 层不打印（告警统一由服务层 _config_warn 出）"
+    assert max(_imports_outside_functions(source)) < _block_line(source, block), \
+        "4c-1 的 import 必须全部在函数体内（模块级 import 一名都不许新增）"
+
+    for capability in ("predict_pattern", "suggest_prescription", "generate_predraft"):
+        assert capability in block, "能力键 %s 必须留在块注释里（能力键 ←→ 函数名唯一对照）" % capability
+
+    five = ["patient_name", "complaint", "transcript", "past_records", "teacher_skeleton"]
+    assert list(inspect.signature(agent.predict_pattern_candidates).parameters) == five
+    assert list(inspect.signature(agent.suggest_formula).parameters) == five
+    assert list(inspect.signature(agent.generate_predraft).parameters) == \
+        ["patient_name", "formula_name", "complaint", "transcript", "past_records", "teacher_skeleton"]
+
+    for prompt, placeholders in ((agent.PATTERN_CANDIDATE_PROMPT, five),
+                                 (agent.FORMULA_SUGGESTION_PROMPT, five),
+                                 (agent.PREDRAFT_PROMPT, ["formula_name"] + five)):
+        for placeholder in placeholders:
+            assert "{%s}" % placeholder in prompt, "提示词缺占位符：%s" % placeholder
+    assert agent.PATTERN_DISCLAIMER in agent.PATTERN_CANDIDATE_PROMPT
+    assert agent.FORMULA_DISCLAIMER in agent.FORMULA_SUGGESTION_PROMPT
+    assert agent.PREDRAFT_DISCLAIMER in agent.PREDRAFT_PROMPT
+    assert "不能做诊断" in agent.PATTERN_CANDIDATE_PROMPT
+    assert "不能给剂量" in agent.FORMULA_SUGGESTION_PROMPT, "「无剂量药单」先写进提示词，再在代码里兜"
+    assert "不能落库、不能发送、不能签字" in agent.PREDRAFT_PROMPT
+
+    assert agent.PATTERN_CONFIDENCE_LEVELS == ("high", "medium", "low")
+    assert (agent.MAX_PATTERN_CANDIDATES, agent.MAX_FORMULA_CANDIDATES,
+            agent.MAX_PREDRAFT_ITEMS) == (3, 3, 20)
+    assert (agent.PROMPT_TEXT_LIMIT, agent.FORMULA_USAGE) == (2000, "僅供參考")
+    assert agent.PARSE_FAILED == "parse_failed"
+
+
+# ---- AI 层三个能力的**行为契约**（模型一律桩掉：不出网、不花钱）----
+
+class _FakeLLM:
+    """`agent.llm` 的替身：`invoke(prompt)` 记下提示词并回一段固定文本（或按需抛异常）。"""
+
+    def __init__(self, content="", raises=None):
+        self.content = content
+        self.raises = raises
+        self.prompts = []
+
+    def invoke(self, prompt):
+        self.prompts.append(prompt)
+        if self.raises is not None:
+            raise RuntimeError(self.raises)
+        return type("_Reply", (), {"content": self.content})()
+
+
+def _llm(monkeypatch, content="", raises=None):
+    """把 `agent.llm` 换成替身 → 返回它（写回包 / 查提示词）。"""
+    import agent
+
+    fake = _FakeLLM(content, raises)
+    monkeypatch.setattr(agent, "llm", fake)
+    return fake
+
+
+def test_agent_capabilities_normalize_and_never_raise(monkeypatch):
+    """AI 层三个入口的行为契约（`llm.invoke` 一律桩掉）：围栏 ```json 也能解析、大写 `confidence`
+    归一化、空名字 / 无原文依据的条目**丢掉**（`_PATTERN_REPLY` 三条只剩一条）；方剂建议**代码级去
+    剂量**（组成去剂量 + 去括号备注、`usage` 恒契约值、整份无数字）；预填是唯一保留剂量的能力，空
+    方名回落到老师指定方名；LLM 抛异常 / 回包不是 JSON → 空结果 + `error='parse_failed'`（绝不编造、
+    绝不抛）；提示词里剥掉图片 URL 段、正文按 `PROMPT_TEXT_LIMIT` 截断。"""
+    import agent
+
+    pattern_llm = _llm(monkeypatch, _PATTERN_REPLY)
+    pattern = agent.predict_pattern_candidates(
+        patient_name="张三", complaint=_SUGGESTION_COMPLAINT, transcript=_SUGGESTION_DRAFT,
+        past_records="- %s" % _PAST_RECORD_PLAN, teacher_skeleton=_SKELETON_TEXT)
+
+    assert pattern == {"candidates": [{"name": "肝胃不和證", "confidence": "high",
+                                       "basis": ["反覆胃脘脹痛 3 個月"], "note": "與情志相關"}],
+                       "disclaimer": agent.PATTERN_DISCLAIMER}, \
+        "空名字 / `basis` 空的条目丢掉；`HIGH` 归一化成 `high`；围栏 JSON 也能解析"
+    assert _SUGGESTION_COMPLAINT in pattern_llm.prompts[0] and _SKELETON_TEXT in pattern_llm.prompts[0]
+
+    formula_llm = _llm(monkeypatch, _FORMULA_REPLY)
+    formula = agent.suggest_formula(patient_name="张三", complaint=_SUGGESTION_COMPLAINT,
+                                    transcript=_SUGGESTION_DRAFT, past_records="",
+                                    teacher_skeleton="")
+
+    (only,) = formula["formulas"]
+    assert (only["name"], only["modification"]) == ("柴胡桂枝湯", "痛甚加元胡")
+    assert only["composition"] == ["柴胡", "桂枝", "甘草"], "去剂量（`柴胡 9g`）+ 去括号备注（`桂枝(去皮)`）"
+    assert only["usage"] == agent.FORMULA_USAGE == "僅供參考", "`usage` 恒用契约值（不信回包）"
+    assert not re.search(r"\d", "".join([only["name"], only["modification"]] + only["composition"])), \
+        "「无剂量药单」是代码级保证：整份建议一个数字都没有"
+    assert formula["disclaimer"] == agent.FORMULA_DISCLAIMER and "error" not in formula
+    assert _SUGGESTION_COMPLAINT in formula_llm.prompts[0]
+
+    predraft_llm = _llm(monkeypatch, _PREDRAFT_REPLY)
+    predraft = agent.generate_predraft(
+        patient_name="张三", formula_name="", complaint=_SUGGESTION_COMPLAINT,
+        transcript=_SUGGESTION_DRAFT, past_records="", teacher_skeleton="")
+
+    assert predraft == {"predraft": {
+        "formula_name": "柴胡桂枝湯",
+        "items": [{"herb": "柴胡", "dose": "9g", "role": "君"},
+                  {"herb": "甘草", "dose": "6g", "role": "使"}],
+        "decoction": "日一劑，分二次溫服"}, "disclaimer": agent.PREDRAFT_DISCLAIMER}, \
+        "预填是唯一保留剂量的能力（授权期专属）；空 `herb` 的条目丢掉"
+    assert '"dose"' in agent.PREDRAFT_PROMPT, "预填允许剂量（授权期专属）：提示词样例里就带 dose"
+    assert "dose" not in agent.FORMULA_SUGGESTION_PROMPT, "方剂建议的提示词里连 dose 这个字段都没有"
+    assert "【老师指定的方名（可为空，空则按材料拟一个）】" in predraft_llm.prompts[0]
+
+    # 模型没给方名 → 回落到老师指定的方名（老师自己写的方名不算编造）；两者都没有 → 空预填 + 标记
+    _llm(monkeypatch, '{"predraft": {"items": [{"herb": "柴胡"}]}}')
+    fallback = agent.generate_predraft(patient_name="张三", formula_name="老師指定方",
+                                       complaint="", transcript="", past_records="",
+                                       teacher_skeleton="")
+    assert fallback["predraft"] == {"formula_name": "老師指定方",
+                                    "items": [{"herb": "柴胡", "dose": "", "role": ""}],
+                                    "decoction": ""}
+    assert "error" not in fallback and fallback["disclaimer"] == agent.PREDRAFT_DISCLAIMER
+
+    _llm(monkeypatch, '{"predraft": {"items": [{"herb": "柴胡"}]}}')
+    empty = agent.generate_predraft(patient_name="张三", formula_name="", complaint="", transcript="",
+                                    past_records="", teacher_skeleton="")
+    assert empty == {"predraft": _blank_predraft_shape(), "error": agent.PARSE_FAILED,
+                     "disclaimer": agent.PREDRAFT_DISCLAIMER}, "没方名也没药味 → 空预填 + 标记"
+
+    # 回包不是 JSON（解说文字 / 数组 / 空串）→ 与解析失败同一条出口
+    _llm(monkeypatch, "模型胡言亂語，不是 JSON")
+    assert agent.suggest_formula(patient_name="", complaint="", transcript="", past_records="",
+                                 teacher_skeleton="") == \
+        {"formulas": [], "error": agent.PARSE_FAILED, "disclaimer": agent.FORMULA_DISCLAIMER}
+
+    _llm(monkeypatch, '[{"name": "肝胃不和證"}]')
+    assert agent.predict_pattern_candidates(patient_name="", complaint="", transcript="",
+                                            past_records="", teacher_skeleton="") == \
+        {"candidates": [], "error": agent.PARSE_FAILED, "disclaimer": agent.PATTERN_DISCLAIMER}, \
+        "只认对象：数组 / 标量一律当解析失败（契约里没有第二种形状）"
+
+    # LLM 抛异常 → 三个入口都是空结果 + 标记（绝不抛、绝不编造）
+    _llm(monkeypatch, raises="模型連線中斷")
+    assert agent.generate_predraft(patient_name="张三", formula_name="柴胡桂枝湯", complaint="",
+                                   transcript="", past_records="", teacher_skeleton="") == \
+        {"predraft": _blank_predraft_shape(), "error": agent.PARSE_FAILED,
+         "disclaimer": agent.PREDRAFT_DISCLAIMER}
+
+    # 提示词卫生：剥掉图片 / 录音 URL 段（噪声 + 幻觉来源，口径同既有生成路径）+ 正文截断
+    media_llm = _llm(monkeypatch, '{"candidates": []}')
+    agent.predict_pattern_candidates(
+        patient_name="张三", complaint="胃痛",
+        transcript="【主訴】胃痛\n【上传的图片】http://x/y.png\n【舌脈】淡\n" + "納可" * 2000,
+        past_records="", teacher_skeleton="")
+
+    prompt = media_llm.prompts[0]
+    assert "y.png" not in prompt and "【上传的图片】" not in prompt, "URL 段一律剥掉"
+    assert "【舌脈】淡" in prompt and prompt.count("納可") <= agent.PROMPT_TEXT_LIMIT, \
+        "正文按 `PROMPT_TEXT_LIMIT` 截断（提示词体积有上限）"
+

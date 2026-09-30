@@ -727,3 +727,406 @@ def scan_student_requests(teacher_name, lineage_id=None):
     return created
 
     
+
+# =====【Epic 2】老師智能體五階段：新增能力（追加，既有段落一字不改）=====
+# 对齐：docs/epic2-agent-stage-design-v1.md §4.3（追加位置 / 输出契约 / 禁区段 / 不 import database）
+#       + §8 step 5（施工步骤 4c-1：`agent.py` 末尾 3 组能力 + 服务侧入口 + 守护测试）。
+# 三条纪律（本段自我约束，⑩ / ㉑ 组的源码级守护钉住）：
+#   ① **既有代码零改动**：本段只往文件末尾追加 —— 六个既有 prompt 常量与既有函数一字不改，
+#      `generate_medical_draft()` 仍是唯一病历生成入口（§5.1 红线②），本段不新增第二条生成路径；
+#   ② **不碰 `database`**：三个新函数零 `database.*` 调用（第 14 行既有的 import 不改、也不新增），
+#      入参全部是纯文本 / dict，AI 层只产文本 —— 落库永远由服务层
+#      （`agent_stage_service.build_suggestion()` / `build_predraft()`）在老师确认路径上完成（§4.3 末条）；
+#   ③ **绝不编造**：LLM 调用失败 / 输出解析不出来，唯一出口是「空结果 + `error='parse_failed'`」
+#      （§4.3 的输出契约），绝不把模型没给的症状、药材、剂量补进去。
+# 文案口径：prompt 正文与本文件既有段落同用简体；`disclaimer` 值按设计 §4.3 **逐字**（繁体），
+#           与 `agent_stage_service.DISCLAIMER_*` 三常量互为同一份字面量（㉑ 组交叉钉住）。
+
+# ---- 能力 1/3【見習期 `predict_pattern`】證型候選 ----
+
+PATTERN_CANDIDATE_PROMPT = (
+    "你是一名中医老师的【证型候选提示员】。你唯一的任务是：根据学生的病历材料，提示 1–3 个"
+    "候选证型，供老师参考。\n\n"
+    "【绝对禁止】\n"
+    "1. 不能做诊断、下结论：不得输出「诊断为」「确诊」「辨证为……」这类结论性表述，"
+    "只许输出「候选证型」并标注仅供参考\n"
+    "2. 不得自行开具处方：不给方剂、不给药材、不给剂量、不给煎服法\n"
+    "3. 不能添加材料里没有说过的症状、舌象、脉象、既往史（材料不足就少给候选，绝不补齐）\n"
+    "4. 不能生成任何可以自动发送给学生 / 患者的文字\n"
+    "5. 不能代替老师签字，也不能要求老师直接采用\n\n"
+    "【必须做的】\n"
+    "1. 每条候选都必须带 basis：至少 1 条**病历原文片段**（照抄材料原话，一个字都不许改）；"
+    "抄不到原文片段的候选一律不要输出\n"
+    "2. confidence 只能是 high / medium / low（证据越直接越高）\n"
+    "3. 最多 3 条候选；材料不足时宁可只给 1 条或 0 条\n"
+    "4. note 用一句话说明这条候选提示的是什么，不要写成结论\n\n"
+    "【输出格式】只输出一个 JSON 对象，不要任何前缀、后缀、解释或 markdown 标记：\n"
+    "{\"candidates\":[{\"name\":\"候选证型名\",\"confidence\":\"medium\","
+    "\"basis\":[\"病历原文片段\"],\"note\":\"一句话提示\"}],"
+    "\"disclaimer\":\"僅供參考，非診斷\"}\n\n"
+    "【学生姓名】\n{patient_name}\n\n"
+    "【主诉（学生原话）】\n{complaint}\n\n"
+    "【病历材料（草案正文，含老师已补充内容）】\n{transcript}\n\n"
+    "【既往病历参考】\n{past_records}\n\n"
+    "【本诊室病历段落骨架（依老师模板，仅供按段落顺序阅读材料）】\n{teacher_skeleton}"
+)
+
+# ---- 能力 2/3【助手期 `suggest_prescription`】方劑建議 ----
+
+FORMULA_SUGGESTION_PROMPT = (
+    "你是一名中医老师的【方剂建议员】。你唯一的任务是：根据学生的病历材料，提示 1–3 个"
+    "**可参考的方剂方向**（方名 + 加减思路 + 组成药材名），供老师参考。\n\n"
+    "【绝对禁止】\n"
+    "1. 不能做诊断、下结论：不得输出「诊断为」「确诊」「辨证为……」这类结论性表述\n"
+    "2. **不能给剂量**：任何数字都不许出现（不给 9g / 3钱 / 10ml，也不给「每次多少」）\n"
+    "3. **不能给煎服法**：不给煎煮时间、火候、服用时间、疗程、忌口（那是老师的施治方案）\n"
+    "4. 不得自行开具处方：不能输出任何可以落库 / 可以自动发送的字段（患者名、处方号、金额、发送对象一律不要）\n"
+    "5. 不能添加材料里没有说过的症状、舌象、脉象；不给中成药、西药建议\n"
+    "6. 不能代替老师签字，也不能要求老师直接采用\n\n"
+    "【必须做的】\n"
+    "1. 只写方名 / 加减思路 / 组成药材**名单**；药名照抄标准药名，不带剂量、不带炮制用量\n"
+    "2. modification 写「按什么症状怎么加减」的一句话思路（同样不许出现数字）\n"
+    "3. composition 是药材名字符串数组（如 [\"柴胡\",\"黃芩\"]），不带剂量、不带括号备注\n"
+    "4. usage 恒为「僅供參考」；最多 3 个方剂；材料不足时宁可只给 1 个或 0 个\n\n"
+    "【输出格式】只输出一个 JSON 对象，不要任何前缀、后缀、解释或 markdown 标记：\n"
+    "{\"formulas\":[{\"name\":\"小柴胡湯\",\"modification\":\"口干者加天花粉\","
+    "\"composition\":[\"柴胡\",\"黃芩\"],\"usage\":\"僅供參考\"}],"
+    "\"disclaimer\":\"僅供參考，非處方\"}\n\n"
+    "【学生姓名】\n{patient_name}\n\n"
+    "【主诉（学生原话）】\n{complaint}\n\n"
+    "【病历材料（草案正文，含老师已补充内容）】\n{transcript}\n\n"
+    "【既往病历参考】\n{past_records}\n\n"
+    "【本诊室病历段落骨架（依老师模板，仅供按段落顺序阅读材料）】\n{teacher_skeleton}"
+)
+
+# ---- 能力 3/3【授權期 `generate_predraft`】預處方預填 ----
+
+PREDRAFT_PROMPT = (
+    "你是一名中医老师的【预处方预填员】。你唯一的任务是：根据学生的病历材料，把「预处方」"
+    "的表格字段**预填**出来（方名 + 药味 / 剂量 / 君臣佐使 + 煎服法），供老师逐项核对与修改。\n\n"
+    "【绝对禁止】\n"
+    "1. 不能做诊断、下结论：不得输出「诊断为」「确诊」「辨证为……」这类结论性表述"
+    "（证型只能作为你选药的内部依据，一个字都不许写进返回的数据里）\n"
+    "2. 不得自行开具处方：**不能落库、不能发送、不能签字**，你只返回一段数据，存处方必须由老师本人在系统里操作\n"
+    "3. 不能编造材料里没有依据的药材或剂量：拿不准的剂量留空字符串，等老师补\n"
+    "4. 不能把这份预填当成处方结论，也不能生成任何面向学生 / 患者的文字\n"
+    "5. 不能添加材料里没有说过的症状、舌象、脉象\n\n"
+    "【必须做的】\n"
+    "1. items 每项三个字段：herb（药材名）；dose（剂量，照常规写如 9g，没有依据就写空串）；"
+    "role（君 / 臣 / 佐 / 使，判断不了就写空串）\n"
+    "2. decoction 写煎服法提示（如「水煎服，日一剂」）；拿不准就写「由老師填寫」\n"
+    "3. formula_name 与老师指定的方名一致；老师未指定时按材料给一个常用方名"
+    "（只是预填，不得当成结论）\n"
+    "4. 药味数量克制（一般 4–12 味）；材料不足时宁可少给，不要凑数\n\n"
+    "【输出格式】只输出一个 JSON 对象，不要任何前缀、后缀、解释或 markdown 标记：\n"
+    "{\"predraft\":{\"formula_name\":\"方名\",\"items\":[{\"herb\":\"柴胡\",\"dose\":\"9g\","
+    "\"role\":\"君\"}],\"decoction\":\"水煎服，日一剂\"},"
+    "\"disclaimer\":\"僅供參考，須老師確認並自行開方\"}\n\n"
+    "【老师指定的方名（可为空，空则按材料拟一个）】\n{formula_name}\n\n"
+    "【学生姓名】\n{patient_name}\n\n"
+    "【主诉（学生原话）】\n{complaint}\n\n"
+    "【病历材料（草案正文，含老师已补充内容）】\n{transcript}\n\n"
+    "【既往病历参考】\n{past_records}\n\n"
+    "【本诊室病历段落骨架（依老师模板，仅供按段落顺序阅读材料）】\n{teacher_skeleton}"
+)
+
+# ---------------------------------------------------------------------------
+# 三个能力的契约常量（§4.3 输出契约的**逐字**字面量）
+# ---------------------------------------------------------------------------
+# `disclaimer` 三值：服务层 `DISCLAIMER_PATTERN` / `DISCLAIMER_FORMULA` / `DISCLAIMER_PREDRAFT`
+# 与这里同字面量（㉑ 组交叉钉住：两处必须逐字节同字，改一处要同步另一处）。
+PATTERN_DISCLAIMER = "僅供參考，非診斷"
+FORMULA_DISCLAIMER = "僅供參考，非處方"
+PREDRAFT_DISCLAIMER = "僅供參考，須老師確認並自行開方"
+# 方劑建議的 `usage` 是**契约值**，恒为这一句（不采用模型给的值，免得模型写进剂量 / 疗程）。
+FORMULA_USAGE = "僅供參考"
+# 置信度白名单：模型写了别的值（含大小写变形）→ 一律降为 low（绝不把不确定放成「高」）。
+PATTERN_CONFIDENCE_LEVELS = ("high", "medium", "low")
+# 上限：§4.3 / §4.6-⑥⑦ 的「最多 3 条」；药味上限是防 prompt 回包失控的兜底（不是业务规则）。
+MAX_PATTERN_CANDIDATES = 3
+MAX_FORMULA_CANDIDATES = 3
+MAX_PREDRAFT_ITEMS = 20
+# 入参文本上限：与 `agent_stage_service.truncate_chars()` 的默认值同口径（2000 字），
+# 服务层会先截一次，这里是模型侧的兜底（免得一份超长草案把提示词撑爆）。
+PROMPT_TEXT_LIMIT = 2000
+# 解析失败的唯一标记（服务层据此提示「本次没有产出」，而不是假装成功）。
+PARSE_FAILED = "parse_failed"
+# ---------------------------------------------------------------------------
+# 三个能力的**共享小工具**（纯函数：无副作用、零 `database.*` 调用、不新增 import）
+# ---------------------------------------------------------------------------
+
+# 图片 / 录音的 URL 段落：与既有 `generate_medical_draft()` 第 122–125 行**同一套正则**（同口径）。
+# 理由同该处：模型读不到本地文件，URL 喂进提示词只是噪声 / 幻觉来源。
+_MEDIA_SECTION_PATTERNS = (
+    r"【上传的图片】[\s\S]*?(?=【|$)",
+    r"【上传的录音】[\s\S]*?(?=【|$)",
+    r"【学生上传的图片】[\s\S]*?(?=【|$)",
+    r"【学生上传的录音】[\s\S]*?(?=【|$)",
+)
+
+
+def _clip_text(text, limit=PROMPT_TEXT_LIMIT):
+    """通用收敛：非字符串（`None` / 数字 / list）→ 空串；去首尾空白；过长截断。"""
+    value = text if isinstance(text, str) else ""
+    return value.strip()[:limit]
+
+
+def _plain_text(text, limit=PROMPT_TEXT_LIMIT):
+    """提示词入参清洗：剥掉图片 / 录音 URL 段落（口径与既有生成路径同款），再去空白 + 截断。"""
+    value = text if isinstance(text, str) else ""
+    for pattern in _MEDIA_SECTION_PATTERNS:
+        value = re.sub(pattern, "", value)
+    return _clip_text(value, limit)
+
+
+def _load_json_object(raw_text):
+    """从模型回包里取出一个 JSON 对象（§4.3「严格 JSON → 纯文本兜底」）：
+
+      ① 原样 `json.loads`（prompt 已要求「只输出一个 JSON 对象」）；
+      ② 失败则取**第一个 `{` 到最后一个 `}`** 再试一次（剥掉 ```json 围栏与前后解说）；
+      ③ 仍失败 → `None`（调用方据此返回空结果 + `PARSE_FAILED`）。
+    只认对象（`dict`）：数组 / 标量一律当解析失败 —— 契约里没有第二种形状，不猜。
+    """
+    value = raw_text if isinstance(raw_text, str) else ""
+    attempts = [value]
+    left, right = value.find("{"), value.rfind("}")
+    if left != -1 and right > left:
+        attempts.append(value[left:right + 1])
+    for attempt in attempts:
+        try:
+            data = json.loads(attempt)
+        except (ValueError, TypeError):
+            continue
+        if isinstance(data, dict):
+            return data
+    return None
+
+
+def _text_list(value, limit=200):
+    """把 `basis` / `composition` 这类字段收敛成**非空字符串数组**：
+
+      · 字符串 → 单元素数组（模型偶尔给字符串而不是数组，宽松兼容）；
+      · 其它类型（`None` / dict / 数字）→ 空数组；
+      · 每项去空白 + 截断，空串丢掉（**不补内容**：宁可短，不编造）。
+    """
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, list):
+        return []
+    items = []
+    for item in value:
+        text = _clip_text(item, limit)
+        if text:
+            items.append(text)
+    return items
+
+
+def _dose_free(text, limit=300):
+    """去掉**剂量 / 用量数字写法**（§4.3 方剂建议「不含剂量、不含煎法用量」的代码级保证）：
+    `柴胡 9g` → `柴胡`；`9 克` / `10ml` / `3錢` 同理；残留的阿拉伯数字一并去掉
+    —— 方剂建议整份没有数字字段，连「日一剂」这种写法也留不下来。
+    单位按**长在前**排列（`mg` 先于 `g`），免得 `mg` 被认成 `m` + `g`。
+    """
+    value = text if isinstance(text, str) else ""
+    value = re.sub(r"\s*\d+(?:\.\d+)?\s*(?:mg|kg|ml|g|毫克|千克|毫升|克|錢|钱|兩|两)", "",
+                   value, flags=re.I)
+    return _clip_text(re.sub(r"\d", "", value), limit)
+
+
+def _herb_name(text, limit=60):
+    """药味名收敛：先过 `_dose_free()`，再去掉括号备注（「(炒)」「（先煎）」只留药名）
+    与串尾分隔符（「、」「,」「+」），最后截断。"""
+    value = re.sub(r"[（(][^）)]*[）)]", "", _dose_free(text, limit))
+    return value.strip().strip("、,，;；+｜|").strip()[:limit]
+
+
+def _blank_predraft():
+    """预处方的**空预填**（解析失败时的出口形状）：逐键与成功体同形，一个药味都不编。"""
+    return {"formula_name": "", "items": [], "decoction": ""}
+
+
+# ---------------------------------------------------------------------------
+# 三个能力的**输出规范化**（模型说什么不算数，契约说什么才算数）
+# ---------------------------------------------------------------------------
+
+def _normalize_pattern_candidates(data):
+    """模型输出 → §4.3 的严格形状（`candidates` + `disclaimer`），不满足契约的候选一律丢掉：
+
+      · `name` 为空 → 丢；`basis` 少于 1 条**非空原文片段** → 丢（「必带病历原文依据」是硬契约）；
+      · `confidence` 不在白名单（high / medium / low，大小写不敏感）→ 降为 `low`；
+        `note` 允许为空（只是提示语，不构成依据）；
+      · 最多 `MAX_PATTERN_CANDIDATES`（3）条。
+    一条都不剩（含 `data is None`，即解析失败）→ `{"candidates": [], "error": PARSE_FAILED, ...}`：
+    空结果 + 免责声明，**绝不拿模型的原话补出一条**（§4.3「绝不编造」）。
+    """
+    if not isinstance(data, dict):
+        return {"candidates": [], "error": PARSE_FAILED, "disclaimer": PATTERN_DISCLAIMER}
+    raw_items = data.get("candidates")
+    candidates = []
+    for item in (raw_items if isinstance(raw_items, list) else [])[:MAX_PATTERN_CANDIDATES]:
+        if not isinstance(item, dict):
+            continue
+        name = _clip_text(item.get("name"), 100)
+        basis = _text_list(item.get("basis"), 200)
+        if not name or not basis:
+            continue
+        confidence = item.get("confidence")
+        confidence = confidence.strip().lower() if isinstance(confidence, str) else ""
+        if confidence not in PATTERN_CONFIDENCE_LEVELS:
+            confidence = "low"
+        candidates.append({"name": name, "confidence": confidence, "basis": basis,
+                           "note": _clip_text(item.get("note"), 200)})
+    if not candidates:
+        return {"candidates": [], "error": PARSE_FAILED, "disclaimer": PATTERN_DISCLAIMER}
+    return {"candidates": candidates, "disclaimer": PATTERN_DISCLAIMER}
+
+
+def _normalize_formula_suggestions(data):
+    """模型输出 → §4.3 的严格形状（`formulas` + `disclaimer`）：
+
+      · `name` 为空 或 `composition` 全空 → 丢（没方名 / 没药味的「方剂建议」没有意义）；
+      · `composition` 逐项过 `_herb_name()`（去剂量、去括号备注、去分隔符），空项丢掉；
+      · `modification` 过 `_dose_free()`（加减思路里也不许有数字）；
+      · `usage` 恒用 `FORMULA_USAGE` 契约值（不采用模型给的值 —— 免得模型借这栏写剂量 / 疗程）；
+      · 最多 `MAX_FORMULA_CANDIDATES`（3）个方剂。
+    一个都不剩 → `{"formulas": [], "error": PARSE_FAILED, ...}`（同證型候选：空，不编造）。
+    """
+    if not isinstance(data, dict):
+        return {"formulas": [], "error": PARSE_FAILED, "disclaimer": FORMULA_DISCLAIMER}
+    raw_items = data.get("formulas")
+    formulas = []
+    for item in (raw_items if isinstance(raw_items, list) else [])[:MAX_FORMULA_CANDIDATES]:
+        if not isinstance(item, dict):
+            continue
+        name = _dose_free(_clip_text(item.get("name"), 100), 100)
+        composition = [_herb_name(text) for text in _text_list(item.get("composition"), 60)]
+        composition = [herb for herb in composition if herb]
+        if not name or not composition:
+            continue
+        formulas.append({
+            "name": name,
+            "modification": _dose_free(_clip_text(item.get("modification"), 300), 300),
+            "composition": composition,
+            "usage": FORMULA_USAGE,
+        })
+    if not formulas:
+        return {"formulas": [], "error": PARSE_FAILED, "disclaimer": FORMULA_DISCLAIMER}
+    return {"formulas": formulas, "disclaimer": FORMULA_DISCLAIMER}
+
+
+def _normalize_predraft(data, formula_name=""):
+    """模型输出 → §4.3 的严格形状（`predraft` + `disclaimer`）：
+
+      · 只认 `{"predraft": {...}}` 这一层（契约里没有第二种形状 —— 严格，不猜字段语义）；
+      · `items` 逐项：`herb` 为空 → 丢；`dose` / `role` 允许空串（拿不准就空着，等老师补）；
+      · `formula_name` 为空时用**老师指定的** `formula_name` 兜底（老师自己写的方名不算编造）；
+      · 药味上限 `MAX_PREDRAFT_ITEMS`（20），防回包失控。
+    没有方名或没有药味 → 空预填 + `error=PARSE_FAILED`（同两款建议：绝不编造）。
+    """
+    inner = data.get("predraft") if isinstance(data, dict) else None
+    if not isinstance(inner, dict):
+        return {"predraft": _blank_predraft(), "error": PARSE_FAILED, "disclaimer": PREDRAFT_DISCLAIMER}
+    formula = _clip_text(inner.get("formula_name"), 100) or _clip_text(formula_name, 100)
+    raw_items = inner.get("items")
+    items = []
+    for item in (raw_items if isinstance(raw_items, list) else [])[:MAX_PREDRAFT_ITEMS]:
+        if not isinstance(item, dict):
+            continue
+        herb = _clip_text(item.get("herb"), 60)
+        if not herb:
+            continue
+        items.append({"herb": herb, "dose": _clip_text(item.get("dose"), 40),
+                      "role": _clip_text(item.get("role"), 20)})
+    if not formula or not items:
+        return {"predraft": _blank_predraft(), "error": PARSE_FAILED, "disclaimer": PREDRAFT_DISCLAIMER}
+    return {"predraft": {"formula_name": formula, "items": items,
+                         "decoction": _clip_text(inner.get("decoction"), 300)},
+            "disclaimer": PREDRAFT_DISCLAIMER}
+
+
+# ---------------------------------------------------------------------------
+# 三个**公开能力入口**（服务层唯一入口：`agent_stage_service.build_suggestion()` / `build_predraft()`）
+# ---------------------------------------------------------------------------
+# 签名与返回体**就是契约**（§4.3 符号表；能力键见 §2.1）：
+#   · `predict_pattern_candidates(patient_name, complaint, transcript, past_records, teacher_skeleton)`
+#     ← 見習期 `predict_pattern`；→ `{"candidates":[…],"disclaimer":…}`（≤3 条，每条必带 `basis` 原文依据）
+#   · `suggest_formula(patient_name, complaint, transcript, past_records, teacher_skeleton)`
+#     ← 助手期 `suggest_prescription`；→ `{"formulas":[…],"disclaimer":…}`（方名 + 加减思路 + 药名，
+#       **不含剂量 / 煎服法**）。函数名照 §4.3 符号表，与能力键 `suggest_prescription` 是同一件事的
+#       两个名字（服务层按能力键做能力判定、按函数名调模型）。
+#   · `generate_predraft(patient_name, formula_name, complaint, transcript, past_records, teacher_skeleton)`
+#     ← 授權期 `generate_predraft`；→ `{"predraft":{…},"disclaimer":…}`（预填数据，含剂量；
+#       **永不落库、永不发送、永不签字**）
+# 共同契约：入参纯文本；LLM 异常 / 解析失败 → 空结果 + `error='parse_failed'`（绝不编造）；
+#           返回值只有文本与数字，**没有任何数据库字段**（患者名 / 处方号 / 金额一律不产）。
+# 调用方式：`agent_stage_service` 用关键字参数调（`formula_name=` / `transcript=` …），
+#          免得日后调参顺序时出现「位置参数错位」这种静默事故。
+
+def predict_pattern_candidates(patient_name, complaint, transcript, past_records, teacher_skeleton):
+    """【見習期 `predict_pattern` / §4.3】证型候选提示（≤3 条，每条必带病历原文片段 `basis`）。
+
+    只产文本：**不写库、不发消息、不签字**（落库由服务层在老师确认路径上做）。LLM 抛异常与
+    解析失败走**同一条出口** —— 空候选 + `error='parse_failed'`：调用方据此回「本次没有产出」，
+    而不是把半句模型输出当真。`patient_name` 只用于提示词，不参与任何判定。
+    """
+    prompt = (PATTERN_CANDIDATE_PROMPT
+              .replace("{patient_name}", _clip_text(patient_name, 100))
+              .replace("{complaint}", _plain_text(complaint))
+              .replace("{transcript}", _plain_text(transcript))
+              .replace("{past_records}", _plain_text(past_records))
+              .replace("{teacher_skeleton}", _clip_text(teacher_skeleton, 1000)))
+    try:
+        response = llm.invoke(prompt)
+        raw_text = getattr(response, "content", "") or ""
+    except Exception:
+        return {"candidates": [], "error": PARSE_FAILED, "disclaimer": PATTERN_DISCLAIMER}
+    return _normalize_pattern_candidates(_load_json_object(raw_text))
+
+
+def suggest_formula(patient_name, complaint, transcript, past_records, teacher_skeleton):
+    """【助手期 `suggest_prescription` / §4.3】方剂建议（≤3 个方，方名 + 加减思路 + 药名名单）。
+
+    与 `generate_predraft()` **刻意区分**：这里**一个剂量都不给**（`_dose_free()` 是代码级保证，
+    不只靠提示词），也不给煎服法 —— 「无剂量药单」。同 `predict_pattern_candidates()`：
+    只产文本、出口唯一（异常 / 解析失败 → 空方剂 + `error='parse_failed'`）。
+    """
+    prompt = (FORMULA_SUGGESTION_PROMPT
+              .replace("{patient_name}", _clip_text(patient_name, 100))
+              .replace("{complaint}", _plain_text(complaint))
+              .replace("{transcript}", _plain_text(transcript))
+              .replace("{past_records}", _plain_text(past_records))
+              .replace("{teacher_skeleton}", _clip_text(teacher_skeleton, 1000)))
+    try:
+        response = llm.invoke(prompt)
+        raw_text = getattr(response, "content", "") or ""
+    except Exception:
+        return {"formulas": [], "error": PARSE_FAILED, "disclaimer": FORMULA_DISCLAIMER}
+    return _normalize_formula_suggestions(_load_json_object(raw_text))
+
+
+def generate_predraft(patient_name, formula_name, complaint, transcript, past_records, teacher_skeleton):
+    """【授權期 `generate_predraft` / §4.3】预处方**预填**（方名 + 药味 / 剂量 / 君臣佐使 + 煎服法）。
+
+    这是三个能力里**唯一含剂量**的一个（授权期专属），但它的纪律比另两个更硬：
+    **只返回一段数据** —— 不写库、不发送、不签字；存处方必须由老师在系统里逐项核对后自己操作
+    （§4.6-⑦ 的 `note` 文案把这件事写给老师看）。`formula_name` 是老师指定的方名（可空串）：
+    为空时允许模型按材料拟一个（预填不是结论）；模型给了方名时以模型为准。
+    同前两个：只产文本、出口唯一（异常 / 解析失败 → 空预填 + `error='parse_failed'`，绝不编造）。
+    """
+    prompt = (PREDRAFT_PROMPT
+              .replace("{formula_name}", _clip_text(formula_name, 100))
+              .replace("{patient_name}", _clip_text(patient_name, 100))
+              .replace("{complaint}", _plain_text(complaint))
+              .replace("{transcript}", _plain_text(transcript))
+              .replace("{past_records}", _plain_text(past_records))
+              .replace("{teacher_skeleton}", _clip_text(teacher_skeleton, 1000)))
+    try:
+        response = llm.invoke(prompt)
+        raw_text = getattr(response, "content", "") or ""
+    except Exception:
+        return {"predraft": _blank_predraft(), "error": PARSE_FAILED, "disclaimer": PREDRAFT_DISCLAIMER}
+    return _normalize_predraft(_load_json_object(raw_text), formula_name)
+
+
+
+

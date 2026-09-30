@@ -3206,4 +3206,580 @@ def save_stage_config(teacher_name, config):
         return _config_save_short_circuit(name, _REASON_CONFIG_WRITE_FAILED, False)
 
 
+# ============================================================================
+# 【施工步骤 4c-1】三个新能力的**服务侧入口**（§4.5-① 第 16 行 / §4.6-⑥⑦）
+# ----------------------------------------------------------------------------
+# 本段只追加两个公开函数（接口层的两条路由属 4c-2，本段**零接线**）：
+#   · `build_suggestion(teacher_name, draft_id, kind)`          ← #6 `POST /suggest`（kind: pattern | formula）
+#   · `build_predraft(teacher_name, draft_id, formula_name='')`  ← #7 `POST /predraft`
+# 三条纪律（与 4a / 4b 已验收段落同一套口径）：
+#   ① **口径 B（服务层不抛）**：两个公开函数**永不抛** —— 失败与成功同形，只差 `reason` / `warnings`；
+#   ② **唯一能力闸门**：放行判定只经 `require_capability()`（§2.2）—— 阶段不足时由**闸门自己**写
+#      `permission_denied` 审计（§6.2 第 14 条），本段不自己读阶段、不自己查矩阵、不自己补写拒绝审计；
+#   ③ **只读取数 + 单点审计**：取数只调只读函数（`database.get_drafts()` / `get_patient_records()` /
+#      `template_service.get_active_record_template()` / `record_section_skeleton()`），**零业务写入**
+#      —— 不碰 `drafts` / `patient_records` / `prescriptions`；唯一写点是 `agent_stage_log` 的**一行**
+#      `suggestion_generated` / `predraft_generated`（§1.3 事件名，走 `_stage_event()` best-effort）。
+# 契约：成功体与短路体**逐键同形**（两个函数各 12 键），接口层照 §4.6-⑥⑦ 投影。
+#       `applied` 在两个函数里**恒为 `False`** —— 本族是**只读建议接口**，没有任何「已生效」的写入
+#       可报告（保持这个键在场只为与 4b 三个写接口的返回体同形，不承载语义；「本次成功」的唯一信号
+#       是 `reason`，4c-2 把它加进接口层的 `_AGENT_STAGE_OK_REASONS` 即可）。
+#       `skipped` 的语义则**有区分度**：flag off / 无效调用 = `True`（压根没开始），
+#       越权 / 找不到草案 / 服务侧故障 = `False`（请求被受理后**被拒绝**，不是被跳过）。
+# ============================================================================
+
+# `kind` 枚举（§4.6-⑥：`kind:'pattern'|'formula'`）→ 能力键（§2.1）的**唯一映射**。
+# 分工：`kind` 是**请求体字段值**（接口层只做 `in SUGGESTION_KINDS` 之外的透传），能力键是**矩阵里的列**。
+SUGGESTION_KINDS = ("pattern", "formula")
+_KIND_CAPABILITY = {
+    "pattern": "predict_pattern",         # 見習期：證型候選（`agent.predict_pattern_candidates()`）
+    "formula": "suggest_prescription",    # 助手期：方劑建議（`agent.suggest_formula()`，§4.3 符号表）
+}
+_PREDRAFT_CAPABILITY = "generate_predraft"   # 授權期：預處方預填（`agent.generate_predraft()`）
+
+# `disclaimer` / `note` 固定文案（§4.3 / §4.6-⑦ **逐字**）：与 `agent.PATTERN_DISCLAIMER` /
+# `agent.FORMULA_DISCLAIMER` / `agent.PREDRAFT_DISCLAIMER` 同字面量（㉑ 组交叉钉住：两处必须逐字节
+# 同字，改一处要同步另一处）。**服务层取这里的值** —— 不信模型回包里的 `disclaimer`：免责声明是
+# 铁律文案，不是模型可协商的内容。
+DISCLAIMER_PATTERN = "僅供參考，非診斷"
+DISCLAIMER_FORMULA = "僅供參考，非處方"
+DISCLAIMER_PREDRAFT = "僅供參考，須老師確認並自行開方"
+PREDRAFT_NOTE = "僅供預填，儲存處方仍須老師操作"
+_DISCLAIMERS = {"pattern": DISCLAIMER_PATTERN, "formula": DISCLAIMER_FORMULA}
+
+# §1.3 事件名 —— 同时就是本族**成功**的 `reason`（口径与 `stage_demoted` / `config_saved` 同款）
+_LOG_EVENT_SUGGESTION = "suggestion_generated"
+_LOG_EVENT_PREDRAFT = "predraft_generated"
+_REASON_SUGGESTION_GENERATED = _LOG_EVENT_SUGGESTION
+_REASON_PREDRAFT_GENERATED = _LOG_EVENT_PREDRAFT
+
+# 拒绝 / 故障 reason（字面量与接口层 `_AGENT_STAGE_ERROR_STATUS` 的键**逐字节同字**）
+_REASON_STAGE_KIND_INVALID = "stage_kind_invalid"          # §4.6-⑥ → 接口层 400
+_REASON_STAGE_FORBIDDEN = "stage_forbidden"                # §2.2 / §4.6-⑥⑦ → 403（审计由闸门写）
+_REASON_STAGE_DRAFT_NOT_FOUND = "stage_draft_not_found"    # §4.6-⑥⑦ → 404
+_REASON_SUGGESTION_FAILED = "suggestion_failed"            # 服务侧故障（4c-2 需在接口层登记 503）
+_REASON_PREDRAFT_FAILED = "predraft_failed"                # 同上（同一族故障码，分开便于定位）
+
+# §4.3 的解析失败标记（与 `agent.PARSE_FAILED` 同字面量；㉑ 组交叉钉住）
+_PARSE_FAILED = "parse_failed"
+
+# 空结果 / 拒绝的说明文案
+_DRAFT_NOT_FOUND_MSG = "引用的草案不存在、已簽字，或不屬於該老師（只認老師名下最新的未簽草案）"
+_KIND_INVALID_MSG = "kind 只能是 pattern（證型候選）或 formula（方劑建議）"
+_PARSE_FAILED_WARNINGS = {
+    "pattern": "智能體本次未產出可用的候選證型（回應無法解析或缺少原文依據）："
+               "已按「絕不編造」返回空結果，請老師稍後再試或自行判斷",
+    "formula": "智能體本次未產出可用的方劑建議（回應無法解析）："
+               "已按「絕不編造」返回空結果，請老師稍後再試或自行判斷",
+}
+_PREDRAFT_PARSE_FAILED_WARNING = ("智能體本次未產出可用的預處方預填（回應無法解析）："
+                                  "已按「絕不編造」返回空結果，請老師稍後再試或自行填寫")
+
+# 既往病历参考的取数口径：兜底文案与 `main.py` 既有生成路径**同字面量**，外加「只取最近 N 条」上限
+_NO_PAST_RECORDS = "暂无过往病历"
+_PAST_RECORD_LIMIT = 3
+
+# ---- 取数：只读三件套（草案行 / 既往病历 / 模板骨架）----
+
+def _draft_text(draft, key):
+    """草案行里的字符串字段：行不是 dict / 值不是字符串 → 空串（不猜、不转型）。"""
+    value = draft.get(key) if isinstance(draft, dict) else ""
+    return value if isinstance(value, str) else ""
+
+
+def _suggestion_draft(teacher_name, draft_id):
+    """按 `draft_id` 在**该老师名下最新的未签草案**里反查一行（§4.6-⑥⑦ 的 404 判定口径）。
+
+    只经 §4.5-① 允许的只读函数 `database.get_drafts(teacher_name)`（与工作台的草案列表**同源**：
+    不拼 SQL、不认识列形状），返回 `(行 | None, 失败说明)`：
+      · 命中 → `(dict, "")`；
+      · 找不到（id 不在列表里 / id 非法 / 该草案已签字，或已被同学生的新草案取代）→ `(None, 说明)`；
+      · 读库异常（0003 未跑 / 库被锁 / flag on 而缺 lineage）→ 同样 `(None, 说明)`：**fail-closed**
+        当作「找不到」，绝不退化成全量查询、更不猜内容（与 §1.5 / §2.2 同向）。
+    id 用 `_metric_int()` 收敛：`bool` / 字符串 / `None` → 0 → 必然查不到 = 404（不抛异常）。
+    """
+    import database      # 只在**函数体内**延迟 import（§4.5-①；方向守护见 ⑩ 组）
+
+    target = _metric_int(draft_id, 0)
+    try:
+        rows = database.get_drafts(teacher_name)
+    except Exception as exc:
+        _config_warn("讀取草案列表失敗（%s）：本次按「找不到該草案」處理（fail-closed，不退化為全量查詢）"
+                     % (exc,))
+        return None, "讀取草案列表失敗：%s" % (exc,)
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        if target and _metric_int(row.get("id"), 0) == target:
+            return row, ""
+    return None, _DRAFT_NOT_FOUND_MSG
+
+
+# 「主訴」段的标记（简繁两种写法；逐条枚举，**不做**简繁互换 / 同义词扩展 —— 口径同 3.4-a 的标题识别）
+_COMPLAINT_MARKERS = ("主訴", "主诉")
+
+
+def _complaint_text(content):
+    """从草案正文里切出「主訴」段（切不到 → 空串，由调用方退回整段正文）。
+
+    纯字符串规则（服务层只用 stdlib，这里不值得引入正则）：先找含标记的行，取标记**之后**的文字；
+    该行标记后为空 → 取后续第一个非空行（遇到下一个「【…】」标题即停，不越段取料）。
+    """
+    text = content if isinstance(content, str) else ""
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        head = line.strip()
+        position = -1
+        for marker in _COMPLAINT_MARKERS:
+            found = head.find(marker)
+            if found != -1 and (position == -1 or found < position):
+                position = found
+        if position == -1:
+            continue
+        tail = head[position + 2:]                       # 「主訴」/「主诉」都是 2 字
+        for note in ("（學生原話）", "（学生原话）", "(學生原話)", "(学生原话)"):
+            tail = tail.replace(note, "")
+        tail = tail.strip(" ：:【】#-—").strip()
+        if tail:
+            return tail
+        for following in lines[index + 1:]:
+            candidate = following.strip()
+            if not candidate:
+                continue
+            if candidate.startswith("【"):
+                break
+            return candidate
+    return ""
+
+
+def _past_records_text(teacher_name, patient_name):
+    """该学生**在本老师名下**的既往病历参考文本（拼接口径与 `main.py` 既有生成路径同款）。
+
+    · 只取最近 `_PAST_RECORD_LIMIT` 条（库层已 `ORDER BY id DESC`）：既往病历是**参考**，不是越全
+      越好 —— 几十条会把提示词挤爆（体积上限由 `agent.PROMPT_TEXT_LIMIT` 再兜一层）；
+    · 拼接用 `- {final_plan}`（与 `main.py` 逐字同款：LLM 输入口径与既有生成路径一致）；
+    · 取不到（含空名 / 读库异常）→ `_NO_PAST_RECORDS`：**不阻断**本次建议（既往病历只是增强材料）。
+    """
+    if not patient_name:
+        return _NO_PAST_RECORDS
+    try:
+        import database
+        rows = database.get_patient_records(patient_name, teacher_name)
+    except Exception as exc:
+        _config_warn("讀取既往病歷失敗（%s）：本次按「無既往病歷」處理（不阻斷建議生成）" % (exc,))
+        return _NO_PAST_RECORDS
+    lines = []
+    for row in (rows or [])[:_PAST_RECORD_LIMIT]:
+        if not isinstance(row, dict):
+            continue
+        plan = row.get("final_plan")
+        plan = plan.strip() if isinstance(plan, str) else ""
+        if plan:
+            lines.append("- %s" % plan)
+    return "\n".join(lines) if lines else _NO_PAST_RECORDS
+
+
+def _teacher_skeleton_text(teacher_name):
+    """老师生效 `record` 模板的段落骨架（§12.2 口径；读不到 → 空串 = 一个字段都不加）。
+
+    只读 `template_service` 的两个公开符号（§4.5-①）：它自带 `TEMPLATE_API_ENABLED` 闸门 + 表就绪
+    探测 + schema 版本判定 → 返回 `None` / 抛异常一律按「没有骨架」处理（不阻断建议生成）。
+    """
+    try:
+        import template_service
+        row = template_service.get_active_record_template(teacher_name)
+        return template_service.record_section_skeleton(row) or ""
+    except Exception as exc:
+        _config_warn("讀取病歷模板骨架失敗（%s）：本次不加段落骨架（不阻斷建議生成）" % (exc,))
+        return ""
+
+
+def _suggestion_inputs(teacher_name, draft):
+    """草案行 + 只读业务数据 → 三个能力函数的 5 个纯文本入参（字典；调用侧用关键字取用）。
+
+    · `transcript` = 草案**正文**（`drafts.content`：AI 原稿与老师已改的内容都在这个工作副本里）；
+    · `complaint` = 正文里的「主訴」段；切不到就**整段正文**（宁可多喂，不编造 —— 模型侧还会按
+      `PROMPT_TEXT_LIMIT` 截断到 2000 字）；
+    · `patient_name` = 草案行上的学生名（只用于提示词与展示，不参与任何判定）；
+    · `past_records` = 该学生在本老师名下的既往病历（只读、最多 3 条、空 → `暂无过往病历`）；
+    · `teacher_skeleton` = 老师生效 `record` 模板的段落骨架（读不到 → 空串）。
+
+    两个只读旁路**各自兜异常**（`_past_records_text()` / `_teacher_skeleton_text()`）：它们是**增强**
+    材料，读不到就少这一块，绝不把「产一条建议」变成 500，也绝不因为读不到而拒绝产出。
+    """
+    patient_name = _draft_text(draft, "patient_name")
+    content = _draft_text(draft, "content")
+    return {
+        "patient_name": patient_name,
+        "complaint": _complaint_text(content) or content.strip(),
+        "transcript": content.strip(),
+        "past_records": _past_records_text(teacher_name, patient_name),
+        "teacher_skeleton": _teacher_skeleton_text(teacher_name),
+    }
+
+# ---- 返回体装配（成功 / 短路 / 空结果三条路径同形）----
+
+def _blank_predraft():
+    """空预填：**内层三键恒在场**（成功 / 解析失败 / 短路三条路径同形），一个药味都不编。"""
+    return {"formula_name": "", "items": [], "decoction": ""}
+
+
+def _result_names(items):
+    """`payload` / `predraft` 里的名字列表（只喂**审计文案**：让日志留下「产出了哪几条」这个事实）。
+
+    方剂建议的条目键是 `name`，预填药味条目的键是 `herb`（§4.3 的两个 schema）—— 这里只做键的兼容取用，
+    **不做**任何补全 / 猜测（取不到名就不进列表，审计文案少一个名字比多一个假名字好）。
+    """
+    names = []
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("name") or item.get("herb") or ""
+        if isinstance(name, str) and name:
+            names.append(name)
+    return names
+
+
+def _names_suffix(names):
+    """审计文案里的名字后缀（空列表 → 空串，不留一对空括号）。"""
+    return "（%s）" % "、".join(names) if names else ""
+
+
+def _suggestion_short_circuit(teacher_name, kind, draft_id, reason, *,
+                              skipped=True, errors=None, warnings=None):
+    """`build_suggestion()` 的**零 SQL 短路体**（flag off / 无效调用 / 越权 / 找不到草案 / 故障）。
+
+    与成功路径**逐键同形**（12 键）。其中 `payload={}` + `disclaimer=""` + `generated_at=""` 是
+    **诚实的**：这些路径没有调模型、没有产出，就不摆一份看起来像结果的字段（口径同
+    `_config_save_short_circuit()` 的 `effective={}` / `_transition_short_circuit()` 的 `stage=""`）。
+    `warnings` 保留入参：调用方要解释「为什么没有内容」（如解析失败）时才有话说。
+    """
+    return {
+        "teacher_name": teacher_name,
+        "kind": kind,
+        "draft_id": _metric_int(draft_id, 0),
+        "patient_name": "",
+        "skipped": bool(skipped),
+        "applied": False,
+        "reason": reason,
+        "payload": {},
+        "disclaimer": "",
+        "generated_at": "",
+        "warnings": list(warnings or []),
+        "errors": list(errors or []),
+    }
+
+
+def _predraft_short_circuit(teacher_name, draft_id, reason, *,
+                            skipped=True, errors=None, warnings=None):
+    """`build_predraft()` 的**零 SQL 短路体**：键序与成功体一一对应（`predraft` ↔ `payload`）。
+
+    与 `build_suggestion()` 的一处**有意差异**：这里 `predraft` 给的是 `_blank_predraft()`
+    （内层三键在场）而不是 `{}` —— 因为 `predraft` 的内层形状**与 kind 无关、恒定**，摆一个空壳
+    能让前端在任何状态下都用同一套取值路径（`payload` 的内层形状随 kind 变，故成功前保持 `{}`）。
+    """
+    return {
+        "teacher_name": teacher_name,
+        "draft_id": _metric_int(draft_id, 0),
+        "patient_name": "",
+        "skipped": bool(skipped),
+        "applied": False,
+        "reason": reason,
+        "predraft": _blank_predraft(),
+        "disclaimer": "",
+        "note": PREDRAFT_NOTE,
+        "generated_at": "",
+        "warnings": list(warnings or []),
+        "errors": list(errors or []),
+    }
+
+
+def _suggestion_detail(kind, patient_name, draft_id, payload):
+    """成功路径的审计 `detail`（一行繁体人话，带「谁 / 哪份草案 / 产出几条」三个**可核对事实**）。"""
+    who = patient_name or "（未記名）"
+    if kind == "pattern":
+        names = _result_names(payload.get("candidates"))
+        return ("證型候選已產出（見習期能力 predict_pattern）：學生「%s」、草案 #%s，候選 %d 條%s；"
+                "僅供參考，非診斷" % (who, draft_id, len(names), _names_suffix(names)))
+    names = _result_names(payload.get("formulas"))
+    return ("方劑建議已產出（助手期能力 suggest_prescription）：學生「%s」、草案 #%s，方劑 %d 個%s；"
+            "僅供參考，非處方（無劑量）" % (who, draft_id, len(names), _names_suffix(names)))
+
+
+def _predraft_detail(patient_name, draft_id, predraft):
+    """预填成功路径的审计 `detail`（末句明写「未落庫、未發送、未簽字」—— 把 §4.6-⑦ 的纪律留痕）。"""
+    items = predraft.get("items") if isinstance(predraft, dict) else []
+    formula_name = predraft.get("formula_name", "") if isinstance(predraft, dict) else ""
+    return ("預處方預填已產出（授權期能力 generate_predraft）：學生「%s」、草案 #%s，方名「%s」、"
+            "藥味 %d 項%s；僅預填，未落庫、未發送、未簽字"
+            % (patient_name or "（未記名）", draft_id, formula_name, len(items or []),
+               _names_suffix(_result_names(items))))
+
+
+def _suggestion_disclaimer(kind):
+    """`kind` → `disclaimer` 契约值（未知 kind → 空串；此前的 `kind` 闸门已把它拦掉）。"""
+    return _DISCLAIMERS.get(kind, "")
+
+
+# ---- 公开入口 ①：`build_suggestion()`（#6 `POST /api/agent/stage/suggest`）----
+
+def build_suggestion(teacher_name, draft_id, kind):
+    """【§4.6-⑥ / §4.5-①】`POST /api/agent/stage/suggest` 的**服务侧主体**：證型候選 / 方劑建議。
+
+    返回 **12 键**（形状即契约；短路体逐键同形）：`teacher_name` / `kind` / `draft_id` /
+    `patient_name` / `skipped` / `applied` / `reason` / `payload{…}` / `disclaimer` /
+    `generated_at` / `warnings[]` / `errors[]`（4c-2 的接口层照 §4.6-⑥ 投影成
+    `{kind, draft_id, payload, disclaimer, generated_at}` + 统一错误体；`patient_name` 是服务层
+    多给的**展示用**字段 —— 前端卡片要显示「給 張三 的候選」）。
+
+    六条纪律：
+      ① **flag 先行**（§5.1 红线①）：`AGENT_STAGE_ENABLED` off → 首行短路（**零 DB 访问、零审计**，
+         `reason='agent_stage_disabled'`；接口层第一步就已 404 `agent_stage_disabled`，正常走不到这里）；
+      ② **无效调用短路**：空 `teacher_name`（`teacher_required`）、`kind` 不在 `SUGGESTION_KINDS`
+         （`stage_kind_invalid` + `errors[{path:'kind'}]`）。两条都排在能力判定**之前** —— 免得一个填错
+         参数的请求被记成「越权」（审计只记**真的**越权，否则 §6.2 的 `permission_denied` 会被噪声污染）；
+      ③ **唯一能力闸门**：`require_capability(teacher_name, _KIND_CAPABILITY[kind])`（§2.2）。阶段不足时
+         **闸门自己**写 `permission_denied` 审计 + `[warn]`（§6.2 第 14 条），本函数**不重复告警**，只把
+         `reason='stage_forbidden'` + 闸门同款文案装进 `errors[{path:'capability'}]` → 接口层翻 403；
+      ④ **草案反查**：`draft_id` 必须命中该老师**名下最新的未签草案**（`_suggestion_draft()`），否则
+         `reason='stage_draft_not_found'` → 404 —— 查不到就**不调模型**：绝不拿别人 / 已签字的草案喂 LLM；
+      ⑤ **只读取数 + 单点审计**：取数只经只读函数（`get_drafts` / `get_patient_records` / 模板），唯一写点
+         是一行 `suggestion_generated`（`detail` 带「谁 / 哪份草案 / 产出几条」；best-effort，写失败不改判定）；
+      ⑥ **永不抛**（口径 B）：LLM / 装配异常 → `reason='suggestion_failed'` + `errors[{path:'payload'}]`
+         → 接口层回 5xx。**与「解析失败」严格分开**：解析失败仍是**成功**（200 + 空 `payload` +
+         `payload['error']='parse_failed'` + 一条 `warnings`），故障才是 `suggestion_failed` ——
+         前者是「模型没给出可用内容」（老师可以自己判断），后者是「我们没跑通」（该重试），处置完全不同。
+
+    `payload` 内层形状随 `kind` 而变（§4.3 白名单，模型多给的字段一律不带出）：
+      · `pattern` → `{"candidates":[{name, basis[], confidence}]}`；
+      · `formula` → `{"formulas":[{name, modification, composition[], usage}]}`（**无剂量、无煎服法**）；
+      · 解析失败时两者都会多出一个 `"error":"parse_failed"`。
+    """
+    name = teacher_name or ""
+    if not agent_stage_enabled():
+        _config_warn("智能體階段功能未啟用（AGENT_STAGE_ENABLED off）：本次建議生成直接跳過"
+                     "（零查詢、零寫入、零審計）")
+        return _suggestion_short_circuit(name, kind, draft_id, _BLOCKER_DISABLED)
+    if not name:
+        _config_warn("建議生成缺少 teacher_name（無效調用）：本次直接跳過（零查詢、零寫入）")
+        return _suggestion_short_circuit(name, kind, draft_id, _BLOCKER_TEACHER_REQUIRED)
+    if kind not in SUGGESTION_KINDS:
+        _config_warn("建議生成 kind 非法（kind=%r）：本次不調模型、不讀庫（接口層按 400 stage_kind_invalid 回答）"
+                     % (kind,))
+        return _suggestion_short_circuit(name, kind, draft_id, _REASON_STAGE_KIND_INVALID, skipped=False,
+                                         errors=[{"path": "kind", "msg": _KIND_INVALID_MSG}])
+
+    capability = _KIND_CAPABILITY[kind]
+    if not require_capability(name, capability):
+        # 拒绝的 `[warn]` 与审计由闸门**自己**写（§2.2「拒绝同点写审计」）：这里只把结论装进返回体
+        return _suggestion_short_circuit(
+            name, kind, draft_id, _REASON_STAGE_FORBIDDEN, skipped=False,
+            errors=[{"path": "capability",
+                     "msg": _permission_denied_detail(capability, current_stage(name))}])
+
+    draft, why = _suggestion_draft(name, draft_id)
+    if draft is None:
+        _config_warn("草案反查未命中（teacher=%r, draft_id=%r）：%s —— 本次不調模型（介面層按 404 回答）"
+                     % (name, draft_id, why))
+        return _suggestion_short_circuit(name, kind, draft_id, _REASON_STAGE_DRAFT_NOT_FOUND,
+                                         skipped=False,
+                                         errors=[{"path": "draft_id", "msg": why}])
+
+    try:
+        return _build_suggestion(name, kind, draft)
+    except Exception as exc:
+        _config_warn("證型候選 / 方劑建議生成流程異常（%s）：本次不產出任何內容"
+                     "（介面層按 5xx suggestion_failed 回答）" % (exc,))
+        return _suggestion_short_circuit(name, kind, draft_id, _REASON_SUGGESTION_FAILED,
+                                         skipped=False,
+                                         errors=[{"path": "payload", "msg": "生成流程異常：%s" % (exc,)}])
+
+
+def _result_list(value):
+    """AI 层给的条目数组 → `list`（非 list → `[]`）：只收敛**外层形状**，一个字段都不改。
+
+    条目内容（`name` / `basis` / `confidence` …）是 `agent.py` 规范化器的职责（§4.3 白名单在那里
+    落地）：服务层再动一次内容就会出现「两处实现同一份规范化」的分叉风险，故这里只做容器兜底。
+    """
+    return list(value) if isinstance(value, list) else []
+
+
+def _build_suggestion(teacher_name, kind, draft):
+    """`build_suggestion()` 的**实体**（flag / 入参 / 能力 / 草案四道闸门已由调用方过掉）。
+
+    三步：**取数 → 调模型 → 装返回体**。
+      · 只经**关键字参数**调 AI 层（`agent.py` 的调用约定明写如此）—— 防止日后入参增删时出现
+        「位置参数错位」这种静默事故；
+      · `payload` 只投影契约里那一个键（`candidates` / `formulas`）+ 可选的 `error` 标记：模型多给的
+        字段一律**不带出**（§4.3 是白名单）；
+      · `disclaimer` 一律取**服务层常量**（不信回包里的那一份：免责声明是铁律文案，不是模型可协商的内容）；
+      · 无论成功还是解析失败，都写**一行** `suggestion_generated`（§1.6「拒绝也要留痕」的同向纪律：
+        成功路径更要留痕 —— 「产出几条」是事后核对「AI 到底给了什么」的唯一依据）。
+    """
+    import agent      # 只在**函数体内**延迟 import：服务层不在模块级依赖 AI 层（与 `database` 同纪律）
+
+    draft_id = _metric_int(draft.get("id"), 0)
+    inputs = _suggestion_inputs(teacher_name, draft)
+    patient_name = inputs["patient_name"]
+
+    if kind == "pattern":
+        result = agent.predict_pattern_candidates(        # 見習期能力（能力键 `predict_pattern`）
+            patient_name=patient_name, complaint=inputs["complaint"], transcript=inputs["transcript"],
+            past_records=inputs["past_records"], teacher_skeleton=inputs["teacher_skeleton"])
+        payload = {"candidates": _result_list(result.get("candidates"))}
+        what = "候選證型"
+    else:
+        result = agent.suggest_formula(                   # 助手期能力（能力键 `suggest_prescription`）
+            patient_name=patient_name, complaint=inputs["complaint"], transcript=inputs["transcript"],
+            past_records=inputs["past_records"], teacher_skeleton=inputs["teacher_skeleton"])
+        payload = {"formulas": _result_list(result.get("formulas"))}
+        what = "方劑建議"
+
+    warnings = []
+    if result.get("error") == _PARSE_FAILED:              # §4.3：解析失败 = **成功**的空结果 + 明确标记
+        payload["error"] = _PARSE_FAILED
+        warnings.append(_PARSE_FAILED_WARNINGS[kind])
+        _config_warn("智能體未產出可用的%s（解析失敗 / 缺原文依據）：本次返回空結果，絕不編造"
+                     "（draft_id=%s）" % (what, draft_id))
+
+    _stage_event(_LOG_EVENT_SUGGESTION, teacher_name, current_stage(teacher_name),
+                 _suggestion_detail(kind, patient_name, draft_id, payload))
+    return {
+        "teacher_name": teacher_name,
+        "kind": kind,
+        "draft_id": draft_id,
+        "patient_name": patient_name,
+        "skipped": False,
+        "applied": False,                                 # 恒 False：本族只读，无「已生效」写入可报
+        "reason": _REASON_SUGGESTION_GENERATED,
+        "payload": payload,
+        "disclaimer": _suggestion_disclaimer(kind),
+        "generated_at": datetime.now().isoformat(),
+        "warnings": warnings,
+        "errors": [],
+    }
+
+
+# ---- 公开入口 ②：`build_predraft()`（#7 `POST /api/agent/stage/predraft`）----
+
+def build_predraft(teacher_name, draft_id, formula_name=""):
+    """【§4.6-⑦ / §4.5-①】`POST /api/agent/stage/predraft` 的**服务侧主体**：预处方**预填**。
+
+    返回 **12 键**（短路体逐键同形）：`teacher_name` / `draft_id` / `patient_name` / `skipped` /
+    `applied` / `reason` / `predraft{formula_name, items[], decoction}` / `disclaimer` / `note` /
+    `generated_at` / `warnings[]` / `errors[]`（4c-2 照 §4.6-⑦ 投影成
+    `{draft_id, predraft, disclaimer, note}` + 统一错误体）。
+
+    与 `build_suggestion()` 共用同一套六条纪律（flag 先行 / 空名短路 / 唯一闸门 / 草案反查 /
+    只读取数 + 单点审计 / 永不抛），差异只有三处：
+      · 能力键固定为 `generate_predraft`（**授权期**）—— 見習期 / 助手期一律 403：**含剂量的数据
+        不外泄**（剂量是三個能力里唯一的高危面，也是铁律「永不开方」最容易被绕过的一格）；
+      · 入参多一个 `formula_name`（老师指定的方名，可空）：空则由模型按材料拟一个（老师自己写的
+        方名不算编造）。本层**原样透传**、不做校验 —— 它只是提示词里的一行材料（`agent._clip_text()`
+        在 AI 层收敛），预填不是结论，不是「老师已经决定开这张方」；
+      · `note` 固定为 §4.6-⑦ 的**逐字**文案「僅供預填，儲存處方仍須老師操作」：本接口
+        **永不写 `prescriptions`**、永不发送、永不签字 —— 存处方只有一条路径（老师在工作台逐项核对
+        后自己操作），这句话要跟着每一次预填一起回到前端。
+    """
+    name = teacher_name or ""
+    if not agent_stage_enabled():
+        _config_warn("智能體階段功能未啟用（AGENT_STAGE_ENABLED off）：本次預處方預填直接跳過"
+                     "（零查詢、零寫入、零審計）")
+        return _predraft_short_circuit(name, draft_id, _BLOCKER_DISABLED)
+    if not name:
+        _config_warn("預處方預填缺少 teacher_name（無效調用）：本次直接跳過（零查詢、零寫入）")
+        return _predraft_short_circuit(name, draft_id, _BLOCKER_TEACHER_REQUIRED)
+
+    if not require_capability(name, _PREDRAFT_CAPABILITY):
+        # 拒绝的 `[warn]` 与审计由闸门**自己**写（§2.2）：这里只把结论装进返回体 → 接口层 403
+        return _predraft_short_circuit(
+            name, draft_id, _REASON_STAGE_FORBIDDEN, skipped=False,
+            errors=[{"path": "capability",
+                     "msg": _permission_denied_detail(_PREDRAFT_CAPABILITY, current_stage(name))}])
+
+    draft, why = _suggestion_draft(name, draft_id)
+    if draft is None:
+        _config_warn("草案反查未命中（teacher=%r, draft_id=%r）：%s —— 本次不調模型（介面層按 404 回答）"
+                     % (name, draft_id, why))
+        return _predraft_short_circuit(name, draft_id, _REASON_STAGE_DRAFT_NOT_FOUND, skipped=False,
+                                       errors=[{"path": "draft_id", "msg": why}])
+
+    try:
+        return _build_predraft(name, draft, formula_name)
+    except Exception as exc:
+        _config_warn("預處方預填流程異常（%s）：本次不產出任何內容"
+                     "（介面層按 5xx predraft_failed 回答）" % (exc,))
+        return _predraft_short_circuit(name, draft_id, _REASON_PREDRAFT_FAILED, skipped=False,
+                                       errors=[{"path": "predraft",
+                                                "msg": "生成流程異常：%s" % (exc,)}])
+
+
+def _predraft_payload(value):
+    """AI 层预填 → 契约**三键**（非 dict / 缺键 / 类型不对 → 按空值兜底）：只补形状，不改内容。
+
+    `predraft` 的内层形状是**恒定**的（与 kind 无关），而接口层要把这三键直接放进响应体 ——
+    服务层必须自己保证「三键恒在场」，不能把契约寄托在 AI 层某次回包上（㉑ 组按三条路径都钉住）。
+    """
+    payload = _blank_predraft()
+    if not isinstance(value, dict):
+        return payload
+    formula_name, items, decoction = (value.get("formula_name"), value.get("items"),
+                                      value.get("decoction"))
+    payload["formula_name"] = formula_name if isinstance(formula_name, str) else ""
+    payload["items"] = list(items) if isinstance(items, list) else []
+    payload["decoction"] = decoction if isinstance(decoction, str) else ""
+    return payload
+
+
+def _build_predraft(teacher_name, draft, formula_name):
+    """`build_predraft()` 的**实体**（flag / 入参 / 能力 / 草案四道闸门已由调用方过掉）。
+
+    与 `_build_suggestion()` 同构（取数 → 调模型 → 装返回体），三处差异：
+      · `patient_name=` / `formula_name=` 走**关键字**（`formula_name` 是 AI 层签名里的**第二个**参数，
+        位置调用极易错位 —— 关键字调用把这件事钉死）；
+      · `predraft` 出参过一遍 `_predraft_payload()`（三键恒在场）；
+      · 解析失败**不往 `predraft` 里塞标记**：内层三键是给前端直接渲染用的（多一个 `error` 键会让
+        「空预填」与「预填里有内容」两种状态多一个判别维度），标记只落在 `warnings` 里 —— 老师看得懂
+        「本次没有产出」，而 `reason` 仍是成功（解析失败不是故障）。
+    """
+    import agent      # 只在**函数体内**延迟 import（同 `_build_suggestion()`）
+
+    draft_id = _metric_int(draft.get("id"), 0)
+    inputs = _suggestion_inputs(teacher_name, draft)
+    result = agent.generate_predraft(                     # 授權期能力（能力键 `generate_predraft`）
+        patient_name=inputs["patient_name"], formula_name=formula_name,
+        complaint=inputs["complaint"], transcript=inputs["transcript"],
+        past_records=inputs["past_records"], teacher_skeleton=inputs["teacher_skeleton"])
+    predraft = _predraft_payload(result.get("predraft"))
+
+    warnings = []
+    if result.get("error") == _PARSE_FAILED:              # §4.3：解析失败 = **成功**的空预填 + 提醒
+        warnings.append(_PREDRAFT_PARSE_FAILED_WARNING)
+        _config_warn("智能體未產出可用的預處方預填（解析失敗）：本次返回空預填，絕不編造"
+                     "（draft_id=%s）" % (draft_id,))
+
+    _stage_event(_LOG_EVENT_PREDRAFT, teacher_name, current_stage(teacher_name),
+                 _predraft_detail(inputs["patient_name"], draft_id, predraft))
+    return {
+        "teacher_name": teacher_name,
+        "draft_id": draft_id,
+        "patient_name": inputs["patient_name"],
+        "skipped": False,
+        "applied": False,                                 # 恒 False：预填**没有落库**（§4.6-⑦）
+        "reason": _REASON_PREDRAFT_GENERATED,
+        "predraft": predraft,
+        "disclaimer": DISCLAIMER_PREDRAFT,
+        "note": PREDRAFT_NOTE,                            # §4.6-⑦ 逐字：存处方仍须老师操作
+        "generated_at": datetime.now().isoformat(),
+        "warnings": warnings,
+        "errors": [],
+    }
+
+
+
+
+
+
+
+
 
