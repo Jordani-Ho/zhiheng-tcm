@@ -377,6 +377,10 @@ $py | python -
 | 5 | 在 flag off 下期待任何師門 UI / `lineage_id` | **不會**（§4.4 零行為變化）：見附錄 A |
 | 6 | 改 `$env:LINEAGE_ENABLED` 但沒重啟 uvicorn | **不生效**：env 是進程級的，`lineage_enabled()` 每次現讀也只讀**本進程** env（§0.1） |
 | 7 | 用舊入口（「+ 添加学生」/ 邀請碼）加學生後期待其進入本門 | flag on 下該行 `lineage_id = ''` = 未歸屬（設計 §3.2 附註，`docs/epic4-lineage-design-v1.md:482`）→ 老師端看不到，學生端只給提示 |
+| 8 | 看到 `400 lineage_required` 就斷定「前端漏傳參數」 | **先看 `msg` 再定位，不能靠錯誤碼定位**：`lineage_read_scope()`（`backend/lineage_service.py:272-304`）**先校 `lineage_id` 後校 `teacher_name`**，兩者**共用同一個錯誤碼** `lineage_required` —— 缺 `lineage_id`（msg「缺少師門上下文（lineage_id）」）會**遮住**缺 `teacher_name`（msg「缺少老師身份（teacher_name）」，只有 `lineage_id` 合法時才可能出現）。附錄 B 的只讀探針可逐條驗證 |
+
+> 第 **8** 行即本轮 CTO 報告的 **TD-010**（學生端 `/api/role-data` 400）的誤判來源；
+> 核查結論（含真機庫副本 + flag on 的 `TestClient` 實測矩陣）見 `docs/tech-debt.md` **§8**。
 
 ---
 

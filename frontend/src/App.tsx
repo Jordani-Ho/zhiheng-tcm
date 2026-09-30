@@ -668,8 +668,17 @@ export default function App() {
     return () => { cancelled = true }
   }, [lineageEnabled, lineageIsTeacher, lineageView, selectedPatient, lineageTick])
 
-  // 【§7.3】切换师门视图：本門（具体 lineage_id）= 人的维度同步跟上（换 selectedTeacher → 既有 effect 全量重拉）；
-  // 「全部師門（彙總）」= 本門上下文不变，只把彙總卡片拉起来。两种都先清场（clearLineageScopedPanels）。
+  // 【§7.3】切换师门视图（2026-09-29 CTO 裁决③：**彙總视图 = 只读彙總、不重拉本門数据**；本注释只对齐语义，逻辑未动）：
+  // · 本門（具体 lineage_id）：人的维度同步跟上 —— 目标师的 `teacher_name !== selectedTeacher` 时才换
+  //   `selectedTeacher`（`:678-681`），由依赖数组命中触发既有 gated effect 全量重拉（`:855-862`）。
+  // · 「全部師門（彙總）」：**没有本門上下文** —— `currentLineageId` 对 ALL 回落为空串（`:554`）→
+  //   五个本門读点的 URL 不带 `lineage_id`（flag on 下后端按 §3.2 / §5.2 fail-loud 回 400 → 面板呈空态，
+  //   属设计预期）；本视图只把**只读**彙總卡片拉起来（`:657-669` → `GET /api/lineages/summary`），
+  //   **不重拉**本門数据。
+  // · 两种都先清场（`clearLineageScopedPanels`）= §7.3 的「先清場」；「再重拉」实际**只由
+  //   `[currentRole, selectedPatient, selectedTeacher, lineageReady]`（`:862`）驱动** → 切回**同一位**老師的
+  //   本門时依赖不变、不重拉（面板停在清场后的空态）= 本轮代码走查新发现、**已登记待裁决**的殘項
+  //   （`docs/tech-debt.md` §8 TD-010「事实 d」）；轮内按 CTO 指令**只改注释、不动逻辑**。
   const handleSwitchLineageView = (view: string) => {
     if (view === lineageView) return
     clearLineageScopedPanels()
