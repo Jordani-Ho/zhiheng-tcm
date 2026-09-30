@@ -2978,12 +2978,18 @@ export default function App() {
             【Epic 2 步驟 6c】追加 `onEvaluated`：階段卡自己剛寫了階段真值（評估 / 降級成功）→ 重拉本工作台，
             讓「⏳ 待你確認」的新推薦與「📜 行動日誌」裡新增的降級一行**立刻可見**（沿用既有共享路徑
             `fetchAgentWorkbench()`，其末尾已自增 `agentStageRefreshKey` → 階段卡自己也重探一次）。
-            不新增按鈕、不加接口、下方既有三個區塊的 JSX 一行不改。 */}
+            不新增按鈕、不加接口、下方既有三個區塊的 JSX 一行不改。
+            【Epic 2 步驟 6d】追加 `draftId`：能力區（🧪 證型候選 / 📜 方劑建議 / 🧾 預處方預填）執行時要引用
+            一份**未簽草案**（服務端只信 DB：拿 `draft_id` 在該老師名下最新的未簽草案裡反查，查不到就回
+            404 `stage_draft_not_found`）。取值與診室其餘各區同一個口徑（`clinicPatientDrafts[0]`，見上方
+            第 341 行的定義）—— 不為這張卡另建一份草案來源，避免「卡片看到的草案」與「診室在編的草案」分叉。
+            無值 / 本地佔位草案（負 id，尚未落庫）→ 卡內三顆一起置灰並說明，不送必然失敗的請求。 */}
         {isTeacherRole && teacherTab === 'home' && (
           <AgentStagePanel
             teacherName={selectedTeacher}
             teacherId={selectedTeacher}
             refreshKey={agentStageRefreshKey}
+            draftId={clinicPatientDrafts[0]?.id}
             onEvaluated={() => { fetchAgentWorkbench() }}
           />
         )}

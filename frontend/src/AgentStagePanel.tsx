@@ -1,8 +1,10 @@
 /**
- * 老師端首頁「🧭 智能體階段」卡（Epic 2 · 施工步驟 **6a + 6b + 6c**）
+ * 老師端首頁「🧭 智能體階段」卡（Epic 2 · 施工步驟 **6a + 6b + 6c + 6d**）
  *   6a：骨架 + 掛載探測 + 階段真值靜態區；6b：指標區（① ② ③）+ 閾值折疊區 + `config_source` 角標 + 「🔄 立即評估」；
  *   6c：「⬇ 降級」卡內二次確認（`to_stage` 只列低於當前 rank 者 + `reason` 輸入）+ 評估 / 降級成功後
- *       回調父級重拉「智能體工作台」（`onEvaluated`）。
+ *       回調父級重拉「智能體工作台」（`onEvaluated`）；
+ *   6d：能力區（按 `capabilities` 渲染 §4.5-⑤ 列的三顆：🧪 證型候選 / 📜 方劑建議 / 🧾 預處方預填）
+ *       + `draftId` 前置條件 + 結果**只讀**展示（永不回填編輯框）。
  *
  * 對齊：docs/epic2-agent-stage-design-v1.md
  *   §4.5-⑤ 前端卡片（探測 / 展示 / 按鈕 / 能力區 / 鐵律文案 / 樣式復用）
@@ -19,8 +21,9 @@
  *   ✓ 6c：「⬇ 降級」（卡內二次確認區 + `reason` 輸入 + 目標階段只列**低於當前 rank** 者）→
  *     `POST …/demote` → **重拉 #1**（徽章翻新、來源變「老師主動降級」）；評估 / 降級成功後調
  *     `onEvaluated()` → 父級重拉工作台（新推薦 / 行動日誌立刻可見）；
- *   ✗ 6d 能力區（`capabilities` → 🧪 證型候選 / 📜 方劑建議 / 🧾 預處方預填；需 `draftId`）。
- *   `capabilities` 的型別已按契約定好（形狀即契約），6d 只加渲染、不改型別。
+ *   ✓ 6d：能力區（`capabilities` 五鍵逐格置灰 + `draftId` 前置條件 + 🧪/📜/🧾 三顆按鈕 →
+ *     `POST …/suggest` / `POST …/predraft`）+ 結果**卡內只讀展示**（永不回填編輯框）；
+ *   `capabilities` 的型別 6a 已按契約定好（形狀即契約）—— 6d 只加渲染、不改型別。
  *
  * 【6b 的三個施工口徑（偏離原句時的理由都寫在這裡）】
  *   1. 「🔄 立即評估」**常顯**（不只在 `stale` 時）：設計 §4.5-⑤ 的按鈕清單本就無條件列出，且服務層在
@@ -61,6 +64,44 @@
  *      `pending_stage` / `pending_task_id`（`agent_stage_service.py:2972-2981`）→ 工作台那兩塊
  *      要立刻跟上。這是**超出 requirement 字面**的一處（requirement 只寫了 evaluate 後調）；
  *      如要嚴格照字面，把 `handleDemote` 末尾那一行刪掉即可（其餘邏輯不受影響）。
+ *
+ * 【6d 的八條施工口徑】
+ *   1. 能力區**追加在 6b 按鈕行下方、6c 降級區上方**（新開一個 div）：兩區的 JSX 一字不改
+ *      ——「不改已驗收區」比「三行按鈕擠在一起」重要。
+ *   2. 五鍵 `capabilities` 是**唯一門控來源**（§2.3 矩陣 / §4.5-⑤「按 capabilities 渲染」）：
+ *      `predict_pattern` / `suggest_prescription` / `generate_predraft` 各渲染一顆按鈕（🧪 / 📜 / 🧾）
+ *      並逐格置灰，置灰理由用 `CAPABILITY_MIN_STAGE_LABELS`（能力 → 最低階段的鏡像）說成
+ *      「尚未開放（需「見習期」）」（§4.5-⑤ 的逐字理由文案）。`record_observation` / `generate_draft`
+ *      **不渲染按鈕**：它們是老師本來就在用的既有鏈路（§5.2 / §5.3），本卡多給一個入口只會
+ *      長出第二條到達路徑（§4.5-⑤ 的按鈕清單也只有這三顆）。
+ *   3. `draftId` 是執行能力的**前置條件**（服務端只信 DB：`draft_id` 在該老師名下最新的未簽草案裡
+ *      反查，反查不到就不調模型 → 404 `stage_draft_not_found`）。缺省 → 三顆一起置灰 + 一句提示；
+ *      負 id（`App.tsx` 第 59 天的**本地佔位草案**，老師還沒按「保存病歷修改」落庫）同樣置灰 ——
+ *      那個值送到後端是 100% 的 404，擋在請求前只是把「必然的失敗」換成一句可行的提示。
+ *      **這不是第二個能力判定**：能力只有 `capabilities` 一處；草案是否屬於該老師 / 是否已簽字，
+ *      仍由後端反查（`_suggestion_draft()`）判，本卡連「查一下」都不做。
+ *   4. 單飛（一次一顆）：結果區只有一份，且沒有理由讓老師同時打兩條 LLM → 有一顆在飛時另兩顆一起置灰。
+ *   5. 失敗分級（**不假成功**：任何非 2xx 都**不顯示任何產出**、也不留舊結果 —— 一份陳舊的候選貼在
+ *      「能力不足」旁邊會被讀成「他給了候選」）：
+ *      · 404 `agent_stage_disabled` → 整卡退場；503 `agent_stage_store_unavailable` → 6a「表未就緒」紅字；
+ *      · 403 `stage_forbidden` → 「能力不足：需「見習期」」+（本卡快照可能已過時，可點「🔄 立即評估」重讀）。
+ *        這條只會出現在「按鈕是亮的、後端卻說不行」的情形 = 快照過時；判定權在後端，本卡不覆核、不自行改徽章；
+ *      · 404 `stage_draft_not_found` → 「草案不存在」+ 後端 `msg`；400 `stage_kind_invalid` /
+ *        503 `suggestion_failed` / `predraft_failed` → 各自繁體人話；其餘（含網絡異常）沿用後端 `msg`。
+ *        這些失敗一律 `⚠` 前綴 → **紅字**；「成功但沒有內容」那一句不帶 `⚠` → **灰字**（口徑 6）。
+ *   6. 解析失敗是**成功**（200 + `payload.error='parse_failed'` + 空結果）→ 顯示「模型這次沒給出可用內容」
+ *      （§4.3「絕不編造」），**不是**紅字故障（與 503 嚴格分開）—— 畫面上用**灰字**，紅字只給真失敗；
+ *      顏色由 `⚠` 前綴決定（同 6b `evaluateNote` / 6c `demoteNote`），這條契約因此看得見。
+ *      ⚠ #7 的四鍵投影**不含 `warnings`**（`agent_stage_api.py:447-452`）→ 預處方的解析失敗在前端
+ *      看不出來，只能按「三鍵全空 = 本次沒有產出」判，文案與 #6 同一句。
+ *   7. **不調 `onEvaluated()`**（與 6c 口徑 6 的取捨方向相反，理由是同一個「有沒有東西要刷新」）：
+ *      `suggest` / `predraft` 寫的是 `agent_stage_log`（階段審計），**從不寫** `agent_action_log`
+ *      （「建議」不是「動作」：`applied` 恆 False，`test_agent_stage.py:5836-5839` 釘住）→
+ *      工作台「⏳ 待你確認 / 📜 行動日誌」兩塊**沒有新行**可顯示 ⇒ 沒有可刷新的東西。
+ *   8. 結果**只在本卡展示**，不自動回填任何編輯框（§4.6 全族只讀：接口層不 import 六個禁忌符號，
+ *      「AI 永不落庫 / 永不開方 / 永不簽字」由路由面直接保證）→ 預處方要採用，仍須老師在診室逐項操作。
+ *      `formulas[]` 的 `usage` 前端**不渲染**：值恆為常量「僅供參考」（`agent.py:990`，不採用模型給的值），
+ *      與 `disclaimer` 同一句話，印兩次只是噪音。
  *
  * 【探測（§4.5-⑤ 首條；與 `TemplateStudio` 同一套口徑）】
  *   `GET /api/agent/stage?teacher_name=&teacher_id=`
@@ -173,6 +214,86 @@ export interface StageView {
   degraded: boolean
 }
 
+/* ---------- 【6d】能力區的三個回包形狀（§4.6-⑥⑦ 的出參列，形狀即契約） ---------- */
+
+/**
+ * 🧪 證型候選的一條（§4.3 白名單四鍵：`name` / `confidence` / `basis` / `note`）。
+ *
+ * 逐鍵可選（`?`）**不是**型別悲觀：服務層 `_result_list()` 只投影鍵集、**不補默認值**
+ * （`agent_stage_service.py:3612-3615`「原条目里没有的键就不出现（不补默认值）」）
+ * → 契約形狀本來就允許缺鍵；前端按缺鍵退化顯示，壞形狀不該炸掉老師首頁（同 6b 的 `Partial` 取態）。
+ * `confidence` 的白名單是 `high|medium|low`（AI 層歸一化：`agent.py:844` / `agent.py:973-976`），
+ * 本卡只翻譯、不校驗。
+ */
+export interface StagePatternCandidate {
+  name?: string
+  confidence?: string
+  basis?: string[]
+  note?: string
+}
+
+/** 📜 方劑建議的一條（§4.3 白名單四鍵；**無劑量、無煎服法**：`usage` 恆為常量「僅供參考」）。 */
+export interface StageFormulaSuggestion {
+  name?: string
+  modification?: string
+  composition?: string[]
+  usage?: string
+}
+
+/** 🧾 預處方預填的藥味一條（§4.6-⑦ 三鍵；`dose` 是 §4.2 唯一合法的劑量位）。 */
+export interface StagePredraftItem {
+  herb?: string
+  dose?: string
+  role?: string
+}
+
+/** 🧾 預處方預填的內層三鍵（服務層 `_blank_predraft()` 保證恆在場：非 dict / 缺鍵 → 空值兜底）。 */
+export interface StagePredraftPayload {
+  formula_name?: string
+  items?: StagePredraftItem[]
+  decoction?: string
+}
+
+/** `POST /api/agent/stage/suggest` 的**五鍵**投影（`payload` 內層隨 `kind`：`candidates[]` / `formulas[]`）。 */
+export interface StageSuggestResponse {
+  kind?: string
+  draft_id?: number
+  payload?: {
+    candidates?: StagePatternCandidate[]
+    formulas?: StageFormulaSuggestion[]
+    /** 解析失敗標記（**成功**回應才會有它：`payload` 的頂層鍵，見檔頭 §6d 口徑 6）。 */
+    error?: string
+  }
+  disclaimer?: string
+  generated_at?: string
+}
+
+/** `POST /api/agent/stage/predraft` 的**四鍵**投影（`predraft` 內層三鍵恆在場；`note` 是 §4.6-⑦ 逐字文案）。 */
+export interface StagePredraftResponse {
+  draft_id?: number
+  predraft?: StagePredraftPayload
+  disclaimer?: string
+  note?: string
+}
+
+/**
+ * 【6d】結果區的預處方：與 `StagePredraftPayload` 同形，但 `items` **保證非空**
+ * （空藥味表不進結果區 → 走 `capNote` 的「模型這次沒給出可用內容」）→ 渲染端不必再判空。
+ */
+export type StagePredraftResult = Omit<StagePredraftPayload, 'items'> & { items: StagePredraftItem[] }
+
+/**
+ * 【6d】能力區的**結果狀態**（判別聯合：`kind` 決定渲染哪一種；一次只有一份 —— 單飛，見檔頭 §6d 口徑 4）。
+ *
+ * 只裝「成功且有產出」的回包：失敗與解析失敗走 `capNote`，**不進這裡**（檔頭 §6d 口徑 5/6）。
+ * `disclaimer` / `note` 一律用後端給的那一份（`僅供參考，非診斷` / `非處方` / `須老師確認並自行開方`
+ * 與 §4.6-⑦ 的預填提示）—— 鐵律文案前端**不重寫**，只轉運。
+ */
+export type StageCapabilityResult =
+  | { kind: 'pattern'; items: StagePatternCandidate[]; disclaimer: string; generatedAt: string }
+  | { kind: 'formula'; items: StageFormulaSuggestion[]; disclaimer: string; generatedAt: string }
+  | { kind: 'predraft'; predraft: StagePredraftResult; disclaimer: string; note: string }
+
 /** 接口失敗（不拋異常，用返回值表達 —— 與 `TemplateStudio` 的 `TemplateApiFailure` 同款）。 */
 export interface StageApiFailure {
   status: number
@@ -187,7 +308,9 @@ export interface AgentStagePanelProps {
   teacherId: string
   /** 刷新信號：`App.tsx` 的 `fetchAgentWorkbench()` 末尾自增（老師點 ✅/❌/掃描後本卡重探一次）。 */
   refreshKey: number
-  /** 【6d · 已裁決①】當前就診學生的未簽草案 id；無值 → 能力區三按鈕置灰。6a 不渲染能力區，故不讀。 */
+  /** 【6d】當前就診學生的**未簽草案 id**（`App.tsx` 傳 `clinicPatientDrafts[0]?.id`）。無值 / 非正數
+   *  （`App.tsx` 第 59 天的本地佔位草案是**負 id**）→ 能力區三顆一起置灰；見檔頭 §6d 口徑 3：
+   *  這是「執行能力的前置條件」，不是第二個能力判定。 */
   draftId?: number
   /**
    * 【6c】本卡剛剛**寫入了階段真值**（`evaluate` 或 `demote` 成功）→ 請父級重拉「智能體工作台」卡：
@@ -206,9 +329,8 @@ export interface AgentStagePanelProps {
  * 本表只服務**只有 key 沒有 label** 的兩處：`next_stage`、`pending_stage`（兩者都只是 stage key）。
  * 漂移風險：本倉前端無測試基建，後端改 `STAGE_LABELS` 時必須同步這裡（review 覆蓋）。
  *
- * 【6d 待補】`CAPABILITY_MIN_STAGE_LABELS`（能力 → 最低階段，用於置灰原因「尚未開放（需「見習期」）」）
- * 刻意**不在本步定義**：6a 不渲染能力區 → 常量無人讀 → `tsc -b`（`noUnusedLocals`）直接報錯。
- * 它與它的消費者在 6d 一起落地（鏡像來源：`agent_stage_service.py:79-85` `CAPABILITY_MIN_STAGE`）。
+ * 【6d 已落地】`CAPABILITY_MIN_STAGE_LABELS` 定義在下面 —— 6a 當時刻意不定義它：能力區不渲染 →
+ * 常量無人讀 → `tsc -b`（`noUnusedLocals`）直接報錯；它與它的消費者在 6d 一起落地。
  */
 const AGENT_STAGE_LABELS: Record<string, string> = {
   observation: '觀察期',
@@ -216,6 +338,79 @@ const AGENT_STAGE_LABELS: Record<string, string> = {
   apprentice: '見習期',
   assistant: '助手期',
   authorized: '授權期'
+}
+
+/**
+ * 【6d】能力 → 最低階段的**繁體階段名**（置灰理由的鏡像來源：§4.5-⑤「未开放时按钮置灰 +
+ * 繁体原因文案（`尚未開放（需「見習期」）`）」）。
+ *
+ * 合成自後端兩張表：`agent_stage_service.py:79-85` `CAPABILITY_MIN_STAGE`（能力 → 階段 key）
+ *   × 上面那份 `AGENT_STAGE_LABELS`（階段 key → 繁體名）。本表**只服務展示**：
+ * 按鈕亮不亮由 `view.capabilities` 決定（後端唯一判定，見檔頭 §6d 口徑 2/3），
+ * 這張表**不**參與任何放行 / 拒絕 —— 它連一個 `require` 的味道都沒有。
+ * 漂移風險與 `AGENT_STAGE_LABELS` 同款（本倉前端無測試基建）：後端改
+ * `CAPABILITY_MIN_STAGE` / `STAGE_LABELS` 時必須同步這裡（review 覆蓋）。
+ */
+const CAPABILITY_MIN_STAGE_LABELS: Record<string, string> = {
+  predict_pattern: '見習期',
+  suggest_prescription: '助手期',
+  generate_predraft: '授權期'
+}
+
+/**
+ * 【6d】能力區的三顆按鈕（§4.5-⑤ 的按鈕清單逐顆對應一個能力鍵）。
+ *
+ * · `cap` 是 `view.capabilities` 的鍵 = **唯一門控來源**（不見第二個判定）；
+ * · `kind` 是 #6 `POST …/suggest` 的 `kind` 欄位（`pattern` / `formula`）；`generate_predraft`
+ *   走 #7 `POST …/predraft` —— 契約裡 #7 **整條忽略** `kind`（`agent_stage_api.py:428-429`）→
+ *   這一格是空串，且**不會**進請求體（送了也只是噪音）；
+ * · `busyText` 只換字面（在飛的那一顆用置灰姿態，同 6b「評估中…」）。
+ */
+const AGENT_STAGE_CAPABILITY_BUTTONS: Array<{
+  cap: keyof StageCapabilities
+  text: string
+  busyText: string
+  kind: string
+}> = [
+  { cap: 'predict_pattern', text: '🧪 證型候選', busyText: '🧪 生成中…', kind: 'pattern' },
+  { cap: 'suggest_prescription', text: '📜 方劑建議', busyText: '📜 生成中…', kind: 'formula' },
+  { cap: 'generate_predraft', text: '🧾 預處方預填', busyText: '🧾 生成中…', kind: '' }
+]
+
+/** 【6d】`confidence` 的繁體譯名（AI 層白名單 `high|medium|low`；未登記的值原樣顯示，不猜、不譯）。 */
+const AGENT_STAGE_CONFIDENCE_LABELS: Record<string, string> = {
+  high: '高',
+  medium: '中',
+  low: '低'
+}
+
+/**
+ * 【6d】`draftId` 缺省（沒選中學生 / 該學生沒有任何草案）時的提示：三顆一起置灰，理由就這一句
+ * （需求逐字給的句子，**不加尾巴**）。「為什麼」由檔頭 §6d 口徑 3 交代，不塞進老師看的句子裡。
+ */
+const AGENT_STAGE_CAPABILITY_NO_DRAFT_HINT = '請先在診室選中學生並有一份未簽草案'
+
+/**
+ * 【6d】本地佔位草案的提示：`App.tsx` 第 59 天的機制會給「還沒落庫的草案」一個**負 id**
+ * （`localDrafts`）→ 後端 `_suggestion_draft()` 必然反查不到。擋在請求前並說清怎麼解，
+ * 比送出去換一個 404 好（見檔頭 §6d 口徑 3：這不是能力判定）。
+ */
+const AGENT_STAGE_CAPABILITY_UNSAVED_DRAFT_HINT =
+  '這份草案還在本機暫存（尚未落庫）：請先在診室按「保存病歷修改」，再回到本卡'
+
+/**
+ * 【6d】「模型這次沒給出可用內容」的**統一文案**：`parse_failed`（#6 有明確標記）與「有標記但空殼」
+ * / #7 三鍵全空（投影不含 `warnings`，看不見標記）**共用同一句** —— 兩者對老師的處置完全一樣
+ * （稍後再試 or 自行判斷），分兩句話只是把後端的鍵名講給老師聽（檔頭 §6d 口徑 6）。
+ * **不帶 `⚠` 前綴**：它是 200 成功，渲染成灰字（前綴即顏色開關，見 `ASP_CAP_EMPTY`）。
+ */
+const AGENT_STAGE_CAPABILITY_EMPTY_TEXT =
+  '模型這次沒給出可用內容：已按「絕不編造」返回空結果，請稍後再試或自行判斷'
+
+/** 【6d】置灰理由（§4.5-⑤ 逐字句式）：能力 → 「尚未開放（需「見習期」）」；未登記的能力不退化成空白。 */
+const capabilityClosedText = (cap: string) => {
+  const stage = CAPABILITY_MIN_STAGE_LABELS[cap]
+  return stage ? `尚未開放（需「${stage}」）` : '尚未開放（階段不足）'
 }
 
 /** 五階段的**展示順序**（§0.4「不可跳級」；純展示用 —— 任何判定一律在後端，前端不重複實現）。 */
@@ -460,6 +655,42 @@ const ASP_SELECT: CSSProperties = {
 }
 const ASP_INPUT: CSSProperties = { ...ASP_SELECT, flex: '1 1 240px', minWidth: '200px' }
 
+/* ---------- 【6d】能力區：樣式（按鈕直接沿用 6b/6c 的 `ASP_BUTTON_OUTLINE` / `…_OFF`） ---------- */
+
+/** 能力區外框：虛線上緣 + 內距，與 6b 指標區 / 6c 降級區視覺同族（不引 UI 庫、不新增色值）。 */
+const ASP_CAP_BOX: CSSProperties = {
+  marginTop: '12px', borderTop: '1px dashed #ece3cd', paddingTop: '10px'
+}
+/** 三顆按鈕的橫排容器（`flex-start` + 換行：窄螢幕自然堆疊，不做響應式判斷）。 */
+const ASP_CAP_ROW: CSSProperties = {
+  display: 'flex', gap: '14px', flexWrap: 'wrap', alignItems: 'flex-start'
+}
+/** 一顆按鈕 + 它的置灰理由（縱向一欄：理由永遠貼著自己那顆按鈕，不集中成一段看圖猜謎）。 */
+const ASP_CAP_CELL: CSSProperties = {
+  display: 'flex', flexDirection: 'column', gap: '4px', maxWidth: '260px'
+}
+/** 結果區：淺底 + 金邊的「展示」容器（比 `ASP_DEMOTE_BOX` 寬：要放藥味清單與原文依據）。 */
+const ASP_CAP_RESULT: CSSProperties = {
+  background: '#fffdf5', border: '1px solid #e2d6b8', borderRadius: '8px', padding: '10px 12px',
+  marginTop: '10px', fontSize: '13px', color: '#333', lineHeight: '1.9'
+}
+/** 能力區的紅字（失敗 / 解析失敗）：整行一句話，**不**用 `ASP_ALERT_TEXT` 的粗體（那是「指標壞了」的語氣）。 */
+const ASP_CAP_ALERT: CSSProperties = {
+  fontSize: '12px', color: '#c0392b', lineHeight: '1.8', marginTop: '8px'
+}
+/**
+ * 能力區的**非故障**一行（解析失敗 / 本次沒產出）：灰字 —— 那是 **200 成功**（只是模型沒給出內容），
+ * 紅字只留給真失敗。顏色由「`⚠` 前綴」決定（與 6b `evaluateNote` / 6c `demoteNote` 同一套判法），
+ * 於是「解析失敗是成功」這條契約在畫面上就看得出來，不必為它多開一個 state。
+ */
+const ASP_CAP_EMPTY: CSSProperties = {
+  fontSize: '12px', color: '#999', lineHeight: '1.8', marginTop: '8px'
+}
+/** 預處方藥味表的三欄寬（`herb` / `dose` / `role` 左緣對齊，方便老師逐列核對）。 */
+const ASP_CAP_HERB_CELL: CSSProperties = { minWidth: '104px', fontWeight: 'bold' }
+const ASP_CAP_DOSE_CELL: CSSProperties = { minWidth: '76px' }
+const ASP_CAP_ROLE_CELL: CSSProperties = { minWidth: '44px' }
+
 /* ============================ 工具（與 TemplateStudio 同款；不改既有的兩個文件） ============================ */
 
 /**
@@ -494,6 +725,15 @@ async function callStageApi<T>(path: string, init?: RequestInit): Promise<StageA
     }
   }
 }
+
+/**
+ * 【6d】白名單欄位（`basis` / `composition`）→ 非空字串陣列：形狀不對（後端違約 / 舊快照 / 非字串項）
+ * 一律退化為空陣列 —— 同 6b 取 `Partial` 的取態（不猜、不轉型、不白屏）；空陣列由呼叫端給兜底文案。
+ */
+const stringList = (value: unknown): string[] =>
+  Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+    : []
 
 /** stage key → 繁體徽章（後端只給 key 的兩處用：`next_stage` / `pending_stage`；未知 key 原樣顯示）。 */
 const stageKeyLabel = (key: string) => AGENT_STAGE_LABELS[key] || key
@@ -530,9 +770,87 @@ const stageSinceText = (value: string) => {
   return text.length >= 10 ? text.slice(0, 10) : text
 }
 
+/* ============================ 【6d】能力區：純函數（不改 state、不發請求、不碰徽章） ============================ */
+
+/**
+ * 【6d】回包陣列 → 只留 dict 條目（服務層 `_result_list()` 也是這麼篩的：非 dict 條目直接跳過，
+ * 不包殼、不補默認值）—— 前端不重複實現業務，只是**不讓一個壞條目炸掉整張卡**。
+ * 這裡刻意用**函數宣告**而不是泛型箭頭：`.tsx` 裡的 `<T>(…) => …` 會被解析成 JSX 元素（TS17008）。
+ */
+function objectList<T>(value: unknown): T[] {
+  return Array.isArray(value)
+    ? value.filter((item): item is T => !!item && typeof item === 'object')
+    : []
+}
+
+/** 【6d】`draftId` 可否送去後端反查：無值 / 非正數（本地佔位草案是**負 id**）→ false（檔頭 §6d 口徑 3）。 */
+const draftIdUsable = (draftId: number | undefined) =>
+  typeof draftId === 'number' && Number.isFinite(draftId) && draftId > 0
+
+/** 【6d】`draftId` 不可用時的那一句提示（「沒選中」與「還沒落庫」分開說：兩者的解法不同）。 */
+const draftUnusableHint = (draftId: number | undefined) =>
+  draftId ? AGENT_STAGE_CAPABILITY_UNSAVED_DRAFT_HINT : AGENT_STAGE_CAPABILITY_NO_DRAFT_HINT
+
+/**
+ * 【6d】🧪 `suggest(kind='pattern')` 的成功回包 → 結果區狀態；`null` = 本次沒有可用產出。
+ *
+ * 三種「沒有產出」共用一個結論（檔頭 §6d 口徑 6）：`payload.error='parse_failed'`（後端明確標記）、
+ * `candidates` 空陣列、`candidates` 型別不是陣列 —— 對老師都是「這次沒有內容」，不留半截結果。
+ */
+const patternResultOf = (data: StageSuggestResponse): StageCapabilityResult | null => {
+  const items = objectList<StagePatternCandidate>(data.payload?.candidates)
+  if (data.payload?.error === 'parse_failed' || items.length === 0) return null
+  return { kind: 'pattern', items, disclaimer: data.disclaimer || '', generatedAt: data.generated_at || '' }
+}
+
+/** 【6d】📜 `suggest(kind='formula')` 的成功回包 → 結果區狀態（判空口徑同 `patternResultOf()`）。 */
+const formulaResultOf = (data: StageSuggestResponse): StageCapabilityResult | null => {
+  const items = objectList<StageFormulaSuggestion>(data.payload?.formulas)
+  if (data.payload?.error === 'parse_failed' || items.length === 0) return null
+  return { kind: 'formula', items, disclaimer: data.disclaimer || '', generatedAt: data.generated_at || '' }
+}
+
+/**
+ * 【6d】🧾 `predraft` 的成功回包 → 結果區狀態；`null` = 本次沒有可用產出。
+ *
+ * 判空**只能**看資料本身（藥味陣列為空）：#7 的四鍵投影不含 `warnings`（`agent_stage_api.py:447-452`）
+ * → 後端那句「本次未產出可用的預處方預填（解析失敗）」到不了前端（檔頭 §6d 口徑 6）。
+ */
+const predraftResultOf = (data: StagePredraftResponse): StageCapabilityResult | null => {
+  const predraft = data.predraft || {}
+  const items = objectList<StagePredraftItem>(predraft.items)
+  if (items.length === 0) return null
+  return {
+    kind: 'predraft', predraft: { ...predraft, items },
+    disclaimer: data.disclaimer || '', note: data.note || ''
+  }
+}
+
+/**
+ * 【6d】能力區的失敗碼 → 卡內一行繁體人話（**純字串映射**：不改 state、不發請求、不碰徽章）。
+ *
+ * `403 stage_forbidden` 用 `CAPABILITY_MIN_STAGE_LABELS` 說「需哪一階」—— 與置灰理由同一份鏡像，
+ * 老師看到的兩種狀態（置灰 / 被拒）用的是同一個階段名。這條只可能出現在「按鈕是亮的、後端卻說
+ * 不行」= 快照已過時，所以順帶把重讀入口寫出來（判定權在後端，本卡**不**自行翻徽章）。
+ * 文案裡的 `msg` 逐字用後端統一錯誤體（`agent_stage_api.py:207-222` 已是繁體人話）。
+ */
+const capabilityFailureText = (failure: StageApiFailure, cap: string) => {
+  if (failure.code === 'stage_forbidden') {
+    return `⚠ 能力不足：需「${CAPABILITY_MIN_STAGE_LABELS[cap] || '更高階段'}」`
+      + '（本卡顯示的階段快照可能已過時，可點「🔄 立即評估」重讀）'
+  }
+  if (failure.code === 'stage_draft_not_found') return `⚠ 草案不存在：${failure.msg}`
+  if (failure.code === 'stage_kind_invalid') return `⚠ 請求參數不合法：${failure.msg}`
+  if (failure.code === 'suggestion_failed') return `⚠ 建議生成失敗（服務側故障）：${failure.msg}`
+  if (failure.code === 'predraft_failed') return `⚠ 預處方預填失敗（服務側故障）：${failure.msg}`
+  return `⚠ 生成未完成：${failure.msg}`
+}
+
 /* ============================ 主組件 ============================ */
 
-export default function AgentStagePanel({ teacherName, teacherId, refreshKey, onEvaluated }: AgentStagePanelProps) {
+export default function AgentStagePanel({
+  teacherName, teacherId, refreshKey, draftId, onEvaluated
+}: AgentStagePanelProps) {
   const [probeState, setProbeState] = useState<StageProbeState>('probing')
   const [view, setView] = useState<StageView | null>(null)
   // 【6b】手動評估：`evaluating` = 請求在飛（按鈕置灰防連點，也防兩次評估交錯寫快照）；
@@ -551,6 +869,12 @@ export default function AgentStagePanel({ teacherName, teacherId, refreshKey, on
   const [demoteReason, setDemoteReason] = useState(AGENT_STAGE_DEMOTE_REASON_DEFAULT)
   const [demoting, setDemoting] = useState(false)
   const [demoteNote, setDemoteNote] = useState('')
+  // 【6d】能力區（`capabilities` 五鍵 → 三顆按鈕）：`capBusy` = 在飛的那顆能力鍵（空串 = 沒在飛；
+  // **單飛**：另兩顆一起置灰，理由見檔頭 §6d 口徑 4）；`capNote` = 一行紅字（失敗 / 解析失敗）；
+  // `capResult` = 本次**成功**的產出（三個能力共用這一份展示區；失敗時清空）。
+  const [capBusy, setCapBusy] = useState('')
+  const [capNote, setCapNote] = useState('')
+  const [capResult, setCapResult] = useState<StageCapabilityResult | null>(null)
 
   // 掛載探測（§4.5-⑤ 首條）：結果緩存於 state，不重複探測；換老師 / 刷新信號變化才重探。
   // 重置與抓取都放在 async 閉包內（不在 effect 內同步 setState，避免級聯渲染）。
@@ -679,6 +1003,67 @@ export default function AgentStagePanel({ teacherName, teacherId, refreshKey, on
     onEvaluated?.()
   }
 
+  /**
+   * 【6d】能力區三顆按鈕的**共用**處理器（`cap` = 能力鍵，按鈕清單見 `AGENT_STAGE_CAPABILITY_BUTTONS`）。
+   *
+   * 送出的路由只有兩條（§4.6-⑥⑦）：
+   *   · 🧪 / 📜 → `POST /api/agent/stage/suggest`（body = 鑑權兩欄 + `draft_id` + `kind`）；
+   *   · 🧾      → `POST /api/agent/stage/predraft`（body = 鑑權兩欄 + `draft_id` + `formula_name`
+   *     —— 契約裡 #7 **整條忽略** `kind`，故不送；`formula_name` 留空 = 由模型按材料自擬方名）。
+   * `draft_id` 是服務端反查的唯一鑰匙（**只信 DB**，不收客戶端上傳的病歷文本）：本卡只負責把它確認好，
+   * 至於「這份草案算不算數」（屬於該老師？已簽字？已被新草案取代？）永遠由後端反查判定（404 照實顯示）。
+   *
+   * 失敗一律**卡內**呈現（檔頭 §6d 口徑 5）：任何非 2xx 都不顯示任何產出、也**清掉上一次的結果**
+   * （一份陳舊的候選貼在「能力不足」旁邊會被讀成「他給了候選」）；404 / 503 表未就緒照 6a 的分級
+   * （整卡退場 / 「階段表未就緒」紅字）。成功但空殼（`parse_failed` / 藥味全空）走同一句
+   * 「模型這次沒給出可用內容」—— 解析失敗是**成功**，不是紅字故障（檔頭 §6d 口徑 6）。
+   * 本處理器**不調** `onEvaluated()`：本族只寫 `agent_stage_log`，工作台兩塊沒有新行（§6d 口徑 7）。
+   */
+  const handleCapability = async (cap: keyof StageCapabilities) => {
+    if (capBusy) return
+    // 門控只有 `capabilities` 一處（按鈕就是按它置灰的）：這裡再問一次只是防鍵盤 / 程序觸發，
+    // 不是第二個判定 —— 它與按鈕用的是同一格布爾。
+    if (!view || view.capabilities?.[cap] !== true) return
+    if (!draftIdUsable(draftId)) {          // 【6d 口徑 3】前置條件：無值 / 本地佔位草案（負 id）
+      setCapResult(null)
+      setCapNote(`⚠ ${draftUnusableHint(draftId)}`)
+      return
+    }
+    const button = AGENT_STAGE_CAPABILITY_BUTTONS.find(item => item.cap === cap)
+    const init: RequestInit = {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(cap === 'generate_predraft'
+        ? { teacher_name: teacherName, teacher_id: teacherId, draft_id: draftId, formula_name: '' }
+        : { teacher_name: teacherName, teacher_id: teacherId, draft_id: draftId, kind: button?.kind || '' })
+    }
+    /** 失敗 → 卡內紅字：404 = flag 中途被關（整卡退場）；503 表沒建 → 6a 的「階段表未就緒」。 */
+    const noteFailure = (failure: StageApiFailure) => {
+      if (failure.code === 'agent_stage_disabled') { setProbeState('off'); return }
+      if (failure.code === 'agent_stage_store_unavailable') { setProbeState('no_store'); return }
+      setCapNote(capabilityFailureText(failure, cap))
+    }
+    setCapBusy(cap)
+    setCapNote('')
+    setCapResult(null)
+    if (cap === 'generate_predraft') {
+      const asked = await callStageApi<StagePredraftResponse>('/api/agent/stage/predraft', init)
+      setCapBusy('')
+      if (!asked.ok) { noteFailure(asked.failure); return }
+      const produced = predraftResultOf(asked.data)
+      if (!produced) { setCapNote(AGENT_STAGE_CAPABILITY_EMPTY_TEXT); return }
+      setCapResult(produced)
+      return
+    }
+    const asked = await callStageApi<StageSuggestResponse>('/api/agent/stage/suggest', init)
+    setCapBusy('')
+    if (!asked.ok) { noteFailure(asked.failure); return }
+    // 走哪一種結果由**送出的那一格** `kind` 決定（不拿回包裡的 `kind` 當分支依據：它只是回聲）。
+    const produced = cap === 'suggest_prescription' ? formulaResultOf(asked.data) : patternResultOf(asked.data)
+    if (!produced) { setCapNote(AGENT_STAGE_CAPABILITY_EMPTY_TEXT); return }
+    setCapResult(produced)
+  }
+
   // §4.5-⑤ / 裁決②：503 = 運維故障（遷移沒跑）→ **卡內紅字**說清楚，不靜默消失
   if (probeState === 'no_store') {
     return (
@@ -707,6 +1092,9 @@ export default function AgentStagePanel({ teacherName, teacherId, refreshKey, on
   const modification = metrics.modification_consistency
   const minSamples = typeof thresholds.min_samples === 'number' ? thresholds.min_samples : 0
   const configBadge = configSourceBadge(view.config_source)
+  // 【6d】能力區的五鍵：`Partial` 兜底（理由同 `metrics` / `thresholds` —— 後端違約時退化成
+  // 「全部置灰」而不是把老師首頁炸掉）。置灰是**唯一保守方向**：寧可不給按鈕，也不放行一個沒依據的請求。
+  const capabilities: Partial<StageCapabilities> = view.capabilities || {}
   // §2.5 的臨時運維閘：放寬態下**不推荐升级** → 必須當場可見（不能只藏在折疊區裡）。
   const matrixRelaxed = thresholds.matrix_enforced === false
   // 【6c】降級候選（由低到高的前幾階）與「實際會送出的目標」：兩者都隨 `view.stage` 推導
@@ -834,6 +1222,146 @@ export default function AgentStagePanel({ teacherName, teacherId, refreshKey, on
         {/* 回執（成功 = 時間戳 / 失敗 = ⚠ 開頭）；以 `⚠` 前綴決定顏色 —— 只有這兩種回執，不值得為它多開一個 state。 */}
         {evaluateNote && (
           <span style={evaluateNote.startsWith('⚠') ? ASP_ALERT_TEXT : ASP_METRIC_HINT}>{evaluateNote}</span>
+        )}
+      </div>
+
+      {/* ---------- 【6d】能力區（§4.5-⑤「按 capabilities 渲染」；唯一門控來源 = 後端 #1 的五鍵） ---------- */}
+      {/* 放在 6b 按鈕行**下方**、6c 降級區**上方**（新開一個 div）→ 那兩區的 JSX 一字不改（檔頭 §6d 口徑 1）。 */}
+      {/* 三顆按鈕**常顯**（同 6b「🔄 立即評估」的理由）：置灰時理由就貼在自己那顆下面，不讓老師猜。 */}
+      <div style={ASP_CAP_BOX}>
+        <div style={ASP_SECTION_TITLE}>
+          🧠 智能體能力（{view.stage_label || stageKeyLabel(view.stage)}）
+        </div>
+        {/* 沒有可引用的草案時，先把「怎麼才能用」說在最上面（三顆都置灰，理由同一件事）。 */}
+        {!draftIdUsable(draftId) && (
+          <div style={{ ...ASP_HINT, marginBottom: '6px' }}>{draftUnusableHint(draftId)}</div>
+        )}
+        <div style={ASP_CAP_ROW}>
+          {AGENT_STAGE_CAPABILITY_BUTTONS.map(item => {
+            const allowed = capabilities[item.cap] === true
+            const busy = capBusy === item.cap
+            const ready = allowed && draftIdUsable(draftId) && capBusy === ''
+            return (
+              <div key={item.cap} style={ASP_CAP_CELL}>
+                <button
+                  type="button"
+                  style={ready ? ASP_BUTTON_OUTLINE : ASP_BUTTON_OUTLINE_OFF}
+                  onClick={() => handleCapability(item.cap)}
+                  disabled={!ready}
+                >
+                  {busy ? item.busyText : item.text}
+                </button>
+                {/* 置灰理由逐顆說（不集中成一段）：能力沒開 → 「尚未開放（需「見習期」）」；
+                    能力開了但沒有可引用的草案 → 前置條件；另一顆在飛 → 單飛說明。 */}
+                {!allowed && <span style={ASP_METRIC_HINT}>{capabilityClosedText(item.cap)}</span>}
+                {allowed && !draftIdUsable(draftId) && (
+                  <span style={ASP_METRIC_HINT}>需先選中未簽草案</span>
+                )}
+                {allowed && draftIdUsable(draftId) && !busy && capBusy !== '' && (
+                  <span style={ASP_METRIC_HINT}>另一項生成中，完成後再試</span>
+                )}
+              </div>
+            )
+          })}
+        </div>
+        {/* 一行回執：`⚠` 開頭 = 失敗（紅字）；否則 = 解析失敗 / 本次沒產出（**灰字**，它是 200）。
+            兩種互斥：有產出就顯示下面的結果區，不會同時出現。 */}
+        {capNote && (
+          <div style={capNote.startsWith('⚠') ? ASP_CAP_ALERT : ASP_CAP_EMPTY}>{capNote}</div>
+        )}
+
+        {/* 🧪 證型候選：**原文依據逐條列出**（`basis` 是 AI 層的硬契約：沒有原文片段就不產出這條）——
+            老師要能自己核對「這句話出自病歷哪一段」，否則一個候選證型只是猜測。 */}
+        {capResult?.kind === 'pattern' && (
+          <div style={ASP_CAP_RESULT}>
+            <div style={ASP_METRIC_HINT}>
+              證型候選 {capResult.items.length} 條
+              {capResult.generatedAt ? `（產生於 ${capResult.generatedAt}）` : ''}
+            </div>
+            {capResult.items.map((item, index) => {
+              const basis = stringList(item.basis)
+              return (
+                <div key={`pattern-${index}`} style={{ marginTop: '6px' }}>
+                  <div>
+                    <span style={ASP_METRIC_VALUE}>{item.name || '（模型未給證型名）'}</span>
+                    <span style={{ ...ASP_METRIC_HINT, marginLeft: '8px' }}>
+                      信心：{AGENT_STAGE_CONFIDENCE_LABELS[item.confidence || ''] || item.confidence || '未給'}
+                    </span>
+                  </div>
+                  <div style={ASP_METRIC_HINT}>
+                    原文依據：{basis.length > 0 ? basis.join('；') : '未給'}
+                  </div>
+                  {item.note && <div style={ASP_METRIC_HINT}>提示：{item.note}</div>}
+                </div>
+              )
+            })}
+            <div style={{ ...ASP_METRIC_HINT, marginTop: '6px' }}>
+              {capResult.disclaimer || '僅供參考'}；以上內容只在本卡顯示，不會自動填入病歷 —— 採用與否由你判斷。
+            </div>
+          </div>
+        )}
+
+        {/* 📜 方劑建議：**無劑量**（AI 層逐項去劑量、服務層白名單只留四鍵）→ 照實說明，
+            免得老師讀成「模型忘了寫劑量」。 */}
+        {capResult?.kind === 'formula' && (
+          <div style={ASP_CAP_RESULT}>
+            <div style={ASP_METRIC_HINT}>
+              方劑建議 {capResult.items.length} 條
+              {capResult.generatedAt ? `（產生於 ${capResult.generatedAt}）` : ''}
+            </div>
+            {capResult.items.map((item, index) => {
+              const herbs = stringList(item.composition)
+              return (
+                <div key={`formula-${index}`} style={{ marginTop: '6px' }}>
+                  <div>
+                    <span style={ASP_METRIC_VALUE}>{item.name || '（模型未給方名）'}</span>
+                    {item.modification && (
+                      <span style={{ ...ASP_METRIC_HINT, marginLeft: '8px' }}>加減：{item.modification}</span>
+                    )}
+                  </div>
+                  <div style={ASP_METRIC_HINT}>
+                    藥味（本建議不含劑量）：{herbs.length > 0 ? herbs.join('、') : '未給'}
+                  </div>
+                </div>
+              )
+            })}
+            <div style={{ ...ASP_METRIC_HINT, marginTop: '6px' }}>
+              {capResult.disclaimer || '僅供參考'}；劑量與煎服法須由你判定；以上只在本卡顯示，不會自動開方。
+            </div>
+          </div>
+        )}
+
+        {/* 🧾 預處方預填：**唯一帶劑量**的能力（授權期專屬）→ 逐列列出「劑量 / 角色」，空值顯示「—」，
+            並把 §4.6-⑦ 的 `note`（儲存處方仍須老師操作）逐字帶上 —— 前端不重寫這句鐵律文案。 */}
+        {capResult?.kind === 'predraft' && (
+          <div style={ASP_CAP_RESULT}>
+            <div style={{ ...ASP_METRIC_VALUE, marginBottom: '4px' }}>
+              預處方預填：{capResult.predraft.formula_name || '（模型未給方名）'}
+            </div>
+            <div style={{ ...ASP_METRIC_ROW, ...ASP_METRIC_HINT }}>
+              <span style={ASP_CAP_HERB_CELL}>藥味</span>
+              <span style={ASP_CAP_DOSE_CELL}>劑量</span>
+              <span style={ASP_CAP_ROLE_CELL}>角色</span>
+            </div>
+            {capResult.predraft.items.map((item, index) => (
+              <div key={`predraft-${index}`} style={ASP_METRIC_ROW}>
+                <span style={ASP_CAP_HERB_CELL}>{item.herb || '—'}</span>
+                <span style={ASP_CAP_DOSE_CELL}>{item.dose || '—'}</span>
+                <span style={ASP_CAP_ROLE_CELL}>{item.role || '—'}</span>
+              </div>
+            ))}
+            {capResult.predraft.decoction && (
+              <div style={ASP_METRIC_ROW}>
+                <span style={{ ...ASP_METRIC_LABEL, minWidth: '84px', fontWeight: 'normal' }}>煎服法</span>
+                <span>{capResult.predraft.decoction}</span>
+              </div>
+            )}
+            <div style={{ ...ASP_METRIC_HINT, marginTop: '6px' }}>
+              「—」= 模型拿不準（請自行判定）；{capResult.note || '僅供預填，儲存處方仍須老師操作'}；
+              以上只在本卡顯示，不會自動填入開方區 —— 要採用請你自己在診室逐項核對後操作。
+            </div>
+            <div style={ASP_METRIC_HINT}>{capResult.disclaimer || '僅供參考'}</div>
+          </div>
         )}
       </div>
 
