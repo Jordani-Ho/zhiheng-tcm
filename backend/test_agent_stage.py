@@ -4799,3 +4799,407 @@ def test_only_confirmation_path_changes_the_stage_triple(db, stage_gate):
     assert (row["stage"], row["stage_source"]) == ("apprentice", "teacher_confirm")
     assert row["stage_since"] != "S1", "确认路径是**唯一**动这三列的地方"
 
+
+# ===========================================================================
+# ⑳ 【施工步骤 4b-2】接口层：#1–#5 五个 endpoint（§4.6 表格逐行 + §4.5-② 的顺序纪律）
+#
+# 本组的边界（⑲ 组留给 4a 服务层三件套 `stage_view` / `demote` / `save_stage_config` 的专门用例，
+# 故接口层这组编号顺延到 ⑳）：
+#   ① 五条路由的**顺序纪律**：`_guard()`（flag → 404 / 存储未就绪 → 503）**先于** `_check_identity()`
+#      （缺栏位 400 / 名字与 ID 不一致 403）—— 文件头第 23–26 行那条「顺序不可颠倒」的行为级守护；
+#   ② 逐条对齐 §4.6 的「出参（要点）」列：#1 直出 15 键、#2 直出 18 键 + `changed`、#3 三键、
+#      #4 三键（`{effective, source, warnings}`）、#5 四键（`{stage, previous_stage, stage_since, stage_source}`）；
+#   ③ 只读接口**零写入**（#1 / #3 各连发十次：五张表行数不变、审计表零增量）；
+#   ④ 写接口的**失败语义**：#4 校验未过 → 400 + `errors[].path` + **旧值不变**（只拦不清、整体不写入）；
+#      #5 同阶 / 向上 → 409、非法值 → 400，两种都「阶段一字不动、审计一行不写」；
+#   ⑤ #6 `suggest` / #7 `predraft` **本步不注册**：路由表里没有它们，请求落 FastAPI 默认 404
+#      （`agent_stage_api.py` 那句「假实现比 404 更糟」的行为级守护；4c 落地时本组要改成
+#      403 `stage_forbidden` / 404 `stage_draft_not_found` 那一族）；
+#   ⑥ 源码级：接口层不 import `database` / `sqlite3`、不碰 §2.1 六个禁忌符号（接口层文件头的承诺）。
+# 本组**不改** ⑬–⑱ 组一行：造数 / 断言助手全部复用现有实现（`_raw_scalar` / `_put_raw_state_row` /
+# `_table_counts` / `database.get_agent_stage_state` / `database.get_agent_stage_logs` /
+# `database.get_agent_action_log` / `_EVALUATE_SNAPSHOT_KEYS` / `_GATE_CAPS` / `_GATE_GRID`）。
+# 接口层用例一律走 `conftest.client`（真实 HTTP，含 4b-1 在 `main.py` 注册的 `AgentStageError` 处理器）。
+# ===========================================================================
+
+# 五条已注册路由的 (方法, 路径)——「flag off 全部 404」与「路由表恰好这些」共用同一份清单，避免两处漂移
+_STAGE_ROUTE_TABLE = (
+    ("get", "/api/agent/stage"),
+    ("post", "/api/agent/stage/evaluate"),
+    ("get", "/api/agent/stage/config"),
+    ("put", "/api/agent/stage/config"),
+    ("post", "/api/agent/stage/demote"),
+)
+
+# 本步**已注册**的 (方法, 路径) 集合（#1–#5）；#6 `suggest` / #7 `predraft` 不在其中（见组头 ⑤）
+_STAGE_REGISTERED_ROUTES = {
+    ("GET", "/api/agent/stage"),
+    ("POST", "/api/agent/stage/evaluate"),
+    ("GET", "/api/agent/stage/config"),
+    ("PUT", "/api/agent/stage/config"),
+    ("POST", "/api/agent/stage/demote"),
+}
+
+# §4.6-①「出参（要点）」列的**逐键转写**（服务层契约是 15 键；`stage_view()` 的 docstring 同列，
+# 刻意不从返回值反推键集：键集漂移时必须红）
+_STAGE_VIEW_KEYS = (
+    "teacher_name", "stage", "stage_label", "stage_since", "stage_source", "pending_stage",
+    "pending_task_id", "capabilities", "metrics", "thresholds", "next_stage", "blockers",
+    "config_source", "stale", "degraded",
+)
+
+# §2.3 表格 learning 那一行的逐格字面量（复用 ⑮ 组的 `_GATE_CAPS` / `_GATE_GRID` 表，不另抄一份）
+_LEARNING_CAPABILITIES = {cap: cell for cap, cell in zip(_GATE_CAPS, _GATE_GRID["learning"])}
+
+# §3.1 三个指标键（`metrics` 一节的键集；③ `inquiry_preference_consistency` 是占位键）
+_METRIC_KEYS = ("template_match", "modification_consistency", "inquiry_preference_consistency")
+
+
+def _auth(teacher=TEACHER):
+    """双栏位鉴权（§4.6 全表入参都是 `teacher_name` + `teacher_id` 成对，且必须是同一个人）。"""
+    return {"teacher_name": teacher, "teacher_id": teacher}
+
+
+def _api_source():
+    """接口层源码（源码级守护用；路径由 `database.__file__` 反推，不硬编码盘符）。"""
+    path = os.path.join(os.path.dirname(os.path.abspath(database.__file__)), "agent_stage_api.py")
+    with open(path, encoding="utf-8") as fh:
+        return fh.read()
+
+
+def _api_detail(response):
+    """统一错误体的四键 `{error, msg, errors, warnings}`（§0.3 惯例：真 HTTP 状态码 + 统一错误体）。"""
+    return response.json()["detail"]
+
+
+def _stage_log_events(teacher=TEACHER):
+    """该老师的审计事件类型（⑮ 组的读法；`id` 倒序，单条断言时只看内容）。"""
+    return [row["event_type"] for row in database.get_agent_stage_logs(teacher)]
+
+
+def _stage_actions(teacher=TEACHER):
+    """该老师的行动日志 `action` 列（工作台「📜 行動日誌」的数据源）。"""
+    return [row["action"] for row in database.get_agent_action_log(teacher)]
+
+
+# ---- ② 顺序纪律：flag → 存储 → 鉴权 ----
+
+def test_api_flag_off_all_five_routes_404_agent_stage_disabled(client, monkeypatch):
+    """§5.1 红线① / §7.1-⑫：flag off → 五条路由**全部** 404 `agent_stage_disabled`（统一错误体），
+    且**先于**鉴权 —— 缺栏位 / 名字与 ID 不一致的请求同样是 404，不是 400 / 403。
+
+    为什么顺序不能反（`agent_stage_api.py` 文件头第 23–26 行）：倒过来的话，flag off 时「缺参数」
+    会漏出 400 —— 前端就分不清「功能没开（整卡不渲染）」与「老师填错了」。"""
+    monkeypatch.setenv("AGENT_STAGE_ENABLED", "off")
+
+    for method, path in _STAGE_ROUTE_TABLE:
+        for payload in ({"teacher_name": "", "teacher_id": ""}, _auth()):
+            call = getattr(client, method)
+            res = call(path, json=payload) if method in ("post", "put") else call(path, params=payload)
+            assert res.status_code == 404, "%s %s 应 404（实测 %d）" % (method, path, res.status_code)
+            detail = _api_detail(res)
+            assert detail["error"] == "agent_stage_disabled"
+            assert set(detail) == {"error", "msg", "errors", "warnings"}, "统一错误体四键"
+
+
+def test_api_store_not_ready_is_503_and_precedes_identity(client, monkeypatch):
+    """flag on 但 0003 三表未就绪 → 503 `agent_stage_store_unavailable`（**不是** 404 / 400），
+    且同样先於鉴权（先回答「服务能不能用」，再谈「你是谁」；§7.1-⑫ 要求 404 与 503 不得合并）。
+
+    这里 monkeypatch 服务层探针（⑬ 组已在四种真实库形态上钉住探针本身；本组要钉的是**接线**：
+    接口层确实问了它、并把 False 如实翻成 503 —— 若某天 `_guard()` 忘了问，本用例立刻红）。"""
+    import agent_stage_service
+
+    monkeypatch.setattr(agent_stage_service, "agent_stage_store_ready", lambda: False)
+
+    for params in (_auth(), {"teacher_name": TEACHER, "teacher_id": ""}):
+        res = client.get("/api/agent/stage", params=params)
+        assert res.status_code == 503
+        assert _api_detail(res)["error"] == "agent_stage_store_unavailable"
+
+
+def test_api_identity_requires_both_fields_and_matching_names(client):
+    """§4.6 全表入参：`teacher_name` + `teacher_id` 缺一 → 400 `teacher_required`；两者不等 → 403
+    `teacher_mismatch`（每个 endpoint 的第二句，**在 `_guard()` 之后**）。
+
+    400 覆盖「忘了传名字」这一形态：空名会命中**全局行**（服务层 `save_stage_config` 的注释），
+    故接口层必须在触到业务之前拦住请求 —— 顺带钉住「空名的 PUT 不会写到全局行」。"""
+    no_id = client.get("/api/agent/stage", params={"teacher_name": TEACHER, "teacher_id": ""})
+    assert no_id.status_code == 400 and _api_detail(no_id)["error"] == "teacher_required"
+
+    mismatch = client.get("/api/agent/stage",
+                          params={"teacher_name": TEACHER, "teacher_id": OTHER_TEACHER})
+    assert mismatch.status_code == 403 and _api_detail(mismatch)["error"] == "teacher_mismatch"
+
+    empty_put = client.put("/api/agent/stage/config",
+                           json={"teacher_name": "", "teacher_id": "",
+                                 "config": {"schema_version": 1}})
+    assert empty_put.status_code == 400 and _api_detail(empty_put)["error"] == "teacher_required"
+    assert _raw_scalar("SELECT COUNT(*) FROM agent_stage_config WHERE teacher_name = ?", ("",)) == 1, \
+        "空名请求必须被拦在业务之前：全局行仍是迁移种下的那一行（没被改写成新配置）"
+
+
+# ---- ① #1 阶段视图（§4.6-①）----
+
+def test_api_stage_view_shape_and_capabilities_for_default_stage(client):
+    """§4.6-① / §2.3 / §3.1：`GET /api/agent/stage` 直出 `stage_view()` 的 15 键；未初始化老师
+    （无状态行）落在配置链的 `default_stage`（`learning`）→ `capabilities` 逐格 = §2.3 的 learning 行；
+    三个新能力里 `predict_pattern` / `suggest_prescription` / `generate_predraft` 一律 False。"""
+    import agent_stage_service
+
+    res = client.get("/api/agent/stage", params=_auth())
+    assert res.status_code == 200
+    view = res.json()
+
+    assert set(view) == set(_STAGE_VIEW_KEYS), "接口层直出：键集必须与 §4.6-① 逐键一致"
+    assert view["teacher_name"] == TEACHER
+    assert view["stage"] == "learning" and view["stage_source"] == "default"
+    assert view["stage_label"] == agent_stage_service.STAGE_LABELS["learning"]
+    assert view["stage_since"] == "", "无状态行（未初始化）→ 兜底体不带起始时刻"
+    assert view["degraded"] is False
+    assert view["stale"] is True, "没快照 → stale（提示再点一次评估，不阻断任何东西）"
+    assert view["blockers"] == ["evaluation_not_run"], "没评估过 → 唯一一条「尚未评估」"
+    assert view["next_stage"] == "apprentice"
+
+    assert set(view["capabilities"]) == set(_GATE_CAPS), "能力面五键（§2.3 的列）"
+    assert view["capabilities"] == _LEARNING_CAPABILITIES
+    assert set(view["metrics"]) == set(_METRIC_KEYS)
+    assert view["metrics"]["inquiry_preference_consistency"] is None, "③ 占位键恒为 null（§3.1）"
+    assert len(view["thresholds"]) == 13, "§4.6-① 的 thresholds 是 `_THRESHOLD_KEYS` 十三键（快照回显）"
+    assert view["thresholds"]["min_template_match"] == \
+        agent_stage_service.DEFAULT_STAGE_CONFIG["min_template_match"]
+    assert "schema_version" not in view["thresholds"], "版本号不是判定阈值（不进快照）"
+
+
+def test_api_stage_view_is_read_only_across_ten_calls(client):
+    """§3.8 / 口径 A：#1 是**只读**接口 —— 连点十次，五张表行数不变、`agent_stage_log` 零增量
+    （权限面只做投影、不调闸门，故不会为「拒绝」长出 `permission_denied`）。"""
+    before = _table_counts()
+
+    for _ in range(10):
+        assert client.get("/api/agent/stage", params=_auth()).status_code == 200
+
+    assert _table_counts() == before, "只读接口不得写任何一张表（含审计表）"
+    assert _stage_log_events() == []
+
+
+# ---- ③ #3 读配置（§4.6-③）----
+
+def test_api_get_config_three_keys_same_source_as_service(client):
+    """§4.6-③ / §3.4 第 4 条：`GET /api/agent/stage/config` 的三键 —— `effective` 与 `source`
+    **同源**（与直接调服务层逐键相等）、`source` 如实回答「全局行在、老师行还没写」、
+    `defaults` 是 §3.5 十六键内置默认的**副本**（不是服务层那个共享字典本身）。"""
+    import agent_stage_service
+
+    res = client.get("/api/agent/stage/config", params=_auth())
+    assert res.status_code == 200
+    body = res.json()
+
+    assert set(body) == {"effective", "source", "defaults"}
+    assert body["effective"] == agent_stage_service.load_stage_config(TEACHER)
+    assert body["source"] == agent_stage_service.stage_config_source(TEACHER)
+    assert body["source"] == {"global": True, "teacher_override": False, "env_override": []}, \
+        "迁移种了全局行 → global=True；老师还没写过自己那一行 → teacher_override=False"
+    assert body["effective"]["default_stage"] == "learning"
+    assert body["defaults"] == agent_stage_service.DEFAULT_STAGE_CONFIG
+    assert len(body["defaults"]) == 16, "§3.5 的 16 键键表（唯一硬编码点在服务层常量）"
+    assert body["defaults"] is not agent_stage_service.DEFAULT_STAGE_CONFIG, "必须是副本（深拷贝）"
+
+
+def test_api_get_config_is_read_only_across_ten_calls(client):
+    """口径 A 同款：#3 十次调用零写入 —— 「老师还没写过自己那一行」这件事不能被一个 GET 悄悄改变。"""
+    before = _table_counts()
+
+    for _ in range(10):
+        assert client.get("/api/agent/stage/config", params=_auth()).status_code == 200
+
+    assert _table_counts() == before, "只读接口不得写任何一张表（含配置表 / 审计表）"
+    assert _raw_scalar("SELECT COUNT(*) FROM agent_stage_config WHERE teacher_name = ?",
+                       (TEACHER,)) == 0, "GET 不得替老师建行"
+    assert _stage_log_events() == []
+
+
+# ---- ④ #4 写配置（§4.6-④）----
+
+def test_api_put_config_success_returns_effective_source_warnings(client):
+    """§4.6-④：写成功 → 200 + 三键 `{effective, source, warnings}`；`effective` 是**写完再读**的四层
+    合并值（老师行盖过内置默认）、`source` 如实回答「这两层现在都在」、`warnings` 为空（写进去的两个
+    键都在 §3.5 键表内、也没被 env 覆盖）；同时钉住落库 + `config_changed` 审计一行。"""
+    payload = {"schema_version": 1, "min_template_match": 0.9, "max_samples": 20}
+
+    res = client.put("/api/agent/stage/config", json=dict(_auth(), config=payload))
+    assert res.status_code == 200
+    body = res.json()
+
+    assert set(body) == {"effective", "source", "warnings"}, "§4.6-④ 出参三键（服务层其余键不下发）"
+    assert body["warnings"] == []
+    assert body["effective"]["min_template_match"] == 0.9
+    assert body["effective"]["max_samples"] == 20
+    assert body["effective"]["default_stage"] == "learning", "没提交的键回落到上一级（不是部分合并）"
+    assert body["source"] == {"global": True, "teacher_override": True, "env_override": []}
+
+    assert _raw_scalar("SELECT COUNT(*) FROM agent_stage_config WHERE teacher_name = ?",
+                       (TEACHER,)) == 1, "写入目标是老师自己的行（不是全局行）"
+    assert _stage_log_events() == ["config_changed"], "配置变更留审计一行"
+
+
+def test_api_put_config_invalid_is_400_with_errors_and_zero_write(client):
+    """§3.4 第 5 条 / §4.6-④：校验未过 → 400 `stage_config_invalid` + `errors[{path,msg}]`，
+    且**整体不写入**（「只拦不清」）→ 该老师的生效配置仍是写入前那一份（旧值不变）、审计一行不写。
+
+    顺带钉住「请求体缺 `config` 键」（`config=None`）走的是同一条 400，而不是 500 / FastAPI 的 422：
+    服务层 `validate_stage_config()` 对「根不是对象」只回一条错误（`path=''`）。"""
+    import agent_stage_service
+
+    bad = client.put("/api/agent/stage/config",
+                     json=dict(_auth(), config={"schema_version": 1, "min_template_match": 1.5}))
+    assert bad.status_code == 400
+    detail = _api_detail(bad)
+    assert detail["error"] == "stage_config_invalid"
+    assert [err["path"] for err in detail["errors"]] == ["min_template_match"]
+    assert detail["msg"]
+
+    missing = client.put("/api/agent/stage/config", json=_auth())
+    assert missing.status_code == 400
+    assert _api_detail(missing)["error"] == "stage_config_invalid"
+    assert _api_detail(missing)["errors"][0]["path"] == "", "缺 config 键 = 根不是对象（同一条 400）"
+
+    after = client.get("/api/agent/stage/config", params=_auth()).json()
+    assert after["effective"]["min_template_match"] == \
+        agent_stage_service.DEFAULT_STAGE_CONFIG["min_template_match"], "旧值不变（没写进去）"
+    assert after["source"]["teacher_override"] is False, "老师行根本没建过"
+    assert _stage_log_events() == []
+
+
+# ---- ⑤ #5 手动降级（§4.6-⑤）----
+
+def test_api_demote_lower_stage_returns_four_keys_and_manual_source(client):
+    """§4.6-⑤：#5 手动降级成功 → 200 + **恰好四键** `{stage, previous_stage, stage_since,
+    stage_source}`（工作台要显示「見習期 → 觀察期」与「自何时起」）；`stage_source` 恒为
+    `manual_demote`、`stage_since` 刷新为本次时刻；落库 + 两类留痕（`stage_demoted` 事件 +
+    `manual_demote` 行动日志）。"""
+    _put_raw_state_row(TEACHER, "assistant", stage_since="S1", stage_source="default")
+
+    res = client.post("/api/agent/stage/demote",
+                      json=dict(_auth(), to_stage="observation", reason="測試降級"))
+    assert res.status_code == 200
+    body = res.json()
+
+    assert set(body) == {"stage", "previous_stage", "stage_since", "stage_source"}
+    assert body["stage"] == "observation" and body["previous_stage"] == "assistant"
+    assert body["stage_source"] == "manual_demote"
+    assert body["stage_since"] and body["stage_since"] != "S1", "进入时刻刷新为本次时刻"
+
+    row = database.get_agent_stage_state(TEACHER)
+    assert (row["stage"], row["stage_source"]) == ("observation", "manual_demote")
+
+    logs = database.get_agent_stage_logs(TEACHER)
+    assert [log["event_type"] for log in logs] == ["stage_demoted"]
+    assert (logs[0]["from_stage"], logs[0]["to_stage"]) == ("assistant", "observation")
+    assert "測試降級" in (logs[0]["detail"] or ""), "老师填的说明原样进审计人话"
+    assert _stage_actions() == ["manual_demote"]
+
+
+def test_api_demote_same_or_higher_stage_is_409_and_changes_nothing(client):
+    """§4.6-⑤ / §6.1-8：同阶 / 高于当前的「降级」请求 → 409 `stage_transition_invalid`
+    （不可能被满足的请求，**不许假成功**）；阶段三列与待确认对逐字节不动、审计零新增。"""
+    _put_raw_state_row(TEACHER, "apprentice", stage_since="S1", stage_source="default",
+                       pending_stage="assistant", pending_task_id=7)
+
+    same = client.post("/api/agent/stage/demote", json=dict(_auth(), to_stage="apprentice"))
+    higher = client.post("/api/agent/stage/demote", json=dict(_auth(), to_stage="authorized"))
+
+    for res in (same, higher):
+        assert res.status_code == 409, "「降级」指向不低于当前的位置 = 无法满足的请求"
+        assert _api_detail(res)["error"] == "stage_transition_invalid"
+
+    row = database.get_agent_stage_state(TEACHER)
+    assert (row["stage"], row["stage_since"], row["stage_source"]) == ("apprentice", "S1", "default")
+    assert (row["pending_stage"], row["pending_task_id"]) == ("assistant", 7), "被拒的降级不动任何一列"
+    assert _stage_log_events() == [] and _stage_actions() == []
+
+
+def test_api_demote_illegal_target_is_400_and_changes_nothing(client):
+    """§4.6-⑤：`to_stage` 不在五阶段内 → 400 `stage_invalid_value`（空串 / 缺键也走这条 ——
+    模型层的 `to_stage: str = ""` 就是为了让「缺键」落在这个可读的码上，而不是 FastAPI 的 422）。"""
+    _put_raw_state_row(TEACHER, "assistant", stage_since="S1")
+
+    for to_stage in ("vip", ""):
+        res = client.post("/api/agent/stage/demote", json=dict(_auth(), to_stage=to_stage))
+        assert res.status_code == 400, "to_stage=%r 应 400（实测 %d）" % (to_stage, res.status_code)
+        assert _api_detail(res)["error"] == "stage_invalid_value"
+
+    assert _raw_scalar("SELECT stage FROM agent_stage_state WHERE teacher_name = ?",
+                       (TEACHER,)) == "assistant"
+    assert _stage_log_events() == []
+
+
+# ---- ② #2 跑一次评估（§4.6-②）----
+
+def test_api_evaluate_returns_snapshot_with_changed_and_stays_at_stage(client):
+    """§4.6-② / §3.6 / 约束 3：`POST /evaluate` 直出 18 键快照 + `changed`；没有有效样本 →
+    `blockers` 逐条写明、`reason='blocked'`、`recommended=False`、`stage_changed=False`（**绝不向上写
+    stage**）；两次调用各留一行 `evaluation` 审计、`last_evaluated_at` 落库。"""
+    before = client.get("/api/agent/stage", params=_auth()).json()
+
+    first = client.post("/api/agent/stage/evaluate", json=_auth())
+    assert first.status_code == 200
+    body = first.json()
+
+    assert set(body) == set(_EVALUATE_SNAPSHOT_KEYS) | {"changed"}, "接口层直出：18 键 + changed"
+    assert body["skipped"] is False and body["reason"] == "blocked"
+    assert body["stage"] == "learning" and body["stage_label"] == before["stage_label"]
+    assert body["blockers"], "没样本 / 没模板 → 逐条写明为什么没推荐（不翻 4xx）"
+    assert body["changed"] == {"stage_changed": False, "recommended": False, "demoted": False,
+                               "reason": "blocked"}
+    assert body["evaluated_at"]
+
+    row = database.get_agent_stage_state(TEACHER)
+    assert row["stage"] == "learning", "评估不向上写阶段"
+    assert row["last_evaluated_at"] == body["evaluated_at"], "快照落库，供 #1 的 stale 判定"
+
+    second = client.post("/api/agent/stage/evaluate", json=_auth())
+    assert second.status_code == 200
+    assert second.json()["changed"]["stage_changed"] is False
+
+    assert _stage_log_events() == ["evaluation", "evaluation"], "每次评估（含无推荐）各留一行"
+    assert _stage_actions() == [], "没有推荐就没有行动日志（写点克制）"
+
+
+# ---- ⑥ 路由面与源码级守护 ----
+
+def test_api_router_registers_only_the_five_step_4b2_routes(client):
+    """本步的路由面**恰好**是 #1–#5：路由表里没有 #6 `suggest` / #7 `predraft`（服务侧能力入口属 4c）。
+
+    「名字在、行为不在」的假实现比 404 更糟（接口层文件头第 39–41 行的说明）→ 既查路由表，也真发一次请求钉住
+    它落的是 FastAPI 默认 404（`{"detail": "Not Found"}`，**不是**统一错误体）；4c 落地后本用例要改成
+    403 `stage_forbidden` / 404 `stage_draft_not_found` 那一族。"""
+    import agent_stage_api
+
+    registered = {(method, route.path)
+                  for route in agent_stage_api.router.routes
+                  for method in (getattr(route, "methods", None) or ())
+                  if method in ("GET", "POST", "PUT", "DELETE")}    # GET 会被自动补 HEAD，故只看显式四种
+    assert registered == _STAGE_REGISTERED_ROUTES
+
+    for path, payload in (("/api/agent/stage/suggest", dict(_auth(), draft_id=1, kind="pattern")),
+                          ("/api/agent/stage/predraft", dict(_auth(), draft_id=1))):
+        res = client.post(path, json=payload)
+        assert res.status_code == 404, "%s 本步不得注册（实测 %d）" % (path, res.status_code)
+        assert res.json() == {"detail": "Not Found"}, "未注册的路由由 FastAPI 默认 404 兜底"
+
+
+def test_api_module_never_imports_database_or_forbidden_symbols():
+    """源码级（接口层文件头第 18–22 行的承诺）：接口层不 import `database` / `sqlite3`、不碰 §2.1 六个
+    禁忌符号 —— 业务侧全在服务层，路由面因此天然「AI 永不落库 / 永不开方 / 永不签字」（§4.6 末段）。
+
+    与 ⑩ 组同口径（复用同一套 AST 提取器）：只看**真的 import 了什么**与 `database.<属性>` 访问，
+    文档 / 注释里「提到」这些名字不算违规（接口层文件头就列着这份清单）。"""
+    imported, attributes = _service_imports_and_database_attrs(_api_source())
+
+    assert "agent_stage_service" in imported, "守护自身不得静默失效：接口层必须经服务层处理业务"
+    assert "database" not in imported, "接口层不得 import database（分层：业务侧全在 agent_stage_service）"
+    assert "sqlite3" not in imported, "接口层不得 import sqlite3（存储就绪探针由服务层转发）"
+    assert attributes == set(), "接口层不得访问 database.<任何东西>"
+    for symbol in _FORBIDDEN_SERVICE_IMPORTS:
+        assert symbol not in imported, "接口层不得 import 禁忌符号 %s" % symbol
