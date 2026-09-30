@@ -457,6 +457,30 @@ UPDATE patient_records
   4. flag on 时 `''` 未归属行**不显示**；
   5. flag off → 无任何师门 UI，请求 URL 中**无** `lineage_id`（网络面板核对）。
 
+### 7.5 学生自加 vs 老师拉入的账号语义差异（step 4.4 追加；§3.4 表格第 2 行的口径细化）
+
+> 编号说明：本小节在 step 4.4 收口计划中拟编号 **§7.4**，但 §7.4 已被「验收手段受限」占用（且 §8 ⑪ 组按编号引用它），为避免同号两节，故顺延为 **§7.5**。
+
+同一条接口 `POST /api/student-lineages`（`lineage_service.join_student_lineage()`，`lineage_service.py:754-800`）承载两种语义，**分岔键 = `teacher_name` 是否为空**（`:778`）：
+
+| 维度 | **学生自加**（`teacher_name` 空） | **老师拉入**（`teacher_name` 非空） |
+| :---- | :---- | :---- |
+| 入口 | 学生端「📇 我的老師」加入（`App.tsx:2090 handleAddTeacher` → `joinLineageByTeacher` `:691-710`），请求体只有 `{student_name, lineage_id}` | 管理端 / 老师端直连接口，带 `{student_name, lineage_id, teacher_name}`；**前端目前无入口**（见下「现状缺口」） |
+| `patients` 账号 | **不建**（本接口不碰建号，避免与邀请码 / 老师拉入形成第二套建号实现） | **建**（复用既有 `database.teacher_add_student()`，`database.py:532-547`，语句一字不改：`INSERT OR IGNORE INTO patients(guardian_name='self', relation='本人')`） |
+| 积分账户 | 不动 | `INSERT OR IGNORE INTO points_accounts`（初始 100 分，同上函数第 3 步） |
+| 归属行 | 唯一写点 `_upsert_membership()`（`:712-751`）：先 `UPDATE`，`rowcount == 0` 才 `INSERT` | 同左：`teacher_add_student()` 顺手插的那行（`lineage_id=''`）被紧接着的 `_upsert_membership()` **就地更新**到本师门 → 归属行始终只有一个写点 |
+| 额外校验 | 无 | 多一道 403 `lineage_forbidden`（`:786-789`：该老师必须是本师门 owner） |
+| 共同校验（顺序） | `lineage_gate()` → 名字 / id 形状 → 404 `lineage_not_found` → 400 `lineage_invalid`（已封存）→ 409 `student_lineage_limit`（`:704-709` 在**任何写入之前**计数，拒绝时库内零新行） | 同左 |
+| 幂等 | 已在同门（`active` 且 `lineage_id` 相同）→ `changed=false` 且零写入 | 同左 |
+
+三条必须写明的推论：
+
+1. **「学生自加不建账号」≠「学生没有账号」**：学生账号由既有两条路径产生 —— 邀请码（`database.accept_invite()`，`database.py:1014-1024`）或老师拉入（`teacher_add_student()`）。本接口只负责归属行，故 flag on 与否都不改变「账号从哪来」的既有口径。
+2. **两种语义的可见性后果完全相同**：老师端能否看见该学生，取决于 `patient_teachers(status='active', lineage_id=本门)`，**不**取决于账号由谁创建（§3.1「归属 = 访问范围，不是所有权」）。
+3. **`''` 行的处置仍按 §2.4 纪律 2**：任何绕过本接口写入的归属行（含旧入口）都是「未歸屬」，flag on 下对任何师门都不可见、只给提示（学生端文案 `App.tsx:3139-3142`）。
+
+**现状缺口（必须留痕，属待批子步）**：老师端「👥 學生管理」的新增学生按钮仍走**旧路径** `POST /api/teacher/add-student`（`App.tsx:3192` → `database.teacher_add_student()`，**不写** `lineage_id`），邀请码接受（`POST /api/invites/accept`）同理 —— 这两条路径产出的归属行 `lineage_id = ''`，flag on 下即「未歸屬」：老师端读路径按师门过滤后**看不到**该学生，学生端只显示「未歸屬資料請聯絡管理員」。后端**已备好**老师拉入分支（`lineage_service.py:762-766` 已披露「§4.3 歸屬組的 flag on 改造屬待批子步」），前端尚未接入口。自测 / 演示时请留意：用旧入口加完学生后，需再走一次师门加入（或直连接口带 `teacher_name`）才会落进本门。
+
 ---
 
 ## 8. 测试矩阵

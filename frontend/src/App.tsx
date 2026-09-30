@@ -764,10 +764,13 @@ export default function App() {
   // 【第75天新增 / 改动2】老师进入诊室页时拉一次该老师的「施治方案模板」：
   // GET /api/plan_template?teacher_name=李老师 → { content }（后端没有记录时返回空串，前端按“无模板”处理）。
   // 依赖 currentRole / teacherTab / selectedTeacher：切到诊室页、或换了老师时各拉一次；拉取失败就当没模板，不阻塞诊室记录。
+  // 【Epic 4 step 4.4】这里**不**走 withLineage：plan_templates 是 Epic 1 兼容镜像、**不师门化**（设计 §2.3 /
+  // 附录 A1 裁决「不加」，缺口登记 tech-debt.md TD-005 / TD-007），后端对该参数**一律忽略**；
+  // 故按 §4.4「URL 逐字面纯净」保持原样 `?teacher_name=`（flag on / off 两种状态下 URL 完全相同）。
   useEffect(() => {
     if (currentRole !== '李老师' && currentRole !== '李老师智能体') return
     if (teacherTab !== 'clinic') return
-    fetch(withLineage(`/api/plan_template?teacher_name=${selectedTeacher}`))
+    fetch(`/api/plan_template?teacher_name=${selectedTeacher}`)
       .then(r => r.json())
       .then(d => setPlanTemplate(d && typeof d.content === 'string' ? d.content : ''))
       .catch(() => setPlanTemplate(''))
