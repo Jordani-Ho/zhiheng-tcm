@@ -13,14 +13,24 @@
  *   GET    /api/templates?teacher_name&teacher_id&type?&status?&include_schema?  → {templates, counts}
  *   GET    /api/templates/{id}                                                   → {template, chain, generated_count}
  *   GET    /api/templates/active?type=                                           → {template|null}
- *   POST   /api/templates                    body {teacher_name, teacher_id, type, name?, schema_json?}
+ *   POST   /api/templates                    body {teacher_name, teacher_id, type, name?, schema_json?}（+ lineage_id?）
  *   PUT    /api/templates/{id}                body {teacher_name, teacher_id, name?, schema_json?}
  *   POST   /api/templates/{id}/publish         body {teacher_name, teacher_id} → {template, archived_ids, changed}
  *   POST   /api/templates/{id}/archive         body {teacher_name, teacher_id} → {template, changed}
  *   POST   /api/templates/{id}/activate        body {teacher_name, teacher_id} → {template, archived_ids, changed}
- *   POST   /api/templates/{id}/derive          body {teacher_name, teacher_id} → {template, reused_draft}
+ *   POST   /api/templates/{id}/derive          body {teacher_name, teacher_id}（+ lineage_id?）→ {template, reused_draft}
  *   錯誤體：{detail: {error, msg, errors:[{path,msg}], warnings:[]}}（讀 res.detail.error / .msg）
  *   flag off → 404 templates_disabled；表未就緒 → 503 template_store_unavailable
+ *
+ * 【Epic 4 §3.3 / §7.2】師門（`lineage_id`）—— 本檔只做「按上下文拼參」，不做任何師門判定：
+ *   · flag **off**（默認）→ 逐字保留 Epic 1 口徑：`lineage_id` 一律留空，且**傳非空值會 400
+ *     `lineage_not_supported`** → 本組件只在 `lineageId` 非空時才拼 URL 參數 / 才加請求體鍵
+ *     （flag off 的 URL 與請求體與 Epic 4 之前逐字面一致，§4.4 零行为变化）；
+ *   · flag **on** → 模板接口**要求**非空 `lineage_id`（缺 → 400 `lineage_required`，後端不許回落成
+ *     「一律留空」）：`GET /api/templates`、`POST /api/templates`、`POST /api/templates/{id}/derive`
+ *     三處必帶；其餘入口後端不校驗，帶了會被 Pydantic 當多餘鍵忽略（不報錯）；
+ *   · flag on 但該老師**尚未開山門** → 探測即 400 `lineage_required` → 卡內紅字提示
+ *     （不靜默消失、更不越權兜底成別人的師門）。
  *
  * 樣式：不新增任何 npm 依賴；沿用存量內聯 style + serif 字體 + 主色 #8b4513（與 App.tsx 視覺一致）。
  */
@@ -210,9 +220,12 @@ const formatTime = (value?: string | null) => {
 
 const typeLabel = (type: TemplateType) => TEMPLATE_TYPE_TABS.find(t => t.key === type)?.label || String(type)
 
-/** 身份參數（GET 走 query、POST/PUT 走 body；`teacher_name == teacher_id` 否則後端 403）。 */
-const identityQuery = (teacherName: string, teacherId: string) =>
-  `teacher_name=${encodeURIComponent(teacherName)}&teacher_id=${encodeURIComponent(teacherId)}`
+/** 身份參數（GET 走 query、POST/PUT 走 body；`teacher_name == teacher_id` 否則後端 403）。
+ *  【Epic 4 §7.2】`lineage_id` **只在这里拼一次**（集中在一处拼参）：空串 → 完全不產生該參數，
+ *  URL 與 Epic 4 之前逐字面一致（§4.4）；非空 → 追加在最後，不改動既有參數順序。 */
+const identityQuery = (teacherName: string, teacherId: string, lineageId?: string) =>
+  `teacher_name=${encodeURIComponent(teacherName)}&teacher_id=${encodeURIComponent(teacherId)}` +
+  (lineageId ? `&lineage_id=${encodeURIComponent(lineageId)}` : '')
 
 /** 接口調用包裝：讀 `{detail:{error,msg,errors,warnings}}`，網絡異常統一成 `network_error`。 */
 async function callTemplateApi<T>(path: string, init?: RequestInit): Promise<ApiResult<T>> {
@@ -244,6 +257,19 @@ async function callTemplateApi<T>(path: string, init?: RequestInit): Promise<Api
     }
   }
 }
+
+/**
+ * 【Epic 4 §3.3 / §4.1】「師門上下文有問題」的失敗判定（**只認後端的師門錯誤碼**，不按狀態碼猜）：
+ *   · 400 `lineage_required`：flag on 但請求缺 `lineage_id`（含老師尚未開山門）；
+ *   · 404 `lineage_not_found` / 400 `lineage_invalid` / 403 `lineage_forbidden`：上下文師門不存在 / 越門；
+ *   · 503 `lineage_store_unavailable`：flag on 但遷移未跑。
+ * 命中 → 卡內紅字（不靜默消失、不越權兜底成別人的師門）；**不命中** → 走原有錯誤分支
+ * （flag off 的 404 `templates_disabled` 仍按「關閉」處理，舊行為逐字面不變）。
+ */
+const lineageProbeFailure = (failure: TemplateApiFailure): boolean =>
+  failure.code === 'lineage_required' || failure.code === 'lineage_not_found' ||
+  failure.code === 'lineage_forbidden' || failure.code === 'lineage_invalid' ||
+  failure.code === 'lineage_store_unavailable'
 
 /**
  * `schema_json` 可能是存量回填行（缺 `version` 等鍵）→ 讀取時一律「缺鍵 = 默認值」，
@@ -915,9 +941,13 @@ interface TemplateStudioProps {
   /** 老師身份（老師端「管理」頁籤傳入；目前 `teacher_name` 與 `teacher_id` 同值）。 */
   teacherName: string
   teacherId: string
+  /** 【Epic 4 §3.3 / §7.2】當前師門 id（由 App.tsx 的 `withLineage` **同一份**上下文傳入，不另算一份）。
+   *  空串 = flag off / 該老師尚未開山門 → **不拼** `lineage_id`（URL 與請求體逐字面不變，§4.4 零行为变化）；
+   *  非空 = flag on → 模板接口必帶（後端缺則 400 `lineage_required`）。 */
+  lineageId?: string
 }
 
-type ProbeState = 'unknown' | 'on' | 'off' | 'unavailable'
+type ProbeState = 'unknown' | 'on' | 'off' | 'no_lineage' | 'unavailable'
 type LoadState = 'idle' | 'loading' | 'ready' | 'error'
 
 interface PanelState { mode: 'edit' | 'view'; row: TemplateRow }
@@ -1016,8 +1046,11 @@ function validateDraft(templateType: TemplateType, schema: Record<string, any>, 
  * §13.1 掛載點：老師端「管理」頁籤的一張卡片（`App.tsx` 只做 import + 掛載，不改原有頁面結構）。
  * flag off → 本組件返回 `null`（卡片整體不渲染）；表未就緒 → 卡內紅字。
  */
-export default function TemplateStudio({ teacherName, teacherId }: TemplateStudioProps) {
+export default function TemplateStudio({ teacherName, teacherId, lineageId = '' }: TemplateStudioProps) {
   const [probeState, setProbeState] = useState<ProbeState>('unknown')
+  // 【Epic 4】手動重試計數：`no_lineage`（如老師剛在別處開山門 / 上下文師門剛恢復）時，
+  // 「🔄 重新載入」需要**重跑探測**（只重拉列表會維持同一個錯誤），故用它作為探測 effect 的依賴。
+  const [probeNonce, setProbeNonce] = useState(0)
   const [loadState, setLoadState] = useState<LoadState>('idle')
   const [rows, setRows] = useState<TemplateRow[]>([])
   const [counts, setCounts] = useState<Record<string, number>>({})
@@ -1034,18 +1067,27 @@ export default function TemplateStudio({ teacherName, teacherId }: TemplateStudi
   const [herbs, setHerbs] = useState<any[]>([])
   const [herbsLoaded, setHerbsLoaded] = useState(false)
 
-  const identity = { teacher_name: teacherName, teacher_id: teacherId }
+  // 【Epic 4 §3.3】請求體身份：`lineageId` 空串時**不加** `lineage_id` 鍵（flag off 的請求體逐字面不變，
+  // 且此時後端收到非空值反而 400 `lineage_not_supported`）；非空則三個必帶入口（POST 新建 / POST derive）
+  // 都能滿足後端校驗 —— 其餘入口的模型沒有這個欄位，Pydantic 默認忽略多餘鍵，不會 422。
+  const identity = {
+    teacher_name: teacherName,
+    teacher_id: teacherId,
+    ...(lineageId ? { lineage_id: lineageId } : {})
+  }
   const rowsByType: Record<TemplateType, TemplateRow[]> = { inquiry: [], record: [], treatment: [], prescription: [] }
   rows.forEach(row => { if (rowsByType[row.type]) rowsByType[row.type].push(row) })
 
-  /** §13.5 列表數據：`GET /api/templates`（含四類總數 counts）。 */
+  /** §13.5 列表數據：`GET /api/templates`（含四類總數 counts；flag on 時帶當前師門，§3.3）。 */
   const loadList = async () => {
     setLoadState('loading')
     const result = await callTemplateApi<{ templates: TemplateRow[]; counts: Record<string, number> }>(
-      `/api/templates?${identityQuery(teacherName, teacherId)}`)
+      `/api/templates?${identityQuery(teacherName, teacherId, lineageId)}`)
     if (!result.ok) {
       if (result.failure.status === 404) { setProbeState('off'); setLoadState('idle'); return }
       if (result.failure.status === 503) { setProbeState('unavailable'); setLoadState('idle'); return }
+      // 【Epic 4】flag on 但老師未開山門 / 上下文師門失效 → 400（不許退化成「全量或別門」）
+      if (lineageProbeFailure(result.failure)) { setProbeState('no_lineage'); setLoadState('idle'); setError(result.failure.msg); return }
       setLoadState('error')
       setError(result.failure.msg)
       return
@@ -1064,7 +1106,7 @@ export default function TemplateStudio({ teacherName, teacherId }: TemplateStudi
     setDraftSchema(row.schema_json || {})
     setChain([])
     const result = await callTemplateApi<{ template: TemplateRow; chain: ChainItem[] }>(
-      `/api/templates/${row.id}?${identityQuery(teacherName, teacherId)}`)
+      `/api/templates/${row.id}?${identityQuery(teacherName, teacherId, lineageId)}`)
     if (!result.ok) {
       if (result.failure.status === 404) {
         setError('該模板已不存在，請重新載入列表')
@@ -1093,21 +1135,24 @@ export default function TemplateStudio({ teacherName, teacherId }: TemplateStudi
       setLoadState('loading')
       setError('')
       const probe = await callTemplateApi<unknown>(
-        `/api/templates?include_schema=0&type=inquiry&${identityQuery(teacherName, teacherId)}`)
+        `/api/templates?include_schema=0&type=inquiry&${identityQuery(teacherName, teacherId, lineageId)}`)
       if (cancelled) return
       if (!probe.ok) {
         setLoadState('idle')
         // 404 templates_disabled → 視為關閉（不渲染）；503 → 卡內紅字；其它（含網絡異常 / 身份缺失）→ 一律不渲染，不阻塞其它頁籤
+        // 【Epic 4】例外：後端明確回師門錯誤碼（flag on 未開山門 / 上下文師門失效）→ 卡內紅字說清楚，不靜默消失
+        if (lineageProbeFailure(probe.failure)) { setProbeState('no_lineage'); setError(probe.failure.msg); return }
         setProbeState(probe.failure.status === 503 ? 'unavailable' : 'off')
         return
       }
       setProbeState('on')
       const list = await callTemplateApi<{ templates: TemplateRow[]; counts: Record<string, number> }>(
-        `/api/templates?${identityQuery(teacherName, teacherId)}`)
+        `/api/templates?${identityQuery(teacherName, teacherId, lineageId)}`)
       if (cancelled) return
       if (!list.ok) {
         if (list.failure.status === 404) { setProbeState('off'); setLoadState('idle'); return }
         if (list.failure.status === 503) { setProbeState('unavailable'); setLoadState('idle'); return }
+        if (lineageProbeFailure(list.failure)) { setProbeState('no_lineage'); setLoadState('idle'); setError(list.failure.msg); return }
         setLoadState('error')
         setError(list.failure.msg)
         return
@@ -1118,7 +1163,7 @@ export default function TemplateStudio({ teacherName, teacherId }: TemplateStudi
     }
     run()
     return () => { cancelled = true }
-  }, [teacherName, teacherId])
+  }, [teacherName, teacherId, lineageId, probeNonce])
 
   // 開方模板才需要庫存清單（懶載入，避免無謂請求）；來源與診室開方同一份 `GET /api/herbs`。
   useEffect(() => {
@@ -1310,7 +1355,7 @@ export default function TemplateStudio({ teacherName, teacherId }: TemplateStudi
     <div style={TS_BOX}>
       <div style={{ display: 'flex', alignItems: 'center', gap: '10px', flexWrap: 'wrap', marginBottom: '12px' }}>
         <span style={{ fontSize: '18px', color: '#8b4513', fontWeight: 'bold' }}>📜 模板傳承（四類）</span>
-        <button style={TS_GHOST_BTN} disabled={busy || probeState !== 'on'}
+        <button style={TS_GHOST_BTN} disabled={busy || probeState === 'unavailable'}
           onClick={() => {
             setError('')
             setNotice('')
@@ -1318,6 +1363,9 @@ export default function TemplateStudio({ teacherName, teacherId }: TemplateStudi
             setPanel(null)
             setChain([])
             setHerbsLoaded(false)
+            // 【Epic 4】師門上下文不成立時：整卡只有紅字，必須**重跑探測**才可能恢復（§3.3）；
+            // 正常（on）時維持原行為：只重拉列表，不重複探測。
+            if (probeState !== 'on') { setProbeState('unknown'); setProbeNonce(n => n + 1); return }
             loadList()
           }}>
           🔄 重新載入
@@ -1329,6 +1377,20 @@ export default function TemplateStudio({ teacherName, teacherId }: TemplateStudi
 
       {probeState === 'unavailable' && (
         <div style={TS_ERROR}>模板表未就緒，請聯絡管理員（遷移未跑 / templates 表缺失）</div>
+      )}
+
+      {/* 【Epic 4 §3.3】flag on 但師門上下文不成立（老師尚未開山門 / 師門不存在 / 越門）：
+          後端模板接口要求非空 lineage_id → 這裡明確說清，**不**靜默消失、**不**越權兜底成別人的師門。 */}
+      {probeState === 'no_lineage' && (
+        <div style={TS_ERROR}>師門未就緒：{error || '模板需歸屬到一個師門（後端要求 lineage_id）'}　—— 請先開山門，或確認當前師門狀態後重新載入</div>
+      )}
+
+      {/* 【Epic 4 §7.2】只讀展示本頁模板歸屬的師門（階段一：一位老師 = 一個師門，無切換器） */}
+      {(probeState === 'on' || probeState === 'no_lineage') && lineageId && (
+        <div style={{ background: '#f5f7fd', border: '1px solid #c9d4ea', borderRadius: '8px', padding: '8px 12px', marginBottom: '12px', fontSize: '12px', color: '#3a4a7a', lineHeight: '1.7' }}>
+          🏯 本頁模板歸屬師門：<span style={{ fontWeight: 'bold' }}>{lineageId}</span>
+          （階段一：一位老師 = 一個師門，不提供切換）
+        </div>
       )}
 
       {probeState === 'on' && loadState === 'error' && (

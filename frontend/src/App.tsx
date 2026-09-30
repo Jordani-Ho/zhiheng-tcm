@@ -20,6 +20,13 @@ const dateSelectStyle: React.CSSProperties = { padding: '8px', borderRadius: '6p
 const sectionTitleStyle: React.CSSProperties = { fontSize: '20px', fontWeight: 'bold', color: '#8b4513', borderBottom: '2px solid #d4c8a8', paddingBottom: '6px', marginBottom: '12px', letterSpacing: '1px' }
 // 【第67天新增】设置页签内分区小卡片样式（复用 boxStyle，内边距略收窄，视觉上从属于所属分区）
 const sectionCardStyle: React.CSSProperties = { ...boxStyle, padding: '16px 24px' }
+// 【Epic 4 §7.2】師門小徽章（诊室 / 管理 / 模板配置 卡片标题旁）：只读展示「本頁限師門：xxx」，
+// 与顶部「目前師門」条同源同色（#3a4a7a / 淡蓝底），纯展示、不参与任何请求与判定。
+const lineageChipStyle: React.CSSProperties = {
+  display: 'inline-block', fontSize: '12px', color: '#3a4a7a', background: '#f5f7fd',
+  border: '1px solid #c9d4ea', borderRadius: '10px', padding: '1px 10px',
+  marginLeft: '10px', fontWeight: 'normal', verticalAlign: 'middle'
+}
 // 【第59天新增】诊室二期：把脉可选的脉象（可多选）
 const PULSE_TYPES = ['浮', '沉', '迟', '数', '虚', '实', '滑', '涩']
 // 【第59天重构】拍照清晰度检测阈值：Canvas 取灰度 → 3x3 拉普拉斯卷积 → 求灰度方差，< 100 视为“可能不够清晰”，
@@ -105,6 +112,66 @@ const summarizeComplaint = (content?: string | null) => {
   if (!text) return '（无内容）'
   return text.length > COMPLAINT_SUMMARY_LIMIT ? text.slice(0, COMPLAINT_SUMMARY_LIMIT) + '...' : text
 }
+
+// ============== 【Epic 4 / step 4.3】師門（lineage）前端上下文 ==============
+// 對齊：docs/epic4-lineage-design-v1.md §7（7.1 两个维度并存 / 7.2 老师端 / 7.3 学生端 / 7.4 手动清单）。
+// 四条纪律（本段 + 全部调用点共同遵守，改一处要一起看）：
+//   ① flag off（探测接口非 2xx）→ **不渲染任何师门 UI**，且所有请求 URL **不带** lineage_id
+//      （§4.4 零行为变化：既有 URL 逐字面不变，后端 lineage_read_scope() 直接返回 (False, "")）；
+//   ② lineage_id 只在**一处**拼进 URL（组件里的 `withLineage`）= §7.2「集中在一处拼参」，避免散落漏传；
+//   ③ 切换师门 = 换上下文 → **先清场再重拉**（切 selectedTeacher 触发既有 effect 全量重拉，同时同步清空旧列表，防串门）；
+//   ④ UI 文案一律繁体古字（Epic 1 §13.4 / 决策 11），与 TemplateStudio 的繁體口径一致。
+/** `GET /api/lineages?teacher_name=` 的一行（老师端视角；含 `archived`，§7.2 要显示封存提示条）。 */
+interface LineageRow {
+  id: string
+  name: string
+  owner_teacher_name: string
+  description: string
+  status: string
+  created_at: string
+  updated_at: string
+}
+/** `GET /api/student-lineages?student_name=` 的一行（学生端**唯一**真相源：人 / 组织两个维度同源，§7.1）。 */
+interface StudentLineageRow {
+  student_name: string
+  teacher_name: string
+  lineage_id: string
+  name: string
+  status: string          // 归属行状态：active = 在門內 / inactive = 已退出
+  lineage_status: string  // 師門自身状态：active / archived（与上一行语义不同，勿混用）
+  owner_teacher_name: string
+  joined_at: string
+  unassigned: boolean     // true = `lineage_id` 为空（未歸屬，§2.4）：只提示，不兜底成任何师门
+}
+/** `GET /api/lineages/summary?student_name=` 的一项（跨师门**只读**汇总，不做单一级别，§7.3）。 */
+interface LineageSummaryRow {
+  lineage_id: string
+  name: string
+  teacher_name: string
+  status: string
+  visits: number
+  unsigned_drafts: number
+  last_visit_at: string
+}
+/** 学生端视图哨兵：`本門` = 具体 lineage_id；「全部師門（彙總）」= 本值。 */
+const LINEAGE_ALL_VIEW = '__all__'
+/** localStorage key 前缀（附录 A3：记住学生上次选的师门视图；flag off 时**不写**任何 key）。 */
+const LINEAGE_VIEW_STORE_PREFIX = 'zh.lineage.'
+const lineageViewStoreKey = (studentName: string) => `${LINEAGE_VIEW_STORE_PREFIX}${studentName || ''}`
+const loadLineageView = (studentName: string): string => {
+  try { return window.localStorage.getItem(lineageViewStoreKey(studentName)) || '' } catch { return '' }
+}
+const saveLineageView = (studentName: string, view: string) => {
+  // 隐私模式 / 配额满 → 静默忽略：记住选择是加分项，不是功能前置条件
+  try { window.localStorage.setItem(lineageViewStoreKey(studentName), view) } catch { /* noop */ }
+}
+/** 师门切换按钮样式（全站 serif 宋体 + 棕金主色，与 teacherBtnStyle / teacherTabBtnStyle 同风格）。 */
+const lineageTabStyle = (active: boolean): React.CSSProperties => ({
+  padding: '4px 12px', margin: '3px', borderRadius: '15px', cursor: 'pointer', fontFamily: 'serif', fontSize: '12px',
+  border: `1px solid ${active ? '#8b4513' : '#d4c8a8'}`,
+  background: active ? '#8b4513' : 'transparent',
+  color: active ? '#fdfcf0' : '#8b4513'
+})
 // 【第74天新增 / 开方九宫格改造】开方「君臣佐使」与「煎法」选项（与后端 database.py 的
 // PRESCRIPTION_ROLES / PRESCRIPTION_COOKING_METHODS 白名单一一对应，改一处要同步另一处）
 const HERB_ROLES = ['君', '臣', '佐', '使']
@@ -448,6 +515,212 @@ export default function App() {
     )
   }
 
+  // ============== 【Epic 4 / step 4.3】師門上下文（flag 探测 → 选择器 → 清场） ==============
+  // 老师端判定：本段位置在下方 `isTeacherRole`（老师端页签那一段）之前，故不复用那个常量，
+  // 按同一口径本地判定（`const` 有 TDZ，渲染期提前引用会 ReferenceError）。
+  const lineageIsTeacher = currentRole === '李老师' || currentRole === '李老师智能体'
+  // 师门接口可用性（true = flag on）：探测拿到 2xx 才置 true；404 `lineage_disabled` / 其它非 2xx / 连不上 → false（降级旧视图）
+  const [lineageEnabled, setLineageEnabled] = useState(false)
+  // 学生端归属清单（GET /api/student-lineages）：📇「我的老师」与 🏯「我的師門」两个维度**同一份**数据（§7.1「同源」）
+  const [studentLineages, setStudentLineages] = useState<StudentLineageRow[]>([])
+  // 学生端当前视图：具体 lineage_id（=「本門」）或 LINEAGE_ALL_VIEW（=「全部師門（彙總）」）
+  const [lineageView, setLineageView] = useState('')
+  // 「全部師門（彙總）」只读卡片（GET /api/lineages/summary）
+  const [lineageSummary, setLineageSummary] = useState<LineageSummaryRow[]>([])
+  // 加入 / 退出师门请求中（按钮置灰，防重复点击）
+  const [lineageBusy, setLineageBusy] = useState(false)
+  // 老师端「目前師門」（§7.2 阶段一一师一门 → 无切换器，只读展示 + archived 提示条）
+  const [teacherLineage, setTeacherLineage] = useState<LineageRow | null>(null)
+  // 写操作（加入 / 退出）后 +1 → 归属清单 / 视图落地 / 汇总一起重拉（避免写后各写一份刷新逻辑）
+  const [lineageTick, setLineageTick] = useState(0)
+
+  // 在門內（active 且归属到真实师门）的归属行；`unassigned=true` 的未歸屬行单独取出（§7.3：不显示、只提示）
+  const activeMemberships = studentLineages.filter(r => r.status === 'active' && !!r.lineage_id)
+  const unassignedMemberships = studentLineages.filter(r => r.unassigned)
+
+  // **当前师门上下文**：老师端 = 自己的唯一师门；学生端 = 当前咨询老师（selectedTeacher）对应的师门，
+  // 取不到时回落显式选中的视图。flag off → 恒为空串（于是所有请求 URL 与 Epic 4 之前逐字面一致）。
+  const currentLineageId = (() => {
+    if (!lineageEnabled) return ''
+    if (lineageIsTeacher) return teacherLineage ? teacherLineage.id : ''
+    const row = studentLineages.find(r => r.teacher_name === selectedTeacher && r.status === 'active' && !!r.lineage_id)
+    if (row) return row.lineage_id
+    return lineageView && lineageView !== LINEAGE_ALL_VIEW ? lineageView : ''
+  })()
+
+  // §7.2「集中在一处拼参」：**唯一**的 lineage 拼参出口。
+  // 空上下文（flag off / 未歸屬 / 还没开山门）→ 原样返回 URL（不产生 `?lineage_id=`，也不改变参数顺序）。
+  const withLineage = (url: string) =>
+    currentLineageId ? `${url}${url.includes('?') ? '&' : '?'}lineage_id=${encodeURIComponent(currentLineageId)}` : url
+
+  // §7.3「先清场再重拉」：切师门时把「上一个师门拉回来的列表」同步清空，
+  // 再靠既有的 `[currentRole, selectedPatient, selectedTeacher]` effect 全量重拉 —— 防陈旧数据串门。
+  const clearLineageScopedPanels = () => {
+    setRoleData(null)
+    setDrafts([])
+    setPatientRecords([])
+    setAppointments([])
+    setCalendarData(null)
+    setPendingComplaints([])
+    setAgentPendingTasks([])
+    setAgentDoneTasks([])
+    setAgentActionLogs([])
+    setLineageSummary([])
+    setShowHistory(false)
+  }
+
+  // 【Epic 4 §7.2】卡片标题旁的師門只讀徽章（诊室队列 / 诊室工作台 / 學生管理 三处共用同一个 render，
+  // 避免三份重複標記）：flag off 或還沒探到師門 → 返回 null（零 UI）；`archived` → 追加「已封存 · 只讀」。
+  const renderLineageChip = () => (lineageEnabled && teacherLineage ? (
+    <span style={lineageChipStyle}>
+      🏯 本頁限師門：{teacherLineage.name || teacherLineage.id}
+      {teacherLineage.status === 'archived' ? '（已封存 · 只讀）' : ''}
+    </span>
+  ) : null)
+
+  // 【§7.2】老师端：进入老师端（或换老师）拉一次自己的师门 → teacherLineage。
+  // 探测接口本身就是 flag 探测器：非 2xx（404 `lineage_disabled` / 连不上）→ lineageEnabled=false，
+  // 整段师门 UI 不渲染、请求也不带 lineage_id（§4.4 零行为变化）。
+  useEffect(() => {
+    if (!lineageIsTeacher) return
+    setStudentLineages([])
+    setLineageSummary([])
+    setLineageView('')
+    let cancelled = false
+    fetch(`/api/lineages?teacher_name=${encodeURIComponent(selectedTeacher)}`)
+      .then(res => (res.ok ? res.json() : null))
+      .then((data: { lineages?: LineageRow[] } | null) => {
+        if (cancelled) return
+        if (!data) { setLineageEnabled(false); setTeacherLineage(null); return }
+        const rows = Array.isArray(data.lineages) ? data.lineages : []
+        setLineageEnabled(true)
+        setTeacherLineage(rows.find(row => row.status === 'active') || rows[0] || null)
+      })
+      .catch(() => { if (!cancelled) { setLineageEnabled(false); setTeacherLineage(null) } })
+    return () => { cancelled = true }
+  }, [currentRole, selectedTeacher, lineageIsTeacher])
+
+  // 【§7.1 / §7.3】学生端：拉「我的師門」= 人 / 组织两个维度的唯一数据源（不新增第二套后端真相）。
+  // flag off / 接口非 2xx → 整段师门 UI 不渲染；成功则顺带把上次选的视图落地（附录 A3，flag on 才写 localStorage）。
+  useEffect(() => {
+    if (lineageIsTeacher) return
+    setTeacherLineage(null)
+    let cancelled = false
+    const run = async () => {
+      try {
+        const res = await fetch(`/api/student-lineages?student_name=${encodeURIComponent(selectedPatient)}`)
+        if (!res.ok) {
+          if (!cancelled) { setLineageEnabled(false); setStudentLineages([]); setLineageSummary([]); setLineageView('') }
+          return
+        }
+        const data = await res.json().catch(() => null)
+        if (cancelled) return
+        const rows: StudentLineageRow[] = data && Array.isArray(data.student_lineages) ? data.student_lineages : []
+        setLineageEnabled(true)
+        setStudentLineages(rows)
+        // 视图落地：只认「此刻仍在門內」的 lineage_id，否则回落本門（当前咨询老师的师门），再退到第一个在門师门
+        const selectable = rows.filter(r => r.status === 'active' && !!r.lineage_id)
+        const stored = loadLineageView(selectedPatient)
+        const next = selectable.some(r => r.lineage_id === stored)
+          ? stored
+          : ((selectable.find(r => r.teacher_name === selectedTeacher) || selectable[0] || {}).lineage_id || '')
+        setLineageView(next)
+        if (next) saveLineageView(selectedPatient, next)
+      } catch {
+        if (!cancelled) { setLineageEnabled(false); setStudentLineages([]); setLineageSummary([]) }
+      }
+    }
+    run()
+    return () => { cancelled = true }
+  }, [currentRole, selectedPatient, selectedTeacher, lineageTick, lineageIsTeacher])
+
+  // 【§7.3】彙總卡片：只在「全部師門（彙總）」视图下且 flag on 时拉；切视图先清场再重拉（防串门）。
+  useEffect(() => {
+    if (!lineageEnabled || lineageIsTeacher) return
+    if (lineageView !== LINEAGE_ALL_VIEW) { setLineageSummary([]); return }
+    let cancelled = false
+    fetch(`/api/lineages/summary?student_name=${encodeURIComponent(selectedPatient)}`)
+      .then(res => (res.ok ? res.json() : null))
+      .then((data: { summary?: LineageSummaryRow[] } | null) => {
+        if (!cancelled) setLineageSummary(data && Array.isArray(data.summary) ? data.summary : [])
+      })
+      .catch(() => { if (!cancelled) setLineageSummary([]) })
+    return () => { cancelled = true }
+  }, [lineageEnabled, lineageIsTeacher, lineageView, selectedPatient, lineageTick])
+
+  // 【§7.3】切换师门视图：本門（具体 lineage_id）= 人的维度同步跟上（换 selectedTeacher → 既有 effect 全量重拉）；
+  // 「全部師門（彙總）」= 本門上下文不变，只把彙總卡片拉起来。两种都先清场（clearLineageScopedPanels）。
+  const handleSwitchLineageView = (view: string) => {
+    if (view === lineageView) return
+    clearLineageScopedPanels()
+    setLineageView(view)
+    if (lineageEnabled) saveLineageView(selectedPatient, view)   // flag on 才写（flag off 不写任何 key）
+    if (view !== LINEAGE_ALL_VIEW) {
+      const target = studentLineages.find(r => r.lineage_id === view)
+      if (target && target.teacher_name && target.teacher_name !== selectedTeacher) setSelectedTeacher(target.teacher_name)
+    }
+  }
+
+  // 【§7.3】退出师门：两步确认（① 副作用明示 ② 二次确认）→ DELETE /api/student-lineages →「資料不會被刪除」。
+  // 成功后刷新两个列表（学生归属清单 + 「我的老师」），并靠 lineageTick 重拉视图 / 汇总。
+  const handleLeaveLineage = (row: StudentLineageRow) => {
+    const label = row.name || row.lineage_id
+    if (!confirm(`退出師門的影響：\n· 「${label}」的老師將看不到你在本師門的資料\n· 你的資料不會被刪除（仍可讀自己的病歷）\n\n確定要退出「${label}」嗎？`)) return
+    if (!confirm(`再確認一次：退出師門「${label}」？`)) return
+    setLineageBusy(true)
+    fetch(`/api/student-lineages?student_name=${encodeURIComponent(selectedPatient)}&lineage_id=${encodeURIComponent(row.lineage_id)}`, {
+      method: 'DELETE'
+    })
+      .then(async res => {
+        const data = await res.json().catch(() => null)
+        if (!res.ok) {
+          alert((data && data.detail && data.detail.msg) || `退出師門失敗（${res.status}）`)
+          return
+        }
+        setLineageTick(t => t + 1)
+        fetch(`/api/patient-teachers?patient_name=${selectedPatient}`)
+          .then(r => r.json()).then((list: string[]) => setPatientTeachers(Array.isArray(list) ? list : []))
+          .catch(() => { /* 「我的老师」刷新失败不影响退出结果 */ })
+        alert(`已退出「${label}」：資料不會被刪除，仍可讀自己在本師門的病歷。`)
+      })
+      .catch(() => alert('退出師門失敗，請確認後端服務是否在運行'))
+      .finally(() => setLineageBusy(false))
+  }
+
+  // 【§7.1】加入师门（人的维度 ↔ 组织维度同源）：flag on 时「加入某位老師」= 加入**其师门** →
+  // ① 查该老师开创的师门（GET /api/lineages?teacher_name=，阶段一一师一门）② 走 POST /api/student-lineages
+  // 写归属行（归属行的唯一写点，超上限的 409 `student_lineage_limit` 直接透出后端文案）。
+  const joinLineageByTeacher = (teacherName: string) => {
+    setLineageBusy(true)
+    fetch(`/api/lineages?teacher_name=${encodeURIComponent(teacherName)}`)
+      .then(res => (res.ok ? res.json() : null))
+      .then(async (data: { lineages?: LineageRow[] } | null) => {
+        const rows = data && Array.isArray(data.lineages) ? data.lineages : []
+        const target = rows.find(row => row.status === 'active') || rows[0] || null
+        if (!target) {
+          alert(`「${teacherName}」尚未開山門（還沒有師門）：請老師先建立師門，再加入。`)
+          return
+        }
+        const res = await fetch('/api/student-lineages', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ student_name: selectedPatient, lineage_id: target.id })
+        })
+        const body = await res.json().catch(() => null)
+        if (!res.ok) {
+          alert((body && body.detail && body.detail.msg) || `加入師門失敗（${res.status}）`)
+          return
+        }
+        setLineageTick(t => t + 1)
+        fetch(`/api/patient-teachers?patient_name=${selectedPatient}`)
+          .then(r => r.json()).then((list: string[]) => setPatientTeachers(Array.isArray(list) ? list : []))
+          .catch(() => { /* 「我的老师」刷新失败不影响加入结果 */ })
+        alert(`已加入「${target.name || target.id}」（${teacherName} 的師門）`)
+      })
+      .catch(() => alert('加入師門失敗，請確認後端服務是否在運行'))
+      .finally(() => setLineageBusy(false))
+  }
+
   // ============== 初始化 ==============
   useEffect(() => {
     fetch('/api/huangli').then(r => r.json()).then(d => setHuangli(d)).catch(() => setHuangli(null))
@@ -478,7 +751,7 @@ export default function App() {
 
   useEffect(() => {
     if (currentRole === '李老师' || currentRole === '李老师智能体') {
-      fetch(`/api/teacher-patients?teacher_name=${selectedTeacher}`)
+      fetch(withLineage(`/api/teacher-patients?teacher_name=${selectedTeacher}`))
         .then(r => r.json()).then(d => setTeacherPatients(d))
         .catch(() => setTeacherPatients([]))
       fetchSchedule()
@@ -494,7 +767,7 @@ export default function App() {
   useEffect(() => {
     if (currentRole !== '李老师' && currentRole !== '李老师智能体') return
     if (teacherTab !== 'clinic') return
-    fetch(`/api/plan_template?teacher_name=${selectedTeacher}`)
+    fetch(withLineage(`/api/plan_template?teacher_name=${selectedTeacher}`))
       .then(r => r.json())
       .then(d => setPlanTemplate(d && typeof d.content === 'string' ? d.content : ''))
       .catch(() => setPlanTemplate(''))
@@ -609,15 +882,15 @@ export default function App() {
     fetch(`/api/patients?guardian_name=${guardian}`).then(r => r.json()).then(d => setPatients(d)).catch(() => setPatients([]))
   }
   const fetchRoleData = () => {
-    fetch(`/api/role-data?role=${currentRole}&patient_name=${selectedPatient}&teacher_name=${selectedTeacher}`)
+    fetch(withLineage(`/api/role-data?role=${currentRole}&patient_name=${selectedPatient}&teacher_name=${selectedTeacher}`))
       .then(r => r.json()).then(d => setRoleData(d)).catch(() => setRoleData(null))
   }
   const fetchDrafts = () => {
-    fetch(`/api/drafts?teacher_name=${selectedTeacher}`)
+    fetch(withLineage(`/api/drafts?teacher_name=${selectedTeacher}`))
       .then(r => r.json()).then(d => setDrafts(d)).catch(() => setDrafts([]))
   }
   const fetchPatientRecords = () => {
-    fetch(`/api/patient-records?patient_name=${selectedPatient}&teacher_name=${selectedTeacher}`)
+    fetch(withLineage(`/api/patient-records?patient_name=${selectedPatient}&teacher_name=${selectedTeacher}`))
       .then(r => r.json()).then(d => {
         const sorted = [...d].sort((a: any, b: any) => b.id - a.id)
         setPatientRecords(sorted)
@@ -878,15 +1151,15 @@ export default function App() {
   // 任一接口失败只把对应区块置空，不影响其它区块；响应不是数组时同样按空处理（防止 .map 报错）。
   const fetchAgentWorkbench = () => {
     const teacher = encodeURIComponent(selectedTeacher)
-    fetch(`/api/agent_tasks?teacher_name=${teacher}&status=pending`)
+    fetch(withLineage(`/api/agent_tasks?teacher_name=${teacher}&status=pending`))
       .then(res => res.json())
       .then(data => setAgentPendingTasks(Array.isArray(data) ? data : []))
       .catch(() => setAgentPendingTasks([]))
-    fetch(`/api/agent_tasks?teacher_name=${teacher}&status=approved`)
+    fetch(withLineage(`/api/agent_tasks?teacher_name=${teacher}&status=approved`))
       .then(res => res.json())
       .then(data => setAgentDoneTasks(Array.isArray(data) ? data.slice(0, 5) : []))
       .catch(() => setAgentDoneTasks([]))
-    fetch(`/api/agent_action_log?teacher_name=${teacher}&limit=10`)
+    fetch(withLineage(`/api/agent_action_log?teacher_name=${teacher}&limit=10`))
       .then(res => res.json())
       .then(data => setAgentActionLogs(Array.isArray(data) ? data : []))
       .catch(() => setAgentActionLogs([]))
@@ -901,7 +1174,7 @@ export default function App() {
   //          不弹窗、不影响诊室其它功能；后端补上接口后本卡片无需再改代码。
   const fetchPendingComplaints = () => {
     setComplaintsLoading(true)
-    fetch(`/api/complaints?teacher_name=${encodeURIComponent(selectedTeacher)}&status=pending`)
+    fetch(withLineage(`/api/complaints?teacher_name=${encodeURIComponent(selectedTeacher)}&status=pending`))
       .then(res => {
         if (!res.ok) throw new Error(`complaints ${res.status}`)
         return res.json()
@@ -948,7 +1221,7 @@ export default function App() {
   // 后端返回 { ok, created }；created 兼容老字段 new_tasks（都取不到时按 0 处理，避免 undefined 弹窗）。
   const handleAgentScan = () => {
     setScanningAgent(true)
-    fetch('/api/agent/scan', {
+    fetch(withLineage('/api/agent/scan'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ teacher_name: selectedTeacher })
@@ -991,7 +1264,7 @@ export default function App() {
   }
     // 【第50天新增】拉取可视化排班数据
   const fetchCalendar = () => {
-    fetch(`/api/appointments/calendar?teacher_name=${selectedTeacher}`)
+    fetch(withLineage(`/api/appointments/calendar?teacher_name=${selectedTeacher}`))
       .then(r => r.json())
       .then(d => setCalendarData(d))
       .catch(() => setCalendarData(null))
@@ -1398,7 +1671,7 @@ export default function App() {
   // （后端在该接口里会自动生成病历草案），再用 GET /api/drafts 取回这个学生的真实 draft_id，
   // 最后 PUT 写入老师编辑的内容。这条临时陈述在签字时会被 sign_draft 一并删除，不会留下脏数据。
   const findDraftIdByPatient = (patientName: string): Promise<number | null> =>
-    fetch(`/api/drafts?teacher_name=${encodeURIComponent(selectedTeacher)}`)
+    fetch(withLineage(`/api/drafts?teacher_name=${encodeURIComponent(selectedTeacher)}`))
       .then(r => r.json())
       .then((list: any[]) => {
         if (!Array.isArray(list)) return null
@@ -1427,7 +1700,7 @@ export default function App() {
     setLocalDraftSaving(true)
     // 先更新本地显示，避免看起来“没保存”
     setLocalDrafts(prev => prev.map(d => d.id === localId ? { ...d, content: newContent } : d))
-    return fetch(`/api/transcriptions?patient_name=${encodeURIComponent(patientName)}&teacher_name=${encodeURIComponent(selectedTeacher)}`)
+    return fetch(withLineage(`/api/transcriptions?patient_name=${encodeURIComponent(patientName)}&teacher_name=${encodeURIComponent(selectedTeacher)}`))
       .then(r => r.json())
       .then((list: any[]) => {
         const latest = Array.isArray(list) && list.length > 0 ? list[0] : null
@@ -1811,7 +2084,11 @@ export default function App() {
   }
 
   // ============== 老师/邀请码 ==============
+  // 【Epic 4 §7.1】两个维度同源：「我的老师」的加入 / 退出 = 加入 / 退出**其师门**。
+  // flag on → 走师门归属入口（GET /api/lineages 找师门 + POST/DELETE /api/student-lineages，归属行的唯一写点）；
+  // flag off → 下面原样保留旧路径（POST/DELETE /api/patient-teachers），URL 与请求体逐字面不变。
   const handleAddTeacher = (teacherName: string) => {
+    if (lineageEnabled) { joinLineageByTeacher(teacherName); return }
     fetch('/api/patient-teachers', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -1823,6 +2100,10 @@ export default function App() {
   }
 
   const handleRemoveTeacher = (teacherName: string) => {
+    // 【Epic 4 §7.1】flag on：退出某位老师 = 退出其师门（两步确认 + 副作用明示都在 handleLeaveLineage 里）；
+    // 找不到对应归属行（未歸屬 / 该老师还没开山门）时仍走下面的旧路径。
+    const membership = studentLineages.find(r => r.teacher_name === teacherName && r.status === 'active' && !!r.lineage_id)
+    if (lineageEnabled && membership) { handleLeaveLineage(membership); return }
     if (!confirm(`确定要退出老师【${teacherName}】的咨询吗？`)) return
     fetch(`/api/patient-teachers?patient_name=${selectedPatient}&teacher_name=${teacherName}`, { method: 'DELETE' })
       .then(() => {
@@ -1865,10 +2146,14 @@ export default function App() {
 
   // ============== 预约 ==============
   const fetchAppointments = () => {
-    const url = currentRole.includes('老师')
+    let url = currentRole.includes('老师')
       ? `/api/appointments?teacher_name=${selectedTeacher}`
       : `/api/appointments?patient_name=${selectedPatient}`
-    fetch(url).then(r => r.json()).then(d => setAppointments(d)).catch(() => setAppointments([]))
+    // 【Epic 4 §3.2 P0-④】flag on 时学生端也要补 teacher_name：后端 `lineage_read_scope()` 要求
+    // 「老师身份 + 师门」双因子（缺 teacher_name → 400 lineage_required，绝不退化为全量）；
+    // flag off → 不补任何参数，URL 与 Epic 4 之前逐字面一致。
+    if (lineageEnabled && !currentRole.includes('老师')) url = `${url}&teacher_name=${encodeURIComponent(selectedTeacher)}`
+    fetch(withLineage(url)).then(r => r.json()).then(d => setAppointments(d)).catch(() => setAppointments([]))
   }
 
   const handleCreateAppointment = () => {
@@ -2401,6 +2686,29 @@ export default function App() {
           </div>
         )}
 
+        {/* 【Epic 4 §7.2】老師端「目前師門」：阶段一 = 一师一门 → **不提供切换器**（直接消除「切错师门」这个越权源），
+            只在页签栏下方做**只读展示**（§7.2「侧栏或设置区显示」；首页/诊室/管理/设置四个页签共用这一处，不重复渲染四份）。
+            `status='archived'` → 顶部提示条（只读提示，不阻塞、不改任何请求）。
+            flag off / 接口非 2xx → 整段不渲染，且所有请求 URL 不带 lineage_id（§4.4 零行为变化）。 */}
+        {isTeacherRole && lineageEnabled && teacherLineage && (
+          <div style={{ marginBottom: '16px' }}>
+            {teacherLineage.status === 'archived' && (
+              <div style={{ padding: '8px 14px', marginBottom: '8px', background: '#fdf0e6', border: '1px solid #e8c9a0', borderRadius: '10px', fontSize: '13px', color: '#a0522d', lineHeight: '1.8' }}>
+                ⚠️ 目前師門已封存（只讀）：仍可查閱本門既有資料，但不再接受新學生加入；如需沿用本門，請先取消封存。
+              </div>
+            )}
+            <div style={{ ...boxStyle, marginBottom: 0, padding: '10px 16px', background: '#f5f7fd', border: '1px solid #c9d4ea', display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '8px' }}>
+              <div style={{ fontSize: '14px', color: '#3a4a7a', fontWeight: 'bold' }}>
+                🏯 目前師門：{teacherLineage.name || teacherLineage.id}
+                <span style={{ marginLeft: '8px', fontWeight: 'normal', fontSize: '12px', color: '#6b7aa8' }}>（階段一：一位老師 = 一個師門，不提供切換）</span>
+              </div>
+              <div style={{ fontSize: '12px', color: '#888' }}>
+                本頁資料均限本師門 · {teacherLineage.id}
+              </div>
+            </div>
+          </div>
+        )}
+
         {/* 【第62天调整】黄历卡片只在首页显示（老师端切到诊室/管理/设置时隐藏；学生端始终显示） */}
         {(huangli && (!isTeacherRole || teacherTab === 'home')) && (
           <div style={boxStyle}>
@@ -2753,6 +3061,10 @@ export default function App() {
               </button>
             </div>
             <div style={{ fontSize: '13px', color: '#666', marginBottom: '8px' }}>当前咨询：<span style={{ color: '#8b4513', fontWeight: 'bold' }}>{selectedTeacher}</span></div>
+            {/* 【Epic 4 §7.3】flag on：上限措辞对齐师门口径（阶段一一师一门 → 数值语义不变，只说清它等于几个师门） */}
+            {lineageEnabled && (
+              <div style={{ fontSize: '12px', color: '#8b4513', marginBottom: '8px' }}>階段一：一位老師 = 一個師門（最多 3 個師門）</div>
+            )}
             <div style={{ display: 'flex', flexWrap: 'wrap' }}>
               {patientTeachers.map(t => (
                 <div key={t} style={{ display: 'flex', alignItems: 'center', margin: '4px' }}>
@@ -2774,10 +3086,87 @@ export default function App() {
           </div>
         )}
 
+        {/* 【Epic 4 §7.1 / §7.3】🏯 我的師門（组织维度）：与上方「人的维度」**同源** —— 两个列表都读
+            GET /api/student-lineages，不新增第二套后端真相。flag off / 接口 404 → 整段不渲染（请求也不带 lineage_id）。
+            视觉：与既有卡片一致的 boxStyle + 师门主色 #3a4a7a（区别于人的维度的棕金 #8b4513）。 */}
+        {!lineageIsTeacher && lineageEnabled && (
+          <div style={{ ...boxStyle, background: '#f5f7fd' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '10px' }}>
+              <div style={{ fontSize: '18px', color: '#3a4a7a', fontWeight: 'bold' }}>🏯 我的師門（{activeMemberships.length}/3）</div>
+              {lineageBusy && <span style={{ fontSize: '12px', color: '#888' }}>處理中…</span>}
+            </div>
+
+            {/* 视图切换器（§7.3：`本門` / `全部師門（彙總）`；≥2 个在門师门才需要切） */}
+            {activeMemberships.length > 1 && (
+              <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', marginBottom: '8px' }}>
+                <span style={{ fontSize: '12px', color: '#666', marginRight: '4px' }}>切換師門：</span>
+                {activeMemberships.map(m => (
+                  <button key={m.lineage_id} style={lineageTabStyle(lineageView === m.lineage_id)} onClick={() => handleSwitchLineageView(m.lineage_id)}>
+                    {m.name || m.lineage_id}{lineageView === m.lineage_id ? '（本門）' : ''}
+                  </button>
+                ))}
+                <button style={lineageTabStyle(lineageView === LINEAGE_ALL_VIEW)} onClick={() => handleSwitchLineageView(LINEAGE_ALL_VIEW)}>全部師門（彙總）</button>
+              </div>
+            )}
+
+            {/* 歸屬清單（§7.3）：在門內在前（可「進入本門」/「退出師門」），退出歷史在後（只读，標記「已退出」） */}
+            {studentLineages.filter(r => !r.unassigned).map(r => (
+              <div key={`${r.teacher_name}-${r.lineage_id}`} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '6px 10px', background: '#fff', borderRadius: '8px', marginBottom: '5px', fontSize: '13px' }}>
+                <div>
+                  <span style={{ color: '#3a4a7a', fontWeight: 'bold' }}>{r.name || r.lineage_id}</span>
+                  <span style={{ color: '#888', marginLeft: '8px' }}>師 · {r.teacher_name}</span>
+                  {r.status !== 'active' && <span style={{ marginLeft: '8px', padding: '1px 8px', borderRadius: '10px', border: '1px solid #ddd', color: '#999', fontSize: '11px' }}>已退出</span>}
+                  {r.lineage_status === 'archived' && <span style={{ marginLeft: '8px', padding: '1px 8px', borderRadius: '10px', border: '1px solid #e8c9a0', color: '#a0522d', fontSize: '11px' }}>已封存</span>}
+                  {r.joined_at && <span style={{ color: '#bbb', marginLeft: '8px', fontSize: '11px' }}>加入於 {formatAgentTime(r.joined_at)}</span>}
+                </div>
+                {r.status === 'active' && (
+                  <div style={{ display: 'flex', gap: '6px' }}>
+                    <button onClick={() => handleSwitchLineageView(r.lineage_id)} style={{ padding: '3px 10px', borderRadius: '12px', border: '1px solid #3a4a7a', background: 'transparent', color: '#3a4a7a', cursor: 'pointer', fontSize: '11px', fontFamily: 'serif' }}>進入本門</button>
+                    <button disabled={lineageBusy} onClick={() => handleLeaveLineage(r)} style={{ padding: '3px 10px', borderRadius: '12px', border: '1px solid #c0392b', background: 'transparent', color: '#c0392b', cursor: lineageBusy ? 'not-allowed' : 'pointer', fontSize: '11px', fontFamily: 'serif' }}>退出師門</button>
+                  </div>
+                )}
+              </div>
+            ))}
+
+            {/* 空態：flag on 但一個在門師門都沒有（含「全部已退出」） */}
+            {activeMemberships.length === 0 && (
+              <div style={{ fontSize: '13px', color: '#888', padding: '8px' }}>尚未加入任何師門：可在上方「我的老师」裡加入一位老師（= 加入其師門）。</div>
+            )}
+
+            {/* 未歸屬（§7.3）：flag on 时**不显示** `lineage_id=''` 行的内容，只按 §2.4 纪律 2 给提示，绝不兜底成某个师门 */}
+            {unassignedMemberships.length > 0 && (
+              <div style={{ fontSize: '12px', color: '#a0522d', marginTop: '6px' }}>
+                未歸屬：{unassignedMemberships.map(r => r.teacher_name || '（無老師名）').join('、')} —— 未歸屬資料請聯絡管理員。
+              </div>
+            )}
+
+            {/* 彙總卡片（§7.3）：**只读** —— 各師門就診數 / 未簽草案數 / 最近活動；不做單一等級（段位屬 Epic 5 §D5） */}
+            {lineageView === LINEAGE_ALL_VIEW && (
+              <div style={{ marginTop: '10px', padding: '10px', background: '#fff', borderRadius: '8px', border: '1px dashed #b9c3e0' }}>
+                <div style={{ fontSize: '13px', color: '#3a4a7a', fontWeight: 'bold', marginBottom: '6px' }}>全部師門（彙總 · 只讀）</div>
+                {lineageSummary.length === 0 ? (
+                  <div style={{ fontSize: '12px', color: '#888' }}>暫無彙總數據（僅統計在門師門的就診數 / 未簽草案數）。</div>
+                ) : (
+                  lineageSummary.map(s => (
+                    <div key={s.lineage_id} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '5px 0', borderTop: '1px dashed #eee', fontSize: '13px', color: '#333' }}>
+                      <span>{s.name || s.lineage_id}{s.status === 'archived' ? '（已封存）' : ''}<span style={{ color: '#999', marginLeft: '8px', fontSize: '12px' }}>師 · {s.teacher_name}</span></span>
+                      <span style={{ fontFamily: 'monospace', fontSize: '12px', color: '#555' }}>
+                        就診 {s.visits} 次 · 未簽草案 {s.unsigned_drafts} 份 · 最近 {s.last_visit_at ? formatAgentTime(s.last_visit_at) : '—'}
+                      </span>
+                    </div>
+                  ))
+                )}
+              </div>
+            )}
+
+            <div style={{ fontSize: '11px', color: '#999', marginTop: '8px', fontStyle: 'italic' }}>退出師門 = 歸屬標記為已退出，資料不會被刪除；自己在本門的病歷仍可查閱。</div>
+          </div>
+        )}
+
         {/* 【第62天调整】管理页签 · 学生（在上）：学生管理 */}
         {(currentRole === '李老师' || currentRole === '李老师智能体') && teacherTab === 'manage' && (
           <div style={{ ...boxStyle, background: '#f0f7f0' }}>
-            <div style={{ fontSize: '18px', color: '#5a7d5a', fontWeight: 'bold', marginBottom: '10px' }}>👥 学生管理（{teacherPatients.length}人）</div>
+            <div style={{ fontSize: '18px', color: '#5a7d5a', fontWeight: 'bold', marginBottom: '10px' }}>👥 学生管理（{teacherPatients.length}人）{renderLineageChip()}</div>
             {/* 【第58天新增】老师端设置学生提醒频率（A 每天 / B 隔天 / C 每周），与学生端 localStorage 共享 */}
             <div style={{ marginBottom: '12px', padding: '10px', background: '#fff', borderRadius: '8px', border: '1px dashed #b8d8c0' }}>
               <div style={{ fontSize: '13px', color: '#5a7d5a', fontWeight: 'bold', marginBottom: '8px' }}>⏰ 提醒频率设置（当前学生：{selectedPatient}）</div>
@@ -2798,7 +3187,7 @@ export default function App() {
                 const name = input?.value.trim()
                 if (!name) { alert("请输入学生姓名"); return }
                 fetch('/api/teacher/add-student', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ teacher_name: selectedTeacher, student_name: name }) })
-                  .then(() => { input.value = ''; fetch(`/api/teacher-patients?teacher_name=${selectedTeacher}`).then(r => r.json()).then(d => setTeacherPatients(d)); fetchPatients('张三') })
+                  .then(() => { input.value = ''; fetch(withLineage(`/api/teacher-patients?teacher_name=${selectedTeacher}`)).then(r => r.json()).then(d => setTeacherPatients(d)); fetchPatients('张三') })
               }} style={{ padding: '8px 16px', borderRadius: '6px', border: 'none', background: '#5a7d5a', color: '#fff', cursor: 'pointer' }}>+ 添加学生</button>
               <button onClick={handleCreateInvite} style={{ padding: '8px 16px', borderRadius: '6px', border: '1px solid #8b4513', background: 'transparent', color: '#8b4513', cursor: 'pointer' }}>🎫 生成邀请码</button>
             </div>
@@ -2839,7 +3228,7 @@ export default function App() {
                         <button onClick={() => {
                           if (!confirm(`确定要将学生【${s.name}】从您的名单中移除吗？`)) return
                           fetch(`/api/patient-teachers?patient_name=${s.name}&teacher_name=${selectedTeacher}`, { method: 'DELETE' })
-                            .then(() => fetch(`/api/teacher-patients?teacher_name=${selectedTeacher}`).then(r => r.json()).then(d => setTeacherPatients(d)))
+                            .then(() => fetch(withLineage(`/api/teacher-patients?teacher_name=${selectedTeacher}`)).then(r => r.json()).then(d => setTeacherPatients(d)))
                         }} style={{ padding: '4px 10px', borderRadius: '12px', border: '1px solid #c0392b', background: 'transparent', color: '#c0392b', cursor: 'pointer', fontSize: '12px' }}>移除</button>
                       )}
                     </div>
@@ -3304,9 +3693,12 @@ export default function App() {
 
         {/* 【Epic 1 子任務 4】管理頁籤 · 模板傳承（四類）：插在「學生管理」之後、「中藥材庫存」之前。
             卡片自帶 flag 探測（TEMPLATE_API_ENABLED=off → 整體不渲染；503 → 卡內紅字），
-            App.tsx 不參與任何模板邏輯，原有頁面結構與其它頁籤不受影響。 */}
+            App.tsx 不參與任何模板邏輯，原有頁面結構與其它頁籤不受影響。
+            【Epic 4 §3.3 / §7.2】把 `withLineage` **同一份**師門上下文傳進去（集中在一處拼参）：
+            flag off / 未開山門 → 空串 → TemplateStudio 不拼 lineage_id（請求與 Epic 4 之前逐字面一致）；
+            flag on → 非空 → 模板三處必帶入口（GET 列表 / POST 新建 / POST 衍生）自動帶上當前師門。 */}
         {isTeacherRole && teacherTab === 'manage' && (
-          <TemplateStudio teacherName={selectedTeacher} teacherId={selectedTeacher} />
+          <TemplateStudio teacherName={selectedTeacher} teacherId={selectedTeacher} lineageId={currentLineageId} />
         )}
 
         {/* 【第51天新增 / 第62天调整】中药材库存（合并进「管理」页签，排在学生卡片下方） */}
@@ -3542,7 +3934,7 @@ export default function App() {
             数据全部复用现有 state（appointments / teacherPatients / selectedPatient / clinicQueue），不新增接口、不改后端。 */}
         {isTeacherRole && teacherTab === 'clinic' && (
           <div style={{ ...boxStyle, background: '#f7fcf9', width: '100%' }}>
-            <div style={{ fontSize: '20px', color: '#5a7d5a', fontWeight: 'bold', marginBottom: '6px', paddingBottom: '12px', borderBottom: '2px solid #d8e8d8' }}>🩺 诊室队列</div>
+            <div style={{ fontSize: '20px', color: '#5a7d5a', fontWeight: 'bold', marginBottom: '6px', paddingBottom: '12px', borderBottom: '2px solid #d8e8d8' }}>🩺 诊室队列{renderLineageChip()}</div>
             <div style={{ fontSize: '12px', color: '#999', marginTop: '10px', marginBottom: '16px' }}>
               队列双列（📅 预约面诊 / 💻 远程问诊）｜ 搜索 + 临时加插 ｜ 当前就诊学生
             </div>
@@ -3776,7 +4168,7 @@ export default function App() {
             所有原有按钮、接口、state 逻辑保持不变，只是重新排列（仅诊室页签显示）。 */}
         {(currentRole === '李老师' || currentRole === '李老师智能体') && teacherTab === 'clinic' && (
           <div style={{ ...boxStyle, background: '#fcfdfa', border: '1px solid #d4c8a8', width: '100%' }}>
-            <div style={{ textAlign: 'center', fontSize: '20px', color: '#8b4513', fontWeight: 'bold', marginBottom: '6px', paddingBottom: '12px', borderBottom: '2px solid #e6dcc2' }}>🩺 诊室工作台</div>
+            <div style={{ textAlign: 'center', fontSize: '20px', color: '#8b4513', fontWeight: 'bold', marginBottom: '6px', paddingBottom: '12px', borderBottom: '2px solid #e6dcc2' }}>🩺 诊室工作台{renderLineageChip()}</div>
             <div style={{ textAlign: 'center', fontSize: '12px', color: '#999', marginBottom: '16px' }}>
               现场辅助记录（原料）→ 病历草案（AI 整理成品）→ 病历标签 → 开方 → 辨证施治方案（五部分共用一个外边框，部分之间虚线分隔）
             </div>
