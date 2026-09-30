@@ -1,6 +1,8 @@
 /**
- * 老師端首頁「🧭 智能體階段」卡（Epic 2 · 施工步驟 **6a + 6b**）
- *   6a：骨架 + 掛載探測 + 階段真值靜態區；6b：指標區（① ② ③）+ 閾值折疊區 + `config_source` 角標 + 「🔄 立即評估」。
+ * 老師端首頁「🧭 智能體階段」卡（Epic 2 · 施工步驟 **6a + 6b + 6c**）
+ *   6a：骨架 + 掛載探測 + 階段真值靜態區；6b：指標區（① ② ③）+ 閾值折疊區 + `config_source` 角標 + 「🔄 立即評估」；
+ *   6c：「⬇ 降級」卡內二次確認（`to_stage` 只列低於當前 rank 者 + `reason` 輸入）+ 評估 / 降級成功後
+ *       回調父級重拉「智能體工作台」（`onEvaluated`）。
  *
  * 對齊：docs/epic2-agent-stage-design-v1.md
  *   §4.5-⑤ 前端卡片（探測 / 展示 / 按鈕 / 能力區 / 鐵律文案 / 樣式復用）
@@ -14,7 +16,9 @@
  *   ✓ 6b：① ② 指標（百分比 + 樣本數 / 樣本不足 / 違規紅字 / 近似樣本 / 最差樣本）、③ 佔位文案、
  *     13 鍵閾值折疊區（`matrix_enforced=false` 紅字）、`config_source` 來源角標、
  *     `stale` 提示（設計原句）+「🔄 立即評估」→ `POST …/evaluate` → **重拉 #1**；
- *   ✗ 6c 「⬇ 降級」（卡內二次確認 + `reason` 輸入）與確認升級後的完整刷新鏈路；
+ *   ✓ 6c：「⬇ 降級」（卡內二次確認區 + `reason` 輸入 + 目標階段只列**低於當前 rank** 者）→
+ *     `POST …/demote` → **重拉 #1**（徽章翻新、來源變「老師主動降級」）；評估 / 降級成功後調
+ *     `onEvaluated()` → 父級重拉工作台（新推薦 / 行動日誌立刻可見）；
  *   ✗ 6d 能力區（`capabilities` → 🧪 證型候選 / 📜 方劑建議 / 🧾 預處方預填；需 `draftId`）。
  *   `capabilities` 的型別已按契約定好（形狀即契約），6d 只加渲染、不改型別。
  *
@@ -26,10 +30,37 @@
  *   2. 評估後**只重拉 #1**（`GET /api/agent/stage`）：#2 的 18 鍵快照**不含 `capabilities`**
  *      （接口層註釋 `agent_stage_api.py:281-282` 明說「能力區的唯一來源是 #1」）→ 拿 #2 的 body
  *      整體 `setView` 會把能力區的依據抹掉。本卡因此**只**認 #1 為 `view` 的唯一來源。
- *   3. 評估成功只留一行時間戳回執；`changed{stage_changed, recommended, demoted, reason}` **不在本卡渲染**
- *      （屬 6c 的確認 / 降級鏈路）。連帶後果：本節點不會主動刷新下方「智能體工作台」卡 —— 父級
- *      `refreshKey` 只能由 `fetchAgentWorkbench()` 自增。**若本輪真的產生了新推薦**，老師要等該卡拉一次
- *      才會看到「⏳ 待你確認」的新項（6c 落地完整鏈路時一併解決：`evaluate` 後回調父級重拉）。
+ *   3. 評估成功只留一行時間戳回執；`changed{stage_changed, recommended, demoted, reason}` **不在本卡渲染**。
+ *      【6c 已補】`evaluate` / `demote` 成功後調 `onEvaluated()` → 父級 `fetchAgentWorkbench()`（末尾已自增
+ *      `agentStageRefreshKey`）→ 下方「智能體工作台」卡（⏳ 待你確認 / 📜 行動日誌）立刻跟上。
+ *      副作用：`refreshKey` 自增會讓本卡的**探測 effect 再跑一次**（`probing` 期間整卡短暫不渲染）——
+ *      這是 **6a 既有**行為（老師點 ✅/❌/🔍 走的就是同一條路），本步刻意不動探測口徑（見 §6c 口徑 6）。
+ *
+ * 【6c 的六條施工口徑】
+ *   1. 降級區**追加在 6b 按鈕行下方**（新開一個 div），6b 那一行的 JSX 一字不改 ——「不改已驗收區」
+ *      比「兩顆按鈕擠一行」重要。
+ *   2. 下拉的目標階段只列**低於當前 rank** 者：rank 用 `AGENT_STAGE_ORDER`（§0.4 展示順序 = 後端
+ *      `STAGES` 的鏡像）現算。這是**展示所需的最小本地計算**，不是第二份判定 —— 接受 / 拒絕
+ *      （非法值 400 `stage_invalid_value`、同階段或向上 409 `stage_transition_invalid`）永遠只在
+ *      後端 `_demote()`（`agent_stage_service.py:2947-2958`）。
+ *   3. 卡內二次確認 = **防誤點**的 UI 護欄，與 §1.1「降級立即生效、無需確認」不矛盾：那句講的是
+ *      **狀態機**不需要「待老師確認」那道閘（只有升級才有 `pending_*`），不是講 UI 不許問一次。
+ *      全程不彈窗、不阻塞其它卡片（§4.5-⑤ 原句「先弹卡内二次确认区，不打断页面」）。
+ *   4. 失敗分級（**不假成功**：任何非 2xx 都不改徽章、不收起二次確認區）：
+ *      · 404 `agent_stage_disabled`（flag 中途被關）→ 整卡退場；
+ *      · 503 `agent_stage_store_unavailable`（遷移沒跑）→ 走 6a 的「階段表未就緒」紅字；
+ *      · 其餘（400 `stage_invalid_value` / 409 `stage_transition_invalid` / 503 `demote_write_failed` /
+ *        503 `stage_read_degraded` / 403 `teacher_mismatch` / 網絡異常）→ **卡內紅字** + 保留舊畫面，
+ *        文案直接用後端統一錯誤體的 `msg`（`agent_stage_api.py:207-222` 逐條已是繁體人話）。
+ *        ⚠ 503 **不能**一律當「遷移沒跑」：`demote_write_failed` 是「寫不進去、階段保持原值」，
+ *        與 `agent_stage_store_unavailable` 的處置完全不同 → 本卡按 `failure.code` 分，不看狀態碼。
+ *   5. `degraded=true` 時**不禁用**降級按鈕：本卡的 `view` 只是一份快照，快照說降級態不代表此刻還是 ——
+ *      判定權只有後端一處（後端 fail-closed 會回 503 `stage_read_degraded`，卡內照實顯示）。
+ *      與 6b「按鈕常顯」同一條理由：前端不長出第二個判定。
+ *   6. 降級成功**也**調 `onEvaluated()`：降級會寫一行行動日誌（`action='manual_demote'`）+ 清掉
+ *      `pending_stage` / `pending_task_id`（`agent_stage_service.py:2972-2981`）→ 工作台那兩塊
+ *      要立刻跟上。這是**超出 requirement 字面**的一處（requirement 只寫了 evaluate 後調）；
+ *      如要嚴格照字面，把 `handleDemote` 末尾那一行刪掉即可（其餘邏輯不受影響）。
  *
  * 【探測（§4.5-⑤ 首條；與 `TemplateStudio` 同一套口徑）】
  *   `GET /api/agent/stage?teacher_name=&teacher_id=`
@@ -158,6 +189,12 @@ export interface AgentStagePanelProps {
   refreshKey: number
   /** 【6d · 已裁決①】當前就診學生的未簽草案 id；無值 → 能力區三按鈕置灰。6a 不渲染能力區，故不讀。 */
   draftId?: number
+  /**
+   * 【6c】本卡剛剛**寫入了階段真值**（`evaluate` 或 `demote` 成功）→ 請父級重拉「智能體工作台」卡：
+   * 可能剛產生新推薦（⏳ 待你確認）、也可能剛多一行降級行動日誌（📜 行動日誌）。
+   * 可選（`?`）：本卡單獨使用時不傳也能跑 —— 缺省 = 不通知（卡片自身照常刷新）。
+   */
+  onEvaluated?: () => void
 }
 
 /* ============================ 契約鏡像常量（前端唯一允許硬編碼的一塊） ============================ */
@@ -389,6 +426,40 @@ const ASP_BUTTON_OFF: CSSProperties = {
   ...ASP_BUTTON, background: '#c9b79c', borderColor: '#c9b79c', cursor: 'not-allowed'
 }
 
+/* ---------- 【6c】降級區：樣式與文案常量（按鈕沿用 6b 的 `ASP_BUTTON` / `ASP_BUTTON_OFF`） ---------- */
+
+/**
+ * `reason` 輸入框的**默認值**（§4.5-⑤ 原句：默认 `由老師主動降級`）。
+ * 老師可改可清空；清空後審計只留服務層的固定句式（`_demote_note()` 把空白串當「沒填」）。
+ */
+const AGENT_STAGE_DEMOTE_REASON_DEFAULT = '由老師主動降級'
+/**
+ * `reason` 輸入框字數上限：這是**輸入框護欄**（防手滑把一整段話貼進審計），不是校驗 ——
+ * 後端 `AgentStageActionInput.reason` 沒有任何長度限制（`models.py:138`），本卡不新增第二道規則。
+ */
+const AGENT_STAGE_DEMOTE_REASON_MAX_LENGTH = 120
+
+/** 「⬇ 降級」：描邊白底（**不**與「🔄 立即評估」搶主色 —— 收窄權限的動作，點之前先看清二次確認）。 */
+const ASP_BUTTON_OUTLINE: CSSProperties = {
+  padding: '6px 16px', borderRadius: '20px', border: '1px solid #8b4513', background: '#fffdf5',
+  color: '#8b4513', fontSize: '13px', cursor: 'pointer'
+}
+/** 無可降層級 / 降級進行中的描邊按鈕（置灰不可點，與 `ASP_BUTTON_OFF` 同款姿態）。 */
+const ASP_BUTTON_OUTLINE_OFF: CSSProperties = {
+  ...ASP_BUTTON_OUTLINE, borderColor: '#c9b79c', color: '#a8977c', cursor: 'not-allowed'
+}
+/** 卡內二次確認區（淺黃底 + 金邊：與 `ASP_PENDING` 的「提醒」色系一致，但一眼看得出是「要按下去」的區）。 */
+const ASP_DEMOTE_BOX: CSSProperties = {
+  background: '#fffbe8', border: '1px solid #f0e2b6', borderRadius: '8px', padding: '10px 12px',
+  marginTop: '8px', fontSize: '13px', color: '#333'
+}
+/** 原生 `select` / `input` + 棕色描邊（**不引 UI 庫**；配色與卡片一致）。 */
+const ASP_SELECT: CSSProperties = {
+  padding: '4px 8px', borderRadius: '6px', border: '1px solid #e2d6b8', background: '#fffdf5',
+  color: '#333', fontSize: '13px', fontFamily: 'inherit'
+}
+const ASP_INPUT: CSSProperties = { ...ASP_SELECT, flex: '1 1 240px', minWidth: '200px' }
+
 /* ============================ 工具（與 TemplateStudio 同款；不改既有的兩個文件） ============================ */
 
 /**
@@ -427,6 +498,28 @@ async function callStageApi<T>(path: string, init?: RequestInit): Promise<StageA
 /** stage key → 繁體徽章（後端只給 key 的兩處用：`next_stage` / `pending_stage`；未知 key 原樣顯示）。 */
 const stageKeyLabel = (key: string) => AGENT_STAGE_LABELS[key] || key
 
+/**
+ * 【6c】低於 `current` 的階段 key（**由低到高**；`current` 未知 / 已在最低階 → 空陣列）。
+ *
+ * rank 用 `AGENT_STAGE_ORDER` 現算（= 後端 `STAGES` 的鏡像，見檔頭 §6c 口徑 2）：這只回答「下拉裡該列出
+ * 哪幾個選項」的**展示**問題，不是第二份判定 —— 同階段 / 向上的請求自有後端回 409
+ * `stage_transition_invalid`（檔案內**唯一**的階段方向判定在 `_demote()`）。
+ */
+const lowerStageKeys = (current: string) => {
+  const rank = AGENT_STAGE_ORDER.indexOf(current)
+  return rank > 0 ? AGENT_STAGE_ORDER.slice(0, rank) : []
+}
+
+/**
+ * 【6c】實際送出的降級目標：state 裡記的 `picked` 若已不在候選內（剛降級成功 → `view.stage` 已變、
+ * 換了老師、後端階段 key 漂移），就回退到「退一級」；候選為空則回空串（呼叫方據此停手，不送空 `to_stage`）。
+ * 用「推導」而不是 `useEffect` 同步：降級成功後的那一次重繪就會自動修正，不留中間態。
+ */
+const resolveDemoteTarget = (current: string, picked: string) => {
+  const targets = lowerStageKeys(current)
+  return targets.includes(picked) ? picked : (targets[targets.length - 1] || '')
+}
+
 /** blocker 英文碼 → 繁體一句話（未登記的碼原樣顯示 + 標記，見常量註釋）。 */
 const blockerText = (code: string) => AGENT_STAGE_BLOCKER_LABELS[code] || `${code}（未登記文案）`
 
@@ -439,7 +532,7 @@ const stageSinceText = (value: string) => {
 
 /* ============================ 主組件 ============================ */
 
-export default function AgentStagePanel({ teacherName, teacherId, refreshKey }: AgentStagePanelProps) {
+export default function AgentStagePanel({ teacherName, teacherId, refreshKey, onEvaluated }: AgentStagePanelProps) {
   const [probeState, setProbeState] = useState<StageProbeState>('probing')
   const [view, setView] = useState<StageView | null>(null)
   // 【6b】手動評估：`evaluating` = 請求在飛（按鈕置灰防連點，也防兩次評估交錯寫快照）；
@@ -448,6 +541,16 @@ export default function AgentStagePanel({ teacherName, teacherId, refreshKey }: 
   const [evaluateNote, setEvaluateNote] = useState('')
   // 【6b】13 鍵閾值折疊區的展開態（預設收起：老師的日常視線是徽章 + 指標，閾值是備查）。
   const [showThresholds, setShowThresholds] = useState(false)
+  // 【6c】手動降級（§4.5-⑤「先弹卡内二次确认区，不打断页面」）：
+  //   `showDemote` = 二次確認區展開態（卡內、**不彈窗**）；`demoteTarget` = 選中的目標階段 key
+  //   （空串 = 未選 → 由 `resolveDemoteTarget()` 推導出「退一級」）；`demoteReason` = 審計說明
+  //   （預設見常量，老師可改可清空）；`demoting` = 請求在飛（置灰防連點）；
+  //   `demoteNote` = 一行回執（成功 `✅` / 失敗 `⚠`），成功後顯示在按鈕旁、失敗時顯示在區內。
+  const [showDemote, setShowDemote] = useState(false)
+  const [demoteTarget, setDemoteTarget] = useState('')
+  const [demoteReason, setDemoteReason] = useState(AGENT_STAGE_DEMOTE_REASON_DEFAULT)
+  const [demoting, setDemoting] = useState(false)
+  const [demoteNote, setDemoteNote] = useState('')
 
   // 掛載探測（§4.5-⑤ 首條）：結果緩存於 state，不重複探測；換老師 / 刷新信號變化才重探。
   // 重置與抓取都放在 async 閉包內（不在 effect 內同步 setState，避免級聯渲染）。
@@ -510,6 +613,70 @@ export default function AgentStagePanel({ teacherName, teacherId, refreshKey }: 
     setView(refreshed.data)
     setProbeState('on')
     setEvaluateNote(`✅ 已重新評估（${clockText()}）`)
+    // 【6c】通知父級重拉「智能體工作台」卡（檔頭口徑 3）：本輪可能剛建了一張升級推薦單
+    // （⏳ 待你確認）或翻了階段 —— 老師不該還要等別的操作才看到。缺省不傳（獨立使用）時這行是 no-op。
+    onEvaluated?.()
+  }
+
+  /**
+   * 【6c】「確認降級」：`POST /api/agent/stage/demote`（body = 鑑權兩欄 + `to_stage` + `reason`；
+   * §4.6-⑤）→ 成功**重拉 #1**：徽章翻新、`stage_source='manual_demote'`、`pending_*` 被清空
+   * （服務層那一條 upsert 同時清待確認對，`agent_stage_service.py:2972-2973`）。
+   *
+   * 失敗一律**卡內**（檔頭 §6c 口徑 4）：
+   *   · 404 `agent_stage_disabled`（flag 中途被關）→ 整卡退場；
+   *   · 503 `agent_stage_store_unavailable`（遷移沒跑）→ 走 6a 的「階段表未就緒」紅字；
+   *   · 其餘（400 / 409 / 503 `demote_write_failed` / 503 `stage_read_degraded` / 403 / 網絡）→ 紅字 +
+   *     **保留舊畫面 + 二次確認區不關**（老師可改目標 / 改說明直接再試）。
+   * 任何非 2xx 都**不改徽章**：假成功會讓老師以為真的降下去了（§4.6-⑤ 的設計意圖）。
+   * ⚠ 503 按 `failure.code` 分而非狀態碼：`demote_write_failed` 是「寫不進去、階段保持原值」，
+   * 與「表沒建」完全是兩回事（後者已有專門畫面）。
+   */
+  const handleDemote = async () => {
+    if (demoting) return
+    // 目標用**推導值**（不是 state 原值）：降級成功後 `view.stage` 已變，state 可能還記著舊選擇。
+    const target = resolveDemoteTarget(view ? view.stage : '', demoteTarget)
+    if (!target) {
+      // 兜底：候選為空時按鈕已置灰，正常走不到這裡；不讓一個空 `to_stage` 送去換 400。
+      setDemoteNote('⚠ 沒有可選的降級目標（當前階段未知或已在最低階段）')
+      return
+    }
+    setDemoting(true)
+    setDemoteNote('')
+    const demoted = await callStageApi<unknown>('/api/agent/stage/demote', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        teacher_name: teacherName,
+        teacher_id: teacherId,
+        to_stage: target,
+        reason: demoteReason
+      })
+    })
+    if (!demoted.ok) {
+      setDemoting(false)
+      if (demoted.failure.code === 'agent_stage_disabled') { setProbeState('off'); return }
+      if (demoted.failure.code === 'agent_stage_store_unavailable') { setProbeState('no_store'); return }
+      setDemoteNote(`⚠ 降級未完成：${demoted.failure.msg}`)
+      return
+    }
+    const refreshed = await callStageApi<StageView>(
+      `/api/agent/stage?${identityQuery(teacherName, teacherId)}`)
+    setDemoting(false)
+    setShowDemote(false)
+    setDemoteReason(AGENT_STAGE_DEMOTE_REASON_DEFAULT)
+    if (!refreshed.ok) {
+      if (refreshed.failure.code === 'agent_stage_disabled') { setProbeState('off'); return }
+      if (refreshed.failure.code === 'agent_stage_store_unavailable') { setProbeState('no_store'); return }
+      setDemoteNote(`⚠ 降級已送出，但重讀階段視圖失敗（畫面仍是舊快照）：${refreshed.failure.msg}`)
+      return
+    }
+    setView(refreshed.data)
+    setProbeState('on')
+    // 文案用**降級前**選中的 key：重讀後 `view.stage` 已經是目標階段，拿它反推「降去哪」會繞一圈。
+    setDemoteNote(`✅ 已降級至「${stageKeyLabel(target)}」（已寫入階段審計與行動日誌）`)
+    // 檔頭 §6c 口徑 6：降級會寫一行行動日誌 + 清待確認對 → 工作台那兩塊要立刻跟上。
+    onEvaluated?.()
   }
 
   // §4.5-⑤ / 裁決②：503 = 運維故障（遷移沒跑）→ **卡內紅字**說清楚，不靜默消失
@@ -542,6 +709,11 @@ export default function AgentStagePanel({ teacherName, teacherId, refreshKey }: 
   const configBadge = configSourceBadge(view.config_source)
   // §2.5 的臨時運維閘：放寬態下**不推荐升级** → 必須當場可見（不能只藏在折疊區裡）。
   const matrixRelaxed = thresholds.matrix_enforced === false
+  // 【6c】降級候選（由低到高的前幾階）與「實際會送出的目標」：兩者都隨 `view.stage` 推導
+  // （見檔頭 §6c 口徑 2/5 —— 候選只是下拉的選項清單；方向判定在後端）。
+  const currentRank = AGENT_STAGE_ORDER.indexOf(view.stage)
+  const demoteTargets = lowerStageKeys(view.stage)
+  const demoteTargetValue = resolveDemoteTarget(view.stage, demoteTarget)
 
   return (
     <div style={ASP_BOX}>
@@ -662,6 +834,92 @@ export default function AgentStagePanel({ teacherName, teacherId, refreshKey }: 
         {/* 回執（成功 = 時間戳 / 失敗 = ⚠ 開頭）；以 `⚠` 前綴決定顏色 —— 只有這兩種回執，不值得為它多開一個 state。 */}
         {evaluateNote && (
           <span style={evaluateNote.startsWith('⚠') ? ASP_ALERT_TEXT : ASP_METRIC_HINT}>{evaluateNote}</span>
+        )}
+      </div>
+
+      {/* ---------- 【6c】手動降級（§4.5-⑤：卡內二次確認，不彈窗、不阻斷其它卡片） ---------- */}
+      {/* 刻意放在 6b 按鈕行**下方**（新開一個 div）→ 6b 那一行的 JSX 一字不改（檔頭 §6c 口徑 1）。 */}
+      <div style={{ marginTop: '10px' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '10px', flexWrap: 'wrap' }}>
+          <button
+            type="button"
+            style={demoteTargets.length === 0 || demoting ? ASP_BUTTON_OUTLINE_OFF : ASP_BUTTON_OUTLINE}
+            onClick={() => { setShowDemote(open => !open); setDemoteNote('') }}
+            disabled={demoteTargets.length === 0 || demoting}
+          >
+            ⬇ 降級
+          </button>
+          {/* 無可降層級時把**原因**說在按鈕旁（置灰按鈕不給理由 = 讓老師自己猜）。 */}
+          {demoteTargets.length === 0 && (
+            <span style={ASP_HINT}>
+              {currentRank < 0
+                ? '當前階段未知（後端回傳的 stage 不在五階段內），無法降級；請先「🔄 立即評估」或聯絡管理員'
+                : '已在最低階段（觀察期），無可降級'}
+            </span>
+          )}
+          {/* 成功回執顯示在按鈕旁（此時二次確認區已收起）；失敗的紅字顯示在區內（二次確認區不關）。 */}
+          {!showDemote && demoteNote && (
+            <span style={demoteNote.startsWith('⚠') ? ASP_ALERT_TEXT : ASP_METRIC_HINT}>{demoteNote}</span>
+          )}
+        </div>
+
+        {showDemote && demoteTargets.length > 0 && (
+          <div style={ASP_DEMOTE_BOX}>
+            <div style={{ color: '#8b4513', fontWeight: 'bold', marginBottom: '6px' }}>
+              確定要降級嗎？降級立即生效（不必等任何人確認），且智能體不會自動幫你升回。
+            </div>
+            <div style={ASP_METRIC_ROW}>
+              <span style={{ ...ASP_METRIC_LABEL, minWidth: '84px' }}>降級到</span>
+              <select
+                style={ASP_SELECT}
+                value={demoteTargetValue}
+                onChange={event => setDemoteTarget(event.target.value)}
+              >
+                {demoteTargets.map(key => (
+                  <option key={key} value={key}>{stageKeyLabel(key)}</option>
+                ))}
+              </select>
+              <span style={ASP_METRIC_HINT}>當前：{view.stage_label || stageKeyLabel(view.stage)}</span>
+            </div>
+            <div style={ASP_METRIC_ROW}>
+              <span style={{ ...ASP_METRIC_LABEL, minWidth: '84px' }}>降級說明</span>
+              <input
+                style={ASP_INPUT}
+                value={demoteReason}
+                maxLength={AGENT_STAGE_DEMOTE_REASON_MAX_LENGTH}
+                placeholder="可留空（審計只留固定句式）"
+                onChange={event => setDemoteReason(event.target.value)}
+              />
+            </div>
+            <div style={{ ...ASP_HINT, lineHeight: '1.7' }}>
+              這裡寫的說明會原文寫進階段變更審計（下方工作台的「📜 行動日誌」也會多一行）；
+              審計裡的每一句話都要能追溯到一個人，所以接口層不替你編說明。
+            </div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '10px', flexWrap: 'wrap', marginTop: '8px' }}>
+              <button
+                type="button"
+                style={demoting ? ASP_BUTTON_OFF : ASP_BUTTON}
+                onClick={handleDemote}
+                disabled={demoting}
+              >
+                {demoting ? '降級中…' : '確認降級'}
+              </button>
+              <button
+                type="button"
+                style={ASP_BUTTON_OUTLINE}
+                onClick={() => { setShowDemote(false); setDemoteNote('') }}
+                disabled={demoting}
+              >
+                取消
+              </button>
+              {demoting && <span style={ASP_METRIC_HINT}>寫入階段真值中，請勿關閉頁面…</span>}
+            </div>
+            {demoteNote && (
+              <div style={{ ...(demoteNote.startsWith('⚠') ? ASP_ALERT_TEXT : ASP_METRIC_HINT), marginTop: '6px' }}>
+                {demoteNote}
+              </div>
+            )}
+          </div>
         )}
       </div>
 

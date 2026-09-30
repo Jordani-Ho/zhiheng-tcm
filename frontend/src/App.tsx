@@ -2974,12 +2974,17 @@ export default function App() {
             掛載條件與上一張卡**逐字一致**（`isTeacherRole && teacherTab === 'home'`，其中
             `isTeacherRole = currentRole === '李老师' || currentRole === '李老师智能体'`，見本文件上方定義）。
             階段是老師的能力畫像（§5.3）→ **不**傳 lineage_id、也不參與師門就緒門：
-            flag on 但老師尚未開山門時本卡照常顯示（與「📜 模板傳承」卡的 no_lineage 分支刻意不同）。 */}
+            flag on 但老師尚未開山門時本卡照常顯示（與「📜 模板傳承」卡的 no_lineage 分支刻意不同）。
+            【Epic 2 步驟 6c】追加 `onEvaluated`：階段卡自己剛寫了階段真值（評估 / 降級成功）→ 重拉本工作台，
+            讓「⏳ 待你確認」的新推薦與「📜 行動日誌」裡新增的降級一行**立刻可見**（沿用既有共享路徑
+            `fetchAgentWorkbench()`，其末尾已自增 `agentStageRefreshKey` → 階段卡自己也重探一次）。
+            不新增按鈕、不加接口、下方既有三個區塊的 JSX 一行不改。 */}
         {isTeacherRole && teacherTab === 'home' && (
           <AgentStagePanel
             teacherName={selectedTeacher}
             teacherId={selectedTeacher}
             refreshKey={agentStageRefreshKey}
+            onEvaluated={() => { fetchAgentWorkbench() }}
           />
         )}
 
