@@ -1,6 +1,8 @@
 import { useEffect, useState, useRef } from 'react'
 // 【Epic 1 子任務 4】老師端模板配置卡片（📜 模板傳承（四類））：新檔 components 風格獨立，App.tsx 只做 import + 掛載
 import TemplateStudio from './TemplateStudio'
+// 【Epic 2 步驟 6a】老師端 🏠 首頁「🧭 智能體階段」卡（階段畫像 + 一致率；flag off / 探測失敗 → 整卡不渲染）
+import AgentStagePanel from './AgentStagePanel'
 
 interface HuangliData { date: string; lunar: string; solar_term: string; solar_term_tip: string; health_trend: string; homework: string; }
 interface RoleData { role_type: string; name: string; task: string; detail: string; }
@@ -427,6 +429,10 @@ export default function App() {
   const [agentDoneTasks, setAgentDoneTasks] = useState<any[]>([])
   const [agentActionLogs, setAgentActionLogs] = useState<any[]>([])
   const [scanningAgent, setScanningAgent] = useState(false)
+  // 【Epic 2 步驟 6a】🧭 智能體階段卡的刷新信號：老師點 🏠 的 ✅/❌/🔍 走的都是 `fetchAgentWorkbench()`，
+  //   其末尾會自增這個值 → 卡片重探一次（確認升級後徽章要立刻變）。
+  //   刻意**不**放進 `clearLineageScopedPanels`（切角色 / 切師門不該把「老師自己的階段」清空）。
+  const [agentStageRefreshKey, setAgentStageRefreshKey] = useState(0)
   // 【第61天新增】首页「今日备忘录」时间轴：已完成事项（key 列表；点“完成”后从列表移除）+ 当前时间 + 本地记录日期
   const [memoDoneKeys, setMemoDoneKeys] = useState<string[]>([])
   const [memoNow, setMemoNow] = useState(() => Date.now())
@@ -1254,6 +1260,10 @@ export default function App() {
       .then(res => res.json())
       .then(data => setAgentActionLogs(Array.isArray(data) ? data : []))
       .catch(() => setAgentActionLogs([]))
+    // 【Epic 2 步驟 6a】本函數的三個調用點（✅ 確認 / ❌ 忽略 / 🔍 立即掃描）都要走到這裡：
+    //   自增刷新信號 → 🧭 智能體階段卡重探一次。確認升級後 `stage_source='teacher_confirm'`、
+    //   徽章要立刻從「學習期」翻成「見習期」，所以刷新必須掛在這條共享路徑上（不新增按鈕、不加接口）。
+    setAgentStageRefreshKey(k => k + 1)
   }
 
   // 【第82天新增 / 老师端待处理陈述】📝 待处理陈述：拉取当前老师名下 status=pending 的学生陈述
@@ -2958,6 +2968,19 @@ export default function App() {
               )}
             </div>
           </div>
+        )}
+
+        {/* 【Epic 2 步驟 6a】🧭 智能體階段（老師端 🏠 首頁；位置：智能體工作台卡下方、今日備忘錄卡上方）。
+            掛載條件與上一張卡**逐字一致**（`isTeacherRole && teacherTab === 'home'`，其中
+            `isTeacherRole = currentRole === '李老师' || currentRole === '李老师智能体'`，見本文件上方定義）。
+            階段是老師的能力畫像（§5.3）→ **不**傳 lineage_id、也不參與師門就緒門：
+            flag on 但老師尚未開山門時本卡照常顯示（與「📜 模板傳承」卡的 no_lineage 分支刻意不同）。 */}
+        {isTeacherRole && teacherTab === 'home' && (
+          <AgentStagePanel
+            teacherName={selectedTeacher}
+            teacherId={selectedTeacher}
+            refreshKey={agentStageRefreshKey}
+          />
         )}
 
         {/* 【第61天新增】老师端：📋 今日备忘录（动态时间轴 + 未排期事项列；已完成移除、逾期变灰、跨天自动清空） */}
