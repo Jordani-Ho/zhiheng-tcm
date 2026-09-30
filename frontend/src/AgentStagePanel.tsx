@@ -1,20 +1,35 @@
 /**
- * 老師端首頁「🧭 智能體階段」卡（Epic 2 · 施工步驟 **6a**：骨架 + 掛載探測 + 靜態區）
+ * 老師端首頁「🧭 智能體階段」卡（Epic 2 · 施工步驟 **6a + 6b**）
+ *   6a：骨架 + 掛載探測 + 階段真值靜態區；6b：指標區（① ② ③）+ 閾值折疊區 + `config_source` 角標 + 「🔄 立即評估」。
  *
  * 對齊：docs/epic2-agent-stage-design-v1.md
  *   §4.5-⑤ 前端卡片（探測 / 展示 / 按鈕 / 能力區 / 鐵律文案 / 樣式復用）
  *   §4.6-① `GET /api/agent/stage`（服務層 `stage_view()` 直出 **15 鍵**，形狀即契約）
+ *   §4.6-② `POST /api/agent/stage/evaluate`（`evaluate()` 的 **18 鍵**快照 + `changed`，**無** `capabilities`）
  *   §4.7   掛載點與施工循序
  *
- * 【本步（6a）的邊界】只做「掛載探測 + 階段真值靜態區 + 底部鐵律文案」：
- *   ✓ 徽章（後端 `stage_label` 直出，前端**不自己查**標籤表）、`stage_since`、`stage_source` 來源注記、
- *     `next_stage`、`pending_stage` / `pending_task_id`（引導去按既有的 ✅）、`blockers[]`、
- *     `stale` / `degraded` 提示；
- *   ✗ 6b 指標區（① ② ③ + 閾值回顯 + `config_source` 角標）與「🔄 立即評估」；
+ * 【已施工範圍】6a = 「掛載探測 + 階段真值靜態區 + 底部鐵律文案」；6b = 「指標區 + 閾值回顯 + 來源角標 + 手動評估」：
+ *   ✓ 6a：徽章（後端 `stage_label` 直出，前端**不自己查**標籤表）、`stage_since`、`stage_source` 來源注記、
+ *     `next_stage`、`pending_stage` / `pending_task_id`（引導去按既有的 ✅）、`blockers[]`、`degraded` 提示；
+ *   ✓ 6b：① ② 指標（百分比 + 樣本數 / 樣本不足 / 違規紅字 / 近似樣本 / 最差樣本）、③ 佔位文案、
+ *     13 鍵閾值折疊區（`matrix_enforced=false` 紅字）、`config_source` 來源角標、
+ *     `stale` 提示（設計原句）+「🔄 立即評估」→ `POST …/evaluate` → **重拉 #1**；
  *   ✗ 6c 「⬇ 降級」（卡內二次確認 + `reason` 輸入）與確認升級後的完整刷新鏈路；
  *   ✗ 6d 能力區（`capabilities` → 🧪 證型候選 / 📜 方劑建議 / 🧾 預處方預填；需 `draftId`）。
- *   `metrics` / `thresholds` / `capabilities` / `config_source` 的型別本步已按契約定好（形狀即契約），
- *   只是**不渲染** —— 6b/6c/6d 只加渲染，不改型別。
+ *   `capabilities` 的型別已按契約定好（形狀即契約），6d 只加渲染、不改型別。
+ *
+ * 【6b 的三個施工口徑（偏離原句時的理由都寫在這裡）】
+ *   1. 「🔄 立即評估」**常顯**（不只在 `stale` 時）：設計 §4.5-⑤ 的按鈕清單本就無條件列出，且服務層在
+ *      「從沒評估過」時給的唯一 blocker 是 `evaluation_not_run`（`agent_stage_service.py:2568-2569`：
+ *      「先告诉老师去点「立即評估」」）—— 若只在 `stale` 時才給按鈕，「有模板但樣本不足 / 指標沒達標」
+ *      的老師就沒有手動重算的入口。`stale` 只負責那句提示（回復設計原句）。
+ *   2. 評估後**只重拉 #1**（`GET /api/agent/stage`）：#2 的 18 鍵快照**不含 `capabilities`**
+ *      （接口層註釋 `agent_stage_api.py:281-282` 明說「能力區的唯一來源是 #1」）→ 拿 #2 的 body
+ *      整體 `setView` 會把能力區的依據抹掉。本卡因此**只**認 #1 為 `view` 的唯一來源。
+ *   3. 評估成功只留一行時間戳回執；`changed{stage_changed, recommended, demoted, reason}` **不在本卡渲染**
+ *      （屬 6c 的確認 / 降級鏈路）。連帶後果：本節點不會主動刷新下方「智能體工作台」卡 —— 父級
+ *      `refreshKey` 只能由 `fetchAgentWorkbench()` 自增。**若本輪真的產生了新推薦**，老師要等該卡拉一次
+ *      才會看到「⏳ 待你確認」的新項（6c 落地完整鏈路時一併解決：`evaluate` 後回調父級重拉）。
  *
  * 【探測（§4.5-⑤ 首條；與 `TemplateStudio` 同一套口徑）】
  *   `GET /api/agent/stage?teacher_name=&teacher_id=`
@@ -207,10 +222,106 @@ const AGENT_STAGE_BLOCKER_LABELS: Record<string, string> = {
 }
 
 /**
- * `stale=true` 的提示。設計 §4.5-⑤ 的原句尾半段是「可點「立即評估」」——那個按鈕屬 6b，
- * **6a 不指向不存在的控件**（UI 說謊比不提示更糟）；6b 落地按鈕時把本句接成設計原句即可。
+ * `stale=true` 的提示（**6b 已接回設計原句**）。
+ *
+ *   · 設計 §4.5-⑤ 原句（`docs/epic2-agent-stage-design-v1.md:537`）＝ `指標可能已過時，可點「立即評估」`；
+ *   · 本卡 ＝ 6a 的前半段（把「過時」講清楚：上次快照已超出 `metrics_ttl_hours`）+ 設計的尾半段。
+ *     `「立即評估」` 四字現在**真有控件可指**（6b 落了按鈕）；6a 當時只寫前半段，正是因為
+ *     「指向不存在的控件」比不提示更糟。
  */
-const AGENT_STAGE_STALE_HINT = '指標可能已過時：上次評估快照已超出有效期，建議重算'
+const AGENT_STAGE_STALE_HINT =
+  '指標可能已過時：上次評估快照已超出有效期，可點「立即評估」'
+
+/* ============================ 【6b】指標區的文案與工具 ============================ */
+
+/** 三個指標的標題（編號 ①②③ 與設計 §3.1 的定義一一對應，不重排、不合併）。 */
+const AGENT_STAGE_METRIC_LABELS = {
+  template_match: '① 模板匹配度',
+  modification_consistency: '② 病歷修改一致率',
+  inquiry_preference_consistency: '③ 問診偏好一致率'
+}
+
+/**
+ * ③ 的固定文案：`inquiry_preference_consistency` 在 **Epic 2 恆為 `null`**
+ * （服務層 `_METRICS_DEFERRED = {"inquiry_preference_consistency": "deferred_to_epic3"}`，
+ * `agent_stage_service.py:1555-1556`；測試 `test_inquiry_metric_is_null_placeholder` 釘住）。
+ * 刻意**不**顯示「0%」也**不**顯示「—」：占位鍵要一眼看出是「還沒算」而不是「算出來是零」。
+ */
+const AGENT_STAGE_INQUIRY_PLACEHOLDER = '待 Epic 3（尚未計算）'
+
+/**
+ * 「樣本不足」的括號寫法：`樣本不足（2/5）` = 有效樣本 2 份 / 門檻 5 份（設計 §6.6：「样本 2/5 份」）。
+ * `min_samples` 缺失（後端違約，契約上不可能）時退化為「樣本 N 份」—— **不**印「3/0」這種假分數。
+ */
+const samplesShortText = (samples: number, minSamples: number) =>
+  minSamples > 0 ? `樣本不足（${samples}/${minSamples}）` : `樣本不足（樣本 ${samples} 份）`
+
+/** 比率 → 百分比（`null` / 非數字 → 空串；呼叫端據此分支到「樣本不足」）。 */
+const ratioPercentText = (value: number | null | undefined) =>
+  typeof value === 'number' ? `${Math.round(value * 100)}%` : ''
+
+/* ---------- 【6b】閾值折疊區（13 鍵；順序 = 服務層 `_THRESHOLD_KEYS`，逐鍵不移位） ---------- */
+
+/** 值型別只影響**顯示**（整數 / 比率→百分比 / 布爾→是・否）：任何判定都不在前端做。 */
+type StageThresholdKind = 'int' | 'ratio' | 'bool'
+
+const AGENT_STAGE_THRESHOLD_ROWS: Array<{
+  key: keyof StageThresholds
+  label: string
+  kind: StageThresholdKind
+}> = [
+  { key: 'window_days', label: '指標統計窗口（天）', kind: 'int' },
+  { key: 'max_samples', label: '每指標最多取樣本數（性能上限）', kind: 'int' },
+  { key: 'min_samples', label: '允許推薦升級的最少樣本數', kind: 'int' },
+  { key: 'min_template_match', label: '① 模板匹配度達標門檻', kind: 'ratio' },
+  { key: 'min_modification_consistency', label: '② 病歷修改一致率達標門檻', kind: 'ratio' },
+  { key: 'max_violations', label: '窗口內允許的鐵律違規樣本數', kind: 'int' },
+  { key: 'max_permission_denials', label: '窗口內允許的越權次數', kind: 'int' },
+  { key: 'recommend_cooldown_hours', label: '推薦／被拒後的冷卻（小時）', kind: 'int' },
+  { key: 'demote_consistency_floor', label: '規則降級水位（一致率）', kind: 'ratio' },
+  { key: 'demote_streak', label: '連續命中幾次才降級', kind: 'int' },
+  { key: 'truncate_chars', label: '相似度計算前的文字截斷長度（字）', kind: 'int' },
+  { key: 'metrics_ttl_hours', label: '指標快照「新鮮」窗口（小時）', kind: 'int' },
+  { key: 'matrix_enforced', label: '權限矩陣強制（關 = 臨時放寬）', kind: 'bool' }
+]
+
+/**
+ * 單鍵顯示值。比率鍵顯示「百分比（原值 0.75）」：**兩個都給**，老師看得懂、運維能與後端 / 日誌對賬
+ * （`config_changed` 的 `detail` 寫的就是原值）。
+ */
+const thresholdValueText = (
+  thresholds: Partial<StageThresholds>,
+  row: { key: keyof StageThresholds; kind: StageThresholdKind }
+) => {
+  const value = thresholds[row.key]
+  if (row.kind === 'bool') return value === true ? '是（矩陣生效）' : '否（已臨時放寬）'
+  if (row.kind === 'ratio') {
+    return typeof value === 'number' ? `${Math.round(value * 100)}%（原值 ${value}）` : String(value)
+  }
+  return String(value)
+}
+
+/**
+ * 【6b】`config_source` 角標（§3.4 第 4 條「來源必須可回答」）：只在「老師自訂」/「env 真有覆蓋」時出現。
+ *
+ *   · `global`（全局行存在）**刻意不進角標**：那是運維視角，寫給老師只會多一個看不懂的詞；
+ *   · env 鍵名**原樣列出**（`min_template_match` 這種審計識別碼不翻譯 —— 翻譯會妨礙與後端、日誌對賬）；
+ *   · 三鍵全空 → 返回空串 → 呼叫端不渲染任何東西（節點預設 / 全局配置下不該有角標）。
+ */
+const configSourceBadge = (source: StageConfigSource | undefined | null) => {
+  if (!source) return ''
+  const envKeys = Array.isArray(source.env_override) ? source.env_override : []
+  const parts: string[] = []
+  if (source.teacher_override) parts.push('老師自訂')
+  if (envKeys.length > 0) parts.push('環境覆蓋')
+  if (parts.length === 0) return ''
+  const envText = envKeys.length > 0 ? `（鍵：${envKeys.join('、')}）` : ''
+  return `閾值來源：${parts.join(' + ')}${envText}`
+}
+
+/** 評估回執的時間戳（「剛剛那次評估」的肉眼憑證；要精確時刻時以後端 `last_evaluated_at` 為準）。 */
+const clockText = () => new Date().toLocaleTimeString('zh-TW', { hour12: false })
+
 
 /** 卡片底部固定文案（§4.5-⑤：**逐字**，不可省略、不可改寫、不可簡繁轉換）。 */
 const AGENT_STAGE_IRON_RULE =
@@ -244,6 +355,38 @@ const ASP_ERROR: CSSProperties = {
 const ASP_FOOTER: CSSProperties = {
   fontSize: '12px', color: '#999', lineHeight: '1.7', marginTop: '14px',
   borderTop: '1px dashed #d4c8a8', paddingTop: '10px'
+}
+
+/* ---------- 【6b】指標區 / 閾值折疊區 / 按鈕 / 角標的樣式 ---------- */
+
+/** `config_source` 角標：小字 + 淺底，**不搶**階段徽章的焦點。 */
+const ASP_CHIP: CSSProperties = {
+  display: 'inline-block', padding: '2px 10px', borderRadius: '12px', background: '#f5efe0',
+  border: '1px solid #e2d6b8', color: '#8b4513', fontSize: '12px'
+}
+/** 指標行：三行同一套網格（標籤定寬 → 三個百分比左緣對齊，方便掃視）。 */
+const ASP_METRIC_ROW: CSSProperties = {
+  display: 'flex', gap: '10px', flexWrap: 'wrap', alignItems: 'baseline', padding: '4px 0',
+  fontSize: '13px', color: '#333'
+}
+const ASP_METRIC_LABEL: CSSProperties = { minWidth: '132px', color: '#5a4633', fontWeight: 'bold' }
+const ASP_METRIC_VALUE: CSSProperties = { fontWeight: 'bold' }
+const ASP_METRIC_HINT: CSSProperties = { fontSize: '12px', color: '#999' }
+/** 指標區的紅字（違規 > 0 / 矩陣放寬）：只紅不換行背景，避免與 `ASP_ERROR` 的「真錯誤」混淆。 */
+const ASP_ALERT_TEXT: CSSProperties = { fontSize: '12px', color: '#c0392b', fontWeight: 'bold' }
+/** 閾值折疊區的開關（折疊是**視覺**選擇：13 鍵對老師是備查資訊，不該一開場就占滿卡片）。 */
+const ASP_FOLD_BUTTON: CSSProperties = {
+  background: 'none', border: 'none', padding: 0, color: '#8b4513', fontSize: '12px',
+  textDecoration: 'underline', cursor: 'pointer'
+}
+/** 「🔄 立即評估」（主色實心；不用 `:hover` 偽狀態 —— 內聯 style 表達不了，也不值得引 CSS 檔）。 */
+const ASP_BUTTON: CSSProperties = {
+  padding: '6px 16px', borderRadius: '20px', border: '1px solid #8b4513', background: '#8b4513',
+  color: '#fdfcf0', fontSize: '13px', cursor: 'pointer'
+}
+/** 評估進行中的按鈕（置灰 + 不可點；文案改「評估中…」，見 JSX）。 */
+const ASP_BUTTON_OFF: CSSProperties = {
+  ...ASP_BUTTON, background: '#c9b79c', borderColor: '#c9b79c', cursor: 'not-allowed'
 }
 
 /* ============================ 工具（與 TemplateStudio 同款；不改既有的兩個文件） ============================ */
@@ -299,6 +442,12 @@ const stageSinceText = (value: string) => {
 export default function AgentStagePanel({ teacherName, teacherId, refreshKey }: AgentStagePanelProps) {
   const [probeState, setProbeState] = useState<StageProbeState>('probing')
   const [view, setView] = useState<StageView | null>(null)
+  // 【6b】手動評估：`evaluating` = 請求在飛（按鈕置灰防連點，也防兩次評估交錯寫快照）；
+  // `evaluateNote` = 卡內回執（成功顯示時間戳、失敗顯示繁體人話）—— **不 alert**。
+  const [evaluating, setEvaluating] = useState(false)
+  const [evaluateNote, setEvaluateNote] = useState('')
+  // 【6b】13 鍵閾值折疊區的展開態（預設收起：老師的日常視線是徽章 + 指標，閾值是備查）。
+  const [showThresholds, setShowThresholds] = useState(false)
 
   // 掛載探測（§4.5-⑤ 首條）：結果緩存於 state，不重複探測；換老師 / 刷新信號變化才重探。
   // 重置與抓取都放在 async 閉包內（不在 effect 內同步 setState，避免級聯渲染）。
@@ -324,6 +473,45 @@ export default function AgentStagePanel({ teacherName, teacherId, refreshKey }: 
     return () => { cancelled = true }
   }, [teacherName, teacherId, refreshKey])
 
+  /**
+   * 【6b】「🔄 立即評估」：`POST /api/agent/stage/evaluate`（body 只有兩個鑑權欄位；#2 會寫評估快照、
+   * 可能建一張升級推薦單）→ 成功後**重拉 #1** 取新快照與新的 `capabilities`（檔頭口徑 2：拿 #2 的
+   * body 整體 `setView` 會把能力區的依據抹掉）。
+   *
+   * 失敗一律**卡內**呈現（不 alert、不彈窗）：404 = flag 中途被關 → 整卡退場；503 = 存儲掉了 →
+   * 換成「遷移沒跑」紅字；其餘（400 / 403 / 網絡）→ 一行紅字說明並**保留舊畫面**（舊快照對老師仍有價值，
+   * 不因為一次點擊失敗就白屏）。`#2` 的 200 回應體整份未讀（連 `changed` 都不讀）—— 本卡只認 #1 為 `view`。
+   */
+  const handleEvaluate = async () => {
+    if (evaluating) return
+    setEvaluating(true)
+    setEvaluateNote('')
+    const evaluated = await callStageApi<unknown>('/api/agent/stage/evaluate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ teacher_name: teacherName, teacher_id: teacherId })
+    })
+    if (!evaluated.ok) {
+      setEvaluating(false)
+      if (evaluated.failure.status === 404) { setProbeState('off'); return }
+      if (evaluated.failure.status === 503) { setProbeState('no_store'); return }
+      setEvaluateNote(`⚠ 評估未完成：${evaluated.failure.msg}`)
+      return
+    }
+    const refreshed = await callStageApi<StageView>(
+      `/api/agent/stage?${identityQuery(teacherName, teacherId)}`)
+    setEvaluating(false)
+    if (!refreshed.ok) {
+      if (refreshed.failure.status === 404) { setProbeState('off'); return }
+      if (refreshed.failure.status === 503) { setProbeState('no_store'); return }
+      setEvaluateNote(`⚠ 評估已送出，但重讀階段視圖失敗（畫面仍是舊快照）：${refreshed.failure.msg}`)
+      return
+    }
+    setView(refreshed.data)
+    setProbeState('on')
+    setEvaluateNote(`✅ 已重新評估（${clockText()}）`)
+  }
+
   // §4.5-⑤ / 裁決②：503 = 運維故障（遷移沒跑）→ **卡內紅字**說清楚，不靜默消失
   if (probeState === 'no_store') {
     return (
@@ -344,6 +532,17 @@ export default function AgentStagePanel({ teacherName, teacherId, refreshKey }: 
   const nextLabel = view.next_stage ? stageKeyLabel(view.next_stage) : ''
   const pendingLabel = view.pending_stage ? stageKeyLabel(view.pending_stage) : ''
 
+  // 【6b】指標 / 閾值**全部取自 #1 的上次快照**（本卡不重算、不補算）。用 `Partial` 不是型別悲觀：
+  // 後端違約（少一個鍵）時退化為「樣本不足」而不是把老師首頁整頁炸掉 —— 白屏的代價遠大於一次顯示兜底。
+  const metrics: Partial<StageMetrics> = view.metrics || {}
+  const thresholds: Partial<StageThresholds> = view.thresholds || {}
+  const templateMatch = metrics.template_match
+  const modification = metrics.modification_consistency
+  const minSamples = typeof thresholds.min_samples === 'number' ? thresholds.min_samples : 0
+  const configBadge = configSourceBadge(view.config_source)
+  // §2.5 的臨時運維閘：放寬態下**不推荐升级** → 必須當場可見（不能只藏在折疊區裡）。
+  const matrixRelaxed = thresholds.matrix_enforced === false
+
   return (
     <div style={ASP_BOX}>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '10px', flexWrap: 'wrap', marginBottom: '12px' }}>
@@ -359,6 +558,8 @@ export default function AgentStagePanel({ teacherName, teacherId, refreshKey }: 
         <span style={ASP_BADGE}>{view.stage_label || stageKeyLabel(view.stage)}</span>
         {sinceText && <span style={ASP_HINT}>自 {sinceText} 起</span>}
         <span style={ASP_HINT}>{nextLabel ? `下一階段：${nextLabel}` : '已達最高階段'}</span>
+        {/* 【6b】`config_source` 角標：`marginLeft:'auto'` 推到行尾（「角標」的位置語義），窄屏換行時自然回落。 */}
+        {configBadge && <span style={{ ...ASP_CHIP, marginLeft: 'auto' }}>{configBadge}</span>}
       </div>
 
       {sourceLabel && <div style={{ ...ASP_HINT, marginTop: '6px' }}>階段來源：{sourceLabel}</div>}
@@ -380,7 +581,89 @@ export default function AgentStagePanel({ teacherName, teacherId, refreshKey }: 
         </div>
       )}
 
-      {view.stale && <div style={{ ...ASP_HINT, marginTop: '8px' }}>⏳ {AGENT_STAGE_STALE_HINT}</div>}
+      {/* ---------- 【6b】指標區（① ② ③；數值取自上次快照，本卡**不重算**） ---------- */}
+      <div style={{ borderTop: '1px dashed #ece3cd', marginTop: '12px', paddingTop: '10px' }}>
+        <div style={ASP_SECTION_TITLE}>📊 指標（取自上次評估快照）</div>
+        {/* ① 模板匹配度：`value === null` = **空集**（不是 0 分）→ 必須顯示「樣本不足（N/M）」，
+            顯示 0% 會讓「樣本不夠」看起來像「表現很差」。違規 > 0 = 鐵律信號 → 紅字如實報。 */}
+        <div style={ASP_METRIC_ROW}>
+          <span style={ASP_METRIC_LABEL}>{AGENT_STAGE_METRIC_LABELS.template_match}</span>
+          <span style={ASP_METRIC_VALUE}>
+            {templateMatch && typeof templateMatch.value === 'number'
+              ? `${ratioPercentText(templateMatch.value)}（樣本 ${templateMatch.samples} 份）`
+              : samplesShortText(templateMatch ? templateMatch.samples : 0, minSamples)}
+          </span>
+          {templateMatch && templateMatch.violations > 0 && (
+            <span style={ASP_ALERT_TEXT}>⚠ 鐵律違規 {templateMatch.violations} 次</span>
+          )}
+        </div>
+        {/* ② 病歷修改一致率：同樣「無樣本 ≠ 0%」；近似樣本（舊數據只有 `ai_draft`）與最差一份
+            都要標出來 —— 平均值好看但有一份爛，老師有權知道。 */}
+        <div style={ASP_METRIC_ROW}>
+          <span style={ASP_METRIC_LABEL}>{AGENT_STAGE_METRIC_LABELS.modification_consistency}</span>
+          <span style={ASP_METRIC_VALUE}>
+            {modification && typeof modification.value === 'number'
+              ? `${ratioPercentText(modification.value)}（樣本 ${modification.samples} 份）`
+              : samplesShortText(modification ? modification.samples : 0, minSamples)}
+          </span>
+          {modification && modification.approx_samples > 0 && (
+            <span style={ASP_METRIC_HINT}>含 {modification.approx_samples} 份近似樣本（舊數據）</span>
+          )}
+          {modification && typeof modification.min === 'number' && (
+            <span style={ASP_METRIC_HINT}>最差樣本 {ratioPercentText(modification.min)}</span>
+          )}
+        </div>
+        {/* ③ 問診偏好一致率：Epic 2 恆為 `null`（佔位）→ **固定文案**，不顯示 0% / 不顯示破折號。 */}
+        <div style={ASP_METRIC_ROW}>
+          <span style={ASP_METRIC_LABEL}>{AGENT_STAGE_METRIC_LABELS.inquiry_preference_consistency}</span>
+          <span style={ASP_METRIC_HINT}>{AGENT_STAGE_INQUIRY_PLACEHOLDER}</span>
+        </div>
+
+        {/* 13 鍵閾值：預設收起（老師的日常視線是徽章 + 指標；閾值是備查 / 對賬用）。
+            展開後逐鍵「標籤 : 值」，比率鍵附原值 → 能與後端配置、`config_changed` 日誌逐字對上。 */}
+        <div style={{ marginTop: '10px' }}>
+          <button type="button" style={ASP_FOLD_BUTTON} onClick={() => setShowThresholds(open => !open)}>
+            {showThresholds ? '▾' : '▸'} ⚙ 判定閾值（{AGENT_STAGE_THRESHOLD_ROWS.length} 項）
+          </button>
+          {showThresholds && (
+            <div style={{ marginTop: '6px' }}>
+              {AGENT_STAGE_THRESHOLD_ROWS.map(row => (
+                <div key={row.key} style={ASP_METRIC_ROW}>
+                  <span style={{ ...ASP_METRIC_LABEL, fontWeight: 'normal', minWidth: '220px' }}>
+                    {row.label}
+                  </span>
+                  <span style={ASP_METRIC_VALUE}>{thresholdValueText(thresholds, row)}</span>
+                </div>
+              ))}
+              <div style={{ ...ASP_HINT, marginTop: '6px' }}>
+                閾值可由管理員（全局行）/ 老師（專屬行）/ 環境變數覆蓋；每次評估都現讀，改完下一次評估即生效。
+              </div>
+            </div>
+          )}
+        </div>
+        {/* 矩陣放寬的紅字**不藏進折疊區**：收起狀態下也要看得見（§2.5：放寬態不推薦升級）。 */}
+        {matrixRelaxed && (
+          <div style={{ ...ASP_ALERT_TEXT, marginTop: '6px' }}>⚠ 權限矩陣已由管理員放寬（臨時）</div>
+        )}
+      </div>
+
+      {/* ---------- 【6b】手動評估（§4.5-⑤ 按鈕 / §4.6-② 接口） ---------- */}
+      {/* 按鈕**常顯**（檔頭口徑 1）；`stale` 只負責那句設計原句的提示（§4.5-⑤：提示不阻斷任何東西）。 */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: '10px', flexWrap: 'wrap', marginTop: '12px' }}>
+        <button
+          type="button"
+          style={evaluating ? ASP_BUTTON_OFF : ASP_BUTTON}
+          onClick={handleEvaluate}
+          disabled={evaluating}
+        >
+          {evaluating ? '評估中…' : '🔄 立即評估'}
+        </button>
+        {view.stale && <span style={ASP_HINT}>⏳ {AGENT_STAGE_STALE_HINT}</span>}
+        {/* 回執（成功 = 時間戳 / 失敗 = ⚠ 開頭）；以 `⚠` 前綴決定顏色 —— 只有這兩種回執，不值得為它多開一個 state。 */}
+        {evaluateNote && (
+          <span style={evaluateNote.startsWith('⚠') ? ASP_ALERT_TEXT : ASP_METRIC_HINT}>{evaluateNote}</span>
+        )}
+      </div>
 
       {/* `blockers[]` 逐條繁體展示；`[]` 是**有意義的空**（上一輪真的不卡任何一條）→ 整段不顯示 */}
       {blockers.length > 0 && (
