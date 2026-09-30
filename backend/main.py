@@ -8,6 +8,8 @@ import cnlunar
 import database
 import agent
 import template_api
+import lineage_api
+import lineage_service
 import os
 import shutil
 import uuid
@@ -47,6 +49,16 @@ except Exception as exc:  # noqa: BLE001 —— 迁移框架不可用（例如�
 # 启用：$env:TEMPLATE_API_ENABLED = "on"（PowerShell 示例）。
 app.include_router(template_api.router)
 app.add_exception_handler(database.TemplateError, template_api.template_error_handler)
+
+# 【Epic 4 新增】師門（lineage）接口與錯誤碼契約（設計 §4.1 / §4.3 / §4.4）：
+#   · `lineage_service.LineageError` → 真實 HTTP 狀態碼 + 統一錯誤體
+#     （400 `lineage_required` / 400 `lineage_invalid` / 403 `lineage_forbidden` /
+#      404 `lineage_not_found` / 503 `lineage_store_unavailable` …，見 lineage_api.lineage_error_handler）；
+#   · **本子步尚未新增路由**：`lineage_api.router` 目前為空（掛載等於無操作），
+#     §4.2 的 7 個新端點由 4.2 的後續子步落地；
+#   · flag `LINEAGE_ENABLED` **默认 off**（§4.4）→ 老師端讀接口既有行為逐字節不變。
+app.include_router(lineage_api.router)
+app.add_exception_handler(lineage_service.LineageError, lineage_api.lineage_error_handler)
 
 class TranscriptionInput(BaseModel):
     patient_name: str
@@ -178,9 +190,11 @@ def get_patient_teachers(patient_name: str):
     return database.get_patient_teachers(patient_name)
 
 @app.get("/api/teacher-patients")
-def get_teacher_patients(teacher_name: str):
+def get_teacher_patients(teacher_name: str, lineage_id: str = None):
     # 【第44天修改】返回学生列表 + 状态标记
-    students = database.get_teacher_patients(teacher_name)
+    # 【Epic 4 §3.2 P0-① / §4.3】flag on 时必带 lineage_id（缺 → 400 lineage_required）；flag off 时
+    # 参数被忽略、SQL 与响应逐字节不变（lineage_read_scope 不生效）。
+    students = database.get_teacher_patients(teacher_name, lineage_id)
     result = []
     for s in students:
         status = database.get_student_status(s["name"])
@@ -409,8 +423,10 @@ def get_daily_advice(patient_name: str):
     }
 
 @app.get("/api/role-data")
-def get_role_data(role: str, patient_name: str = "张三", teacher_name: str = "李老师"):
-    hw = database.get_homework(patient_name, teacher_name)
+def get_role_data(role: str, patient_name: str = "张三", teacher_name: str = "李老师", lineage_id: str = None):
+    # 【Epic 4 §3.2 P1】聯絡簿读取属老师端派生数据：flag on 时须带 lineage_id（缺 → 400）；
+    # flag off 时第三个参数被忽略，SQL 与响应逐字节不变。
+    hw = database.get_homework(patient_name, teacher_name, lineage_id)
 
     if role == "李老师":
         if not hw:
@@ -650,8 +666,9 @@ async def upload_audio(file: UploadFile = File(...)):
     return {"url": f"/uploads/{unique_name}"}
 
 @app.get("/api/transcriptions")
-def get_transcriptions(patient_name: str = None, teacher_name: str = None):
-    return database.get_transcriptions(patient_name, teacher_name)
+def get_transcriptions(patient_name: str = None, teacher_name: str = None, lineage_id: str = None):
+    # 【Epic 4 §3.2 P0-⑤ / §4.3】老师端待处理转述：flag on 时带 teacher_name 必须同时带 lineage_id。
+    return database.get_transcriptions(patient_name, teacher_name, lineage_id)
 
 @app.post("/api/generate-draft")
 def generate_draft(transcript_id: int):
@@ -677,8 +694,9 @@ def generate_draft(transcript_id: int):
     return {"message": "病历草案生成成功", "draft_id": draft_id}
 
 @app.get("/api/drafts")
-def get_drafts(teacher_name: str = None):
-    return database.get_drafts(teacher_name)
+def get_drafts(teacher_name: str = None, lineage_id: str = None):
+    # 【Epic 4 §3.2 P0-② / §4.3】flag on 时 teacher_name 为空或缺 lineage_id → 400（不退化为全库）。
+    return database.get_drafts(teacher_name, lineage_id)
 
 @app.put("/api/drafts/{draft_id}")
 def update_draft(draft_id: int, update_data: DraftUpdate):
@@ -729,12 +747,14 @@ def get_tags(record_id: int):
     return database.get_tags_for_record(record_id)
 
 @app.get("/api/tags-summary")
-def get_tags_summary(teacher_name: str):
-    return database.get_teacher_tags_summary(teacher_name)
+def get_tags_summary(teacher_name: str, lineage_id: str = None):
+    # 【Epic 4 §3.2 P1】标签统计只统计本师门病历。
+    return database.get_teacher_tags_summary(teacher_name, lineage_id)
 
 @app.get("/api/patient-records")
-def get_patient_records(patient_name: str = None, teacher_name: str = None):
-    return database.get_patient_records(patient_name, teacher_name)
+def get_patient_records(patient_name: str = None, teacher_name: str = None, lineage_id: str = None):
+    # 【Epic 4 §3.2 P0-⑥ / §4.3】历史病历（含 LLM 上下文取材）：flag on 时按师门过滤。
+    return database.get_patient_records(patient_name, teacher_name, lineage_id)
 # ---------- 邀请码 ----------
 class InviteInput(BaseModel):
     teacher_name: str
@@ -833,12 +853,14 @@ def get_appointments(
     patient_name: str = None,
     teacher_name: str = None,
     start_date: str = None,
-    end_date: str = None
+    end_date: str = None,
+    lineage_id: str = None
 ):
-    return database.get_appointments(patient_name, teacher_name, start_date, end_date)
+    # 【Epic 4 §3.2 P1】预约读取：flag on 时按师门过滤。
+    return database.get_appointments(patient_name, teacher_name, start_date, end_date, lineage_id)
 
 @app.get("/api/appointments/calendar")
-def get_appointments_calendar(teacher_name: str):
+def get_appointments_calendar(teacher_name: str, lineage_id: str = None):
     """【第49天】返回未来 7 天 × 所有时段 的预约情况，供可视化网格用"""
     from datetime import timedelta
     today = datetime.now()
@@ -851,7 +873,9 @@ def get_appointments_calendar(teacher_name: str):
     holidays = database.get_teacher_holidays(teacher_name)
 
     # 未来 7 天该老师的所有预约
-    appts = database.get_appointments(teacher_name=teacher_name, start_date=start_str, end_date=end_str)
+    # 【Epic 4 §3.2 P1】日历网格同样只看本师门预约（flag off 时 lineage_id=None → 行为不变）。
+    appts = database.get_appointments(teacher_name=teacher_name, start_date=start_str, end_date=end_str,
+                                      lineage_id=lineage_id)
 
     # 生成 7 天数据
     days = []
@@ -1008,8 +1032,9 @@ def api_create_prescription(data: PrescriptionInput):
 
 
 @app.get("/api/prescriptions")
-def api_get_prescriptions(teacher_name: str, patient_name: str = ""):
-    return database.get_prescriptions(teacher_name, patient_name or None)
+def api_get_prescriptions(teacher_name: str, patient_name: str = "", lineage_id: str = None):
+    # 【Epic 4 §3.2 P1】药方读取：flag on 时按师门过滤（同一老师跨师门不可互见）。
+    return database.get_prescriptions(teacher_name, patient_name or None, lineage_id)
 
 
 # ============ Pydantic 模型：老师智能体 ============
@@ -1025,7 +1050,7 @@ class AgentScanInput(BaseModel):
 
 
 @app.post("/api/agent/scan")
-def api_agent_scan(data: AgentScanInput | None = None, teacher_name: str = ""):
+def api_agent_scan(data: AgentScanInput | None = None, teacher_name: str = "", lineage_id: str = ""):
     """【行政化 B3】统一扫描入口：一次扫完该老师名下学生的三类请示 ——
     沉默关怀（send_care_notice，B1 已有）+ 欠费预存（send_billing_notice）+ 复诊提醒（send_recall_notice），
     都写进同一张 agent_tasks（category='student'、task_type='request'、status='pending'）。
@@ -1033,18 +1058,22 @@ def api_agent_scan(data: AgentScanInput | None = None, teacher_name: str = ""):
     请求体：{"teacher_name": "李老师"}；返回：{"ok": true, "created": N}（N = 本次新创建的任务数）。
     兼容旧调用：不接受请求体时仍认查询参数 ?teacher_name=，响应里保留 new_tasks（与 created 同值），
     这样前端「智能体工作台」和已有测试的老调用方式都不用改。
+
+    【Epic 4 §3.2 P1 / §4.3】flag on 时扫描范围必须限定本师门（缺 lineage_id → 400 lineage_required，
+    绝不退化为「扫全库学生」）；flag off 时 lineage_id 被忽略，行为和返回逐字节不变。
     """
     name = (data.teacher_name if data else "") or teacher_name
     if not name:
         raise HTTPException(status_code=400, detail="teacher_name 不能为空")
-    created = agent.scan_student_requests(name)
+    created = agent.scan_student_requests(name, lineage_id=lineage_id or None)
     return {"ok": True, "created": created, "new_tasks": created}
 
 
 @app.get("/api/agent/tasks")
-def api_get_agent_tasks(teacher_name: str, status: str = "pending"):
+def api_get_agent_tasks(teacher_name: str, status: str = "pending", lineage_id: str = None):
     """老师智能体待办列表。"""
-    return database.get_agent_tasks(teacher_name, status)
+    # 【Epic 4 §3.2 P0-③ / §4.3】flag on 时按师门过滤待办。
+    return database.get_agent_tasks(teacher_name, status, lineage_id)
 
 
 @app.post("/api/agent/tasks/{task_id}/resolve")
@@ -1072,12 +1101,14 @@ class AgentTaskIdInput(BaseModel):
 
 
 @app.get("/api/agent_tasks")
-def api_list_agent_tasks(teacher_name: str, status: str = ""):
+def api_list_agent_tasks(teacher_name: str, status: str = "", lineage_id: str = None):
     """该老师的智能体任务列表；status 不传（或传空串）= 返回全部。
 
     可选值按设计文档：pending / approved / rejected / done / undone。
+
+    【Epic 4 §3.2 P0-③ / §4.3】flag on 时按师门过滤（同一老师跨师门不可互见）。
     """
-    return database.get_agent_tasks(teacher_name, status)
+    return database.get_agent_tasks(teacher_name, status, lineage_id)
 
 
 @app.post("/api/agent_tasks/approve")
@@ -1099,9 +1130,12 @@ def api_reject_agent_task(data: AgentTaskIdInput):
 
 
 @app.get("/api/agent_action_log")
-def api_get_agent_action_log(teacher_name: str, limit: int = 20):
-    """该老师的智能体行动日志，按 created_at 倒序，默认最多 20 条。"""
-    return database.get_agent_action_log(teacher_name, limit)
+def api_get_agent_action_log(teacher_name: str, limit: int = 20, lineage_id: str = None):
+    """该老师的智能体行动日志，按 created_at 倒序，默认最多 20 条。
+
+    【Epic 4 §3.2 P1】flag on 时按师门过滤（日志里带 patient_name 的条目不得跨师门泄露）。
+    """
+    return database.get_agent_action_log(teacher_name, limit, lineage_id)
 
 
 # ============ Pydantic 模型：财务管理（预存 / 赠送 / 扣费） ============
@@ -1150,12 +1184,14 @@ def api_finance_accounts():
 # 点「已处理」→ POST /api/complaints/{id}/process（status → 'processed' + resolved_at）。
 
 @app.get("/api/complaints")
-def api_get_complaints(teacher_name: str, status: str = "pending"):
+def api_get_complaints(teacher_name: str, status: str = "pending", lineage_id: str = None):
     """按老师 + 状态查学生陈述（status 传空串 = 不过滤状态），created_at 倒序。
 
     返回：{"complaints": [{id, patient_name, teacher_name, content, status, created_at}, ...]}
+
+    【Epic 4 §3.2 P1】flag on 时按师门过滤学生陈述。
     """
-    return {"complaints": database.get_complaints(teacher_name, status)}
+    return {"complaints": database.get_complaints(teacher_name, status, lineage_id)}
 
 
 @app.post("/api/complaints/{complaint_id}/process")

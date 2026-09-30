@@ -86,10 +86,27 @@ def _check_identity(teacher_name, teacher_id):
         _fail(403, "teacher_mismatch", "teacher_name 與 teacher_id 不一致")
 
 
-def _check_lineage(lineage_id):
-    """§10.1：Epic 1 `lineage_id` 一律 `''`，傳非空值直接拒（防前端提前誤用留白字段）。"""
-    if lineage_id:
-        _fail(400, "lineage_not_supported", "Epic 1 尚不支援 lineage_id（請留空）")
+def _check_lineage(lineage_id, teacher_id=None):
+    """模板线 `lineage_id` 校验（Epic 1 §10.1 →【Epic 4 §3.3】由「拒」改「校验」）。
+
+    - flag **off**（默认）→ **逐字保留 Epic 1 口径**：`lineage_id` 一律 `''`，传非空值 → 400
+      `lineage_not_supported`（Epic 1 已验收测试因此逐字节不变，§4.3「模板」列的 flag off 一格）；
+    - flag **on** → 必须非空（空 → 400 `lineage_required`），且必须「存在 + 请求老师属于该师门」
+      （400 `lineage_invalid` / 404 `lineage_not_found` / 403 `lineage_forbidden` /
+      503 `lineage_store_unavailable`）—— **不许**回落成 Epic 1 的「一律留空」。
+
+    校验本体一律委托 `lineage_service.lineage_read_scope()`（§5.1 存在性 + 归属双因子）：
+    本函数只决定「flag off 的旧口径 / flag on 的新口径」，不查库、不另写一份错误码表。
+    **`import lineage_service` 放函数体内**（与 `database.lineage_read_scope` 同口径，
+    两个方向都延迟 import，循环依赖在任一路径上都不成立）。
+    """
+    import lineage_service
+
+    if not lineage_service.lineage_enabled():
+        if lineage_id:
+            _fail(400, lineage_service.LINEAGE_NOT_SUPPORTED, "Epic 1 尚不支援 lineage_id（請留空）")
+        return
+    lineage_service.lineage_read_scope(teacher_id, lineage_id)
 
 
 def _check_type(template_type):
@@ -143,7 +160,8 @@ def list_templates(
     """`GET /api/templates`：缺省返四類全部（排序 `type asc, version desc`）；`include_schema=0` 省流量。"""
     _guard()
     _check_identity(teacher_name, teacher_id)
-    _check_lineage(lineage_id)
+    # 【Epic 4 §3.3】把 teacher_id 一起传进去：flag on 时「请求老师必须属于该 lineage_id」。
+    _check_lineage(lineage_id, teacher_id)
     if type is not None:
         _check_type(type)
     if status is not None and status not in database.TEMPLATE_STATUSES:
@@ -164,7 +182,7 @@ def get_active_template(
     """`GET /api/templates/active`：`type` 必填；`template=null` = 無生效模板 → 生成側走舊路徑（§3.4）。"""
     _guard()
     _check_identity(teacher_name, teacher_id)
-    _check_lineage(lineage_id)
+    _check_lineage(lineage_id, teacher_id)
     _check_type(type)
     return {"template": database.get_active_template(teacher_id, type)}
 
@@ -190,7 +208,7 @@ def get_template(template_id: int, teacher_name: str, teacher_id: str):
 def create_template(data: TemplateCreateInput, response: Response):
     _guard()
     _check_identity(data.teacher_name, data.teacher_id)
-    _check_lineage(data.lineage_id)
+    _check_lineage(data.lineage_id, data.teacher_id)
     _check_type(data.type)
     schema_obj = database.default_template_schema(data.type) if data.template_schema is None else data.template_schema
     _validated_schema(data.type, schema_obj)
@@ -277,7 +295,7 @@ def derive_template(template_id: int, data: TemplateDeriveInput, response: Respo
     """§11.4：從 `active` / `archived` 派生新草稿；同鏈已有草稿 → 200 + `reused_draft: true`。"""
     _guard()
     _check_identity(data.teacher_name, data.teacher_id)
-    _check_lineage(data.lineage_id)
+    _check_lineage(data.lineage_id, data.teacher_id)
     # 來源不存在 → 交給服務層回 400 `template_parent_not_found`（§10.2 #9 口徑）；
     # 存在但屬他人 → 403（越權不進服務層）
     existing = database.get_template(template_id)

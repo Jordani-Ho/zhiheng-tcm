@@ -12,6 +12,27 @@ def get_connection():
     return conn
 
 
+# ---------- 【Epic 4 §3.2 / §4.4】老師端讀點的作用域校驗（單一入口） ----------
+def lineage_read_scope(teacher_name, lineage_id=None):
+    """老師端讀點的**統一作用域校驗**：本檔所有帶師門隔離的讀函數只經這一個入口。
+
+    返回 `(filter_on, lineage_id)`：
+      · flag off（`LINEAGE_ENABLED` 未設 / off，默認）→ `(False, "")`：**不發任何 SQL**、
+        不校驗、不拋異常，調用方的語句與參數**逐字節不變**（§4.4「flag off = 零行為變化」）；
+      · flag on → `(True, <合法 lineage_id>)`，調用方把 `lineage_id = ?` 加進 WHERE。
+
+    校驗口徑（存在性 + 歸屬雙因子）與錯誤碼契約全在 `lineage_service`（單一真相源）：
+    空 → 400 `lineage_required` / 格式非法 → 400 `lineage_invalid` / 表缺失 → 503
+    `lineage_store_unavailable` / 不存在 → 404 `lineage_not_found` / 不屬於該師門 → 403
+    `lineage_forbidden`。
+
+    **`import lineage_service` 放在函數體內**：與 `_agent_stage_snapshot_enabled()` 同口徑，
+    保證模組載入期 `database` ↔ `lineage_service` 兩個方向都不成立循環依賴。
+    """
+    import lineage_service
+    return lineage_service.lineage_read_scope(teacher_name, lineage_id)
+
+
 # ============================================================================
 # 【Epic 1 結構重構】向後兼容 re-export：本檔自此只保留「引擎 / 連接 / 建表」職責
 #   backend/template_service.py : 白名單 / 默認骨架 / schema_json 校驗層 / 存取與狀態機
@@ -438,7 +459,15 @@ def get_patient_teachers(patient_name):
     conn.close()
     return [r["teacher_name"] for r in rows]
 
-def get_teacher_patients(teacher_name):
+def get_teacher_patients(teacher_name, lineage_id=None):
+    """【Epic 4 §3.2 P0-①】老師端學生列表：flag on 時必須**同時**命中 `pt.lineage_id`。
+
+    `(False, "")` 分支（flag off / 默認）下 `owner_where` 拼出的字面量與改動前**逐字節相同**：
+    `WHERE pt.teacher_name = ? AND pt.status = 'active'`。
+    """
+    filter_on, lineage_id = lineage_read_scope(teacher_name, lineage_id)
+    owner_where = "pt.lineage_id = ? AND pt.teacher_name = ?" if filter_on else "pt.teacher_name = ?"
+    owner_params = (lineage_id, teacher_name) if filter_on else (teacher_name,)
     conn = get_connection()
     rows = conn.execute("""
         SELECT p.name, p.last_active_at,
@@ -446,9 +475,9 @@ def get_teacher_patients(teacher_name):
         FROM patients p
         INNER JOIN patient_teachers pt ON p.name = pt.patient_name
         LEFT JOIN points_accounts a ON p.name = a.role_name
-        WHERE pt.teacher_name = ? AND pt.status = 'active'
+        WHERE """ + owner_where + """ AND pt.status = 'active'
         ORDER BY p.name
-    """, (teacher_name,)).fetchall()
+    """, owner_params).fetchall()
     conn.close()
     return [dict(r) for r in rows]
 
@@ -588,10 +617,15 @@ def save_patient_profile(patient_name, gender, birth_date, birth_time, birth_pla
     conn.close()
 
 # ---------- 作业相关操作 ----------
-def get_homework(patient_name, teacher_name):
+def get_homework(patient_name, teacher_name, lineage_id=None):
+    """【Epic 4 §3.2 P0-④】聯絡簿：flag on 時須 `lineage_id = ? AND patient_name = ? AND teacher_name = ?`。"""
+    filter_on, lineage_id = lineage_read_scope(teacher_name, lineage_id)
+    owner_where = "lineage_id = ? AND patient_name = ? AND teacher_name = ?" if filter_on \
+        else "patient_name = ? AND teacher_name = ?"
+    owner_params = (lineage_id, patient_name, teacher_name) if filter_on else (patient_name, teacher_name)
     conn = get_connection()
-    row = conn.execute("SELECT * FROM homework WHERE patient_name = ? AND teacher_name = ? ORDER BY id DESC LIMIT 1",
-                       (patient_name, teacher_name)).fetchone()
+    row = conn.execute("SELECT * FROM homework WHERE " + owner_where + " ORDER BY id DESC LIMIT 1",
+                       owner_params).fetchone()
     conn.close()
     return dict(row) if row else None
 
@@ -621,7 +655,15 @@ def insert_transcription(patient_name, teacher_name, content, data_type):
     conn.commit()
     conn.close()
 
-def get_transcriptions(patient_name=None, teacher_name=None):
+def get_transcriptions(patient_name=None, teacher_name=None, lineage_id=None):
+    """【Epic 4 §3.2 P0-⑤】待處理轉述：flag on 且帶 teacher_name 時**前置** `lineage_id = ?`。
+
+    位置在條件列表**最前**（`conditions` 首元素仍是 `processed = 0`，lineage 只插在
+    teacher_name 之前），故 flag off 時 `' AND '.join(conditions)` 結果與改動前逐字節相同。
+    只傳 `patient_name` 不傳 `teacher_name`（學生端讀法）→ flag on 時 `lineage_read_scope`
+    按 §3.2「teacher_name 可空 = 高危」直接 400，**不退化為跨師門查詢**。
+    """
+    filter_on, lineage_id = lineage_read_scope(teacher_name, lineage_id)
     conn = get_connection()
     conditions = ["processed = 0"]
     params = []
@@ -629,6 +671,9 @@ def get_transcriptions(patient_name=None, teacher_name=None):
         conditions.append("patient_name = ?")
         params.append(patient_name)
     if teacher_name:
+        if filter_on:
+            conditions.append("lineage_id = ?")
+            params.append(lineage_id)
         conditions.append("teacher_name = ?")
         params.append(teacher_name)
     query = f"SELECT * FROM transcriptions WHERE {' AND '.join(conditions)} ORDER BY id DESC"
@@ -801,9 +846,25 @@ def insert_draft(transcript_id, patient_name, teacher_name, content, template_id
     conn.close()
     return draft_id
 
-def get_drafts(teacher_name=None):
+def get_drafts(teacher_name=None, lineage_id=None):
+    """【Epic 4 §3.2 P0-②】未簽草案：flag on 時**子查詢內部**就帶 `lineage_id = ?`。
+
+    子查詢決定「每個學生的最新未簽草案」，只在外層過濾會把「本師門沒有草案、別師門有」的
+    學生整行漏掉 —— 這是「越權」的另一面（漏行），故過濾條件必須與 `teacher_name` 一起進子查詢。
+    flag off 時**仍走原兩個分支**（`(teacher_name,)` / 無參），SQL 逐字節不變。
+    """
+    filter_on, lineage_id = lineage_read_scope(teacher_name, lineage_id)
     conn = get_connection()
-    if teacher_name:
+    if filter_on:
+        rows = conn.execute("""
+            SELECT d.* FROM drafts d
+            INNER JOIN (
+                SELECT patient_name, MAX(id) as max_id
+                FROM drafts WHERE signed = 0 AND lineage_id = ? AND teacher_name = ?
+                GROUP BY patient_name
+            ) latest ON d.id = latest.max_id
+        """, (lineage_id, teacher_name)).fetchall()
+    elif teacher_name:
         rows = conn.execute("""
             SELECT d.* FROM drafts d
             INNER JOIN (
@@ -896,10 +957,19 @@ def sign_draft(draft_id, final_plan, final_content=None):
     return draft["patient_name"]
 
 # ---------- 患者健康档案相关操作 ----------
-def get_patient_records(patient_name=None, teacher_name=None):
+def get_patient_records(patient_name=None, teacher_name=None, lineage_id=None):
+    """【Epic 4 §3.2 P0-③】病歷歷史：flag on 時 `lineage_id = ?` **前置**於其它條件。
+
+    学生端（`/api/patient-records?patient_name=...`，不帶 teacher_name）flag on 時直接 400，
+    不退化為全庫查詢；flag off 時 `conditions` / `where` / `query` 組合結果逐字節不變。
+    """
+    filter_on, lineage_id = lineage_read_scope(teacher_name, lineage_id)
     conn = get_connection()
     conditions = []
     params = []
+    if filter_on:
+        conditions.append("lineage_id = ?")
+        params.append(lineage_id)
     if patient_name:
         conditions.append("patient_name = ?")
         params.append(patient_name)
@@ -1062,10 +1132,19 @@ def save_teacher_settings(teacher_name, work_days, work_hours):
     return {"message": "工作时间已保存"}
 
 # ---------- 预约相关操作 ----------
-def get_appointments(patient_name=None, teacher_name=None, start_date=None, end_date=None):
+def get_appointments(patient_name=None, teacher_name=None, start_date=None, end_date=None, lineage_id=None):
+    """【Epic 4 §3.2 P2】預約列表：flag on 且帶 teacher_name 時**前置** `lineage_id = ?`。
+
+    學生端（只給 `patient_name`）flag on 時 400（§3.2「teacher_name 可空 = 高危」）；
+    flag off 時 `conditions` 內容與順序不變 → SQL 字面量逐字節不變。
+    """
+    filter_on, lineage_id = lineage_read_scope(teacher_name, lineage_id)
     conn = get_connection()
     conditions = []
     params = []
+    if filter_on:
+        conditions.append("lineage_id = ?")
+        params.append(lineage_id)
     if patient_name:
         conditions.append("patient_name = ?")
         params.append(patient_name)
@@ -1140,16 +1219,23 @@ def get_tags_for_record(record_id):
     conn.close()
     return [dict(r) for r in rows]
 
-def get_teacher_tags_summary(teacher_name):
-    """返回该老师所有标签的汇总（用于知识库视图）"""
+def get_teacher_tags_summary(teacher_name, lineage_id=None):
+    """返回该老师所有标签的汇总（用于知识库视图）
+
+    【Epic 4 §3.2 P1】flag on 时须 `lineage_id = ? AND teacher_name = ?`（标签也是师门数据）；
+    flag off 时 `owner_where` 拼出的字面量与改动前逐字节相同。
+    """
+    filter_on, lineage_id = lineage_read_scope(teacher_name, lineage_id)
+    owner_where = "lineage_id = ? AND teacher_name = ?" if filter_on else "teacher_name = ?"
+    owner_params = (lineage_id, teacher_name) if filter_on else (teacher_name,)
     conn = get_connection()
     rows = conn.execute("""
         SELECT tag_type, tag_value, COUNT(*) as count
         FROM record_tags
-        WHERE teacher_name = ?
+        WHERE """ + owner_where + """
         GROUP BY tag_type, tag_value
         ORDER BY count DESC
-    """, (teacher_name,)).fetchall()
+    """, owner_params).fetchall()
     conn.close()
     return [dict(r) for r in rows]
 
@@ -1554,11 +1640,20 @@ def _prescription_row_to_dict(row):
     return d
 
 
-def get_prescriptions(teacher_name, patient_name=None):
-    """返回该老师的药方；给了 patient_name 就再按患者过滤。最新在前。"""
+def get_prescriptions(teacher_name, patient_name=None, lineage_id=None):
+    """返回该老师的药方；给了 patient_name 就再按患者过滤。最新在前。
+
+    【Epic 4 §3.2 P1】flag on 时条件列表前两项固定为 `lineage_id = ? AND teacher_name = ?`；
+    flag off 时仍是原来的 `["teacher_name = ?"]` + 可选 patient_name，SQL 逐字节不变。
+    """
+    filter_on, lineage_id = lineage_read_scope(teacher_name, lineage_id)
     conn = get_connection()
-    conditions = ["teacher_name = ?"]
-    params = [teacher_name]
+    if filter_on:
+        conditions = ["lineage_id = ?", "teacher_name = ?"]
+        params = [lineage_id, teacher_name]
+    else:
+        conditions = ["teacher_name = ?"]
+        params = [teacher_name]
     if patient_name:
         conditions.append("patient_name = ?")
         params.append(patient_name)
@@ -1580,26 +1675,39 @@ def _agent_task_row_to_dict(row):
     return d
 
 
-def scan_silent_students(teacher_name, silent_days=30):
+def scan_silent_students(teacher_name, silent_days=30, lineage_id=None):
     """扫描该老师名下的「沉默学生」（last_active_at 为空，或距今 >= silent_days 天），
-    给还没有 pending 同类请示的学生各建一条 agent_tasks 请示，返回新建任务数。"""
+    给还没有 pending 同类请示的学生各建一条 agent_tasks 请示，返回新建任务数。
+
+    【Epic 4 §3.2 P1】flag on 时**两条读语句**都要加 `lineage_id = ?`：
+      ① 学生列表（`patient_teachers`）；
+      ② pending 去重集合（`agent_tasks`）—— 漏改 ② 会让别师门的「已建单」把本师门学生误判为
+         「已有 pending」从而**不再建单**（漏建，越权的镜像面）。
+    注意：本函数**只**改这两条读语句；下面建单的 INSERT 与 `insert_agent_action_log` 一字不动。
+    """
+    filter_on, lineage_id = lineage_read_scope(teacher_name, lineage_id)
+    owner_where = "pt.lineage_id = ? AND pt.teacher_name = ?" if filter_on else "pt.teacher_name = ?"
+    owner_params = (lineage_id, teacher_name) if filter_on else (teacher_name,)
+    task_where = "lineage_id = ? AND teacher_name = ?" if filter_on else "teacher_name = ?"
+    task_params = (lineage_id, teacher_name) if filter_on else (teacher_name,)
     conn = get_connection()
     cur = conn.cursor()
     students = cur.execute("""
         SELECT p.name AS name, p.last_active_at AS last_active_at
         FROM patients p
         INNER JOIN patient_teachers pt ON p.name = pt.patient_name
-        WHERE pt.teacher_name = ? AND pt.status = 'active'
+        WHERE """ + owner_where + """ AND pt.status = 'active'
         ORDER BY p.name
-    """, (teacher_name,)).fetchall()
+    """, owner_params).fetchall()
 
     # 【行政化改造】先把该老师所有 pending 的「学生」类请示里的 patient_name 收集起来做去重集合。
     # 不用以前那种 action_data 字符串全等匹配 —— 这样历史旧格式
     # （{"action": "send_care_notice", ...}）也能命中，action_data 格式升级不会给同一学生重复建单。
     pending_patient_names = set()
     for pending in cur.execute(
-        "SELECT action_data FROM agent_tasks WHERE teacher_name = ? AND category = 'student' AND status = 'pending'",
-        (teacher_name,)
+        "SELECT action_data FROM agent_tasks WHERE " + task_where +
+        " AND category = 'student' AND status = 'pending'",
+        task_params
     ).fetchall():
         try:
             pending_patient_names.add((json.loads(pending["action_data"]) or {}).get("patient_name"))
@@ -1652,18 +1760,25 @@ def scan_silent_students(teacher_name, silent_days=30):
     return created
 
 
-def get_agent_tasks(teacher_name, status='pending'):
-    """按 created_at DESC 返回该老师的智能体任务；status 传空则不过滤状态。"""
+def get_agent_tasks(teacher_name, status='pending', lineage_id=None):
+    """按 created_at DESC 返回该老师的智能体任务；status 传空则不过滤状态。
+
+    【Epic 4 §3.2 P1】flag on 时 `lineage_id = ?` 与 `teacher_name = ?` 一起进 WHERE
+    （两个分支都要改，漏掉任一分支 = 漏改即越权）；flag off 时两条 SQL 逐字节不变。
+    """
+    filter_on, lineage_id = lineage_read_scope(teacher_name, lineage_id)
+    owner_where = "lineage_id = ? AND teacher_name = ?" if filter_on else "teacher_name = ?"
+    owner_params = (lineage_id, teacher_name) if filter_on else (teacher_name,)
     conn = get_connection()
     if status:
         rows = conn.execute(
-            "SELECT * FROM agent_tasks WHERE teacher_name = ? AND status = ? ORDER BY created_at DESC, id DESC",
-            (teacher_name, status)
+            "SELECT * FROM agent_tasks WHERE " + owner_where + " AND status = ? ORDER BY created_at DESC, id DESC",
+            owner_params + (status,)
         ).fetchall()
     else:
         rows = conn.execute(
-            "SELECT * FROM agent_tasks WHERE teacher_name = ? ORDER BY created_at DESC, id DESC",
-            (teacher_name,)
+            "SELECT * FROM agent_tasks WHERE " + owner_where + " ORDER BY created_at DESC, id DESC",
+            owner_params
         ).fetchall()
     conn.close()
     return [_agent_task_row_to_dict(r) for r in rows]
@@ -1746,21 +1861,28 @@ def resolve_agent_task(task_id, decision):
     return {"message": "已处理", "status": new_status}
 
 
-def get_agent_action_log(teacher_name, limit=20):
+def get_agent_action_log(teacher_name, limit=20, lineage_id=None):
     """【行政化改造】返回该老师的智能体行动日志，按 created_at 倒序（同一时间按 id 倒序）。
 
     limit：最多返回多少条（设计文档接口默认 20）：非正数按默认 20 处理，上限 200，防止一把拉爆。
+
+    【Epic 4 §3.2 P1】flag on 时 `lineage_id = ? AND teacher_name = ?`（老师在旗标 on 时
+    必须带师门上下文；空 teacher_name 依然按原样「早返回空列表」——那是**已存在的 fail-closed**
+    行为，不是越权面，故 `teacher_name` 判空**先于**作用域校驗，保持与改动前同序）。
     """
     if not teacher_name:
         return []
+    filter_on, lineage_id = lineage_read_scope(teacher_name, lineage_id)
+    owner_where = "lineage_id = ? AND teacher_name = ?" if filter_on else "teacher_name = ?"
+    owner_params = (lineage_id, teacher_name) if filter_on else (teacher_name,)
     if limit is None or limit <= 0:
         limit = 20
     limit = min(limit, 200)
 
     conn = get_connection()
     rows = conn.execute(
-        "SELECT * FROM agent_action_log WHERE teacher_name = ? ORDER BY created_at DESC, id DESC LIMIT ?",
-        (teacher_name, limit)
+        "SELECT * FROM agent_action_log WHERE " + owner_where + " ORDER BY created_at DESC, id DESC LIMIT ?",
+        owner_params + (limit,)
     ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
@@ -2268,24 +2390,30 @@ def save_plan_template(teacher_name, content):
 #           → 老师端 GET /api/complaints?teacher_name=…&status=pending 看到列表
 #           → 点「已处理」POST /api/complaints/{id}/process → status='processed' + resolved_at。
 
-def get_complaints(teacher_name, status="pending"):
+def get_complaints(teacher_name, status="pending", lineage_id=None):
     """查该老师名下的学生陈述：按 status 过滤，created_at 倒序（同一时间按 id 倒序）。
 
     status 传空串 / None = 不过滤状态（返回该老师全部陈述）。
     返回字段：id / patient_name / teacher_name / content / status / created_at。
+
+    【Epic 4 §3.2 P1】flag on 时两个分支都要 `lineage_id = ? AND teacher_name = ?`
+    （学生陈述里可能有身份信息）；flag off 时两条 SQL 逐字节不变。
     """
+    filter_on, lineage_id = lineage_read_scope(teacher_name, lineage_id)
+    owner_where = "lineage_id = ? AND teacher_name = ?" if filter_on else "teacher_name = ?"
+    owner_params = (lineage_id, teacher_name) if filter_on else (teacher_name,)
     conn = get_connection()
     if status:
         rows = conn.execute(
             "SELECT id, patient_name, teacher_name, content, status, created_at FROM complaints "
-            "WHERE teacher_name = ? AND status = ? ORDER BY created_at DESC, id DESC",
-            (teacher_name, status)
+            "WHERE " + owner_where + " AND status = ? ORDER BY created_at DESC, id DESC",
+            owner_params + (status,)
         ).fetchall()
     else:
         rows = conn.execute(
             "SELECT id, patient_name, teacher_name, content, status, created_at FROM complaints "
-            "WHERE teacher_name = ? ORDER BY created_at DESC, id DESC",
-            (teacher_name,)
+            "WHERE " + owner_where + " ORDER BY created_at DESC, id DESC",
+            owner_params
         ).fetchall()
     conn.close()
     return [dict(r) for r in rows]

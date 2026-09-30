@@ -538,30 +538,43 @@ RECALL_DAYS = 60            # 【可配置阈值】学生距上次就诊超过�
 # 日期格式一改就整个失效，所以废弃文本解析，改为直接读 visit_at 列；visit_at 为空的旧记录没有就诊基准，不参与扫描。
 
 
-def _teacher_student_names(cur, teacher_name):
-    """该老师名下所有在读学生姓名（升序），学生口径与 database.scan_silent_students 保持一致。"""
+def _teacher_student_names(cur, teacher_name, lineage_id=None):
+    """该老师名下所有在读学生姓名（升序），学生口径与 database.scan_silent_students 保持一致。
+
+    【Epic 4 §3.2 P1】flag on 时 `pt.lineage_id = ? AND pt.teacher_name = ?`；flag off 时
+    语句字面量与参数与改动前逐字节相同（`database.lineage_read_scope` 返回 `(False, "")` 时零 SQL）。
+    """
+    filter_on, lineage_id = database.lineage_read_scope(teacher_name, lineage_id)
+    owner_where = "pt.lineage_id = ? AND pt.teacher_name = ?" if filter_on else "pt.teacher_name = ?"
+    owner_params = (lineage_id, teacher_name) if filter_on else (teacher_name,)
     rows = cur.execute("""
         SELECT p.name AS name
         FROM patients p
         INNER JOIN patient_teachers pt ON p.name = pt.patient_name
-        WHERE pt.teacher_name = ? AND pt.status = 'active'
+        WHERE """ + owner_where + """ AND pt.status = 'active'
         ORDER BY p.name
-    """, (teacher_name,)).fetchall()
+    """, owner_params).fetchall()
     return [row["name"] for row in rows]
 
 
-def _pending_task_exists(cur, teacher_name, task_type, category, action, patient_name):
+def _pending_task_exists(cur, teacher_name, task_type, category, action, patient_name, lineage_id=None):
     """去重判断：【task_type + category + action_data.action + patient_name + status='pending'】
     五个条件全中才算「已有同类请示」，否则可以再建一条。
 
     做法：SQL 先按 teacher_name / task_type / category / status 过滤（条件明确、不扫全表），
     再在 Python 侧解析 action_data 比对 action + patient_name —— 这样 action_data 里以后
     增减字段（如 amount / days）也不会漏判，同一学生的不同类型请示（关怀 / 欠费 / 复诊）互不影响。
+
+    【Epic 4 §3.2 P1】flag on 时 WHERE 再加 `lineage_id = ?`：别师门的同类 pending 请示
+    不能把本师门学生的请示「顶掉」（否则本师门该建的单不建 = 漏建）。
     """
+    filter_on, lineage_id = database.lineage_read_scope(teacher_name, lineage_id)
+    owner_where = "lineage_id = ? AND teacher_name = ?" if filter_on else "teacher_name = ?"
+    owner_params = (lineage_id, teacher_name) if filter_on else (teacher_name,)
     rows = cur.execute("""
         SELECT action_data FROM agent_tasks
-        WHERE teacher_name = ? AND task_type = ? AND category = ? AND status = 'pending'
-    """, (teacher_name, task_type, category)).fetchall()
+        WHERE """ + owner_where + """ AND task_type = ? AND category = ? AND status = 'pending'
+    """, owner_params + (task_type, category)).fetchall()
     for row in rows:
         try:
             data = json.loads(row["action_data"]) if row["action_data"] else {}
@@ -580,7 +593,7 @@ def _insert_student_request(cur, teacher_name, title, content, action_data, crea
     """, (teacher_name, title, content, json.dumps(action_data, ensure_ascii=False), created_at))
 
 
-def check_billing_alerts(teacher_name, low_balance=BILLING_LOW_BALANCE):
+def check_billing_alerts(teacher_name, low_balance=BILLING_LOW_BALANCE, lineage_id=None):
     """【B3-改动1：欠费请示】扫描该老师名下学生的余额（accounts.balance），余额 < low_balance 的生成请示。
 
     · 余额来源：accounts 表（username = 学生姓名）。
@@ -590,19 +603,27 @@ def check_billing_alerts(teacher_name, low_balance=BILLING_LOW_BALANCE):
     · 去重：同 teacher + task_type='request' + category='student' + action='send_billing_notice'
       + patient_name + status='pending' 已存在 → 跳过，不重复建单。
     返回：本次新建的请示条数。
+
+    【Epic 4 §3.2 P1】flag on 时：names 由 `_teacher_student_names` 带 lineage 过滤（学生名集合），
+    去重查询由 `_pending_task_exists` 带 lineage 过滤。本函数**不自己发 SQL**，故只透传 `lineage_id`
+    （作用域校验的入口仍是 `database.lineage_read_scope`，由上面两个函数执行，不重复判断）。
+    **但校验必须前置到「开连接」之前**（与 `check_recall_alerts` 同序）：否则 flag on + 缺 / 跨门
+    `lineage_id` 时，被调函数在校验处抛 `LineageError`，本函数已经开出的连接再也走不到
+    `conn.close()` → 连接泄漏（Windows 上会一直锁住库文件）。flag off 时这次调用零 SQL、零变化。
     """
+    database.lineage_read_scope(teacher_name, lineage_id)   # 先校驗（fail-loud 不佔連接）
     conn = database.get_connection()
     cur = conn.cursor()
     now = datetime.now()
     created = 0
-    for name in _teacher_student_names(cur, teacher_name):
+    for name in _teacher_student_names(cur, teacher_name, lineage_id):
         row = cur.execute("SELECT balance FROM accounts WHERE username = ?", (name,)).fetchone()
         if row is None or row["balance"] is None:
             continue  # 没开过户 → 不是预存制学生，不进欠费扫描
         balance = row["balance"]
         if balance >= low_balance:
             continue
-        if _pending_task_exists(cur, teacher_name, "request", "student", "send_billing_notice", name):
+        if _pending_task_exists(cur, teacher_name, "request", "student", "send_billing_notice", name, lineage_id):
             continue
         _insert_student_request(
             cur, teacher_name,
@@ -636,7 +657,7 @@ def _parse_visit_at(value):
     return None
 
 
-def check_recall_alerts(teacher_name, recall_days=RECALL_DAYS):
+def check_recall_alerts(teacher_name, recall_days=RECALL_DAYS, lineage_id=None):
     """【B3-改动2：复诊提醒请示】按 patient_records.visit_at 里每个学生最后一次就诊时间，超过 recall_days 天生成请示。
 
     · 「最后一次就诊时间」= 该老师在 patient_records 里的 MAX(visit_at)（按 patient_name 分组）：
@@ -645,7 +666,14 @@ def check_recall_alerts(teacher_name, recall_days=RECALL_DAYS):
     · 去重：同 teacher + task_type='request' + category='student' + action='send_recall_notice'
       + patient_name + status='pending' 已存在 → 跳过，不重复建单。
     返回：本次新建的请示条数。
+
+    【Epic 4 §3.2 P1】本函数**自己发一条 SQL**（patient_records 聚合），故按 flag on/off 拼 `owner_where`：
+      · flag on：`lineage_id = ? AND teacher_name = ?`（学生集合与去重查询由被调函数各自带过滤）；
+      · flag off：字面量/参数与改动前逐字节相同。
     """
+    filter_on, lineage_id = database.lineage_read_scope(teacher_name, lineage_id)
+    recall_where = "lineage_id = ? AND teacher_name = ?" if filter_on else "teacher_name = ?"
+    recall_params = (lineage_id, teacher_name) if filter_on else (teacher_name,)
     conn = database.get_connection()
     cur = conn.cursor()
     now = datetime.now()
@@ -655,19 +683,19 @@ def check_recall_alerts(teacher_name, recall_days=RECALL_DAYS):
     latest_rows = cur.execute("""
         SELECT patient_name, MAX(visit_at) AS last_visit_at
         FROM patient_records
-        WHERE teacher_name = ? AND visit_at IS NOT NULL AND visit_at != ''
+        WHERE """ + recall_where + """ AND visit_at IS NOT NULL AND visit_at != ''
         GROUP BY patient_name
-    """, (teacher_name,)).fetchall()
+    """, recall_params).fetchall()
     last_visit_map = {row["patient_name"]: row["last_visit_at"] for row in latest_rows}
 
-    for name in _teacher_student_names(cur, teacher_name):
+    for name in _teacher_student_names(cur, teacher_name, lineage_id):
         last_visit = _parse_visit_at(last_visit_map.get(name))
         if last_visit is None:
             continue  # 没有病历 / 旧记录 visit_at 为空 → 没有就诊基准，不算「久未复诊」
         days = (now - last_visit).days
         if days <= recall_days:
             continue
-        if _pending_task_exists(cur, teacher_name, "request", "student", "send_recall_notice", name):
+        if _pending_task_exists(cur, teacher_name, "request", "student", "send_recall_notice", name, lineage_id):
             continue
         _insert_student_request(
             cur, teacher_name,
@@ -682,17 +710,20 @@ def check_recall_alerts(teacher_name, recall_days=RECALL_DAYS):
     return created
 
 
-def scan_student_requests(teacher_name):
+def scan_student_requests(teacher_name, lineage_id=None):
     """【B3-改动3：统一扫描入口】把该老师名下学生的三类请示一次扫完，返回本次新建任务总数。
 
     顺序与设计文档一致：沉默关怀（B1 已有的 database.scan_silent_students）→ 欠费预存 → 复诊提醒。
     三类都写进同一张 agent_tasks（category='student'），各自按 action 独立去重，互不干扰。
+
+    【Epic 4 §3.2 P1】`lineage_id` 一路透传到三类扫描（三者各自经 `database.lineage_read_scope`
+    做存在性 + 归属校验）；flag off 时三个调用与改动前逐字节等价（多传一个 `lineage_id=None` 而已）。
     """
     if not teacher_name:
         return 0
-    created = database.scan_silent_students(teacher_name)
-    created += check_billing_alerts(teacher_name)
-    created += check_recall_alerts(teacher_name)
+    created = database.scan_silent_students(teacher_name, lineage_id=lineage_id)
+    created += check_billing_alerts(teacher_name, lineage_id=lineage_id)
+    created += check_recall_alerts(teacher_name, lineage_id=lineage_id)
     return created
 
     
