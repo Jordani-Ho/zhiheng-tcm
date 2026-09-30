@@ -17,7 +17,10 @@
     ⑩ 总闸契约：`agent_stage_service.agent_stage_enabled()` 的取值语义（默认 off）、闸门两态降级，
        以及**依赖方向**的源码级守护（`database` → 服务层的 import 恒在函数体内，不得动态绕开）
        + §2.1 禁止 import 清单（服务层永不 import 六个禁忌符号）—— 「服务层对 database 零 import」
-       的反向硬断言已按 CTO 批复② 于 step 2.4 删除（§4.5-① 允许服务层 import database）；
+       的反向硬断言已按 CTO 批复② 于 step 2.4 删除（§4.5-① 允许服务层 import database）
+       + §2.2 **单一收口点**守护（§6.3 第 16 条）：全仓扫描 `current_stage(` 的调用点，
+       只许落在 §2.2 白名单（服务层 + step 4 的接口层）内 —— 白名单外的任何文件出现调用 = 绕过
+       矩阵（`require_capability()` 仍是唯一放行点）；
     ⑪ 【§4.2 改 2 / 施工步骤 2.3】`sign_draft` 快照进历史表（双闸门 + 空快照回落 content）+ **改动前
        逐字节基线**守护 + best-effort 钩子 `on_draft_signed` 三态（不存在→静默 / 存在→调用一次 /
        抛异常→只打 warn）+「同一个 flag 闸门与同一个列探测只许一份实现」的行为级与源码级守护
@@ -63,8 +66,11 @@
        ① 三块各有契约用例；② `evaluate()` 首行 flag 闸门（off → 零 SQL、零写入）；
        ③ **绝不向上写 `stage`**（AST 数 `stage=` 关键字实参并**逐处归位**：`_ensure_state_row()` 的
         零 delta 一处、3.4-c 老师确认钩子的唯一向上写一处、该钩子返回体回显一处（不落库）——
-        3.4-c 落地后由 3 处断言接续钉住；另配「有行老师 `stage` / `stage_since` / `stage_source`
-        评估前后逐字节不变」与「无行老师生效阶段 + 权限面不变」两条行为级断言）；
+        3.4-c 落地后由 3 处断言接续钉住；4a 落地降级入口后 +2 处（`_demote()` 的唯一向下写 + 其返回体回显）→ 现为
+        **5 处**（零 delta upsert + 向上 upsert + 向上回显 + 向下 upsert + 向下回显；方向由 ⑲ 组
+         按「值必须严格减少 rank」行为级补齐）；另配「有行老师 `stage` /
+        `stage_since` / `stage_source` 评估前后逐字节不变」与「无行老师生效阶段 + 权限面不变」
+        两条行为级断言）；
        ④ 十条判定逐条进 `blockers`（`value=None` / `pending_stage` / 冷却期三条各有专项）；
        ⑤ `pending_stage` 与 `pending_task_id` **成对**写（先 state 后建单 + 建单抛异常不留半对）；
        ⑥ `stage_config_source()` 与 `load_stage_config` **同源**（同一层走读 + 调用点唯一守护）；
@@ -75,8 +81,10 @@
        只转一次评估）/ `apply_upgrade_confirmation`（老师 ✅ 确认 → **全系统唯一 rank 增加点**）/
        `decline_upgrade`（老师 ❌ 忽略 → 清待确认对 + 冷却起点）。CTO 约束逐条钉住：
        ① 唯一向上写路径（**源码级**：全文件 `stage=` 写入点枚举 + 逐处归位到「所属函数 + 所属调用」，
-       真正落库的状态行写入点恰好 2 处、其中 **rank 增加点计数 = 1**，且值表达式恒为钩子入参
-       `to_stage`；`**` 展开形状出现即红；**行为级**：越级 / 向下 / 非法目标一律拒绝且阶段一个字不动）；
+       真正落库的状态行写入点恰好 3 处（零 delta + 唯一向上 + 4a 的唯一向下）、其中
+       **rank 增加点计数 = 1**、**rank 减少点计数 = 1**，且向上那处的值表达式恒为钩子入参
+       `to_stage`、向下那处的值恒为「现场校验后的落点变量」（方向由 ⑲ 组行为级钉住）；
+       `**` 展开形状出现即红；**行为级**：越级 / 向下 / 非法目标一律拒绝且阶段一个字不动）；
        ② 拒绝用既有 `upgrade_declined` 事件（**不新造第 11 类**、**不用**语义不符的 `permission_denied`），
        跳级 detail 固定含「越級請求被拒：to_stage=X, current=Y」；
        ③ 幂等（已在目标阶段 → `stage` / `stage_since` / `stage_source` 逐字节不变、不写第二条
@@ -850,6 +858,112 @@ def test_service_module_never_imports_forbidden_symbols():
     for symbol in _FORBIDDEN_SERVICE_IMPORTS:
         assert symbol not in imported, f"服务层不得 import 禁忌符号 {symbol}"
         assert symbol not in attributes, f"服务层不得访问 database.{symbol}"
+
+
+# ---- §2.2 单一收口点：`current_stage(` 只许在 §2.2 白名单（服务层 / step 4 接口层）内被调用 ----
+
+# 扫描范围排除项（只认**生产模块**：测试文件里出现这个符号恰恰是为了断言它不存在）
+_SCAN_SKIP_DIRS = {"__pycache__", "node_modules", "site-packages", "venv", "env"}
+
+# §2.2 / §6.3 第 16 条的**调用点白名单**（原句：「扫描 `agent_stage_service` / `agent_stage_api`
+# 之外的文件不得直接出现 `current_stage` 的调用」）—— 白名单外 = 绕过唯一能力闸门。
+_MATRIX_CHOKE_POINT_FILES = {"agent_stage_service.py", "agent_stage_api.py"}
+
+
+def _production_python_files():
+    """全仓 `*.py` 里的**生产模块**路径（按目录名 / 文件名排除测试文件与三方、缓存、工具目录）。
+
+    仓库根 = `backend/` 的父目录（由 `database.__file__` 反推，不硬编码盘符）；带 `.` 前缀的目录
+    （`.git` / `.venv` / `.pytest_cache` …）一律跳过。
+    """
+    root = os.path.dirname(os.path.dirname(os.path.abspath(database.__file__)))
+    found = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [name for name in dirnames
+                       if not name.startswith(".") and name not in _SCAN_SKIP_DIRS]
+        for filename in filenames:
+            if filename.endswith(".py") and not filename.startswith("test_") \
+                    and filename != "conftest.py":
+                found.append(os.path.join(dirpath, filename))
+    return sorted(found)
+
+
+def _current_stage_uses(source):
+    """AST 口径：抽出本文件里 `current_stage` 的**真实**定义点与调用点行号。
+
+    必须用 AST 才能把「注释 / docstring / 告警文案里提到 `current_stage(`」与「代码里真的读了一次
+    阶段真值」分开（本文件头部与 §2.2 的说明文字里就大量「提到」它）。裸调用
+    `current_stage(...)` 与 `模块.current_stage(...)` 都算调用。
+    """
+    import ast
+
+    tree = ast.parse(source)
+    defined, called = [], []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) \
+                and node.name == "current_stage":
+            defined.append(node.lineno)
+        if isinstance(node, ast.Call):
+            func = node.func
+            name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", "")
+            if name == "current_stage":
+                called.append(node.lineno)
+    return sorted(defined), sorted(called)
+
+
+def test_matrix_single_choke_point():
+    """【§2.2 / §6.3 第 16 条】能力闸门**单一收口点**的源码级守护：`current_stage(` 只许出现在
+    §2.2 白名单里 —— 服务层 `agent_stage_service.py`（今天唯一的调用点）+ step 4 落地后的接口层
+    `agent_stage_api.py`。
+
+    为什么：`require_capability()` 是唯一读 `agent_stage_state` 做放行判定的函数（§2.2），而它拿阶段
+    真值的唯一入口就是 `current_stage()`。别的文件（尤其接口层）自己调一次 `current_stage()` 再自行
+    判定，等于在矩阵之外长出**第二个闸门** —— 越权面从「一处可审」散成「各处各自为政」，而「同一个
+    判断只许有一份实现」是本项目红线（Epic 4 裁决①同句）。
+
+    扫描**全仓生产 `*.py`**（跳过测试文件与三方 / 缓存目录），断言三条（白名单口径见 §2.2 / §6.3 第 16 条）：
+      ① **调用点白名单**：`current_stage(...)` 的调用点只许落在 §2.2 白名单内（服务层
+         `agent_stage_service.py` + step 4 落地后的接口层 `agent_stage_api.py`）；白名单外的任何文件
+         （`main.py` / 前端链路 / 未来新模块）出现调用 = 在矩阵之外长出**第二个闸门**；
+       ② **闸门在场**：白名单里必须真有服务层的调用点（`require_capability()` 的唯一真值来源）；
+       ③ **定义点唯一**：`current_stage` 也只许有一份实现（别处再来一份 = fail-closed 口径要漂移；
+          step 4 的接口层只许**调用**、不许自建门）。
+    口径：AST 精确判定**定义 / 调用节点**（注释 / docstring 里「提到」不算）；测试文件不在扫描范围。
+    """
+    callers, definers = {}, {}
+    scanned = _production_python_files()
+    assert scanned, "扫描范围不得为空（守护自身不许静默失效）"
+
+    for path in scanned:
+        with open(path, encoding="utf-8") as fh:
+            source = fh.read()
+        if "current_stage" not in source:            # 先按字面粗筛，再逐文件 AST 精判
+            continue
+        defined, called = _current_stage_uses(source)
+        if defined:
+            definers[os.path.basename(path)] = defined
+        if called:
+            callers[os.path.basename(path)] = called
+
+    assert set(callers) <= _MATRIX_CHOKE_POINT_FILES, \
+        "`current_stage(` 只许在 §2.2 白名单（服务层 / step 4 接口层）内被调用（实测 %r）—— 白名单" \
+        "外出现调用 = 在「唯一能力闸门」之外长出第二个阶段真值读取点" % callers
+    assert "agent_stage_service.py" in callers, \
+        "闸门自身必须在场：`require_capability()` 的唯一真值来源就是服务层的 `current_stage()`" \
+        "（实测 %r）" % callers
+    assert sorted(definers) == ["agent_stage_service.py"], \
+        "`current_stage` 只许有一份实现（实测 %r）—— 第二份 = fail-closed 口径可能漂移（接口层只许" \
+        "调用、不许自建门）" % definers
+
+    # 更强的一条只在「step 4 尚未落地」时成立（`agent_stage_api.py` 不存在 ⇒ 调用点不可能来自接口层）。
+    # 挂在**文件存在性**上 → 接口层合法落地的那天自动让位给上面的白名单，不会变成假红。
+    api_module = os.path.join(os.path.dirname(os.path.abspath(database.__file__)),
+                              "agent_stage_api.py")
+    if not os.path.exists(api_module):
+        assert sorted(callers) == ["agent_stage_service.py"], \
+            "step 4 尚未落地（agent_stage_api.py 不存在）：`current_stage(` 的唯一调用点必须是 " \
+            "agent_stage_service.py（实测 %r）" % callers
+
 
 # ============ ⑪ 【§4.2 改 2】sign_draft：快照进历史表 + best-effort 钩子 ============
 #
@@ -3463,10 +3577,16 @@ def test_evaluate_third_metric_is_null_placeholder(db, stage_gate):
 # ---- 约束 3：绝不向上写 stage（AST 守护 + 两条行为级断言）----
 
 def test_evaluate_stage_write_point_is_pinned_to_the_zero_delta_helper():
-    """CTO 约束 3 的**精确形态**（3.4-c 落地后按预告升级）：服务层的 `stage=` 关键字实参**恰好 3 处**，
-    逐处归位 —— ① `_ensure_state_row()`：值表达式恒为 `view["stage"]`（评估前 `describe_stage()` 已
-    报告的同一个阶段 → **零 delta**）；② 3.4-c 老师确认钩子的状态行写入（**全系统唯一 rank 增加点**，
-    见 ⑱ 组）；③ 同一钩子把结果装进**返回体**时对 `_transition_result()` 的 `stage=` 回显（**不落库**）。
+    """CTO 约束 3 的**精确形态**（3.4-c 落地后按预告升级，4a 再按同一预告 +2）：服务层的
+    `stage=` 关键字实参**恰好 5 处**，逐处归位 —— ① `_ensure_state_row()`：值表达式恒为
+    `view["stage"]`（评估前 `describe_stage()` 已报告的同一个阶段 → **零 delta**）；② 3.4-c 老师
+    确认钩子的状态行写入（**全系统唯一 rank 增加点**，见 ⑱ 组）；③ 同一钩子把结果装进**返回体**时对
+    `_transition_result()` 的 `stage=` 回显（**不落库**）；④ 4a `_demote()` 的状态行写入（**全系统
+    唯一 rank 减少点**，值恒为现场校验后的落点变量 `target`，见 ⑲ 组）；⑤ 同一降级函数把结果装进
+    **返回体**时对 `_transition_result()` 的 `stage=` 回显（**不落库**）。
+    5 处构成 = 零 delta upsert + 向上 upsert + 向上回显 + 向下 upsert + 向下回显
+    （**3 处落库 + 2 处回显**）；CTO 裁决：`apply_upgrade_confirmation` 与 `_demote` 是对称操作，
+    写法必须一致（各自的 upsert 与回显传的必须是**同一个变量**，见 ⑱ 组逐处归位）。
     `pending_stage=` / `from_stage=` / `to_stage=` 是别的形参名，AST 精确匹配不计入。
     """
     import ast
@@ -3477,9 +3597,9 @@ def test_evaluate_stage_write_point_is_pinned_to_the_zero_delta_helper():
     tree = ast.parse(inspect.getsource(agent_stage_service))
     keywords = [node for node in ast.walk(tree)
                 if isinstance(node, ast.keyword) and node.arg == "stage"]
-    assert len(keywords) == 3, \
-        "3.4-c 落地后 stage= 关键字实参必须恰好 3 处（零 delta + 唯一向上写 + 返回体回显），" \
-        "实测行号 %r" % [n.lineno for n in keywords]
+    assert len(keywords) == 5, \
+        "4a 落地后 stage= 关键字实参必须恰好 5 处（零 delta + 向上 upsert + 向上回显 + " \
+        "向下 upsert + 向下回显），实测行号 %r" % [n.lineno for n in keywords]
     keywords.sort(key=lambda node: node.lineno)
 
     lines, start = inspect.getsourcelines(agent_stage_service._ensure_state_row)
@@ -3490,7 +3610,12 @@ def test_evaluate_stage_write_point_is_pinned_to_the_zero_delta_helper():
     assert ast.dump(zero_delta[0].value) == ast.dump(ast.parse('view["stage"]', mode="eval").body), \
         "写入值必须是「评估前读到的阶段」本身（零 delta），不得是别的表达式"
 
-    for name in ("evaluate", "_evaluate", "_recommend_upgrade", "stage_config_source"):
+    # 只读族逐个钉住「体内没有一行 stage= 实参」：读函数绝不许写阶段真值（口径 A 的 AST 形态；
+    # 4a 新增的四个符号一并纳入，降级写点只许在 `_demote()` 里）
+    for name in ("evaluate", "_evaluate", "_recommend_upgrade", "stage_config_source",
+                 "stage_view", "_stage_view", "_stage_view_short_circuit",
+                 "effective_capabilities", "_capability_view", "save_stage_config",
+                 "_save_stage_config", "_config_save_short_circuit"):
         body = ast.parse(inspect.getsource(getattr(agent_stage_service, name)))
         assert [node.lineno for node in ast.walk(body)
                 if isinstance(node, ast.keyword) and node.arg == "stage"] == [], name
@@ -4226,7 +4351,6 @@ def test_hooks_present_with_flag_off_keep_both_forwarders_zero_stage_sql(db, tas
     assert database.find_pending_upgrade_task(TEACHER) is None
 
 
-
 # ---- 约束 1：唯一向上写路径（源码级：写入点枚举 + 逐处归位 + rank 增加点计数 = 1）----
 
 def test_only_upward_stage_write_path_is_teacher_confirmation():
@@ -4237,13 +4361,18 @@ def test_only_upward_stage_write_path_is_teacher_confirmation():
       ② 状态行写入函数的 `**` 展开形状 —— **出现即红**（`stage` 可能被藏在展开里，枚举就不再完整）。
     `pending_stage=` / `from_stage=` / `to_stage=` 是别的形参名，AST 精确匹配天然不计入。
 
-    本步落地后的定态（**三处 `stage=` 实参 / 两处状态行写入 / 一处 rank 增加**）：
+    4a 落地后的定态（**五处 `stage=` 实参 / 三处状态行写入 / 一处 rank 增加 / 一处 rank 减少**；
+    构成 = 零 delta upsert + 向上 upsert + 向上回显 + 向下 upsert + 向下回显 = 3 处落库 + 2 处回显）：
       · `_ensure_state_row()` 的零 delta 写入（值恒为 `view["stage"]` → 不改变 rank）；
       · `apply_upgrade_confirmation()` 的状态行写入（**唯一 rank +1**，值恒为钩子入参 `to_stage`）；
-      · 同一钩子把结果装配进返回体时对 `_transition_result()` 的 `stage=` 回显（**不落库**）。
-    为什么钉「写入点」而不是直接钉「向上写」：rank 增加是**运行时**属性，源码级只能钉「值从哪来」；
-    写入值恒为 `to_stage`（非字面量）+ 该分支只在 `_next_stage()` 单级校验之后才可达 —— 后半句由
-    `test_apply_upgrade_confirmation_rejects_cross_level_targets` 行为级用例补全。
+      · 同一钩子把结果装配进返回体时对 `_transition_result()` 的 `stage=` 回显（**不落库**）；
+      · `_demote()` 的状态行写入（**唯一 rank −1**，值 = 现场校验后的落点变量 `target`）。
+      · 同一降级函数把结果装配进返回体时对 `_transition_result()` 的 `stage=` 回显（**不落库**）
+        —— CTO 裁决：`apply_upgrade_confirmation()` 与 `_demote()` 是对称操作，写法必须一致。
+    为什么钉「写入点」而不是直接钉「向上 / 向下」：rank 变化是**运行时**属性，源码级只能钉「值从哪来」
+    + 「属于哪个函数」；向上那处的值恒为 `to_stage`、向下那处的值恒为 `target` 且只在「严格低于当前」
+    的校验**之后**才可达 —— 两句分别由 `test_apply_upgrade_confirmation_rejects_cross_level_targets`
+    与 ⑲ 组的 `test_demote_never_raises_stage_rank`（行为级）补全。
     """
     import ast
     import inspect
@@ -4258,20 +4387,48 @@ def test_only_upward_stage_write_path_is_teacher_confirmation():
         ("_ensure_state_row", _STATE_ROW_WRITER),
         ("apply_upgrade_confirmation", _STATE_ROW_WRITER),
         ("apply_upgrade_confirmation", "_transition_result"),
-    ], "stage= 写入点清单变了（实测 %r）—— 多一处就说明「唯一向上写路径」被绕开" % [
+        ("_demote", _STATE_ROW_WRITER),
+        ("_demote", "_transition_result"),
+    ], "stage= 写入点清单变了（实测 %r）—— 多一处就说明「唯一向上 / 向下写路径」被绕开" % [
         (s[0], s[1], s[2]) for s in sites]
 
-    assert len(state_row_sites) == 2 and len(sites) == 3
-    increasing = [s for s in state_row_sites if s[0] != "_ensure_state_row"]
-    assert [s[0] for s in increasing] == ["apply_upgrade_confirmation"], \
-        "rank 增加点必须**恰好 1 个**且就是老师确认钩子（实测 %r）" % [s[0] for s in state_row_sites]
+    assert len(state_row_sites) == 3 and len(sites) == 5
+    # 方向按**所属函数**归属（rank 增减是运行时属性）：向上点恰好 1 个（老师确认）、向下点恰好 1 个
+    by_owner = {}
+    for site in state_row_sites:
+        by_owner.setdefault(site[0], []).append(site)
+    assert sorted(by_owner) == ["_demote", "_ensure_state_row", "apply_upgrade_confirmation"], \
+        "落库写入点的所属函数清单变了（实测 %r）" % sorted(by_owner)
+    increasing = by_owner["apply_upgrade_confirmation"]
+    decreasing = by_owner["_demote"]
+    assert len(increasing) == 1 and len(decreasing) == 1, \
+        "向上 / 向下各**恰好 1 个**落库点（实测 向上 %d 个 / 向下 %d 个）" % (
+            len(increasing), len(decreasing))
 
-    zero_delta = state_row_sites[0]
-    assert zero_delta[0] == "_ensure_state_row"
+    # 返回体回显恰好 2 处（向上 / 向下各一），且**回显的值必须与同一函数的落库写入点是同一个变量**
+    # —— CTO 裁决「`apply_upgrade_confirmation` 与 `_demote` 是对称操作，写法必须一致」的源码级形态
+    echoes = {site[0]: site for site in sites if site[1] != _STATE_ROW_WRITER}
+    assert sorted(echoes) == ["_demote", "apply_upgrade_confirmation"], \
+        "返回体回显必须恰好 2 处（向上 / 向下各一），实测 %r" % sorted(echoes)
+    for owner, echo in echoes.items():
+        assert ast.dump(echo[3]) == ast.dump(by_owner[owner][0][3]), \
+            "%s：回显的值必须与同函数的落库写入点同一个变量（禁止另起一份表达式）" % owner
+
+    zero_delta = by_owner["_ensure_state_row"][0]
     assert ast.dump(zero_delta[3]) == ast.dump(ast.parse('view["stage"]', mode="eval").body), \
         "零 delta 写入的值必须是「评估前读到的阶段」本身"
     assert ast.dump(increasing[0][3]) == ast.dump(ast.parse("to_stage", mode="eval").body), \
         "唯一向上写路径的值必须是钩子入参 to_stage（不是字面量、也不是别处的行值）"
+    assert ast.dump(decreasing[0][3]) == ast.dump(ast.parse("target", mode="eval").body), \
+        "唯一向下写路径的值必须是降级函数体内的落点变量 target（手动 = 入参 to_stage、规则 = 规则落点）"
+
+    # `target` 的赋值来源只有 §1.6 / §3.7 的三条（多一条 = 「向下写」不再收敛）；方向的**现成校验**
+    # （必须严格低于当前阶段）属行为级，见 ⑲ 组。源码级只钉形态，不改这三行的语义。
+    assigned = [line.strip() for line in inspect.getsource(agent_stage_service._demote).splitlines()
+                if line.strip().startswith("target = ")]
+    assert assigned == ["target = to_stage", "target = _CONSERVATIVE_STAGE",
+                        "target = STAGES[max(current_rank - 1, 0)]"], \
+        "落点变量的赋值来源只有三条（手动 / 规则重置 / 规则降级），实测 %r" % assigned
 
     # 逐处按行号归位：行号必须落在「所属函数」的源码区间内，且所属调用名必须非空
     for owner, called, lineno, _value in sites:

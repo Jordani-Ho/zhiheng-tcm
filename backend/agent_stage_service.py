@@ -1494,7 +1494,7 @@ _NON_CONTENT_CHARS = " \t\u3000\r\n（）()[]［］【】<>《》←→-—*·:�
 #   约束 3「evaluate 绝不向上写 stage」→ 服务层的 `stage=` 关键字实参**恰好 1 处**，且只在
 #     `_ensure_state_row()` 里、值恒为 `view["stage"]`（= 评估前 `describe_stage()` 已报告的
 #     **同一个**阶段 → 零 delta、不改变任何权限面）。为什么这一处不能省，见 `_ensure_state_row()`
-#     的 docstring（状态表 DDL 默认 `stage='observation'`，会静默把未初始化老师降一级）；⑰ 组有 AST 守护；
+#     的 docstring（状态表 DDL 默认 `stage='observation'`，会静默把未初始化老师降一级）；⑰ 组有 AST 守护（现为 5 处，见 4a 段头）；
 #   约束 4「can_recommend 10 条全真才推荐、逐条进 blockers」→ `_evaluate_blockers()` **无短路**
 #     逐条判定（顺序与 §3.6 伪码对齐）；`value is None` / `pending_stage` / 冷却期三条各有专项用例；
 #   约束 5「pending_stage / pending_task_id 成对写」→ `_recommend_upgrade()`：**先**写 state
@@ -1884,7 +1884,8 @@ def _ensure_state_row(teacher_name, view):
       3. `get_agent_stage_state()` 的 `sqlite3.Error` **不吞**（裁决⑤）→ 冒泡给 `evaluate()` 的
          §3.8 失败短路：读不到状态行时评估不会再往下写任何东西。
 
-    3.4-c 落地「唯一向上写路径」后，服务层的 `stage=` 写入点由 1 变 2（+ `apply_upgrade_confirmation`）。
+    3.4-c 落地「唯一向上写路径」后，服务层的 `stage=` 写入点由 1 变 2（+ `apply_upgrade_confirmation`）；
+    4a 落地「唯一向下写路径」后再变 3（+ `_demote()`），计数由 ⑰ / ⑱ 组源码级守护同步钉住。
     """
     import database
 
@@ -2097,8 +2098,8 @@ def evaluate(teacher_name):
 
     **绝不向上写 `stage`**（约束 3）：本函数只写 `pending_stage` 一对、指标快照与两类日志；
     `stage` 的向上变化只有 3.4-c 的老师确认一条路径（`apply_upgrade_confirmation`）。
-    全文件 `stage=` 关键字实参共 3 处（零 delta `_ensure_state_row()` + 唯一向上写 + 返回体回显），
-    见 ⑰ / ⑱ 组的源码级守护。
+    全文件 `stage=` 关键字实参共 5 处（零 delta `_ensure_state_row()` + 向上 upsert + 向上回显 +
+    向下 upsert + 向下回显；3 处落库 + 2 处回显），见 ⑰ / ⑱ / ⑲ 组的源码级守护。
 
     返回体（**18 键快照 + `changed`**，形状即契约；接口层直出）：
       `teacher_name` / `skipped` / `reason`
@@ -2141,10 +2142,15 @@ def evaluate(teacher_name):
 #
 # CTO 七条约束 → 本段逐条落点：
 #   约束 1「apply_upgrade_confirmation 是唯一 rank 增加点」→ 本段唯一的 `stage` 真值写入就在该钩子
-#     **函数体内**，且现场校验「目标 == `_next_stage(当前)`」（单级、不可跳级，§1.1）。全文件
-#     `stage=` 关键字实参因此恰好 **3 处**：`_ensure_state_row()` 的零 delta、本钩子唯一向上写、
+#     **函数体内**，且现场校验「目标 == `_next_stage(当前)`」（单级、不可跳级，§1.1）。本段落地时
+#     全文件 `stage=` 关键字实参因此恰好 **3 处**：`_ensure_state_row()` 的零 delta、本钩子唯一向上写、
 #     本钩子把结果装进返回体时对 `_transition_result()` 的**回显**（不落库）；其中真正落库的
-#     **状态行写入点只有 2 处**（`upsert_agent_stage_state(..., stage=…)`），**rank 增加点计数 = 1**。
+#     **状态行写入点 2 处**（`upsert_agent_stage_state(..., stage=…)`），**rank 增加点计数 = 1**
+#     （现为 5 处，见 4a 段头）。
+#     【4a 同步】降级入口落地后这两项计数变为 **5 处实参 / 3 处落库 / 2 处回显**（+ `_demote()` 的
+#     唯一向下写 + 该函数返回体对 `_transition_result()` 的 `stage=` 回显；方向恒向下、由 ⑲ 组按
+#     「值必须严格减少 rank」行为级钉住；CTO 裁决：与老师确认钩子是对称操作、写法必须一致）—— 本段
+#     其余口径一字未改。
 #     两处计数都由 ⑱ 组源码级守护钉住（⑰ 组那条「恰好 1 处」的临时钉同步升级为「3 处 + 逐处归位」
 #     —— 该断言自己的 docstring 与 `_ensure_state_row()` 的注释都预告了这次升级）。
 #   约束 2「越级拒绝」→ 目标 ≠ 下一阶段（跳级 / 向下 / 未知 / 缺 `to`）→ **阶段一个字不动**，
@@ -2495,5 +2501,709 @@ def on_draft_signed(teacher_name):
     except Exception as exc:
         _config_warn("簽字後的階段評估異常（%s）：本次跳過，簽字結果不受影響" % (exc,))
         return None
+
+
+# ============================================================================
+# 【施工步骤 4a】服务层交付面：`demote` / `stage_view` / `effective_capabilities` /
+#                 `save_stage_config` + 「唯一阶段写路径」源码级守护（⑲ 组）
+# ----------------------------------------------------------------------------
+# 对齐：设计 §4.5-①（公开符号表）/ §4.6（7 个接口的**服务侧**口径）/ §3.4 第 5–6 条（配置写入）/
+#      §3.7（规则降级复用同一个降级写口）/ §3.8（GET 恒快、无副作用、不重算）/ §1.5 / §1.6。
+# **本段零接线**：`agent_stage_api.py` / `models.py` / `main.py` / `database.py` 与库层 8 个函数
+# 一字不动（接口层属 4b）；本段只补齐「接口层直连族」的四个服务符号，供 ⑲ 组与 4b 使用。
+#
+# 三条本段自行钉死的口径（⑲ 组逐条覆盖，汇报里列清）：
+#   口径 A「读函数严格只读」：`stage_view()` / `effective_capabilities()` 全程**只发 SELECT**、
+#     零写入、**零审计**（§3.8「GET 恒快、无副作用、不改状态」）。为此 `stage_view()` **不调
+#     `require_capability()`** —— 闸门会为拒绝写 `permission_denied`，一次 GET 会凭空长出审计行；
+#     视图改为复用同一份判定数据（`CAPABILITY_MATRIX` + `matrix_enforced`）**逐格算出**同一张表，
+#     ⑲ 组用「视图五格 ≡ 闸门五格」的**行为级**断言钉住两者不许分叉。
+#   口径 B「拒绝必须可回答、服务层不抛」：四个符号**都不抛**（与钩子族同款），拒绝 / 失败一律走
+#     返回体的 `reason`（配置校验另带结构化 `errors`、写入另带 `warnings`）—— `AgentStageError`
+#     的抛出点仍是接口层（3.3 段已钉：「本异常在 flag off 时不会被抛出，接口层第一道门卫直接
+#     404 `agent_stage_disabled`」）；4b 只需把 `reason` / `errors` 装进统一错误体
+#     （`_fail(status, code, msg, errors, warnings)`），状态码映射照 §4.6 的表。
+#   口径 C「flag off 零 SQL」：四个符号首行都是总闸（或空名短路），不通过即返回**逐键同形**的
+#     短路体 → ⑲ 组沿用 ⑰⑱ 的「语句级零 SQL + 五张表零增量」双断言。
+#
+# 写点清单（**只增两类**，其余沿用 3.4-b / 3.4-c 的既有写口）：
+#   · `demote()` 的状态行写入（单条 upsert 写全 `stage` / `stage_since` / `stage_source` + 清待确认
+#     对 → 无半写）+ 两张日志（`stage_demoted` 事件 + §1.6 转移名的行动日志）；
+#   · `save_stage_config()` 的配置行写入（整体覆盖、不部分生效）+ 一行 `config_changed` 审计。
+# 两个写函数都遵循「状态先行、审计殿后」；审计写口全部 best-effort（§1.3）。
+#
+# 与 ⑱ 组「唯一向上写路径」的关系（**口径变更，已披露**）：本段的 `demote()` 让全文件 `stage=`
+# 关键字实参从 3 处变 5 处 —— 新增的 2 处都在降级函数体内：① 状态行写入，写的是现场校验后的落点
+# 变量 `target`（手动降级 = 入参 `to_stage`，规则源 = 规则落点），且只在「落点严格低于当前」的校验
+# **之后**才可达（方向恒为向下）；② 同一函数把结果装进返回体时对 `_transition_result()` 的 `stage=`
+# 回显（**不落库**，只装配返回体），与 3.4-c 老师确认钩子的两处同形 —— CTO 裁决：两者是对称操作、
+# 写法必须一致（**回显的值必须与同函数的 upsert 同一个变量**，⑱ 组有 AST 比对）。故「rank 增加点
+# 计数 = 1」的守护按**所属函数**识别唯一向上点（`apply_upgrade_confirmation`），另配「降级点必须
+# 严格减少 rank」的**行为级**断言 —— ⑰ / ⑱ 两组的计数断言、`_ensure_state_row()` / `evaluate()` /
+# 3.4-c 段头的同句注释、以及 `docs/epic4-lineage-design-v1.md`（§3 裁决③ / §5.3 / §7 验收表⑧）
+# 提到的「恰 3 处」一并同步为「5 处实参 / 3 处落库 / 2 处回显 / 1 处向上 / 1 处向下」；本段之外
+# **没有任何行为改动**。
+# ============================================================================
+
+# `stage_source`（§1.2 五个字面量里的三个**降级**来源；与 §1.6 的三个转移动作名**同字面量**）
+_STAGE_SOURCE_MANUAL_DEMOTE = "manual_demote"
+_STAGE_SOURCE_RULE_DEMOTE = "rule_demote"
+_STAGE_SOURCE_RULE_RESET = "rule_reset"
+
+# 允许进入 `demote()` 的来源白名单（另两个字面量属升阶 / 读取兜底：`teacher_confirm` / `default`）
+_DEMOTE_SOURCES = (_STAGE_SOURCE_MANUAL_DEMOTE, _STAGE_SOURCE_RULE_DEMOTE, _STAGE_SOURCE_RULE_RESET)
+
+# 事件名（§1.3 共 10 类里的两类）
+_LOG_EVENT_STAGE_DEMOTED = "stage_demoted"
+_LOG_EVENT_CONFIG_CHANGED = "config_changed"
+
+# 返回体 `reason`（**复用**已有字面量，不新造同义词）
+_REASON_STAGE_DEMOTED = _LOG_EVENT_STAGE_DEMOTED                 # 阶段真的降下去了
+_REASON_STAGE_INVALID_VALUE = "stage_invalid_value"             # §4.6-⑤：非法阶段 / 非法来源 → 400
+_REASON_DEMOTE_WRITE_FAILED = "demote_write_failed"             # 状态行写入失败（阶段保持原值、无半写）
+_REASON_CONFIG_SAVED = "config_saved"                           # 配置已整体写入
+_REASON_CONFIG_INVALID = "stage_config_invalid"                 # §3.4 第 5 条：校验未过 → 整体不写入
+_REASON_CONFIG_WRITE_FAILED = "config_write_failed"             # 配置行写入失败（读取链仍是旧配置）
+
+# GET 视图在「从没评估过」时唯一的一条 blocker（读不到快照 = 先告诉老师去点「立即評估」）
+_BLOCKER_NOT_EVALUATED = "evaluation_not_run"
+
+# 未知阶段 / 空名的 fail-closed 答案：权限面最小的那个阶段（`observation` = `STAGES[0]`）
+_CONSERVATIVE_STAGE = STAGES[0]
+
+# 配置键「在 / 不在」的哨兵（`None` 可能是脏行里的真实值，不能拿它当「不存在」）
+_CONFIG_ABSENT = object()
+
+
+def _capability_view(stage, matrix_enforced):
+    """五键权限面（**纯查表，零 SQL、零审计**）：与 `require_capability()` 的四步判定**逐格同值**。
+
+    口径 A 的落地：视图不能调闸门（闸门会为拒绝写 `permission_denied`），所以这里把闸门的第 ③④ 步
+    写成一次性表计算 —— 「矩阵是数据」这条纪律让「照抄」只剩两行：同一份 `CAPABILITY_MATRIX`（经
+    `_matrix_allows()` 单点查表）与同一份 `_MATRIX_RELAXED_CAPABILITIES`，**不新增第三个判定源**。
+    """
+    if matrix_enforced:
+        return {capability: _matrix_allows(stage, capability) for capability in CAPABILITIES}
+    return {capability: (_matrix_allows(stage, capability)
+                         or capability in _MATRIX_RELAXED_CAPABILITIES)
+            for capability in CAPABILITIES}
+
+
+def _matrix_enforced_now(teacher_name, stage):
+    """**按需**读放宽开关（§2.5）：有格子被矩阵拒绝时才读配置链（与闸门「用到才读」同口径）。
+
+    取四层配置链的 `matrix_enforced`（缺失 / 读坏 → 内置 `True` → 继续强制）：读不到配置永远不会
+    变成权限放大（fail-closed，与 `require_capability()` 第 ④ 步逐字同源，不新增第二份读法）。
+    全放行的阶段（`learning` / `authorized`）**一次配置都不读** —— 视图的快速路径由此成立。
+    """
+    if all(_matrix_allows(stage, capability) for capability in CAPABILITIES):
+        return True
+    return bool(load_stage_config(teacher_name).get("matrix_enforced", True))
+
+
+def _short_circuit_capabilities():
+    """flag off 的权限面：与 `require_capability()` 的第一步**逐格一致**（只放行既有能力例外）。
+
+    为什么视图在 flag off 也报这份表而不是「空着」：它是那一刻**真实生效**的权限面（`generate_draft`
+    照旧可用，§5.1 红线①）—— 视图撒谎比视图空着更危险；「功能没开」由接口层 404 与 `blockers` 里的
+    `agent_stage_disabled` 回答。
+    """
+    return {capability: capability in LEGACY_ALLOWED_WHEN_DISABLED for capability in CAPABILITIES}
+
+
+def effective_capabilities(teacher_name):
+    """当前老师**实际生效**的权限面（§4.6-①，`GET /api/agent/stage` 里 `capabilities` 一节的来源）。
+
+    前端按它渲染三个新能力入口按钮的可用 / 置灰与繁体原因（§4.5-⑤），故本函数是「能力区」的唯一
+    数据来源；但判定本身仍只在 `require_capability()`（§2.2），本函数只是**同一份判定的只读投影**。
+
+    返回 **7 键**（形状即契约；短路体逐键同形）：
+      `teacher_name` / `enabled` / `stage` / `stage_label` / `degraded` / `matrix_enforced` /
+      `capabilities{5 键}`
+
+    · `capabilities` 与 `require_capability()` **逐格同值**（同一份矩阵 + 同一份放宽开关）；
+    · `matrix_enforced` 报**实际生效**值（有格子被拒才读配置链；§2.5 的临时放宽要让前端看得见）；
+    · **只读**：全程只发 SELECT、零写入、零审计（口径 A）；
+    · flag off → `enabled=False` + 既有能力例外（零 SQL）；空名 → `enabled=True` 但 `stage=""` +
+      **最保守阶段**的权限面（fail-closed：不知道阶段时按 `observation` 报，绝不凭空放大）。
+
+    与 `describe_stage()` 的分工：真值（`stage` / `stage_label` / `degraded`）**只从它取**（单一真相
+    源），本函数不自己读状态行 —— ⑲ 组按「同一老师同一时刻两处 `stage` 必须相等」钉住这条分工。
+    """
+    name = teacher_name or ""
+    if not agent_stage_enabled():
+        _config_warn("智能體階段功能未啟用（AGENT_STAGE_ENABLED off）：本次權限面直接返回既有能力"
+                     "例外（零查詢、零寫入）")
+        return {
+            "teacher_name": name,
+            "enabled": False,
+            "stage": "",
+            "stage_label": "",
+            "degraded": False,
+            "matrix_enforced": True,        # flag off 时矩阵没被咨询过 → 报 fail-closed 的强制态
+            "capabilities": _short_circuit_capabilities(),
+        }
+    if not name:
+        _config_warn("查詢權限面缺少 teacher_name（無效調用）：本次按「最保守階段」回答"
+                     "（零查詢、零寫入）")
+        return {
+            "teacher_name": name,
+            "enabled": True,
+            "stage": "",
+            "stage_label": "",
+            "degraded": False,
+            "matrix_enforced": True,
+            "capabilities": _capability_view(_CONSERVATIVE_STAGE, True),
+        }
+
+    view = describe_stage(name)
+    stage = view.get("stage") or ""
+    enforced = _matrix_enforced_now(name, stage)
+    return {
+        "teacher_name": name,
+        "enabled": True,
+        "stage": stage,
+        "stage_label": view.get("stage_label") or "",
+        "degraded": bool(view.get("degraded")),
+        "matrix_enforced": enforced,
+        "capabilities": _capability_view(stage, enforced),
+    }
+
+
+# ---------------------------------------------------------------------------
+# 【4a-②】`GET /api/agent/stage` 的服务侧主体：`stage_view()`（§4.6-① 的 15 键）
+#   · 三份数据源各读一次：阶段真值（§1.5 唯一读口）+ 生效配置（§3.4 现读）+ 上次评估快照；
+#   · `metrics` = `last_metrics_json` **直出**（§3.8「GET 不重算」：重算属 `evaluate()`）；
+#   · 权限面**不调闸门**（口径 A：闸门会为拒绝写 `permission_denied`）→ 复用同一份矩阵逐格算。
+# ---------------------------------------------------------------------------
+
+def _last_snapshot(teacher_name):
+    """读状态行里的**上一次评估快照**（`last_metrics_json` / `last_evaluated_at`），返回 `(snapshot, at)`。
+
+    三态都「诚实地空」，且**零写入**（不修脏行、不建行、不写审计 —— 口径 A）：
+      · **无状态行**（从未评估过的老师）→ `({}, "")` 且**不告警**（未初始化属正常态，与 §1.5 ③ 同口径）；
+      · **列空 / JSON 损坏 / 不是对象**（人手 SQL 写坏）→ `({}, at)` + 一条繁体告警（不修、不炸）；
+      · **读库异常**（0003 未跑 / 库被锁）→ `({}, "")` + 告警「讀取…失敗」（§3.8：GET 绝不 500）。
+
+    为什么不在这一层报 `degraded`：`describe_stage()` 已经如实回答**阶段真值**的读取质量，而
+    「没有快照」与「快照读不到」在视图上**同形**（`metrics` 空骨架 + `evaluation_not_run`），
+    多一个布尔量只会让前端多写一套渲染、还分不出更细的信息（§3.8：GET 回答「有没有数」）。
+    """
+    import database      # 只在**函数体内**延迟 import（§4.5-①；方向守护见 ⑩ 组）
+
+    try:
+        row = database.get_agent_stage_state(teacher_name)
+    except sqlite3.Error as exc:
+        _config_warn("讀取狀態行（上一次評估快照）失敗（%s）：本次按「尚未評估」回答" % (exc,))
+        return {}, ""
+    if row is None:
+        return {}, ""
+
+    at = row.get("last_evaluated_at") or ""
+    raw = row.get("last_metrics_json")
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except ValueError:
+            _config_warn("狀態行的 last_metrics_json 不是合法 JSON（人手 SQL 改壞？）："
+                         "本次按「尚未評估」回答，不修該行、不改寫、不拋")
+            return {}, at
+    if not isinstance(raw, dict) or not raw:
+        return {}, at
+    return raw, at
+
+
+def _snapshot_metrics(snapshot):
+    """快照里的三个指标键；没有快照 / 键坏 → §3.4-a 的空骨架（前端只需一套渲染）。
+
+    **不做第二次判定**：值 / 样本数 / blocker 全部原样直出（`evaluate()` 写下什么就显示什么）。
+    只做形状兜底（非对象项换成空骨架、多余键丢掉）—— 一个坏键不该让整个 `GET` 变成 500。
+    """
+    blank = _blank_metrics_snapshot(_BLOCKER_NOT_EVALUATED)
+    stored = snapshot.get("metrics") if isinstance(snapshot, dict) else None
+    if not isinstance(stored, dict) or not stored:
+        return blank
+    return {key: (stored[key] if isinstance(stored.get(key), dict) else blank[key])
+            for key in blank}
+
+
+def _snapshot_blockers(snapshot):
+    """快照里的 `blockers`（上一次评估的结论）；没有快照 → 唯一的一条 `evaluation_not_run`。
+
+    只做形状兜底（丢掉非字符串 / 空串项），**顺序原样保留**（`evaluate()` 写下的顺序就是给老师
+    看的顺序）；`[]` 是**有意义的空**（上一轮真的不卡任何一条），与「没有快照」严格区分。
+    """
+    raw = snapshot.get("blockers") if isinstance(snapshot, dict) else None
+    if not isinstance(raw, (list, tuple)):
+        return [_BLOCKER_NOT_EVALUATED]
+    return [item for item in raw if isinstance(item, str) and item]
+
+
+def _metrics_stale(evaluated_at, cfg):
+    """`stale` = 「指标可能已过时」（§4.6-① 末条）：`now - last_evaluated_at > metrics_ttl_hours`。
+
+    方向恒为「提示老师再点一次评估」，**不阻断任何东西**。四个边界都取最保守的答案：
+      · 从没评估过（`evaluated_at` 空）→ `True`（没有任何新鲜指标可言）；
+      · 时间戳读不懂（脏行）→ `True` + 繁体告警：读不懂的脏时间**不等于**新鲜；
+      · `metrics_ttl_hours` 非正数（含脏值）→ 按字面读，窗口 0 小时 = 立刻过期 → `True`；
+      · 时区混用（带 tz 的脏值与本地 `now` 相减报 `TypeError`）→ `True`（不让脏值炸掉 GET）。
+    未来时刻（负年龄，机器时钟回拨）→ `False`：`last_evaluated_at` 比「现在」还新，没有过期一说。
+    """
+    if not evaluated_at:
+        return True
+    try:
+        evaluated = datetime.fromisoformat(str(evaluated_at))
+    except ValueError:
+        _config_warn("狀態行的 last_evaluated_at 不是可解析時間（%r）：本次按「可能已過時」回答"
+                     % (evaluated_at,))
+        return True
+    config = cfg if isinstance(cfg, dict) else {}
+    ttl = _metric_int(config.get("metrics_ttl_hours"), DEFAULT_STAGE_CONFIG["metrics_ttl_hours"])
+    if ttl <= 0:
+        return True
+    try:
+        age = (datetime.now() - evaluated).total_seconds()
+    except TypeError:
+        _config_warn("狀態行的 last_evaluated_at 與本地時間不可比較（時區混用）："
+                     "本次按「可能已過時」回答")
+        return True
+    return age > ttl * 3600
+
+
+def _stage_view_short_circuit(teacher_name, blocker, degraded=False):
+    """`stage_view()` 的**零 SQL** 短路体（flag off / 无效调用 / 读异常）：与正常路径**逐键同形**。
+
+    每个值都「诚实地空」：没读库就不编造阶段（`stage` 一族空串）、`thresholds` 空字典（没走配置链）、
+    `stale=True`（没有任何新鲜指标可言）。`blockers` 只有一条 = 短路原因本身（与 `evaluate()` 的
+    短路口径一致：把原因放进 `blockers` 而不是另造字段）。
+    """
+    return {
+        "teacher_name": teacher_name,
+        "stage": "",
+        "stage_label": "",
+        "stage_since": "",
+        "stage_source": "",
+        "pending_stage": "",
+        "pending_task_id": 0,
+        "capabilities": _short_circuit_capabilities(),
+        "metrics": _blank_metrics_snapshot(blocker),
+        "thresholds": {},
+        "next_stage": None,
+        "blockers": [blocker],
+        "config_source": _blank_config_source(),
+        "stale": True,
+        "degraded": bool(degraded),
+    }
+
+
+def _stage_view(teacher_name):
+    """`stage_view()` 的实体（flag / 空名闸门已由调用方过掉）：三份数据源各读一次 → 拼 15 键。
+
+    · 阶段真值 = `describe_stage()`（§1.5 唯一读口；fail-closed、永不抛）—— `stage_label` 一并由它
+      给出，本函数**不自己查** `STAGE_LABELS`（真值只许有一个来源，⑲ 组按「两处 `stage` 恒相等」钉住）；
+    · 生效配置 = `load_stage_config()` + `stage_config_source()`（§3.4：两处**同源**且现读不缓存）；
+    · 上次评估快照 = `_last_snapshot()`（`last_metrics_json` 直出，不重算）；
+    · 权限面 = `_capability_view()`（口径 A：不调闸门，否则一次 GET 会为拒绝长出 `permission_denied`）。
+    `thresholds` / `next_stage` 全部是**回显与查表**，不做任何判定 —— §3.8「GET 恒快、无副作用」由此成立。
+    """
+    view = describe_stage(teacher_name)
+    stage = view.get("stage") or ""
+    cfg = load_stage_config(teacher_name)
+    snapshot, evaluated_at = _last_snapshot(teacher_name)
+    enforced = _matrix_enforced_now(teacher_name, stage)
+    fields = _view_fields(view)
+    return {
+        "teacher_name": teacher_name,
+        "stage": stage,
+        "stage_label": view.get("stage_label") or "",
+        "stage_since": fields["stage_since"],
+        "stage_source": fields["stage_source"],
+        "pending_stage": fields["pending_stage"],
+        "pending_task_id": fields["pending_task_id"],
+        "capabilities": _capability_view(stage, enforced),
+        "metrics": _snapshot_metrics(snapshot),
+        "thresholds": _thresholds_snapshot(cfg),
+        "next_stage": _next_stage(stage),
+        "blockers": _snapshot_blockers(snapshot),
+        "config_source": stage_config_source(teacher_name),
+        "stale": _metrics_stale(evaluated_at, cfg),
+        "degraded": bool(view.get("degraded")),
+    }
+
+
+def stage_view(teacher_name):
+    """【§4.6-① / §3.8】`GET /api/agent/stage` 的**服务侧主体**（接口层直出，不做二次加工）。
+
+    返回 **15 键**（形状即契约；短路体逐键同形）：
+      `teacher_name` / `stage` / `stage_label` / `stage_since` / `stage_source` / `pending_stage` /
+      `pending_task_id` / `capabilities{5}` / `metrics{3}` / `thresholds{13}` / `next_stage` /
+      `blockers[]` / `config_source{3}` / `stale` / `degraded`
+
+    四条纪律（⑲ 组逐条覆盖）：
+      · **只读**（口径 A）：全程只发 SELECT —— 零写入、零审计、不修脏行、不改状态；`metrics` 直接回显
+        上次快照**不重算**（重算属 `evaluate()`，§3.8「GET 恒快、无副作用」）；
+      · flag off → 首行短路（**零 SQL**）+ `blockers=['agent_stage_disabled']` + 既有能力例外（视图不
+        撒谎：那一刻 `generate_draft` 真的还能用，§5.1 红线①）；
+      · 空 `teacher_name` → 零 SQL 短路（`teacher_required`；**不拿空名去查库** —— 空名会命中全局行 /
+        建表默认值，属「无效调用」而非「新老师」）；
+      · **永不抛**（口径 B）：读异常 → 一条繁体告警 + 同形兜底体（`degraded=True`、
+        `blockers=['evaluate_failed']`，复用既有字面量、不新造同义词）；「读不到」绝不升级成接口层 500。
+    """
+    name = teacher_name or ""
+    if not agent_stage_enabled():
+        _config_warn("智能體階段功能未啟用（AGENT_STAGE_ENABLED off）：本次階段視圖直接返回短路體"
+                     "（零查詢、零寫入）")
+        return _stage_view_short_circuit(name, _BLOCKER_DISABLED)
+    if not name:
+        _config_warn("查詢階段視圖缺少 teacher_name（無效調用）：本次直接返回短路體"
+                     "（零查詢、零寫入）")
+        return _stage_view_short_circuit(name, _BLOCKER_TEACHER_REQUIRED)
+
+    try:
+        return _stage_view(name)
+    except Exception as exc:
+        _config_warn("階段視圖讀取異常（%s）：本次返回兜底體（degraded=True，零寫入）" % (exc,))
+        return _stage_view_short_circuit(name, _BLOCKER_EVALUATE_FAILED, True)
+
+
+# ---------------------------------------------------------------------------
+# 【4a-③】`demote()`：全系统**唯一**的向下写路径（§4.6-⑤ 手动降级 / §3.7 规则降级与重置）
+#   · 三个来源（`manual_demote` / `rule_demote` / `rule_reset`）共用**同一个**落库动作；
+#   · 落点：手动 = 入参 `to_stage`（现场校验「严格更低」）、`rule_demote` = 降一级、`rule_reset` = 观察期；
+#   · 「状态先行、审计殿后」：单条 upsert 写全后，才写 `stage_demoted` + 一行行动日志。
+# ---------------------------------------------------------------------------
+
+
+def _demote_note(reason):
+    """`reason` 的入参兜底：非字符串（`None` / 数字 / 对象）一律当「没填」—— 审计文案不许因它抛。"""
+    return reason.strip() if isinstance(reason, str) else ""
+
+
+def _demote_detail(source, current, target, note):
+    """降级事件 / 行动日志的**同一段人话**（繁体；两处共用一份文案，避免审计与展示漂移）。
+
+    三种来源各一段固定句式 + 老师填的说明（有才带）。`rule_reset` 的那一段保留 §3.7 钉死的
+    字面 `[stage_reset] 智能體輸出觸及禁區，已回退至觀察期`（工作台「📜 行動日誌」里要能搜到这一句，
+    运维据此定位铁律违规）—— 该来源的落点恒为 `_CONSERVATIVE_STAGE`（观察期），故这句话永远是真话。
+    """
+    tail = "（老師說明：%s）" % note if note else ""
+    if source == _STAGE_SOURCE_RULE_RESET:
+        return ("[stage_reset] 智能體輸出觸及禁區，已回退至觀察期（原「%s」）%s"
+                % (STAGE_LABELS.get(current, current), tail))
+    if source == _STAGE_SOURCE_RULE_DEMOTE:
+        return ("[stage_demote] 表現回退：連續命中低於水位，「%s」自動降一級至「%s」%s"
+                % (STAGE_LABELS.get(current, current), STAGE_LABELS.get(target, target), tail))
+    return ("老師主動降級：「%s」→「%s」%s（單向操作，智能體不會自動升回）"
+            % (STAGE_LABELS.get(current, current), STAGE_LABELS.get(target, target), tail))
+
+
+def _demote_noop(teacher_name, view, current, source, note):
+    """降级幂等 no-op（规则源已在地板阶段）：`stage` / `stage_since` / `stage_source` **一个字不动**。
+
+    §1.1「同阶段重复操作幂等」在降级侧的形态（与 `apply_upgrade_confirmation()` 的 `_upgrade_noop`
+    同为「返回体同形、状态不动」）：
+      · **不刷新** `stage_since`（那是「在这个阶段待了多久」的审计基准，也是 §3.7 降级判定的输入）；
+      · **不写第二条 `stage_demoted`**（变更类事件只对应**真实**的阶段变化，否则审计表会长出
+        没有对应变更的「降级」）；
+      · 只做两件**限制方向**的收尾：清掉残留的待确认对（规则判定「该退」时，状态行不该还挂着
+        「⏳ 待你確認升階」）+ 一行 no-op 行动日志（如实记下规则这次的判定，人话写明「無需變更」）。
+    为什么 `manual_demote` **不走**这条路：老师点「降级」却给了一个不低于当前的目标 = 无法满足的
+    请求 → 由 `_demote()` 现场**拒绝**（接口层 409），比「假装成功」更能让老师定位问题。
+    """
+    cleared = _clear_pending_pair(teacher_name)
+    detail = ("規則降級未產生變化：當前已在「%s」（地板階段），本次無需變更"
+              "（階段起始時刻不刷新、不重複記錄階段變更）" % (STAGE_LABELS.get(current, current),))
+    if note:
+        detail += "（規則說明：%s）" % note
+    _action_log(teacher_name, 0, source, detail)
+    fields = _view_fields(view)
+    if cleared:
+        fields["pending_stage"], fields["pending_task_id"] = "", 0
+    return _transition_result(teacher_name, _REASON_ALREADY_AT_STAGE,
+                              previous_stage=current, **fields)
+
+
+def _demote(teacher_name, to_stage, reason, source):
+    """`demote()` 的实体（flag / 空名 / 来源三道闸门已由调用方过掉）：读真值 → 定落点 → 一条 upsert → 两张日志。
+
+    落点（§1.6 / §3.7 三条规则，**只在这里**出现一次）：
+      · `manual_demote` → 入参 `to_stage`，且现场要求「严格低于当前」（同阶段 / 向上 → 拒绝）；
+      · `rule_reset`     → 恒为 `_CONSERVATIVE_STAGE`（观察期；铁律违规的回退目标）；
+      · `rule_demote`    → `current_rank - 1`（降一级，地板 = 观察期；已在观察期 → 幂等 no-op）。
+    三次读真值失败 / 真值不在白名单 → **零写入**（fail-closed：读不到阶段就绝不改阶段）。
+    """
+    import database      # 只在**函数体内**延迟 import（§4.5-①；方向守护见 ⑩ 组）
+
+    note = _demote_note(reason)
+    view = describe_stage(teacher_name)          # §1.5 唯一读口（只发 SELECT，永不抛）
+    current = view.get("stage") or ""
+    current_rank = STAGE_RANK.get(current)
+    if view.get("degraded") or current_rank is None:
+        _config_warn("讀不到階段真值（降級態）：拒絕本次降級，「%s」維持不變（fail-closed，零寫入）"
+                     % (current or "—",))
+        return _transition_result(teacher_name, _REASON_STAGE_READ_DEGRADED, degraded=True,
+                                  **_view_fields(view))
+
+    if source == _STAGE_SOURCE_MANUAL_DEMOTE:
+        if to_stage not in STAGE_RANK:
+            _config_warn("降級目標非法（to_stage=%r，當前「%s」）：本次階段一個字不動"
+                         "（接口層按 400 stage_invalid_value 回答）" % (to_stage, current))
+            return _transition_result(teacher_name, _REASON_STAGE_INVALID_VALUE,
+                                      previous_stage=current, **_view_fields(view))
+        if STAGE_RANK[to_stage] >= current_rank:
+            # §4.6-⑤：同階段 / 向上都按 409 拒绝（「降级」请求指向不低於当前的位置 = 无法满足的请求）
+            _config_warn("降級請求被拒：to_stage=%s 不低於 current=%s（同階段 / 向上），階段不變"
+                         "（接口層按 409 stage_transition_invalid 回答）" % (to_stage, current))
+            return _transition_result(teacher_name, _REASON_STAGE_TRANSITION_INVALID,
+                                      previous_stage=current, **_view_fields(view))
+        target = to_stage
+    elif source == _STAGE_SOURCE_RULE_RESET:
+        target = _CONSERVATIVE_STAGE
+    else:
+        target = STAGES[max(current_rank - 1, 0)]
+
+    if STAGE_RANK[target] >= current_rank:
+        # 规则源已在地板（observation）/ `rule_reset` 恰好在观察期 → 无可降层级
+        return _demote_noop(teacher_name, view, current, source, note)
+
+    # ---- 全系统唯一的向下写路径：**一条** upsert 写全（阶段 + 进入时刻 + 来源 + 清待确认对）----
+    now = datetime.now().isoformat()
+    try:
+        database.upsert_agent_stage_state(teacher_name, stage=target, stage_since=now,
+                                          stage_source=source, pending_stage="", pending_task_id=0)
+    except Exception as exc:
+        _config_warn("寫入降級結果失敗（%s）：「%s」保持不變（單條 upsert，無半寫）" % (exc, current))
+        return _transition_result(teacher_name, _REASON_DEMOTE_WRITE_FAILED,
+                                  previous_stage=current, **_view_fields(view))
+
+    detail = _demote_detail(source, current, target, note)
+    _stage_change_event(_LOG_EVENT_STAGE_DEMOTED, teacher_name, current, target, detail)
+    _action_log(teacher_name, 0, source, detail)      # §1.6 的动作名与 §1.2 的 stage_source 同一字面量
+    return _transition_result(teacher_name, _REASON_STAGE_DEMOTED, applied=True,
+                              stage=target, previous_stage=current, stage_since=now,
+                              stage_source=source, pending_stage="", pending_task_id=0,
+                              degraded=bool(view.get("degraded")))
+
+
+def demote(teacher_name, to_stage, reason, source=_STAGE_SOURCE_MANUAL_DEMOTE):
+    """【§1.6 / §4.6-⑤】降级（老师手动 / 规则自动）→ **全系统唯一的向下写路径**。
+
+    签名照 §4.5-①：`demote(teacher_name, to_stage, reason, source='manual_demote')`。`source` 三个
+    取值（§1.2 的 `stage_source` 字面量）决定落点与状态行 `stage_source` 列：手动降级读 `to_stage`、
+    `rule_demote` 降一级、`rule_reset` 回观察期（逐条见 `_demote()`）。
+
+    分支与 `reason`（返回体与三个钩子**同形 13 键**，前端一套渲染）：
+      · flag off → `skipped=True` / `agent_stage_disabled`（首行总闸，**零 SQL**）；
+      · 空 `teacher_name` → `skipped=True` / `teacher_required`（**零 SQL**）；
+      · `source` 不在 §1.2 白名单 → `stage_invalid_value`（**零写入**：来源非法即无效调用）；
+      · 真值读不到（`describe_stage()` 降级态）→ `stage_read_degraded`（fail-closed，**零写入**）；
+      · 手动目标不在五阶段 / 不低于当前 → `stage_invalid_value` / `stage_transition_invalid`
+        （**零写入 + 零审计**；接口层映射 400 / 409，接口层的访问日志与本次繁体告警回答）；
+      · 规则源已在地板（无非降层级）→ `already_at_stage`（幂等 no-op，见 `_demote_noop()`）；
+      · 状态行写失败 → `demote_write_failed`（**单条** upsert，无半写；阶段保持原值）；
+      · 成功 → `stage_demoted` / `applied=True`（`stage_source` = `source`）+ 两张日志。
+
+    口径 B（服务层不抛）：本函数**永不抛** —— 内部兜住一切异常，`AgentStageError` 的抛出点仍是接口层
+    （4b 按 `reason` 装进统一错误体）。返回体的 `degraded` 如实回答真值读取质量，调用方不得把降级态
+    当「已落库的结果」。
+
+    留痕边界（口径 A 的写侧对应物）：降级**不是**读函数（会写状态行 + 两张日志），但 §1.6 的「拒绝
+    也要留痕」只对**真实发生**的转移成立 —— 被拒的调用（非法目标 / 无法满足的方向）**零审计**，
+    免得阶段审计表里长出没有对应变更的 `stage_demoted`；「老师点错了」的可见性由接口层负责（4b）。
+    """
+    name = teacher_name or ""
+    if not agent_stage_enabled():
+        _config_warn("智能體階段功能未啟用（AGENT_STAGE_ENABLED off）：本次降級直接跳過"
+                     "（零查詢、零寫入）")
+        return _transition_short_circuit(name, _BLOCKER_DISABLED)
+    if not name:
+        _config_warn("降級缺少 teacher_name（無效調用）：本次直接跳過（零查詢、零寫入）")
+        return _transition_short_circuit(name, _BLOCKER_TEACHER_REQUIRED)
+    if source not in _DEMOTE_SOURCES:
+        _config_warn("降級來源非法（source=%r）：本次階段一個字不動（§1.2 只認 %s）"
+                     % (source, "、".join(_DEMOTE_SOURCES)))
+        return _transition_short_circuit(name, _REASON_STAGE_INVALID_VALUE, False)
+
+    try:
+        return _demote(name, to_stage, reason, source)
+    except Exception as exc:
+        _config_warn("降級流程異常（%s）：本次不改動任何階段狀態" % (exc,))
+        return _transition_short_circuit(name, _REASON_DEMOTE_WRITE_FAILED, False)
+
+
+# ---------------------------------------------------------------------------
+# 【4a-④】`save_stage_config()`：`PUT /api/agent/stage/config`（§3.4 第 5–6 条 / §4.6-④）
+#   · 校验先行、**整体拒绝**（校验不过 → 一个字节都不写，只拦不清）；
+#   · 整行覆盖、**不部分生效**（写入的那一行 = 本次提交的内容本身）；
+#   · 「状态先行、审计殿后」：配置行落盘成功后写**一行** `config_changed`（带逐键 diff）。
+# ---------------------------------------------------------------------------
+
+
+def _config_value_text(value):
+    """配置值的人话（审计 diff 用）：`_CONFIG_ABSENT` →「（無此鍵）」，其余走 JSON 规范写法。"""
+    if value is _CONFIG_ABSENT:
+        return "（無此鍵）"
+    try:
+        return json.dumps(value, ensure_ascii=False, sort_keys=True)
+    except (TypeError, ValueError):
+        return repr(value)
+
+
+def _config_changes_line(previous, current):
+    """`config_changed` 审计的逐键 diff 人话（§3.4 第 6 条：`min_template_match 0.75→0.8 …`）。
+
+    两侧都是**生效配置**（四层合并结果），不是「行里存了什么」：左侧回答「改之前判定用的是多少」、
+    右侧回答「从现在起判定用的是多少」—— 运维拿这一行就能重放「判定为何变了」。
+    键序固定（先 §3.5 键表顺序，再未知键的字典序）→ 同一份改动两次写出**完全一致**的字符串（可 diff）；
+    数字按 JSON 规范写法渲染（`0.8`），设计文档示例里的 `0.80` 是同一个数、同一个意思。
+    无实质变化 → 空串（调用方补一句「無實質變更」）。
+    """
+    before = previous if isinstance(previous, dict) else {}
+    after = current if isinstance(current, dict) else {}
+    keys = list(DEFAULT_STAGE_CONFIG) + sorted((set(before) | set(after)) - set(DEFAULT_STAGE_CONFIG))
+    changes = []
+    for key in keys:
+        old = before.get(key, _CONFIG_ABSENT)
+        new = after.get(key, _CONFIG_ABSENT)
+        if old is _CONFIG_ABSENT and new is _CONFIG_ABSENT:
+            continue
+        if old == new:
+            continue
+        changes.append("%s %s→%s" % (key, _config_value_text(old), _config_value_text(new)))
+    return "；".join(changes)
+
+
+def _config_warnings(given, source):
+    """`PUT` 的 `warnings[]`（§4.6-④）：两条**只读**提示，**都不阻断写入** —— 校验只拦「会算错的」。
+
+    ① 本次写入的键仍会被环境变量层覆盖（env 是最高一层，§3.4）→ 老师「改了却不见效」的那类问题，
+       在响应里先答掉（`stage_config_source()` 的 `env_override` 就是这份名单）；
+    ② 键不在 §3.5 键表内（前向兼容：原样保留、不参与任何判定）→ 提前告诉调用方「它不会生效」。
+    """
+    config = given if isinstance(given, dict) else {}
+    source = source if isinstance(source, dict) else {}
+    warnings = []
+    shadowed = sorted(key for key in config if key in (source.get("env_override") or []))
+    if shadowed:
+        warnings.append("以下鍵寫入後仍會被環境變數（最高一層）覆蓋：%s" % "、".join(shadowed))
+    unknown = sorted(key for key in config if key not in DEFAULT_STAGE_CONFIG)
+    if unknown:
+        warnings.append("以下鍵不在 §3.5 鍵表內（前向兼容保留，不參與判定）：%s" % "、".join(unknown))
+    return warnings
+
+
+def _config_save_short_circuit(teacher_name, reason, skipped=True):
+    """`save_stage_config()` 的**零 SQL** 短路体（flag off / 无效调用 / 异常）：与成功路径逐键同形。
+
+    `effective` 空字典是**诚实的**：短路路径没有读配置链（flag off 不许读库、无效调用不该读），
+    所以不编造生效值（与 `_transition_short_circuit()` 的 `stage` 空串同口径）；`source` 用零值骨架。
+    """
+    return {
+        "teacher_name": teacher_name,
+        "skipped": bool(skipped),
+        "applied": False,
+        "reason": reason,
+        "effective": {},
+        "source": _blank_config_source(),
+        "warnings": [],
+        "errors": [],
+    }
+
+
+def _save_stage_config(teacher_name, config):
+    """`save_stage_config()` 的实体（flag / 空名闸门已由调用方过掉）：校验 → 写整行 → 回读 → 留痕。"""
+    import database      # 只在**函数体内**延迟 import（§4.5-①；方向守护见 ⑩ 组）
+
+    ok, errors = validate_stage_config(config)
+    if not ok:
+        _config_warn("階段配置校驗未過（%d 條，只攔不清）：本次整體不寫入（§3.4 第 5 條）—— %s"
+                     % (len(errors), _format_errors(errors)))
+        return {
+            "teacher_name": teacher_name,
+            "skipped": False,
+            "applied": False,
+            "reason": _REASON_CONFIG_INVALID,
+            "effective": load_stage_config(teacher_name),   # 回显「仍然是这一份」，老师好对照着改
+            "source": stage_config_source(teacher_name),
+            "warnings": [],
+            "errors": errors,
+        }
+
+    before = load_stage_config(teacher_name)             # 写入前的**生效**配置（diff 的左侧）
+    source = stage_config_source(teacher_name)
+    try:
+        database.upsert_agent_stage_config(teacher_name, config)
+    except Exception as exc:
+        _config_warn("寫入階段配置行失敗（%s）：生效配置仍是寫入前那一份（未落盤、無部分生效）" % (exc,))
+        return {
+            "teacher_name": teacher_name,
+            "skipped": False,
+            "applied": False,
+            "reason": _REASON_CONFIG_WRITE_FAILED,
+            "effective": before,
+            "source": source,
+            "warnings": [],
+            "errors": [],
+        }
+
+    effective = load_stage_config(teacher_name)          # 写入后**回读**：这才叫「生效配置」（≠ 回显入参）
+    after_source = stage_config_source(teacher_name)
+    diff = _config_changes_line(before, effective)
+    _stage_event(_LOG_EVENT_CONFIG_CHANGED, teacher_name, current_stage(teacher_name),
+                 "階段配置已整體寫入（老師專屬行覆蓋，逐鍵變化：%s）"
+                 % (diff or "無實質變更，與寫入前的生效配置逐鍵相同"))
+    return {
+        "teacher_name": teacher_name,
+        "skipped": False,
+        "applied": True,
+        "reason": _REASON_CONFIG_SAVED,
+        "effective": effective,
+        "source": after_source,
+        "warnings": _config_warnings(config, after_source),
+        "errors": [],
+    }
+
+
+def save_stage_config(teacher_name, config):
+    """【§3.4 第 5–6 条 / §4.6-④】`PUT /api/agent/stage/config` 的**服务侧主体**：整体写入阶段配置行。
+
+    返回 **8 键**（形状即契约；短路体逐键同形）：
+      `teacher_name` / `skipped` / `applied` / `reason` / `effective{…}` / `source{3}` /
+      `warnings[]` / `errors[]`
+
+    五条纪律：
+      ① **校验先行、整体拒绝**（§3.4 第 5 条）：`validate_stage_config()` 不过 → **一个字节都不写**、
+         `reason='stage_config_invalid'` + 结构化 `errors[{path,msg}]`（只拦不清：不改入参、不补默认值、
+         不删未知键 —— 校验器本身就只拦不清）；
+      ② **整行覆盖、不部分生效**（第 5 条「不允许部分生效」的写侧形态）：落库的那一行 = 本次提交的
+         内容本身（`upsert_agent_stage_config()` 换整行）；**不做键级合并** —— 没提交的键回落上一级
+         （全局行 / 内置默认），这件事在 `effective` 与审计 diff 里都看得见，行内不会留「半新半旧」；
+      ③ **状态先行、审计殿后**：配置行落盘成功后写**一行** `config_changed`（第 6 条），`detail` 带
+         前后生效配置的逐键 diff；审计写失败只告警（`_stage_event()` 本就 best-effort），绝不回滚配置；
+      ④ **回读生效值**：`effective` 是**写完再读一次**的四层合并结果（不是把入参回显）—— 老师看到的
+         必须是「接下来判定真正会用的那一份」（env 覆盖 / 上级层回落都在里面）；
+      ⑤ flag off / 空名 → 首行短路（**零 SQL**）；空名拒绝尤其重要：`teacher_name=''` 正是**全局行**，
+         不能让一个「忘了传名字」的请求改到**所有老师**的配置。
+
+    写入目标恒为该老师**自己的行**；全局行（`''`）只能由运维直接改库 / 迁移（§7.1-⑥ 的运维动作），
+    不在本接口射程内。口径 B（服务层不抛）：本函数**永不抛** —— 接口层（4b）按 `reason` / `errors`
+    装进统一错误体，状态码照 §4.6-④（校验未过 400、写失败 503）。
+    """
+    name = teacher_name or ""
+    if not agent_stage_enabled():
+        _config_warn("智能體階段功能未啟用（AGENT_STAGE_ENABLED off）：本次配置寫入直接跳過"
+                     "（零查詢、零寫入）")
+        return _config_save_short_circuit(name, _BLOCKER_DISABLED)
+    if not name:
+        _config_warn("寫入階段配置缺少 teacher_name（無效調用）：本次直接跳過（零查詢、零寫入；"
+                     "空名會命中全局行，防「誤改所有老師」）")
+        return _config_save_short_circuit(name, _BLOCKER_TEACHER_REQUIRED)
+
+    try:
+        return _save_stage_config(name, config)
+    except Exception as exc:
+        _config_warn("配置寫入流程異常（%s）：本次不改動任何配置" % (exc,))
+        return _config_save_short_circuit(name, _REASON_CONFIG_WRITE_FAILED, False)
+
 
 

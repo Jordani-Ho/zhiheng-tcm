@@ -56,7 +56,7 @@
 | :-- | :---- | :---- | :---- |
 | ① | `student_lineage` 口径选 **A**：升级 `patient_teachers` 为事实上的 `student_lineage`，**不新建表**；概念名 = `student_lineage`，实现名 = `patient_teachers`（升级版） | 「同一个判断只许有一份实现」（Epic 2 step 2.3 追加要求）；`patient_teachers` 已具备 `status`/`inactive`/3 上限语义（`database.py:124-132`、`:486-525`）；新建表 = 两处真相（双写漂移） | 本文 §2.2；`development-plan-v1.md` §3.3-D4（L134-137）与 §5-Epic 4（L226-228）已同步 |
 | ② | 空串语义选 **②**：`''` = **未归属**；默认师门用**显式 id**（`lin-<slug>`） | 若 `''` = 默认师门，则任何遗漏 lineage 的写入会**静默**落进默认师门（污染且不可区分） | 本文 §2.4 / §5.4；迁移 §6.1-② / §6.2 |
-| ③ | `agent_stage_state` PK 选 **A + C**：阶段保持**老师全局**（`teacher_name` 单列 PK 不变、`lineage_id` 恒 `''`）；另在 `agent_stage_log` **补 `lineage_id` 列**做审计区分 | 「不推倒重来」+ 0003 已验收；step 3.4-c 已建守护（唯一向上写路径、⑱ 组断言 `stage=` 写点恰 3 处）；改 PK 需整表重建 = 变更已验收交付物 | 本文 §5.3；迁移 §6.1-④ |
+| ③ | `agent_stage_state` PK 选 **A + C**：阶段保持**老师全局**（`teacher_name` 单列 PK 不变、`lineage_id` 恒 `''`）；另在 `agent_stage_log` **补 `lineage_id` 列**做审计区分 | 「不推倒重来」+ 0003 已验收；step 3.4-c 已建守护（唯一向上写路径、⑱ 组断言 `stage=` 写点计数；Epic 2 step 4a 落地降级入口后该计数由 **3** 升为 **5**：零 delta upsert + 向上 upsert + 向上返回体回显 + 向下 upsert + 向下返回体回显 = 3 处落库 + 2 处回显，其中向上 / 向下各恰好 1 个落库点）；改 PK 需整表重建 = 变更已验收交付物 | 本文 §5.3；迁移 §6.1-④ |
 | ④ | 全库 downgrade 口径**统一**为「**不删业务列，只回收结构（表、索引）**」；0004 为**已存在例外**，不追溯修改；Epic 4 的 `0005` 采用新口径 | 统一运维直觉（避免「回退丢列」）；0004 已验收，改它属变更已验收交付物 | 本文 §6.3；`docs/tech-debt.md` TD-003 已更新 |
 | ⑤ | 白皮书 §4.2 / §1.2 原文由 CTO 补齐（§1.3 / §1.4）；`lineage` 表按裁决①定稿：TEXT 主键、同构 `templates.lineage_id`、一师一门（`id = 'lin-' + slugify(teacher_name)`） | TEXT 主键 → 与既有两处 `lineage_id` 列零类型转换；一师一门 → 默认师门可由 `owner_teacher_name` 唯一确定 | 本文 §1.3 / §1.4 / §2.1 |
 | ⑥ | 前端「师门」与「我的老师（n/3）」**并存**，两个维度：人的维度（老师关系）+ 组织维度（师门关系）；Epic 4 阶段一师一门 → 3 老师上限 = 3 师门上限 | 不破坏已验收 UI 与语义；「人」与「组织」在概念上正交 | 本文 §7.1 / §7.3 |
@@ -315,7 +315,7 @@ CREATE INDEX IF NOT EXISTS idx_lineage_owner ON lineage (owner_teacher_name, sta
 ### 5.3 边界声明：阶段是老师的能力画像，不是师门的资产（裁决③）
 
 - `agent_stage_state` 保持 **`teacher_name` 单列 PK**（一位老师一行）；`lineage_id` 列保留但**恒 `''`**，不参与过滤、不参与唯一性。
-- **不**重建该表、**不**改 `upsert_agent_stage_state` 的字段口径、**不**动 3.4-c 的**唯一向上写路径**及其守护用例（⑱ 组：`stage=` 写点恰 3 处、写前现场校验 `to_stage == _next_stage(current)`）。
+- **不**重建该表、**不**改 `upsert_agent_stage_state` 的字段口径、**不**动 3.4-c 的**唯一向上写路径**及其守护用例（⑱ 组：`stage=` 写点计数 + 写前现场校验 `to_stage == _next_stage(current)`）。该计数在 Epic 2 step 4a 落地「唯一向下写路径」（`demote()`）后由 3 处升为 **5 处** —— 构成为 **零 delta upsert**（`_ensure_state_row()`）+ **向上 upsert** + **向上返回体回显**（`apply_upgrade_confirmation()` 两处，其中只有 upsert 落库）+ **向下 upsert** + **向下返回体回显**（`_demote()` 两处，同理）= **3 处落库 + 2 处回显**；向上 / 向下各恰好 1 个落库点，且向下那处的值必须在「严格低于当前」的校验之后才可达；两处回显的值必须与同函数的 upsert 同一个变量（CTO 裁决：`apply_upgrade_confirmation()` 与 `_demote()` 是对称操作，写法必须一致）—— 守护本身仍全绿，只同步了期望计数。
 - `agent_stage_log` 补 `lineage_id`（裁决③-C）：**只作审计标注**——写侧尽力带上当时上下文；读取与统计**不按 lineage 过滤**（沿用既有 action log / stats 口径）。
 - 落地含义：同一老师在多个师门之间**共享同一阶段**；师门**不**产生独立阶段画像。若未来白皮书明确要求「一师多门、独立阶段」，需**单独立项**（整表重建 + 回改 ⑱ 守护用例 + 重新验收 0003）。
 - 违反本声明的典型误写：给 `agent_stage_state` 的查询加 `lineage_id = ?`、给 `stage` 升级逻辑加「按师门各算一次」。
@@ -503,7 +503,7 @@ UPDATE patient_records
 | ⑤ | 隔离正确性（**核心**） | 两老师 × 两师门 fixture：逐 §3.2 P0/P1 各走一遍；`teacher_name` 空；跨门 `lineage_id`；不存在的 id；`''` 行 | 返回行集合与「直接 SQL 按 lineage 过滤」**完全一致**；不存在「4xx 之外的静默全量」 |
 | ⑥ | 归属生命周期 | 加入 → 退出 → 再加入；第 4 个师门；老师拉入已存在学生 | `status` 迁移正确；**数据行不删**（病历仍在）；上限 409；再加入回 `active`（§5.4-3 的更新分支） |
 | ⑦ | 模板线 | 四入口 × {合法/缺/越门/不存在}；跨门两条 active 共存；智能体取模板 | `uq_templates_active_one` 生效；`get_active_template` 调用点不漏传 lineage（调用点清单断言） |
-| ⑧ | 阶段边界（裁决③守护） | `PRAGMA table_info(agent_stage_state)`；全行 `lineage_id=''`；`stage=` 写点计数；`agent_stage_log` 写入带 lineage 但 stats 不受影响 | ① PK 仍为 `teacher_name`；② 沿用 Epic 2 ⑱ 组既有断言**必须全绿**（本 Epic 不改这两处代码） |
+| ⑧ | 阶段边界（裁决③守护） | `PRAGMA table_info(agent_stage_state)`；全行 `lineage_id=''`；`stage=` 写点计数（Epic 2 4a 后为 **5**：零 delta upsert + 向上 upsert + 向上回显 + 向下 upsert + 向下回显 = 3 处落库 + 2 处回显）；`agent_stage_log` 写入带 lineage 但 stats 不受影响 | ① PK 仍为 `teacher_name`；② 沿用 Epic 2 ⑱ 组既有断言**必须全绿**（本 Epic 不改这两处代码） |
 | ⑨ | 默认师门与 slug | 种子 id 可复现；中文名 / 重名 / 空名边界；缺 lineage 的写入 | 两次生成同一 id；缺 lineage 被 4xx 拦住且库内**无新行**；`grep` 断言无 `COALESCE(lineage_id` |
 | ⑩ | 双主权自检 | 既有导出路径不带 lineage 不报错；模板导出字段白名单 | 不出现 `lineage_required` 类错误；导出内容**无患者标识**字段 |
 | ⑪ | 前端 | `npx tsc --noEmit` + `npm run build` + §7.4 手动 5 条 | 零 TS 错误；手动 5 条逐条留证 |
