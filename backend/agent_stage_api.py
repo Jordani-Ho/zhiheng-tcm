@@ -2,17 +2,17 @@
 
 對齊：docs/epic2-agent-stage-design-v1.md
   §4.5-② 本文件職責與公開符號（`router` + `_enabled()` / `_fail(...)` / `_guard()` / `_check_identity()`）
-  §4.6   7 個接口的入參 / 出參 / **主要錯誤碼**（本文件的映射表逐條對應那一列；本步落地 #1–#5，
-         #6 `suggest` / #7 `predraft` 屬 4c —— 見下方 §4.6 段頭的留白說明）
+  §4.6   7 個接口的入參 / 出參 / **主要錯誤碼**（本文件的映射表逐條對應那一列；4b-2 落地 #1–#5，
+         **4c-2 追加 #6 `suggest` / #7 `predraft`** —— 見下方 §4.6 段頭的兩段路徑說明）
   §5.1   紅線 ①：`AGENT_STAGE_ENABLED` 未設置 / off → `/api/agent/stage*` 全部 **404
          `agent_stage_disabled`**，既有鏈路逐字節不變
   §7.1-⑫ 前端要能區分「功能沒開（整卡不渲染）」與「遷移沒跑（請運維）」→ 404 與 503 不得合併
 
-本文件當前職責（4b-2 的邊界）：
+本文件當前職責（4b-2 + 4c-2 的邊界）：
   1. `router`（前綴 `/api/agent/stage`，§4.5-② 已實測與 `/api/agent/tasks*`、`/api/agent/scan` 無重疊前綴）
      + **§4.6 的 #1–#5 五個 endpoint**（下方 §4.6 段頭起，逐條對應那一行表格）。**#6 `suggest` / #7 `predraft`
-     屬 4c**（服務側能力入口 `build_suggestion()` / `build_predraft()` 尚未落地）：本步**不註冊**這兩條
-     路由 —— 「名字在、行為不在」的假實現比 404 更糟（理由見下方 §4.6 段頭）。
+     屬 4c**（服務側能力入口 `build_suggestion()` / `build_predraft()` 已於 4c-1 落地）：4c-2 只補投影 + 503 登記
+     路由的細節見下方 §4.6 段頭與文件末尾兩個 endpoint。
   2. 把服務層拋出的 `AgentStageError` 翻譯成**真實 HTTP 狀態碼 + 統一錯誤體**
      （`{"detail": {"error", "msg", "errors", "warnings"}}`）—— 註冊點在 `main.py`
      （`app.add_exception_handler`，與 Epic 1 `template_error_handler`、Epic 4 `lineage_error_handler` 同款）；
@@ -34,11 +34,12 @@
 啟用方式（本機 / 生產，PowerShell）：
     $env:AGENT_STAGE_ENABLED = "on"    # 不設或 off = 全部 404，既有鏈路逐字節不變
 
-【4b-2 的零改動承諾】`agent_stage_service.py` / `database.py` / `models.py` **一字不動**：本步只在
-本文件加 5 條路由與轉譯輔助（兩張表 + 兩個小函數），服務層的業務判定一行都不在這裡重寫。
-`/api/agent/stage/suggest` 與 `/api/agent/stage/predraft`（#6 / #7）**沒有**路由，仍由 FastAPI 的
-默認 404 兜底（形狀是 `{"detail": "Not Found"}`，**不是**統一錯誤體）—— 4c 落地後才會出現
-403 `stage_forbidden` / 404 `stage_draft_not_found` 那一族。
+【4c-2 的零改動承諾】`agent_stage_service.py` / `database.py` / `models.py` **一字不動**：4c-2 只在
+本文件加 2 條路由（#6 / #7）與兩張表的補登（兩個成功 `reason`、兩個 503 故障碼），服務層的業務判定
+一行都不在這裡重寫。**接口層也不自己再問一次能力**：`build_suggestion()` / `build_predraft()` 內部的
+`require_capability()` 就是 §2.2 唯一能力閘門（越權時閘門自己在拒絕點寫 `permission_denied` 審計）——
+在接口層重問一遍會寫出**兩行**審計，還會把「`kind` 非法」的 400 搶先翻成 403（§4.6-⑥ 的錯誤碼
+優先序 kind → 能力 → 草案與服務層的判定順序同源，接口層只轉譯結論）。
 """
 import copy
 
@@ -49,7 +50,8 @@ import agent_stage_service
 from models import (
     AgentStageActionInput,
     AgentStageConfigInput,
-    AgentStageSuggestInput,   # 4c 的 #6 `suggest` 會用它；本步不註冊那條路由（不留空殼路由的紀律見文件頭）
+    AgentStageSuggestInput,   # 4c-2 的 #6 `suggest` / #7 `predraft` **共用**（#7 只讀 teacher_* /
+                              # draft_id / formula_name 三欄，`kind` 係 #6 專屬 —— 見 #7 的說明）
 )
 
 router = APIRouter(prefix="/api/agent/stage", tags=["agent-stage"])
@@ -80,6 +82,9 @@ _AGENT_STAGE_ERROR_STATUS = {
     "stage_read_degraded": 503,        # §1.5 fail-closed：讀不到階段真值就拒絕改階段（服務側故障，不是入參錯）
     "demote_write_failed": 503,        # §4.6-⑤ 落庫失敗 = 服務不可用（與 400 / 409「老師填錯」嚴格分開）
     "config_write_failed": 503,        # §4.6-④ 同款（flag on 但寫不進庫 → 請運維，而不是假成功）
+    "suggestion_failed": 503,          # §4.6-⑥ / 4c-2 補登：建議生成故障（LLM / 裝配異常）—— 與「解析
+                                       #               失敗」嚴格分開：解析失敗仍是 200 + 空 payload
+    "predraft_failed": 503,            # §4.6-⑦ 同款（同一族故障碼，分開便於灰度期定位）
     "already_at_stage": 409,           # §1.1 冪等 no-op（規則源走到；#5 手動路徑由服務層直接判 409 拒絕）
     "agent_stage_disabled": 404,       # §5.1 紅線①（正常已被 `_guard()` 提前攔下；此處兜 flag 中途翻轉的競態）
     "teacher_required": 400,           # §4.6 入參（同上，正常已被 `_check_identity()` 提前攔下）
@@ -165,19 +170,23 @@ def _check_identity(teacher_name, teacher_id):
 
 
 # ---------------------------------------------------------------------------
-# 【施工步驟 4b-2】§4.6 的 #1–#5 五個 endpoint（#6 / #7 屬 4c，本步**不註冊**）
+# 【施工步驟 4b-2】§4.6 的 #1–#5 五個 endpoint（本段由 4b-2 落地；4c-2 的兩條見下段）
 #   #1 GET  /api/agent/stage          → stage_view(teacher_name)（15 鍵直出；§4.6-①）
 #   #2 POST /api/agent/stage/evaluate → evaluate(teacher_name)（18 鍵快照 + `changed` 直出；§4.6-②）
 #   #3 GET  /api/agent/stage/config   → `{effective, source, defaults}` 三鍵（配置讀取鏈；§4.6-③）
 #   #4 PUT  /api/agent/stage/config   → save_stage_config(...)（成功投影 `{effective, source, warnings}`；§4.6-④）
 #   #5 POST /api/agent/stage/demote   → demote(...)（成功投影 `{stage, previous_stage, stage_since, stage_source}`；§4.6-⑤）
+# 【施工步驟 4c-2】（追加在本文件末尾）§4.6 的後兩條 —— 只讀建議接口，零落庫：
+#   #6 POST /api/agent/stage/suggest  → build_suggestion(...)（成功投影五鍵 `{kind, draft_id, payload,
+#                                      disclaimer, generated_at}`；§4.6-⑥）
+#   #7 POST /api/agent/stage/predraft → build_predraft(...)（成功投影四鍵 `{draft_id, predraft,
+#                                      disclaimer, note}`；§4.6-⑦）
 #
-# 為什麼 #6 / #7 這一步**故意沒有路由**：服務側的能力入口（`build_suggestion()` / `build_predraft()`）
-# 還沒落地，先註冊一條空殼路由 = 前端會拿到 200 並以為 AI 真的在產建議。4c 落地時本段的前兩條註釋
-# 就是它的固定開頭（`_guard()` → `_check_identity(...)` → 能力閘門），其中能力閘門只許問
-# `agent_stage_service.require_capability()`（§2.2 唯一能力閘門，只回 `bool`、永不拋）：
-# 不過則 `raise agent_stage_service.AgentStageError("stage_forbidden", ...)`，由
-# `agent_stage_error_handler` 統一出體（越權審計由**服務層**寫，接口層不碰庫；§4.6-⑥⑦）。
+# 4c-2 落地 #6 / #7 時**不在接口層重問能力**：`build_suggestion()` / `build_predraft()` 內部的
+# `require_capability()` 就是 §2.2 唯一能力閘門（不過則回 `reason='stage_forbidden'`，越權審計由閘門
+# **自己在拒絕點**寫一行）。在接口層再問一次會寫出**兩行**審計，而且會把「`kind` 非法」的
+# 400 `stage_kind_invalid` 搶先翻成 403 —— §4.6-⑥ 的錯誤碼優先序（kind → 能力 → 草案）與服務層的
+# 判定順序同源，接口層只負責把服務層的結論翻成 HTTP（`_reject_if_failed()`）。
 #
 # 每個 endpoint 的**固定順序**（§4.5-② / §7.1-⑫）：第一句 `_guard()`（flag → 404、存儲未就緒 → 503）
 # → 第二句 `_check_identity(...)`（缺欄位 400 / 名字與 ID 不一致 403）→ 最後才是業務。
@@ -185,9 +194,13 @@ def _check_identity(teacher_name, teacher_id):
 # 一行判定都不重寫（否則同一份規則會出現第二個實現）。
 # ---------------------------------------------------------------------------
 
-# 服務層寫入類返回體裡「這次算成功」的 `reason`（其餘取值一律當拒絕 —— 理由見 `_reject_if_failed()`）：
-# 只有真的落盤的那兩種 —— `stage_demoted`（#5）/ `config_saved`（#4）。
-_AGENT_STAGE_OK_REASONS = ("stage_demoted", "config_saved")
+# 服務層返回體裡「這次算成功」的 `reason`（其餘取值一律當拒絕 —— 理由見 `_reject_if_failed()`）：
+# 落盤的兩種 —— `stage_demoted`（#5）/ `config_saved`（#4）；產出內容的兩種 —— `suggestion_generated`
+# （#6）/ `predraft_generated`（#7）。後兩者「成功」的語義是「模型跑完且已過 §4.3 白名單」，
+# **解析失敗也走這一路**（空 `payload` + 一條 `warnings`，不是故障）；故障另有 `suggestion_failed` /
+# `predraft_failed` 兩個 503 碼（兩者處置完全不同：前者老師自己判斷，後者請重試）。
+_AGENT_STAGE_OK_REASONS = ("stage_demoted", "config_saved",
+                           "suggestion_generated", "predraft_generated")
 
 # 失敗 `reason` 的繁體人話（統一錯誤體的 `msg`）。碼字面量與服務層的 `_REASON_*` / `_BLOCKER_*`
 # 逐字節同字，改一處要同步另一處；沒登記的碼走兜底句式（照樣帶上可讀 code，灰度期仍能定位）。
@@ -199,6 +212,11 @@ _AGENT_STAGE_OUTCOME_MSG = {
     "demote_write_failed": "階段降級寫入失敗，階段保持不變（單條 upsert，無半寫）",
     "stage_config_invalid": "階段配置校驗未過，本次整體未寫入（一個字都沒改）",
     "config_write_failed": "階段配置寫入失敗，生效配置仍是寫入前那一份",
+    "stage_kind_invalid": "建議類型非法（kind 只接受 pattern / formula），本次不產出任何內容",
+    "stage_forbidden": "當前階段未開放這項能力（智能體越權被拒），本次不產出任何內容",
+    "stage_draft_not_found": "草案反查不到（不屬於這位老師 / 已簽字 / 不存在），本次不調模型",
+    "suggestion_failed": "建議生成流程異常，本次未產出任何內容（服務側故障，可重試）",
+    "predraft_failed": "預處方預填流程異常，本次未產出任何內容（服務側故障，可重試）",
     "agent_stage_disabled": "智能體階段接口未啟用（AGENT_STAGE_ENABLED=off）",
     "teacher_required": "必須帶 teacher_name 與 teacher_id",
 }
@@ -357,4 +375,78 @@ def demote_agent_stage(data: AgentStageActionInput):
         "previous_stage": result["previous_stage"],
         "stage_since": result["stage_since"],
         "stage_source": result["stage_source"],
+    }
+
+
+# ---------- 【#6】證型候選 / 方劑建議（§4.6-⑥；只讀 + 單點審計）----------
+
+@router.post("/suggest")
+def suggest_agent_stage(data: AgentStageSuggestInput):
+    """§4.6-⑥：`build_suggestion()` 的成功投影 —— 五鍵 `{kind, draft_id, payload, disclaimer, generated_at}`。
+
+    · `kind` 決定兩件事：走哪個能力（`pattern` → 見習期 `predict_pattern`；`formula` → 助手期
+      `suggest_prescription`）與 `payload` 的內層形狀（`candidates[]` / `formulas[]`，§4.3 白名單）；
+      **非法 `kind` → 400 `stage_kind_invalid`**，且這條判定排在能力判定**之前**（服務層順序）——
+      填錯參數的請求不該被記成「越權」（`agent_stage_log` 的 `permission_denied` 只記真的越權，
+      否則 §6.2 的越權窗口統計會被噪聲污染）；
+    · `draft_id` 只在**該老師名下最新的未簽草案**裡反查（§4.6-⑥「服務端只信 DB」）：查不到就**不調
+      模型** —— 絕不拿別人 / 已簽字的草案餵 LLM → 404 `stage_draft_not_found`；
+    · `disclaimer` 由服務層給（`pattern` → `僅供參考，非診斷`；`formula` → `僅供參考，非處方`），
+      接口層不重寫文案：鐵律那兩句話跟著每一次產出一起回前端。`payload` 是模型產出**過白名單後**的
+      內容，接口層不加工（多給的鍵在服務層就被丟掉）。
+
+    三類失敗全由 `_reject_if_failed()` 出統一錯誤體（服務層永不拋）：400 `stage_kind_invalid` /
+    403 `stage_forbidden`（能力不足；可解釋文案在 `errors[{path:'capability'}]`）/ 404
+    `stage_draft_not_found` / 503 `suggestion_failed`（我們沒跑通）。**與「解析失敗」嚴格分開**：
+    解析失敗仍是 200 —— 空 `payload` + `payload['error']='parse_failed'`（老師自己看得到「模型這次
+    沒給出可用內容」），只有服務故障才是 5xx。
+    服務層多給的鍵（`teacher_name` / `patient_name` / `skipped` / `applied` / `reason` / `warnings` /
+    `errors`）不在 §4.6-⑥ 的出參列，故不下發；越權 / 查不到的原因由統一錯誤體承載。
+    """
+    _guard()
+    _check_identity(data.teacher_name, data.teacher_id)
+    result = _reject_if_failed(
+        agent_stage_service.build_suggestion(data.teacher_name, data.draft_id, data.kind))
+    return {
+        "kind": result["kind"],
+        "draft_id": result["draft_id"],
+        "payload": result["payload"],
+        "disclaimer": result["disclaimer"],
+        "generated_at": result["generated_at"],
+    }
+
+
+# ---------- 【#7】預處方預填（§4.6-⑦；只讀 + 單點審計）----------
+
+@router.post("/predraft")
+def predraft_agent_stage(data: AgentStageSuggestInput):
+    """§4.6-⑦：`build_predraft()` 的成功投影 —— 四鍵 `{draft_id, predraft, disclaimer, note}`。
+
+    · 能力是**授權期** `generate_predraft`（**與 `kind` 無關**）：預處方預填比 #6 的兩個能力都高一階，
+      階段不足 → 403 `stage_forbidden`（`errors[{path:'capability'}]` 帶可解釋文案；越權審計由服務層
+      閘門在拒絕點寫一行）；
+    · 請求體**共用** `AgentStageSuggestInput`（`models.py` 一字不動）：`kind` 是 #6 專屬欄位，本接口
+      **整條忽略**它（§4.6-⑦ 的入參列只有 `formula_name?`）；`formula_name` 只是提示詞裡的一行材料
+      （AI 層收斂），**不是**「老師已經決定開這張方」；
+    · `draft_id` 的口徑與 #6 完全一致（該老師名下最新的未簽草案；反查不到就不調模型 → 404）；
+    · `predraft` 內層三鍵（`formula_name` / `items[{herb,dose,role}]` / `decoction`）**恆在場**（服務層
+      保證）：解析失敗 / 空回包只給空殼，絕不編造；
+    · `note` 是 §4.6-⑦ 的**逐字**文案 `僅供預填，儲存處方仍須老師操作` —— 本接口**永不寫
+      `prescriptions`**、永不發送、永不簽字：存處方只有一條路徑（老師在工作台逐項核對後自己操作），
+      這句話跟著每一次預填一起回前端。
+
+    失敗與 #6 同款（全由 `_reject_if_failed()` 出體，服務層永不拋）：403 `stage_forbidden` / 404
+    `stage_draft_not_found` / 503 `predraft_failed`（服務故障；與「解析失敗仍是 200 + 空預填」嚴格分開）。
+    服務層多給的鍵（`generated_at` / `patient_name` / `skipped` / `applied` / `reason` / `warnings` /
+    `errors`）不在 §4.6-⑦ 的出參列，故不下發。
+    """
+    _guard()
+    _check_identity(data.teacher_name, data.teacher_id)
+    result = _reject_if_failed(
+        agent_stage_service.build_predraft(data.teacher_name, data.draft_id, data.formula_name))
+    return {
+        "draft_id": result["draft_id"],
+        "predraft": result["predraft"],
+        "disclaimer": result["disclaimer"],
+        "note": result["note"],
     }

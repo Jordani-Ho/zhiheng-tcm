@@ -3550,10 +3550,13 @@ def build_suggestion(teacher_name, draft_id, kind):
          `payload['error']='parse_failed'` + 一条 `warnings`），故障才是 `suggestion_failed` ——
          前者是「模型没给出可用内容」（老师可以自己判断），后者是「我们没跑通」（该重试），处置完全不同。
 
-    `payload` 内层形状随 `kind` 而变（§4.3 白名单，模型多给的字段一律不带出）：
-      · `pattern` → `{"candidates":[{name, basis[], confidence}]}`；
-      · `formula` → `{"formulas":[{name, modification, composition[], usage}]}`（**无剂量、无煎服法**）；
-      · 解析失败时两者都会多出一个 `"error":"parse_failed"`。
+    `payload` 内层形状随 `kind` 而变（§4.3 白名单，**闭集合**：模型多给的字段一律不带出 —— 键集由
+    `_result_list()` 的 `keys_whitelist` 在服务层**再钉一遍**：AI 层回包在本层眼里是**外部输入**）：
+      · `pattern` → `{"candidates":[{name, confidence, basis[], note}]}`（键序照 §4.3 第 477 行）；
+      · `formula` → `{"formulas":[{name, modification, composition[], usage}]}`（**无剂量、无煎服法**，
+        键序照 §4.3 第 478 行）；
+      · 解析失败时两者都会多出一个 `"error":"parse_failed"`（`error` 是 `payload` 的**顶层**键，
+        不属条目白名单，投影器吃不掉它）。
     """
     name = teacher_name or ""
     if not agent_stage_enabled():
@@ -3595,13 +3598,35 @@ def build_suggestion(teacher_name, draft_id, kind):
                                          errors=[{"path": "payload", "msg": "生成流程異常：%s" % (exc,)}])
 
 
-def _result_list(value):
-    """AI 层给的条目数组 → `list`（非 list → `[]`）：只收敛**外层形状**，一个字段都不改。
+def _result_list(value, keys_whitelist=None):
+    """AI 层给的条目数组 → 契约形状的 `list`：**只投影键集，不重写值**。
 
-    条目内容（`name` / `basis` / `confidence` …）是 `agent.py` 规范化器的职责（§4.3 白名单在那里
-    落地）：服务层再动一次内容就会出现「两处实现同一份规范化」的分叉风险，故这里只做容器兜底。
+    分工一句话：**AI 层管「值」，服务层管「键」**。值层收敛（去剂量 / 截断 / 去换行）只由 AI 层的
+    规范化器做，本层**绝不重复实现**（那才会出现「两处实现同一份规范化」的分叉风险）；但键集必须在
+    **这里**再钉一遍 —— AI 层回包在本层眼里是**外部输入**（模型会多嘴，而白名单是**闭集合**），把
+    「多给的字段不带出」寄托在某一次回包守规矩上，就是「方劑建議無劑量」（§4.3 第 478 行）在
+    HTTP 邊界失守的唯一路径：模型多写一个 `dosage` / `dose`，它就会直达前端。
+
+    逐条：
+      · 非 list → `[]`；
+      · 给了 `keys_whitelist`（**产出对外契约的调用点一律要给**）→ 按白名单的**顺序**逐键取用：
+        白名单外的键一律不带出；**非 dict 条目直接跳过**（与 `_result_names()` 同律：形状不对的条目
+        不进列表，也绝不包一层壳来凑数）；原条目里没有的键**就不出现**（不补默认值 —— 补默认值就是
+        编造，与「解析失败只给空壳」同一向纪律）；
+      · `keys_whitelist` 缺省 `None` → **旧口径的容器兜底**（`list(value)`，条目原样带出），只为既
+        有源码级用例（㉑ 组「纯函数形状容忍」的单参调用）逐字保留；**产出契约的新调用点不得走这一
+        支** —— 走了就等于白名单失效，正是本次要堵的那个洞。
     """
-    return list(value) if isinstance(value, list) else []
+    if not isinstance(value, list):
+        return []
+    if keys_whitelist is None:
+        return list(value)
+    items = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        items.append({key: item[key] for key in keys_whitelist if key in item})
+    return items
 
 
 def _build_suggestion(teacher_name, kind, draft):
@@ -3626,13 +3651,15 @@ def _build_suggestion(teacher_name, kind, draft):
         result = agent.predict_pattern_candidates(        # 見習期能力（能力键 `predict_pattern`）
             patient_name=patient_name, complaint=inputs["complaint"], transcript=inputs["transcript"],
             past_records=inputs["past_records"], teacher_skeleton=inputs["teacher_skeleton"])
-        payload = {"candidates": _result_list(result.get("candidates"))}
+        payload = {"candidates": _result_list(
+            result.get("candidates"), ("name", "confidence", "basis", "note"))}
         what = "候選證型"
     else:
         result = agent.suggest_formula(                   # 助手期能力（能力键 `suggest_prescription`）
             patient_name=patient_name, complaint=inputs["complaint"], transcript=inputs["transcript"],
             past_records=inputs["past_records"], teacher_skeleton=inputs["teacher_skeleton"])
-        payload = {"formulas": _result_list(result.get("formulas"))}
+        payload = {"formulas": _result_list(
+            result.get("formulas"), ("name", "modification", "composition", "usage"))}
         what = "方劑建議"
 
     warnings = []
@@ -3719,6 +3746,8 @@ def _predraft_payload(value):
 
     `predraft` 的内层形状是**恒定**的（与 kind 无关），而接口层要把这三键直接放进响应体 ——
     服务层必须自己保证「三键恒在场」，不能把契约寄托在 AI 层某次回包上（㉑ 组按三条路径都钉住）。
+    `items` 里每一条再过一遍键集投影（§4.6-⑦ 明列三键）—— 同一份「AI 层管值、服务层管键」的分工：
+    **`dose` 在这里是 #7 唯一合法的剂量位，不许删**。
     """
     payload = _blank_predraft()
     if not isinstance(value, dict):
@@ -3726,7 +3755,8 @@ def _predraft_payload(value):
     formula_name, items, decoction = (value.get("formula_name"), value.get("items"),
                                       value.get("decoction"))
     payload["formula_name"] = formula_name if isinstance(formula_name, str) else ""
-    payload["items"] = list(items) if isinstance(items, list) else []
+    # §4.6-⑦ 的条目**三键**（`dose` 是 #7 唯一合法的剂量位；非 dict 条目由投影器跳过）
+    payload["items"] = _result_list(items, ("herb", "dose", "role"))
     payload["decoction"] = decoction if isinstance(decoction, str) else ""
     return payload
 

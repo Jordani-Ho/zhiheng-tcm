@@ -4822,22 +4822,27 @@ def test_only_confirmation_path_changes_the_stage_triple(db, stage_gate):
 # 接口层用例一律走 `conftest.client`（真实 HTTP，含 4b-1 在 `main.py` 注册的 `AgentStageError` 处理器）。
 # ===========================================================================
 
-# 五条已注册路由的 (方法, 路径)——「flag off 全部 404」与「路由表恰好这些」共用同一份清单，避免两处漂移
+# 七条已注册路由的 (方法, 路径)——「flag off 全部 404」与「路由表恰好这些」共用同一份清单，避免两处漂移
+# （4c-2 追加 #6 `suggest` / #7 `predraft`：两条都只带请求体，flag off 那一轮照样吃 `json=payload`）
 _STAGE_ROUTE_TABLE = (
     ("get", "/api/agent/stage"),
     ("post", "/api/agent/stage/evaluate"),
     ("get", "/api/agent/stage/config"),
     ("put", "/api/agent/stage/config"),
     ("post", "/api/agent/stage/demote"),
+    ("post", "/api/agent/stage/suggest"),
+    ("post", "/api/agent/stage/predraft"),
 )
 
-# 本步**已注册**的 (方法, 路径) 集合（#1–#5）；#6 `suggest` / #7 `predraft` 不在其中（见组头 ⑤）
+# **已注册**的 (方法, 路径) 集合（4b-2 的 #1–#5 + 4c-2 的 #6 `suggest` / #7 `predraft`；§4.6 七条一条不多一条不少）
 _STAGE_REGISTERED_ROUTES = {
     ("GET", "/api/agent/stage"),
     ("POST", "/api/agent/stage/evaluate"),
     ("GET", "/api/agent/stage/config"),
     ("PUT", "/api/agent/stage/config"),
     ("POST", "/api/agent/stage/demote"),
+    ("POST", "/api/agent/stage/suggest"),
+    ("POST", "/api/agent/stage/predraft"),
 }
 
 # §4.6-①「出参（要点）」列的**逐键转写**（服务层契约是 15 键；`stage_view()` 的 docstring 同列，
@@ -4884,8 +4889,8 @@ def _stage_actions(teacher=TEACHER):
 
 # ---- ② 顺序纪律：flag → 存储 → 鉴权 ----
 
-def test_api_flag_off_all_five_routes_404_agent_stage_disabled(client, monkeypatch):
-    """§5.1 红线① / §7.1-⑫：flag off → 五条路由**全部** 404 `agent_stage_disabled`（统一错误体），
+def test_api_flag_off_all_seven_routes_404_agent_stage_disabled(client, monkeypatch):
+    """§5.1 红线① / §7.1-⑫：flag off → 七条路由**全部** 404 `agent_stage_disabled`（统一错误体），
     且**先于**鉴权 —— 缺栏位 / 名字与 ID 不一致的请求同样是 404，不是 400 / 403。
 
     为什么顺序不能反（`agent_stage_api.py` 文件头第 23–26 行）：倒过来的话，flag off 时「缺参数」
@@ -5168,12 +5173,14 @@ def test_api_evaluate_returns_snapshot_with_changed_and_stays_at_stage(client):
 
 # ---- ⑥ 路由面与源码级守护 ----
 
-def test_api_router_registers_only_the_five_step_4b2_routes(client):
-    """本步的路由面**恰好**是 #1–#5：路由表里没有 #6 `suggest` / #7 `predraft`（服务侧能力入口属 4c）。
+def test_api_router_registers_exactly_seven_routes(client):
+    """路由面**恰好**是 §4.6 的七条：4b-2 的 #1–#5 + 4c-2 的 #6 `suggest` / #7 `predraft`（服务侧能力入口已落地）。
 
-    「名字在、行为不在」的假实现比 404 更糟（接口层文件头第 39–41 行的说明）→ 既查路由表，也真发一次请求钉住
-    它落的是 FastAPI 默认 404（`{"detail": "Not Found"}`，**不是**统一错误体）；4c 落地后本用例要改成
-    403 `stage_forbidden` / 404 `stage_draft_not_found` 那一族。"""
+    既查路由表（一条不多一条不少），也对两条新路由各真发一次「缺鉴权字段」的请求：4b-2 期间它们落的是
+    FastAPI 默认 404（`{"detail": "Not Found"}`，**不是**统一错误体），4c-2 起必须落**统一错误体**
+    （400 `teacher_required` —— 这一路连能力 / 草案 / 模型三关都不进去）。**越权 / 查不到草案那一族**
+    （403 `stage_forbidden` / 404 `stage_draft_not_found` / 400 `stage_kind_invalid` / 503 故障码）由
+    ㉒ 组逐条钉住，本用例只管「路由在场 + 统一错误体」。"""
     import agent_stage_api
 
     registered = {(method, route.path)
@@ -5182,11 +5189,10 @@ def test_api_router_registers_only_the_five_step_4b2_routes(client):
                   if method in ("GET", "POST", "PUT", "DELETE")}    # GET 会被自动补 HEAD，故只看显式四种
     assert registered == _STAGE_REGISTERED_ROUTES
 
-    for path, payload in (("/api/agent/stage/suggest", dict(_auth(), draft_id=1, kind="pattern")),
-                          ("/api/agent/stage/predraft", dict(_auth(), draft_id=1))):
-        res = client.post(path, json=payload)
-        assert res.status_code == 404, "%s 本步不得注册（实测 %d）" % (path, res.status_code)
-        assert res.json() == {"detail": "Not Found"}, "未注册的路由由 FastAPI 默认 404 兜底"
+    for path in ("/api/agent/stage/suggest", "/api/agent/stage/predraft"):
+        res = client.post(path, json={"teacher_name": "", "teacher_id": ""})
+        assert res.status_code == 400, "%s 已注册（实测 %d）" % (path, res.status_code)
+        assert _api_detail(res)["error"] == "teacher_required", "注册后一律走统一错误体（不再是默认 404）"
 
 
 def test_api_module_never_imports_database_or_forbidden_symbols():
@@ -6172,4 +6178,342 @@ def test_agent_capabilities_normalize_and_never_raise(monkeypatch):
     assert "y.png" not in prompt and "【上传的图片】" not in prompt, "URL 段一律剥掉"
     assert "【舌脈】淡" in prompt and prompt.count("納可") <= agent.PROMPT_TEXT_LIMIT, \
         "正文按 `PROMPT_TEXT_LIMIT` 截断（提示词体积有上限）"
+
+
+# ============ ㉒ 【施工步骤 4c-2】接口层 #6 / #7：只读建议接口的 HTTP 投影 ============
+#
+# ㉑ 组把两个服务侧主体（`build_suggestion()` / `build_predraft()`）的 12 键契约、白名单、审计点与
+# 三条失败路径全部钉住了；本组只钉**接口层新增的那一层**（同一件事只钉一次）：
+#   ① 路由在场：§4.6 七条 —— 由 ⑥ 组的 `test_api_router_registers_exactly_seven_routes` 与 ③ 组的
+#      `_STAGE_ROUTE_TABLE`（flag off 全部 404）覆盖，本组不重复；
+#   ② 固定顺序：`_guard()`（flag → 404 / 存储未就绪 → 503）→ `_check_identity()`（400 / 403）→ 业务；
+#   ③ §4.6-⑥⑦ 的**出参列投影**：#6 五键 / #7 四键（服务层多给的键一律不下发 —— 键集就是契约）；
+#   ④ 错误码族逐条：400 `stage_kind_invalid`（且排在 403 之前）/ 403 `stage_forbidden`（含恰好**一行**
+#      审计）/ 404 `stage_draft_not_found`（零审计、零模型调用）/ 503 故障码（与「解析失败仍是 200」
+#      严格分开）；
+#   ⑤ 铁律的 HTTP 面：两条接口都**零落库**（业务表一行不增，唯一新增的是 `agent_stage_log` 的成功事件）。
+#
+# 断言只用接口层可观测的面：HTTP 状态码 + 统一错误体 + 落库行数 + 审计行。
+
+# §4.6-⑥⑦「出参（要点）」列的**逐键转写**（接口层投影后的键集；服务层契约是 12 键，见 ㉑ 组）
+_SUGGEST_API_KEYS = ("kind", "draft_id", "payload", "disclaimer", "generated_at")
+_PREDRAFT_API_KEYS = ("draft_id", "predraft", "disclaimer", "note")
+
+_SUGGEST_PATH = "/api/agent/stage/suggest"
+_PREDRAFT_PATH = "/api/agent/stage/predraft"
+_SUGGEST_PATHS = (_SUGGEST_PATH, _PREDRAFT_PATH)      # 两条共享同一套「顺序 / 鉴权 / 存储」纪律
+
+# 成功路径的假回包（形状 = §4.3 契约；**故意**多塞白名单外的键 → 验「不带出」；`disclaimer` 也故意
+# 换成模型自己编的句子 → 验「免责声明由服务层给，模型那句不采信」）
+_SUGGESTED_PATTERN = {"candidates": [{"name": "肝胃不和證", "confidence": "high",
+                                      "basis": ["反覆胃脘脹痛 3 個月"], "note": "飯後脹甚",
+                                      "dosage": "白名单外：不许带出"}],
+                      "disclaimer": "模型自己编的免责声明"}
+_SUGGESTED_FORMULA = {"formulas": [{"name": "柴胡桂枝湯", "modification": "加減：無",
+                                    "composition": ["柴胡", "桂枝"], "usage": "僅供參考",
+                                    "dose": "白名单外：不许带出"}],
+                      "disclaimer": "模型自己编的免责声明"}
+_SUGGESTED_PREDRAFT = {"predraft": {"formula_name": "柴胡桂枝湯",
+                                    "items": [{"herb": "柴胡", "dose": "9g", "role": "君"}],
+                                    "decoction": "日一劑，分二次溫服"},
+                       "disclaimer": "模型自己编的免责声明"}
+
+
+def _post_capability(client, path, **extra):
+    """#6 / #7 的请求：鉴权两栏 + 业务栏（缺键由 `AgentStageSuggestInput` 的默认值兜住）。"""
+    return client.post(path, json=dict(_auth(), **extra))
+
+
+def _growth(before):
+    """与 `_table_counts()` 的快照比行数增量（**不认表名**，只认「哪几张表动了、动了几行」）。"""
+    after = _table_counts()
+    return {key: after[key] - before[key] for key in before if after[key] != before[key]}
+
+
+def test_api_capability_routes_store_not_ready_is_503_and_precedes_identity(client, monkeypatch):
+    """[㉒-①] flag on 但 0003 三表未就绪 → 两条新路由都是 503 `agent_stage_store_unavailable`
+    （**不是** 404 / 400 / 403），且**先于**鉴权：连「缺鉴权栏位」的请求也回 503
+    （§7.1-⑫：404「功能没开」与 503「迁移没跑」不得合并）。"""
+    import agent_stage_service
+
+    monkeypatch.setattr(agent_stage_service, "agent_stage_store_ready", lambda: False)
+    before = _table_counts()
+
+    for path in _SUGGEST_PATHS:
+        for payload in ({"teacher_name": "", "teacher_id": ""}, _auth()):
+            res = client.post(path, json=payload)
+            assert res.status_code == 503, "%s 存储未就绪先答 503（实测 %d）" % (path, res.status_code)
+            assert _api_detail(res)["error"] == "agent_stage_store_unavailable"
+
+    assert _growth(before) == {}, "存储未就绪的请求零写入（含审计）"
+
+
+def test_api_capability_routes_identity_is_400_then_403(client):
+    """[㉒-②] 第二道门与 #1–#5 共用 `_check_identity()`：缺栏位 → 400 `teacher_required`；
+    名字与 ID 不是同一个人 → 403 `teacher_mismatch`。业务栏位在这一层一律不参与判定。"""
+    for path in _SUGGEST_PATHS:
+        res = client.post(path, json={"teacher_name": "", "teacher_id": ""})
+        assert res.status_code == 400 and _api_detail(res)["error"] == "teacher_required"
+
+        res = client.post(path, json={"teacher_name": TEACHER, "teacher_id": OTHER_TEACHER})
+        assert res.status_code == 403 and _api_detail(res)["error"] == "teacher_mismatch"
+
+        res = client.post(path, json={"teacher_name": TEACHER, "teacher_id": ""})
+        assert res.status_code == 400 and _api_detail(res)["error"] == "teacher_required", \
+            "空 ID 是「缺栏位」而不是「不是同一个人」"
+
+
+def test_api_suggest_kind_invalid_is_400_and_outranks_capability(client):
+    """[㉒-③] §4.6-⑥ 的错误码优先序：`kind` 非法 → **400** `stage_kind_invalid`，即使阶段同样不足
+    （`learning` 期连 `predict_pattern` 都没有）也**不许**变成 403 —— 填错参数的请求不能被记成「越权」
+    （否则 `permission_denied` 审计与 §6.2 的越权窗口统计会被噪声污染）。
+
+    证据两条：HTTP 是 400（不是 403）；`agent_stage_log` **零** `permission_denied`（服务层把 kind
+    闸门排在能力闸门之前，接口层照结论翻译）。"""
+    _set_stage("learning")
+    before = _table_counts()
+
+    for kind in ("", "FORMULA", "patterns", "pattern "):
+        res = _post_capability(client, _SUGGEST_PATH, draft_id=1, kind=kind)
+        assert res.status_code == 400, "kind=%r 必须是 400（实测 %d）" % (kind, res.status_code)
+        detail = _api_detail(res)
+        assert detail["error"] == "stage_kind_invalid"
+        assert [entry["path"] for entry in detail["errors"]] == ["kind"], "要指出是哪个栏位错了"
+
+    assert _stage_log_events() == [], "非法 kind 不是越权：不许写 permission_denied"
+    assert _growth(before) == {}, "被 400 拦下的请求零写入"
+
+
+def test_api_suggest_draft_not_found_is_404_without_touching_the_model(client, monkeypatch):
+    """[㉒-④] `draft_id` 反查不到 → 404 `stage_draft_not_found`：**不调模型**（桩一次都不许被调用）、
+    不写审计（查不到草案不是越权）。**别人的草案同款处理**（服务端只信 DB、只认自己名下的未签草案）。"""
+    monkeypatch.setenv("AGENT_STAGE_ENABLED", "on")
+    _stub_reads(monkeypatch)
+    calls = _stub_model(monkeypatch, "predict_pattern_candidates", _SUGGESTED_PATTERN)
+    _set_stage("apprentice")
+    other_draft_id = _seed_suggestion_draft(teacher=OTHER_TEACHER)
+    before = _table_counts()
+
+    for draft_id in (9999, other_draft_id):
+        res = _post_capability(client, _SUGGEST_PATH, draft_id=draft_id, kind="pattern")
+        assert res.status_code == 404, "draft_id=%r 必须是 404（实测 %d）" % (draft_id, res.status_code)
+        assert _api_detail(res)["error"] == "stage_draft_not_found"
+
+    assert calls == [], "查不到草案一律不调模型（绝不拿别人 / 已签字的草案喂 LLM）"
+    assert _stage_log_events() == [] and _growth(before) == {}
+
+
+def test_api_suggest_forbidden_is_403_and_writes_exactly_one_audit_row(client, monkeypatch):
+    """[㉒-⑤] 阶段不足 → 403 `stage_forbidden`（**不是** 404：前端要区分「功能没开」与「阶段不够」），
+    越权审计**恰好一行**（`permission_denied` + 被拒能力键 + 当前阶段），业务表一行不增 —— 接口层
+    **不重问**能力，否则这里会变成两行（服务层闸门写一行、接口层再写一行）。"""
+    monkeypatch.setenv("AGENT_STAGE_ENABLED", "on")
+    _stub_reads(monkeypatch)
+    calls = _stub_model(monkeypatch, "predict_pattern_candidates", _SUGGESTED_PATTERN)
+    _set_stage("learning")                            # 连見習期能力都没有
+    draft_id = _seed_suggestion_draft()
+    before = _table_counts()
+
+    res = _post_capability(client, _SUGGEST_PATH, draft_id=draft_id, kind="pattern")
+
+    assert res.status_code == 403, "能力不足是 403 而不是 404（实测 %d）" % res.status_code
+    detail = _api_detail(res)
+    assert detail["error"] == "stage_forbidden"
+    assert detail["errors"] and detail["errors"][0]["path"] == "capability"
+    assert "見習期" in detail["errors"][0]["msg"], "文案要说清「差多少」（§2.4 口径）"
+
+    rows = database.get_agent_stage_logs(TEACHER)
+    assert [row["event_type"] for row in rows] == ["permission_denied"], "越权恰好一行审计"
+    assert rows[0]["capability"] == "predict_pattern" and rows[0]["from_stage"] == "learning"
+    assert calls == [], "越权请求也不许调模型"
+    assert list(_growth(before).values()) == [1], "越权只留那一行审计（业务表 / 状态表一行不动）"
+
+
+def test_api_suggest_pattern_success_projects_exactly_five_keys(client, monkeypatch):
+    """[㉒-⑥] 見習期 + `kind='pattern'` → 200，**逐键**就是 §4.6-⑥ 的五键（服务层多给的
+    `patient_name` / `skipped` / `applied` / `reason` / `warnings` / `errors` 一律不下发 —— 键集即契约）。
+    `payload` 只带 §4.3 白名单（模型多给的 `dosage` 不许带出），`disclaimer` 由**服务层**给（模型自己
+    编的那句不采信），`generated_at` 非空；草案正文确实进了提示词（取数只信 DB）。"""
+    import agent_stage_service
+
+    monkeypatch.setenv("AGENT_STAGE_ENABLED", "on")
+    _stub_reads(monkeypatch)
+    calls = _stub_model(monkeypatch, "predict_pattern_candidates", _SUGGESTED_PATTERN)
+    _set_stage("apprentice")
+    draft_id = _seed_suggestion_draft()
+    before = _table_counts()
+
+    res = _post_capability(client, _SUGGEST_PATH, draft_id=draft_id, kind="pattern")
+
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert set(body) == set(_SUGGEST_API_KEYS), "§4.6-⑥ 的出参列逐键一致"
+    assert body["kind"] == "pattern" and body["draft_id"] == draft_id
+    assert body["payload"]["candidates"][0]["name"] == "肝胃不和證"
+    assert "dosage" not in body["payload"]["candidates"][0], "白名单外的键一律不带出"
+    assert body["disclaimer"] == agent_stage_service.DISCLAIMER_PATTERN
+    assert body["disclaimer"] != _SUGGESTED_PATTERN["disclaimer"], "不采信模型自己编的免责声明"
+    assert body["generated_at"], "成功体要带时间戳（卡片要显示「生成於」）"
+
+    assert calls and "反覆胃脘脹痛" in calls[0]["complaint"], "取数只信 DB：草案正文进了提示词"
+    assert calls[0]["patient_name"] == "张三"
+    assert _stage_log_events() == ["suggestion_generated"]
+    assert list(_growth(before).values()) == [1], "只读建议接口：唯一新增的只有那一行审计"
+
+
+def test_api_suggest_formula_needs_the_assistant_stage(client, monkeypatch):
+    """[㉒-⑦] `kind` → 能力映射：`formula` 要助手期（`suggest_prescription`）。見習期发 `formula` → 403
+    （#6 **不是**一个闸门，而是按 kind 分两级），助手期才 200，且 `payload` 换成 `formulas[]`、
+    免责声明换成「非處方」（无剂量药单）。"""
+    import agent_stage_service
+
+    monkeypatch.setenv("AGENT_STAGE_ENABLED", "on")
+    _stub_reads(monkeypatch)
+    _stub_model(monkeypatch, "predict_pattern_candidates", _SUGGESTED_PATTERN)
+    _stub_model(monkeypatch, "suggest_formula", _SUGGESTED_FORMULA)
+    _set_stage("apprentice")
+    draft_id = _seed_suggestion_draft()
+
+    denied = _post_capability(client, _SUGGEST_PATH, draft_id=draft_id, kind="formula")
+
+    assert denied.status_code == 403, "見習期只有 predict_pattern（实测 %d）" % denied.status_code
+    assert _api_detail(denied)["error"] == "stage_forbidden"
+    assert "助手期" in _api_detail(denied)["errors"][0]["msg"], "文案要指到「助手期」那一级"
+
+    _set_stage("assistant")
+    res = _post_capability(client, _SUGGEST_PATH, draft_id=draft_id, kind="formula")
+
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert set(body) == set(_SUGGEST_API_KEYS)
+    assert body["kind"] == "formula"
+    assert body["payload"]["formulas"][0]["name"] == "柴胡桂枝湯"
+    assert "dose" not in body["payload"]["formulas"][0], "方剂建议**无剂量**（§4.3）"
+    assert body["disclaimer"] == agent_stage_service.DISCLAIMER_FORMULA
+    assert _stage_log_events() == ["suggestion_generated", "permission_denied"], "倒序：成功事件在前"
+
+
+def test_api_predraft_success_projects_exactly_four_keys_and_the_literal_note(client, monkeypatch):
+    """[㉒-⑧] 授权期 + #7 → 200，逐键就是 §4.6-⑦ 的四键（**没有** `generated_at`：设计表出参列没有它，
+    服务层多给的不下发）；`predraft` 内层三键恒在场；`note` 是 §4.6-⑦ 的**逐字**文案
+    `僅供預填，儲存處方仍須老師操作`（本接口永不落库 / 发送 / 签字）。"""
+    import agent_stage_service
+
+    monkeypatch.setenv("AGENT_STAGE_ENABLED", "on")
+    _stub_reads(monkeypatch)
+    calls = _stub_model(monkeypatch, "generate_predraft", _SUGGESTED_PREDRAFT)
+    _set_stage("authorized")
+    draft_id = _seed_suggestion_draft()
+    before = _table_counts()
+
+    res = _post_capability(client, _PREDRAFT_PATH, draft_id=draft_id, formula_name="柴胡桂枝湯")
+
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert set(body) == set(_PREDRAFT_API_KEYS), "§4.6-⑦ 的出参列逐键一致（generated_at 不下发）"
+    assert body["draft_id"] == draft_id
+    assert set(body["predraft"]) == {"formula_name", "items", "decoction"}, "内层三键恒在场"
+    assert body["predraft"]["formula_name"] == "柴胡桂枝湯"
+    assert body["predraft"]["items"] == [{"herb": "柴胡", "dose": "9g", "role": "君"}]
+    assert body["predraft"]["decoction"] == "日一劑，分二次溫服"
+    assert body["disclaimer"] == agent_stage_service.DISCLAIMER_PREDRAFT
+    assert body["note"] == agent_stage_service.PREDRAFT_NOTE == "僅供預填，儲存處方仍須老師操作"
+
+    assert calls[0]["formula_name"] == "柴胡桂枝湯" and calls[0]["patient_name"] == "张三"
+    assert _stage_log_events() == ["predraft_generated"]
+    assert list(_growth(before).values()) == [1], "预填永不落库：唯一新增的只有那一行审计"
+
+
+def test_api_predraft_ignores_kind_and_demands_the_authorized_stage(client, monkeypatch):
+    """[㉒-⑨] #7 的请求体共用 `AgentStageSuggestInput`，但**整条忽略** `kind`：助手期 + `kind='pattern'`
+    仍然是 403（能力恒为授权期 `generate_predraft`）—— 若 `kind` 参与了 #7 的判定，这一发会走
+    `suggest_prescription` 而被放行（那等于把「整张方」的预填降级成「无剂量药单」的能力）。"""
+    monkeypatch.setenv("AGENT_STAGE_ENABLED", "on")
+    _stub_reads(monkeypatch)
+    calls = _stub_model(monkeypatch, "generate_predraft", _SUGGESTED_PREDRAFT)
+    _set_stage("assistant")
+    draft_id = _seed_suggestion_draft()
+
+    res = _post_capability(client, _PREDRAFT_PATH, draft_id=draft_id, kind="pattern",
+                           formula_name="柴胡桂枝湯")
+
+    assert res.status_code == 403, "predraft 是授权期能力，与 kind 无关（实测 %d）" % res.status_code
+    detail = _api_detail(res)
+    assert detail["error"] == "stage_forbidden"
+    assert "授權期" in detail["errors"][0]["msg"], "门槛那一级的名字要说出来"
+    assert calls == [], "被拒的请求不碰模型"
+    assert database.get_agent_stage_logs(TEACHER)[0]["capability"] == "generate_predraft", \
+        "审计里的能力键必须是授权期那一项（不是 kind 映射出来的那项）"
+
+
+@pytest.mark.parametrize("path, model, reason", (
+    (_SUGGEST_PATH, "predict_pattern_candidates", "suggestion_failed"),
+    (_PREDRAFT_PATH, "generate_predraft", "predraft_failed"),
+))
+def test_api_capability_routes_failure_is_503(client, monkeypatch, path, model, reason):
+    """[㉒-⑩] 服务侧故障（模型抛异常）→ **503** + 4c-2 新登记的两个故障码（`suggestion_failed` /
+    `predraft_failed`）：与「解析失败仍是 200」严格分开 —— 前者是「我们没跑通」（可重试），
+    后者是「模型这次没给出可用内容」（老师自己判断）。故障不算越权，故零审计、零业务写入。"""
+    monkeypatch.setenv("AGENT_STAGE_ENABLED", "on")
+    _stub_reads(monkeypatch)
+    _stub_model_raising(monkeypatch, model)
+    _set_stage("authorized")
+    draft_id = _seed_suggestion_draft()
+    before = _table_counts()
+
+    res = _post_capability(client, path, draft_id=draft_id, kind="pattern", formula_name="柴胡桂枝湯")
+
+    assert res.status_code == 503, "%s 故障必须是 503（实测 %d）" % (path, res.status_code)
+    detail = _api_detail(res)
+    assert detail["error"] == reason
+    assert detail["errors"], "故障要带着原因一起回"
+    assert _stage_log_events() == [], "故障不是越权，也没有「已产出」事件"
+    assert _growth(before) == {}, "故障路径零写入"
+
+
+def test_api_suggest_parse_failure_is_still_200_with_empty_payload(client, monkeypatch):
+    """[㉒-⑪] 解析失败 = **成功**（§4.3）：200 + 空 `payload` + `payload['error']='parse_failed'`
+    —— 绝不能翻成 5xx（老师看到的是「智能體這次沒給出候選」，不是「系統壞了」）。"""
+    import agent
+    import agent_stage_service
+
+    monkeypatch.setenv("AGENT_STAGE_ENABLED", "on")
+    _stub_reads(monkeypatch)
+    _stub_model(monkeypatch, "predict_pattern_candidates",
+                {"candidates": [], "error": agent.PARSE_FAILED, "disclaimer": agent.PATTERN_DISCLAIMER})
+    _set_stage("apprentice")
+    draft_id = _seed_suggestion_draft()
+
+    res = _post_capability(client, _SUGGEST_PATH, draft_id=draft_id, kind="pattern")
+
+    assert res.status_code == 200, "解析失败不是故障（实测 %d）" % res.status_code
+    body = res.json()
+    assert set(body) == set(_SUGGEST_API_KEYS)
+    assert body["payload"] == {"candidates": [], "error": agent.PARSE_FAILED}, "空结果 + 标记（绝不编造）"
+    assert body["disclaimer"] == agent_stage_service.DISCLAIMER_PATTERN
+    assert _stage_log_events() == ["suggestion_generated"], "解析失败同样算「产出过一次」"
+
+
+def test_api_capability_routes_never_write_business_tables(client, monkeypatch):
+    """[㉒-⑫] 铁律的 HTTP 面：三次成功调用（證型 / 方劑 / 預填）后，五张表里**唯一**动过的是
+    `agent_stage_log`（+3 行：两次 `suggestion_generated` + 一次 `predraft_generated`）——
+    `drafts` / `patient_records` 与状态 / 配置表一行不增：「建議僅供參考」由路由面直接保证
+    （採用一律走既有的老师编辑 / 开方接口；§4.6 末段）。"""
+    monkeypatch.setenv("AGENT_STAGE_ENABLED", "on")
+    _stub_reads(monkeypatch)
+    _stub_model(monkeypatch, "predict_pattern_candidates", _SUGGESTED_PATTERN)
+    _stub_model(monkeypatch, "suggest_formula", _SUGGESTED_FORMULA)
+    _stub_model(monkeypatch, "generate_predraft", _SUGGESTED_PREDRAFT)
+    _set_stage("authorized")
+    draft_id = _seed_suggestion_draft()
+    before = _table_counts()
+
+    for path, extra in ((_SUGGEST_PATH, {"kind": "pattern"}),
+                        (_SUGGEST_PATH, {"kind": "formula"}),
+                        (_PREDRAFT_PATH, {"formula_name": "柴胡桂枝湯"})):
+        res = _post_capability(client, path, draft_id=draft_id, **extra)
+        assert res.status_code == 200, "%s %r 应成功（实测 %d）" % (path, extra, res.status_code)
+
+    assert list(_growth(before).values()) == [3], "三次调用只长三行审计，业务表一行不动"
+    assert _stage_log_events() == ["predraft_generated", "suggestion_generated", "suggestion_generated"]
 
