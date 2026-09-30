@@ -1128,12 +1128,33 @@ def api_agent_scan(data: AgentScanInput | None = None, teacher_name: str = "", l
 
     【Epic 4 §3.2 P1 / §4.3】flag on 时扫描范围必须限定本师门（缺 lineage_id → 400 lineage_required，
     绝不退化为「扫全库学生」）；flag off 时 lineage_id 被忽略，行为和返回逐字节不变。
+
+    【Epic 2 §4.4-③ / 施工步骤 6.5-b】扫描完成后**顺带**跑一次阶段评估 → 响应体**只增** `stage` 字段
+    （总闸 on 时才有这个键；值是 `evaluate()` 的「18 键快照 + changed」直出，见下方接线注释）。
     """
     name = (data.teacher_name if data else "") or teacher_name
     if not name:
         raise HTTPException(status_code=400, detail="teacher_name 不能为空")
     created = agent.scan_student_requests(name, lineage_id=lineage_id or None)
-    return {"ok": True, "created": created, "new_tasks": created}
+    response = {"ok": True, "created": created, "new_tasks": created}
+    # 【Epic 2 §4.4-③ / 施工步骤 6.5-b】阶段评估接线（**只增** `stage` 字段，别的一律不动）：
+    #   ① 总闸 off → 这里**连 `evaluate()` 都不调**（零 SQL）：`ok` / `created` / `new_tasks` 三键与
+    #      Epic 2 之前**逐字节一致**（§5.1 红线①；既不新增键，也不改既有键的值与顺序）；
+    #   ② 总闸 on → `stage` = `evaluate()` 的「18 键快照 + changed」，与接口层
+    #      `POST /api/agent/stage/evaluate`（`agent_stage_api.py` 直出同一个返回体）**同一份**：
+    #      这里不裁剪、不补键（形状即契约；裁剪会变成第二份口径，前端两张卡就对不上了）；
+    #   ③ **best-effort**：评估链自己绝不抛，这里再兜一层 —— 评估坏了只是「本次没带上阶段信息」，
+    #      扫描结果（学生请示闭环的唯一入口）照旧原样返回。这一层只兜 `evaluate()`：
+    #      `scan_student_requests()` 在上一行已经跑完，它自己的异常照常冒泡（不吞真故障）。
+    if agent_stage_service.agent_stage_enabled():
+        try:
+            response["stage"] = agent_stage_service.evaluate(name)
+        except Exception as exc:  # noqa: BLE001 —— 评估是旁路：绝不拖垮扫描（§3.8 失败方向）
+            print(
+                "[warn] 階段評估失敗（本次掃描不帶階段資訊，掃描結果不受影響）：%s: %s"
+                % (type(exc).__name__, exc)
+            )
+    return response
 
 
 @app.get("/api/agent/tasks")

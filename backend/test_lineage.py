@@ -581,7 +581,11 @@ def test_flag_off_agent_scan_full_volume_and_ignores_param(two_lineages, monkeyp
     before = {row["id"] for row in _fetch("SELECT id FROM agent_tasks")}
     first = client.post("/api/agent/scan", json={"teacher_name": TEACHER_A}, params={"lineage_id": LIN_B})
     assert first.status_code == 200
-    assert first.json() == {"ok": True, "created": 4, "new_tasks": 4}
+    # 【Epic 2 §4.4-③ / 施工步骤 6.5-b】`AGENT_STAGE_ENABLED` 在 conftest 里是 on → 该接口会**只增**
+    # 一个 `stage` 键（阶段评估快照，best-effort）。本用例的口径是 Epic 1/4 的「既有三键 + 逐字面」，
+    # 故比对前只摘掉这一个键 —— 对既有三键的逐字节要求一点没放松（本组其余用例不受影响）。
+    body = {key: value for key, value in first.json().items() if key != "stage"}
+    assert body == {"ok": True, "created": 4, "new_tasks": 4}
     new_rows = [row for row in
                 _fetch("SELECT id, title, action_data, lineage_id FROM agent_tasks")
                 if row["id"] not in before]

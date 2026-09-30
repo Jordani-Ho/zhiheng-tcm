@@ -52,7 +52,8 @@
        **返回 bool、拒绝不抛**（403 的抛出点属 step 4 接口层）。**零接线**，且不改 ⑭ 组一行。
     ⑯ 【施工步骤 3.4-a】**指标层**：`compute_template_match`（§3.2 ①）+ `compute_modification_consistency`
        （§3.3 ②）+ 库层只读样本原语 `database.get_draft_samples`（批复 C-1：窗口 + 类型过滤 + LIMIT）：
-       样本集合与三类排除计数（`skipped_no_template` / `skipped_stale_template` / `skipped_empty`）+
+       样本集合与三类排除计数（`skipped_no_template` / `skipped_stale_template` / `skipped_empty`）
+       【6.5-b 追加第四类】`skipped_degraded`（`observation` 降级骨架单列，见 ㉓ 组 / TD-015）+
        铁律违规样本（AI 填了 `teacher` 段 → 该样本 `match = 0.0`）+ **空集语义 `value is None` ≠ 0**
        （CTO 硬约束 2：空值既不是 0 分、也不可能「通过」任何阈值）+ 权重 / 截断 / 窗口 / 上限
        **全部来自 `cfg`**（不硬编码）+ **全程只读**（只发 SELECT / PRAGMA，五张表零写入，flag off 照算）
@@ -1847,6 +1848,25 @@ def _raw_scalar(sql, params=()):
         return conn.execute(sql, params).fetchone()[0]
     finally:
         conn.close()
+
+
+def _seed_transcription(patient_name, teacher_name, content):
+    """直落一条「**待处理**转述」并返回其 id（给 `/api/generate-draft` 这类按 `transcript_id` 取数的入口用）。
+
+    为什么绕开 `database.insert_transcription()`：与本文件造数纪律一致（同 `_raw_execute()` 的
+    docstring）—— 前置态一律**不**走 `database.get_connection()`，免得污染「读数只发 SELECT」的
+    语句级断言（`sql_log`）。落库形状与 `database.py:651` 的同名插入一致（`processed` 取默认 0）。
+
+    **为什么必须「一条一用」（本 helper 存在的第二个理由）**：`database.get_transcriptions()` 的
+    首个条件**恒**是 `processed = 0`（`database.py:668`），而 `database.insert_draft()` 在生成成功
+    后会把它置 1（`database.py:843`）→ **一次生成即消费掉这一行**；要再打一次生成入口（例如
+    「观察期 vs 非观察期」的反证组）必须**新落一条**，复用旧 id 会落到 `main.py:736-737` 的
+    `{"error": "找不到该转述"}`（普通 dict → HTTP 200 且**无** `draft_id`）。既有先例：
+    `test_templates.py:653-656` 的 `_link_transcript()` 同款（一次一条）。
+    """
+    _raw_execute("INSERT INTO transcriptions (patient_name, teacher_name, content, data_type) "
+                 "VALUES (?, ?, ?, 'text')", (patient_name, teacher_name, content))
+    return _raw_scalar("SELECT MAX(id) FROM transcriptions")
 
 
 def _clear_stage_config_rows():
@@ -6522,4 +6542,311 @@ def test_api_capability_routes_never_write_business_tables(client, monkeypatch):
 
     assert list(_growth(before).values()) == [3], "三次调用只长三行审计，业务表一行不动"
     assert _stage_log_events() == ["predraft_generated", "suggestion_generated", "suggestion_generated"]
+
+
+
+# ============ ㉓ 【施工步骤 6.5-b】扫描接线 + 观察期本地骨架 + TD-015 样本单列 ============
+#
+# 6.5-a 已经在**源码级**钉住「两条生成路径都走只读的 `generation_degraded()`」（㉑ 组 + 命令 B），
+# 本组只钉它**对外可观测**的三个面（同一件事不重复钉一遍）：
+#   ① `POST /api/agent/scan` 的接线（§4.4-③）：总闸 on → 响应体**只增** `stage`（= `evaluate()` 的
+#      「18 键快照 + changed」直出）；off → **连 `evaluate()` 都不调**、三键逐字节不变（Epic 2 之前的口径）；
+#   ② `observation` 期的生成链路：正文首行带提示、**LLM 零调用**、仍可编辑 / 签字、模板引用照记（D4）；
+#   ③ TD-015（6.5-b 裁决 = 选项 (a)）：降级骨架从 ① 的样本池**单列**出去（`skipped_degraded`），
+#      不进「模板匹配度」的均值。
+#
+# 断言只用可观测面：HTTP 状态码 / 响应键集与逐字节文本 / 落库行与列 / 审计行 / 语句序列。
+# 本组**不改** ㉑ 组（6.5-a 已验收）与 ⑮ 组的源码守护一行，也不重新钉 `require_capability()` /
+# `_permission_denials_in_window()` / `get_agent_stage_log_stats()` 的既有语义（铁律）。
+
+# 接线之前 `/api/agent/scan` 的**逐字面**返回（flag off 时按字节比对；`created` 在空库恒 0）
+_SCAN_BODY_BEFORE_EPIC2 = '{"ok":true,"created":0,"new_tasks":0}'
+
+# 五阶段字面量（§1.1）：本组只在参数化里用，不在模块级 import 服务层（本文件一向延迟 import）
+_ALL_STAGES = ("observation", "learning", "apprentice", "assistant", "authorized")
+
+
+def _scan(client, teacher=TEACHER):
+    """打一次扫描（`/api/agent/scan` 的唯一调用形态：老师名走请求体）。"""
+    return client.post("/api/agent/scan", json={"teacher_name": teacher})
+
+
+def _draft_row(draft_id):
+    """草案行的「生成那一刻」四列 —— D4 的引用与 TD-015 的样本源都从**列/快照**看，不看接口投影。"""
+    conn = sqlite3.connect(database.DB_PATH)
+    try:
+        conn.row_factory = sqlite3.Row
+        return dict(conn.execute(
+            "SELECT id, content, template_id, template_version, ai_original_content "
+            "FROM drafts WHERE id = ?", (draft_id,)).fetchone())
+    finally:
+        conn.close()
+
+
+# ---- ① 扫描接线（§4.4-③）：只增 stage / flag off 逐字节 / best-effort ----
+
+def test_scan_response_carries_stage_flag_on(client, monkeypatch):
+    """§4.4-③（6.5-b）：總閘 on → 响应体在既有三键之外**只增** `stage`，且**不裁剪**地直出
+    `evaluate()` 的「18 键快照 + changed」（与 `POST /api/agent/stage/evaluate` 同一份形状）。
+
+    另外钉住「接线是**真评估**而不是摆一份空快照」：状态行与审计行各留一处（`evaluation` 一条）。
+    """
+    import agent_stage_service
+
+    monkeypatch.setenv("AGENT_STAGE_ENABLED", "on")
+
+    res = _scan(client)
+
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert set(body) == {"ok", "created", "new_tasks", "stage"}, "只增 stage：一个别的键都不许动"
+    assert body["ok"] is True and body["created"] == body["new_tasks"] == 0
+    assert set(body["stage"]) == set(_EVALUATE_SNAPSHOT_KEYS) | {"changed"}, "直出、不裁剪"
+    assert body["stage"]["teacher_name"] == TEACHER
+    assert body["stage"]["stage"] == agent_stage_service.DEFAULT_STAGE_CONFIG["default_stage"]
+    assert body["stage"]["changed"]["stage_changed"] is False, "首次评估只是落状态行，不升阶"
+    assert _stage_log_events() == ["evaluation"], "评估链的唯一留痕"
+    assert _raw_scalar("SELECT COUNT(*) FROM agent_stage_state WHERE teacher_name = ?",
+                       (TEACHER,)) == 1, "评估会把「从没评估过」的老师补上状态行"
+
+
+def test_scan_response_has_no_stage_field_flag_off(client, sql_log, monkeypatch):
+    """§5.1 红线①（逐字节保护）：總閘 off → 接线**连 `evaluate()` 都不调**（零 SQL），
+    响应体与 Epic 2 之前**逐字节**一致（连键的顺序都不变）。"""
+    monkeypatch.setenv("AGENT_STAGE_ENABLED", "off")
+    marker = len(_all_calls(sql_log))
+
+    res = _scan(client)
+
+    assert res.status_code == 200, res.text
+    assert res.text == _SCAN_BODY_BEFORE_EPIC2, "三键逐字节不变（含顺序、含 JSON 分隔符）"
+    assert _all_calls(sql_log)[marker:] == [], "flag off 时接线零 SQL（连一次 SELECT 都不许发）"
+
+
+def test_scan_does_not_break_on_evaluate_failure(client, monkeypatch, capsys):
+    """best-effort：`evaluate()` 抛异常 → 扫描照旧 200、三键原样返回（评估只是旁路）。
+
+    为什么必须兜这一层：扫描是「学生请示闭环」的唯一入口，不能被阶段评估拖垮；评估链自己
+    「永不抛」是常态，这里是**第二道**保险（吞的只是评估异常，`scan_student_requests()` 的异常照常冒泡）。
+    """
+    import agent_stage_service
+
+    monkeypatch.setenv("AGENT_STAGE_ENABLED", "on")
+
+    def boom(teacher_name):
+        raise RuntimeError("评估链坏了")
+
+    monkeypatch.setattr(agent_stage_service, "evaluate", boom)
+
+    res = _scan(client)
+
+    assert res.status_code == 200, res.text
+    assert res.json() == {"ok": True, "created": 0, "new_tasks": 0}, "评估坏了不许多出一个键"
+    assert "[warn]" in capsys.readouterr().out, "异常必须留痕（与 §1.3 钩子族同款出口）"
+
+
+
+# ---- ② observation 期的生成链路：本地骨架 + 首行提示 + 仍可编辑签字 ----
+
+def test_observation_uses_local_skeleton(client, monkeypatch):
+    """§6.5 第 37 条：觀察期老師收學生陳述 → 草案是**本地骨架 + 首行提示**：
+
+      · 「智能體零輸出」用**猴补丁计数**证明（LLM 一次都没被调，不是看输出像不像）；
+      · 首行恒是提示语、第二行起就是同一份 `build_draft_template()`（既有本地骨架，一字不改）；
+      · 降级只影响「生成」：老师照样能编辑、能签字（签字链路的快照 / 评估钩子照旧）。
+    """
+    import agent
+    import main
+
+    monkeypatch.setenv("AGENT_STAGE_ENABLED", "on")
+    calls = []
+
+    def llm(*args, **kwargs):
+        calls.append((args, kwargs))
+        return "LLM 不该被调用"
+
+    monkeypatch.setattr(agent, "generate_medical_draft", llm)
+    _set_stage("observation")
+
+    res = client.post("/api/transcribe", json={
+        "patient_name": "张三", "teacher_name": TEACHER,
+        "content": "頭痛三日，無發熱", "data_type": "text"})
+
+    assert res.status_code == 200, res.text
+    assert calls == [], "觀察期必须「智能體零輸出」：LLM 一次都不许调（§5.3）"
+
+    drafts = client.get("/api/drafts", params={"teacher_name": TEACHER}).json()
+    assert len(drafts) == 1
+    draft = drafts[0]
+    lines = draft["content"].split("\n")
+    assert lines[0] == main._SKELETON_NOTICE, "降级草案的第一行必须是觀察期提示"
+    assert lines[1] == "【中医病历草案】", "提示语之后就是同一份本地骨架"
+
+    # 仍可编辑 → 仍可签字（降级不碰老师链路）
+    edited = client.put("/api/drafts/%d" % draft["id"], json={"content": "老師編輯後的病歷"})
+    assert edited.status_code == 200, edited.text
+    signed = client.post("/api/drafts/%d/sign" % draft["id"],
+                         json={"final_plan": "抓藥調理", "final_content": "【完整病歷】"})
+    assert signed.status_code == 200, signed.text
+    assert _raw_scalar("SELECT COUNT(*) FROM patient_records WHERE teacher_name = ?",
+                       (TEACHER,)) == 1, "降级草案照样能签成病历"
+
+
+def test_skeleton_notice_is_first_line_of_degraded_draft(client, monkeypatch):
+    """首行断言（**逐字节**）：降级草案 = `_SKELETON_NOTICE` + 换行 + 既有本地骨架；并把
+    「非降级期没有提示行」作为反证（同一份代码、同一批数据，只有阶段不同）钉在同一用例里。
+    反证组**另落一条同内容转述**（内容逐字相同 → 数据等价）：一次生成即把该转述标为已处理，
+    同一条转述喂不进生成入口两次（理由见正文注释）。
+
+    本用例走**第三条生成路径** `/api/generate-draft`（6.5-a 的另一处接线点）：两条路径共用同一个
+    helper，所以「首行恒在 0 位」这条在两个入口都必须成立。
+    """
+    import main
+
+    monkeypatch.setenv("AGENT_STAGE_ENABLED", "on")
+    content = "頭痛三日，無發熱"
+    transcript_id = _seed_transcription("张三", TEACHER, content)
+    skeleton = main.build_draft_template("张三", content, "暂无过往病历")
+    _set_stage("observation")
+
+    res = client.post("/api/generate-draft", params={"transcript_id": transcript_id})
+
+    assert res.status_code == 200, res.text
+    assert "draft_id" in res.json(), res.json()        # 「找不到该转述」也是 200 + error 体，先在这里挡
+    degraded = _draft_row(res.json()["draft_id"])
+    assert degraded["content"] == main._SKELETON_NOTICE + "\n" + skeleton, "提示语恒在正文第 0 位"
+    assert degraded["content"].split("\n", 1)[0] == main._SKELETON_NOTICE
+    assert degraded["ai_original_content"] == degraded["content"], "快照 = 生成那一刻的原文"
+
+    # 【6.5-b 修正·测试侧】反证组必须**新落一条**转述，不能复用上面那条：
+    #   · 本端点只认**未处理**的转述（`database.get_transcriptions()` 首个条件恒为 `processed = 0`，
+    #     `database.py:668`）；而第一次生成成功后 `database.insert_draft()` 已把它置 1（`database.py:843`）
+    #     → **一次生成即消费掉这一行**，复用旧 id 会落到 `main.py:736-737` 的
+    #     `{"error": "找不到该转述"}`（普通 dict → **HTTP 200 且无 `draft_id`**）。
+    #   · 旧版 `res2.status_code == 200` 这条断言挡不住那个分支，失败会以 `KeyError: 'draft_id'`
+    #     的形式出现在下一行（这正是 6.5-b 后那一例红灯）。
+    #   · 新落的一条 patient_name / teacher_name / content 与上面**逐字相同** → 依旧是「同一批数据、
+    #     只把阶段升上去」（真实流程里同款：学生再陈述一次 → 新一行转述）。
+    _set_stage("learning")          # 同一份代码 + 同一批数据，只把阶段升上去
+    transcript_id2 = _seed_transcription("张三", TEACHER, content)
+    res2 = client.post("/api/generate-draft", params={"transcript_id": transcript_id2})
+
+    assert res2.status_code == 200, res2.text
+    assert "draft_id" in res2.json(), res2.json()
+    normal = _draft_row(res2.json()["draft_id"])
+    assert normal["content"] == skeleton, "非降级期：正文与 Epic 2 之前逐字节一致（零标识）"
+
+
+def test_degraded_draft_still_records_template_ref(client, monkeypatch):
+    """D4（§4.2 改 1 / Epic 1 §12.2）：降级草案**照旧**记 `template_id` / `template_version`。
+
+    降级改的是**正文字面**，不是「生成引用」：引用照记 → ① 才有机会认出这一类样本并单列
+    （TD-015 的前提）；漏记的话它会掉进 `skipped_no_template`，运维就分不清「没模板」与「被降级」。
+    """
+    import main
+
+    monkeypatch.setenv("AGENT_STAGE_ENABLED", "on")
+    template_id = _publish_record_template()
+    _set_stage("observation")
+
+    res = client.post("/api/transcribe", json={
+        "patient_name": "张三", "teacher_name": TEACHER,
+        "content": "頭痛三日", "data_type": "text"})
+
+    assert res.status_code == 200, res.text
+    row = _draft_row(_raw_scalar("SELECT MAX(id) FROM drafts"))
+    assert (row["template_id"], row["template_version"]) == (template_id, 1), "生成引用一字不差"
+    assert row["content"].startswith(main._SKELETON_NOTICE)
+    assert row["ai_original_content"].startswith(main._SKELETON_NOTICE)
+
+
+
+# ---- ③ 命令 B 的守护（只读判定）+ 与闸门逐格同值（不自锁的代价与收益）----
+
+def test_generation_degraded_never_writes_audit(db, monkeypatch):
+    """命令 B 的守护（源码级 + 行为级）：`generation_degraded()` 函数体内**零** `_stage_audit`、
+    **零** `require_capability` 调用 —— 这就是「观察期不会自锁」的**根因**（设计 §5.6 交叉风险备忘）。
+
+    反证放在同一用例里：**同一时刻**的闸门为拒绝写一行 `permission_denied` —— 若生成路径接了闸门，
+    §2.4/§3.6 的 `permission_denied_in_window`（默认阈值 0）会把「降级」读成「越权」→ 永远升不出来。
+    """
+    import ast
+    import agent_stage_service
+
+    (func,) = [node for node in ast.parse(_service_source()).body
+               if isinstance(node, ast.FunctionDef) and node.name == "generation_degraded"]
+    called = [_call_names(node) for node in ast.walk(func) if isinstance(node, ast.Call)]
+
+    assert "_stage_audit" not in called, "只读判定绝不写审计（写 = 观察期自锁）"
+    assert "require_capability" not in called, "只读判定绝不走闸门（闸门会为拒绝同点写审计）"
+
+    monkeypatch.setenv("AGENT_STAGE_ENABLED", "on")
+    _put_raw_state_row(TEACHER, "observation")
+
+    assert agent_stage_service.generation_degraded(TEACHER) is True
+    assert _stage_log_events() == [], "只读判定零审计"
+
+    assert agent_stage_service.require_capability(TEACHER, "generate_draft") is False
+    assert _stage_log_events() == ["permission_denied"], "闸门的拒绝留痕（自锁的燃料）"
+
+
+@pytest.mark.parametrize("flag", ("on", "off"))
+@pytest.mark.parametrize("stage", _ALL_STAGES)
+@pytest.mark.parametrize("enforced", (True, False))
+def test_generation_degraded_matches_require_capability_on_all_flag_stage_matrix_combinations(
+        db, monkeypatch, flag, stage, enforced):
+    """只读判定 ≡ 能力闸门（**逐格**）：flag × stage × `matrix_enforced` 共 20 格里
+    `generation_degraded(t) == (not require_capability(t, "generate_draft"))`；
+
+    **唯一差异**是审计行数（前者恒 0、后者只在拒绝时恰 1）—— 这条差异正是「不自锁」的代价与收益。
+    为什么这对 `generate_draft` 恒成立：它**不在** `_MATRIX_RELAXED_CAPABILITIES` 里，
+    `matrix_enforced=False` 的放宽对它无效（`_capability_view()` 与闸门第 ③④ 步逐格同值）。
+    """
+    import agent_stage_service
+
+    monkeypatch.setenv("AGENT_STAGE_ENABLED", flag)
+    _put_raw_config_row(TEACHER, json.dumps({"matrix_enforced": enforced}))
+    _put_raw_state_row(TEACHER, stage)
+
+    degraded = agent_stage_service.generation_degraded(TEACHER)
+    assert _stage_log_events() == [], "只读判定零审计（flag on / off 都一样）"
+
+    allowed = agent_stage_service.require_capability(TEACHER, "generate_draft")
+
+    assert degraded is (not allowed), "同一份矩阵 + 同一份放宽开关 → 结论必须逐格同值"
+    assert _stage_log_events() in ([], ["permission_denied"]), "闸门只可能留下拒绝这一类"
+    assert len(_stage_log_events()) == (0 if allowed else 1), "差异只在「拒绝留痕恰一行」"
+
+
+# ---- ④ TD-015（6.5-b 裁决）：降级样本单列，不进 ① 的均值 ----
+
+def test_template_match_skips_degraded_samples(db, metric_env):
+    """TD-015（裁决 = 选项 (a)：单列 `skipped_degraded`）：觀察期降级骨架**不进** ① 的均值 ——
+    智能体零输出的那一格不该被判「不守模板」（§5.3：产品语义的降级不是智能体产出）。
+
+    本用例同时是「提示语 ↔ 样本识别标记」的**漂移锁**：样本正文用 `main._SKELETON_NOTICE` 拼，
+    提示语一改而服务层的标记没跟 → `skipped_degraded` 立刻归零 → 本用例变红。
+    """
+    import agent_stage_service
+    import main
+
+    template_id = _publish_record_template()
+    _seed_draft(main._SKELETON_NOTICE + "\n" + _PERFECT_DRAFT, template_id)
+
+    only_degraded = agent_stage_service.compute_template_match(TEACHER, {})
+
+    assert only_degraded["skipped_degraded"] == 1, "降级骨架单列计数（不静默丢）"
+    assert only_degraded["samples"] == 0, "降级骨架不算「入选样本」"
+    assert only_degraded["value"] is None, "池里只剩降级样本 → 等价空集（**不是 0 分**）"
+    assert only_degraded["blockers"] == ["template_match_no_samples"]
+    assert (only_degraded["skipped_no_template"], only_degraded["skipped_stale_template"],
+            only_degraded["skipped_empty"], only_degraded["violations"]) == (0, 0, 0, 0)
+
+    _seed_draft(_PERFECT_DRAFT, template_id)        # 再放一份真实产出（倒序样本里排在前）
+    mixed = agent_stage_service.compute_template_match(TEACHER, {})
+
+    assert mixed["skipped_degraded"] == 1, "真实产出入池后，这一类照旧单列"
+    assert mixed["samples"] == 1
+    assert mixed["value"] == pytest.approx(1.0), "均值只由真实产出决定（降级样本不参与）"
+    assert mixed["blockers"] == []
 

@@ -1049,6 +1049,18 @@ _BLOCKER_TEMPLATE_MATCH_NO_SAMPLES = "template_match_no_samples"
 _BLOCKER_MODIFICATION_NO_SAMPLES = "modification_consistency_no_samples"
 _BLOCKER_NO_ACTIVE_TEMPLATE = "no_active_record_template"
 
+# 【施工步骤 6.5-b / TD-015】① 的样本池识别用：觀察期降級骨架的**首行标记**。
+#   为什么不是一个 blocker：它不是「算不出来」，而是「这一类样本不算」（§3.2「排除样本」的第四类计数）。
+#   为什么要认这个标记（TD-015 裁决 = 选项 (a)：单列 `skipped_degraded`）：降级骨架是**产品语义的
+#   降级**（§5.3：智能体零参与、零输出），把它算进 ① 的命中 / 未命中会**结构性拉低**「模板匹配度」
+#   —— 老师会看到「智能体不守模板」的错误指控，而那一刻智能体根本没有输出（与 §5.3 的降级同族）。
+#   字面量来源：`main.py` 的 `_SKELETON_NOTICE`（提示语的**唯一**拼装点，6.5-a）；两者的耦合由
+#   ㉓ 组的 `test_template_match_skips_degraded_samples` 锁死 —— 该用例的样本正文用 `main` 的
+#   那个常量拼，提示语一改而这里的标记没跟 → `skipped_degraded` 立刻归零 → 用例变红。
+#   本段**不 import `main`**：服务层在依赖图的最底层（方向守护见 ⑩ 组），靠「同一字面量 + 锁死用例」
+#   而不是靠反向依赖来保证一致。
+_DEGRADED_DRAFT_MARKER = "【觀察期】"
+
 # 行首列表符（归一化时剥掉；`- 舌象：…` / `* 脈象` / `· 辨證` 这些写法因此可识别）。
 # **刻意不含** `【` / `[` / `〔` / `《`：包裹符由 `_split_heading()` 按「配对的首尾」成对剥，
 # 在这里逐字符剥会把 `【主訴（學生原話）】` 切成 `主訴（學生原話）】`（留下半个 `】`）→ 标题比对全错。
@@ -1251,7 +1263,7 @@ def _match_weights(cfg):
 
 
 def _blank_template_match():
-    """① 的返回体骨架（9 键，⑯ 组逐键钉住）：提前建好 → 各条降级路径都能 `return` 同一个形状。"""
+    """① 的返回体骨架（10 键，⑯ 组逐键钉住）：提前建好 → 各条降级路径都能 `return` 同一个形状。"""
     return {
         "value": None,                      # 空集 → None（**不是 0**，CTO 硬约束 2）
         "samples": 0,                       # 入选样本数（命中当前 active 模板且文本非空）
@@ -1259,6 +1271,8 @@ def _blank_template_match():
         "skipped_no_template": 0,           # `template_id = 0`（生成时没有生效模板）
         "skipped_stale_template": 0,        # `template_id` ≠ 当前 active（老师换过版本）
         "skipped_empty": 0,                 # AI 侧文本为空的样本（不静默丢，§3.2「显式计数」）
+        "skipped_degraded": 0,              # 【6.5-b / TD-015】觀察期降級骨架（首行标记）：
+                                            # 產品語義的降級不是智能體產出 → 单列计数、不进均值
         "hit_rate": None,                   # 入选样本的段命中率均值（便于运维复核总分来源）
         "order_rate": None,                 # 入选样本的段序一致率均值
         "blockers": [],
@@ -1328,17 +1342,23 @@ def _template_match_sample(text, metas, weights):
 def compute_template_match(teacher_name, cfg):
     """① 模板匹配度（§3.2）—— **只算不判**（阈值判定 / 落盘 / 事件属 `evaluate`，3.4-b）。
 
-    返回体 9 键（形状即契约，⑯ 组逐键钉住）：`value` / `samples` / `violations` /
-    `skipped_no_template` / `skipped_stale_template` / `skipped_empty` / `hit_rate` /
-    `order_rate` / `blockers`。
+    返回体 10 键（形状即契约，⑯ 组逐键钉住）：`value` / `samples` / `violations` /
+    `skipped_no_template` / `skipped_stale_template` / `skipped_empty` / `skipped_degraded` /
+    `hit_rate` / `order_rate` / `blockers`。
 
     样本集合（§3.2，来自 `database.get_draft_samples()` 的两类来源：未签字草案 + 已签字病历）：
       · `template_id = 0`（生成时没有生效模板）→ `skipped_no_template`；
       · `template_id` ≠ 当前 active 模板 id（老师换过版本）→ `skipped_stale_template`
         （拿旧模板的输出比新模板骨架不公平）；
       · `template_id` == 当前 active id 且 AI 侧文本非空 → **入选**，按「时间倒序取前
-        `max_samples` 条」计均值；AI 侧文本为空 → `skipped_empty`。
+        `max_samples` 条」计均值；AI 侧文本为空 → `skipped_empty`；
+      · 【6.5-b / TD-015】首行是 `_DEGRADED_DRAFT_MARKER`（`observation` 期降级骨架，§5.3）
+        → `skipped_degraded`：產品語義的降級不是智能體產出，**不进均值**（也不算 violations）。
       排除项一律**显式计数**（§3.2「不静默丢」）。
+
+    识别顺序（6.5-b 定，**不改变既有三类排除的优先级**）：空文本 → 无模板 → 旧模板 → 降级。
+    即「降级骨架但没记模板 / 记的是旧模板」仍先算进既有两类：三类的结果都是「不进均值」，
+    值域不变；`skipped_degraded` 只多标一层「这一类是產品降級」，供运维分辨指标被什么拖低。
 
     三条降级（都**不抛**、都**不写库**，返回体形状不变）：
       · 无生效模板（口径 A：`get_active_record_template()` 返回 `None`，含 `TEMPLATE_API_ENABLED`
@@ -1386,8 +1406,19 @@ def compute_template_match(teacher_name, cfg):
         if template_id != active_id:
             result["skipped_stale_template"] += 1
             continue
-        if not (row.get("ai_text") or "").strip():
+        text = row.get("ai_text") or ""
+        if not text.strip():
             result["skipped_empty"] += 1
+            continue
+        # 【施工步骤 6.5-b / TD-015】觀察期降級骨架（首行标记）→ 单列计数、不进均值：
+        #   · 「首行」= 提示语恒拼在正文第 0 位（`main.py` 的 `_skeleton_draft_with_notice()`），
+        #     这里再 `lstrip()` 是为了容忍「正文前被加了空白 / 换行」的落库形态；
+        #   · 样本的 AI 侧文本恒取**不可变快照**（`ai_original_content` / `ai_original_text`）→
+        #     老师后续的编辑 / 签字**不影响**识别结果（识别的是「生成那一刻智能体有没有参与」）；
+        #   · 识别顺序在既有三类排除**之后**（见本函数 docstring「识别顺序」），
+        #     故不改变任何既有计数语义 —— 只是把「本就该排除的那一类」标得更具体。
+        if (text.lstrip().splitlines() or [""])[0].startswith(_DEGRADED_DRAFT_MARKER):
+            result["skipped_degraded"] += 1
             continue
         if len(values) >= max_samples:
             continue        # 已取满「前 max_samples 条」；继续跑完是为了把排除项计数干净

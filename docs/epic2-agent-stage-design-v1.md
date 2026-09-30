@@ -171,10 +171,14 @@ fail-safe 方向声明：任何「读不到」都**不会**把权限放大（`de
 | 层 | 位置 | 职责 | 失败方向 |
 | :---- | :---- | :---- | :---- |
 | **L1 宪法层** | `agent_stage_service` 的写入边界 + 新 prompts 的禁区段 + 守护测试 | 铁律：永不诊断 / 开方 / 签字 | 任何可疑 → 不产出、写审计日志 |
-| **L2 阶段门控层（后端 service，唯一强制点）** | `agent_stage_service.require_capability(teacher_name, capability)` —— **全项目唯一能力闸门**；`agent_stage_api` 新接口、`main.py` 生成路径接入点、以及服务层内部嵌套调用**都必须**经它 | 阶段 → 能力映射（§2.3）；越权 → 拒绝 + 审计 | **fail-closed**：判定不出（读到异常 / 能力键未知）一律拒绝（`generate_draft` 在 flag off 时的兼容例外，见 §5.1 红线 1） |
+| **L2 阶段门控层（后端 service，唯一强制点）** | `agent_stage_service.require_capability(teacher_name, capability)` —— **全项目唯一能力闸门**；`agent_stage_api` 新接口、以及服务层内部嵌套调用**都必须**经它。**生成路径接入点例外（2026-09-30 · 6.5-b 修正）**：`main.py` 三条生成路径改经**只读**的 `agent_stage_service.generation_degraded(teacher_name)`（同结论、零审计；避免 `permission_denied` 自锁，见 **§5.6**） | 阶段 → 能力映射（§2.3）；越权 → 拒绝 + 审计 | **fail-closed**：判定不出（读到异常 / 能力键未知）一律拒绝（`generate_draft` 在 flag off 时的兼容例外，见 §5.1 红线 1） |
 | **L3 接口层 / 前端** | `agent_stage_api` 的 `_guard()`（照抄 `template_api.py:62-79`）+ 前端只**展示**能力开关 | 统一鉴权（`teacher_name` / `teacher_id` 一致）、flag → 404、表未就绪 → 503、错误体统一 | 前端按钮置灰只是 UI 提示；**服务端一律重判**，前端不可信 |
 
 **为什么强制点只有一个**：`require_capability()` 是唯一读 `agent_stage_state` 做放行判定的函数。新增能力若绕过它，等价于绕过整个矩阵 → 用**守护测试**兜住：扫描 `agent_stage_service` / `agent_stage_api` 之外的文件不得直接出现 `current_stage` 的调用（`test_matrix_single_choke_point`）。
+
+> **修正（2026-09-30 · CTO step 6.5-b）**：上表 L2 的「`main.py` 生成路径接入点必须经 `require_capability()`」**改为**「经 `generation_degraded()` 只读判定」—— 闸门会为拒绝**同点**写 `permission_denied`，而 §2.4 / §3.6 把「窗口内越权次数 > `max_permission_denials`（默认 0）」判成 `permission_denied_in_window` → **阻断升阶**；观察期老师每收一次学生陈述就自动走一次生成路径 → 「产品语义的降级」被记成「越权」→ 永远升不出观察期（**自锁**）。`generation_degraded()` 与闸门**逐格同结论**（㉓ 组有「flag × stage × `matrix_enforced`」20 格等价用例 + 审计行数差恰一行的断言），唯一差异是**不写审计**。
+>
+> 同批修正：**§3.2**（新增第四类排除样本 `skipped_degraded`，TD-015）、**§4.4-②**（伪码改 `generation_degraded`）、**§5.3**（路径伪码同步）、**§5.6**（新增交叉风险备忘）。发现、根因、修复方式与未来提醒全文见 §5.6。
 
 ### 2.3 能力 → 阶段矩阵（L2 判定表，唯一真相源）
 
@@ -249,7 +253,9 @@ match      = 0.0   if violation                                 # 铁律违规�
 - **样本集合**：`drafts`（未签字）+ `patient_records`（已签字，取其 `ai_original_text` / 兜底 `ai_draft`）中，`template_id > 0` 且 `template_id == 当前 active record 模板 id` 的行；窗口 = 近 `window_days`（默认 90）天，按时间倒序取前 `max_samples`（默认 50）。
 - **排除样本（必须显式计数，不静默丢）**：
   - `skipped_no_template`：`template_id = 0`（当时没有生效病历模板）→ 对该指标无意义；
-  - `skipped_stale_template`：`template_id` ≠ 当前 active 模板 id（老师换过版本）→ 用旧模板输出比对新模板骨架不公平，剔除并计数（前端显示 `已略過 N 份舊模板樣本`）。
+  - `skipped_stale_template`：`template_id` ≠ 当前 active 模板 id（老师换过版本）→ 用旧模板输出比对新模板骨架不公平，剔除并计数（前端显示 `已略過 N 份舊模板樣本`）；
+  - `skipped_degraded`【2026-09-30 · 6.5-b / TD-015】：正文**首行**是 §5.3 的降级提示语（`【觀察期】…`）= 生成那一刻智能体**零参与**的本地骨架 → **不是智能体产出**，剔除并单列计数（前端照 `已略過 N 份降級樣本` 同款式样展示）。识别恒定取**不可变快照**（`ai_original_content` / `ai_original_text`）→ 老师后续编辑 / 签字不影响识别；识别顺序在既有三类排除**之后**（空文本 → 无模板 → 旧模板 → 降级），**不改变任何既有计数语义**。
+- **返回体（① 共 10 键）**：`value` / `samples` / `violations` / `skipped_no_template` / `skipped_stale_template` / `skipped_empty` / `skipped_degraded` / `hit_rate` / `order_rate` / `blockers`（**6.5-b**：第 7 键为新增，其余九键逐字不变）。
 - **空集语义**：`samples = 0` → `value = null`（**不是 0**）+ `blockers: template_match_no_samples`；空值**不得**通过任何阈值判定（§3.6）。
 - **违规样本**：`violations > max_violations`（默认 0）→ 触发 `rule_reset`（回观察期）+ 汇报（§3.7）。
 
@@ -489,8 +495,8 @@ and permission_denials_in_window <= max_permission_denials
 | # | 位置 | 改动 | 纪律 |
 | :---- | :---- | :---- | :---- |
 | 1 | `main.py:44-49`（`include_router(template_api.router)` 旁） | 追加 `app.include_router(agent_stage_api.router)` | 只增一行；`template_api` 的注册与异常处理器不动 |
-| 2 | `main.py:559-588` `_record_template_ref` / `_generate_and_store_llm_draft`（三条生成路径的共同出口） | 入口处追加 `if not agent_stage_service.require_capability(teacher_name, "generate_draft"): 走本地骨架路径（§5.3）` | **flag off 时 `require_capability` 恒返回 True** → 今天行为逐字节不变；flag on 且阶段 = `observation` 时才走骨架 |
-| 3 | `main.py:1027-1042` `POST /api/agent/scan` | 末尾追加 `stage = agent_stage_service.evaluate(teacher_name)`（best-effort，try/except），响应体**只增** `stage` 字段 | 既有的 `alerts` / `scan_student_requests` 逻辑与响应字段不动；失败仍返回原结构 |
+| 2 | `main.py:636-663`（施工后行号；原文 `559-588`）`_record_template_ref` / `_generate_and_store_llm_draft`（两条 LLM 路径的共同出口） | 入口处追加 `if agent_stage_service.generation_degraded(teacher_name): 走本地骨架路径（§5.3）` → 接线点 `main.py:652-654`；另一处 `POST /api/generate-draft`（`main.py:753-754`）同样判定，两处共用 `_skeleton_draft_with_notice()`（`main.py:619-626`） | **修正（6.5-b）**：用**只读**的 `generation_degraded()` 而非 `require_capability()` —— 闸门会为拒绝同点写 `permission_denied` → §2.4/§3.6 的 `permission_denied_in_window` 阻断升阶 → 观察期自锁（全文见 §5.6）。**flag off 时 `generation_degraded()` 恒返回 False** → 今天行为逐字节不变；flag on 且阶段 = `observation` 时才走骨架 |
+| 3 | `main.py:1140-1157`（施工后行号；`@app.post("/api/agent/scan")` 在 `:1119`，原文 `1027-1042`）`POST /api/agent/scan` | 末尾追加 `if agent_stage_service.agent_stage_enabled(): try: response["stage"] = agent_stage_service.evaluate(name) except ...`（best-effort）→ 接线点 `main.py:1149-1156`，响应体**只增** `stage` 字段 | 既有的 `scan_student_requests` 逻辑与三键（`ok` / `created` / `new_tasks`）不动；**总闸 off → 连 `evaluate()` 都不调**（零 SQL、三键逐字节不变）；flag on → `stage` = `evaluate()` 的 18 键 + `changed` **直出**（不裁剪、不补键）；评估异常只打 warn、仍返回原三键 |
 | 4 | `main.py:1051-1064` `POST /api/agent/tasks/{task_id}/resolve` 与 `1083-1099` approve/reject | **零改动** | 升级确认复用它们（钩子落在 `database.resolve_agent_task` 内，见 §4.2 改 3） |
 
 - 新增路由统一走 `agent_stage_api.py`（不往 `main.py` 里塞新 endpoint，沿用 Epic 1 的 `template_api.py` 分文件纪律）。
@@ -598,16 +604,17 @@ and permission_denials_in_window <= max_permission_denials
 ```
 POST /api/transcribe / /api/upload / /api/generate-draft
         │
-        ├─ require_capability(teacher, "generate_draft")
-        │        ├─ True  → 既有 LLM 路径（与今天完全一致，含 template 骨架提示）
-        │        └─ False → 本地骨架路径：build_draft_template(...)（main.py:92 既有函数）
+        ├─ generation_degraded(teacher)          # 【6.5-b 修正】只读判定，不调闸门（不改审计）
+        │        ├─ False → 既有 LLM 路径（与今天完全一致，含 template 骨架提示）
+        │        └─ True  → 本地骨架路径：build_draft_template(...)（main.py:121 既有函数）
         │                   · 不调用任何 LLM（智能体零输出）
         │                   · 草案正文首行加提示：『【觀察期】智能體尚未參與，以下為本地骨架，請老師自行填寫。』
-        │                   · 仍走 insert_draft 落库（含快照列）→ 老师可正常编辑 / 签字
+        │                   · 仍走 insert_draft 落库（含快照列 + 模板引用）→ 老师可正常编辑 / 签字
         └─ 两条路径的后续步骤（记录模板引用、返回结构、老师编辑、签字）完全一致
 ```
 
 - **为什么不让观察期直接不出草案**：会让老师端「接收学生陈述」出现空窗（既有关键链路断裂）。降级为本地骨架既保持链路可用，又严格保证**智能体不参与**（铁律精神一致）。
+- **为什么判定用只读的 `generation_degraded()` 而不是 `require_capability()`（2026-09-30 · 6.5-a/6.5-b 修正）**：闸门会为**拒绝**同点写 `permission_denied`，而 §2.4 / §3.6 把「窗口内越权次数 > `max_permission_denials`（默认 0）」判成 `permission_denied_in_window` → **阻断升阶**；本路径每收一次学生陈述就走一次 → 「降级」被记成「越权」→ 观察期永远升不出来（**自锁**）。两者**逐格同结论**（㉓ 组 20 格等价用例），唯一差异是**零审计**。根因、修复与未来提醒见 **§5.6 交叉风险备忘**。
 - 该路径仅对 `observation` 阶段的老师生效；`learning` 及以上与 flag off 时**永不触发**（用例锁定）。
 
 ### 5.4 `templates` / `template_service` / `template_api` 零改动
@@ -627,6 +634,40 @@ POST /api/transcribe / /api/upload / /api/generate-draft
 | 回退顺序 | ① flag 置 off（新接口立即 404、阶段评估停止、既有链路不变）→ ② 如需回收：`alembic downgrade 0002`（删 3 张新表，保留两个快照列）→ ③ 无需回滚病历 / 模板数据（全程未触碰） |
 
 修正（2026-09-28 CTO 批复）：§5.5「test_migrations.py 零改动」的语义是「不改测试断言」。为配合 Alembic head 演进，允许将硬编码的 head 字面量改为动态查询（ScriptDirectory.from_config），属必要的健壮性打磨，不违反本节。
+
+### 5.6 交叉风险备忘：产品语义降级 vs 权限拒绝（2026-09-30 · step 6.5-a 发现 / 6.5-b 回写）
+
+> **本小节为设计文档的「交叉风险备忘」固定小节。任何 Epic 新增「产品语义降级」时，必须先读本节；新增「产品语义降级」时，须在本节追加一条。**
+
+> 编号说明：本条纯**追加**在第 5 章末尾。CTO 指令建议放在「§5.3 之后」并以 §5.4 为例，但 **§5.4 / §5.5 已被占用**且被代码注释与用例 docstring 广泛引用（`database.py:741/820/824/918`、`agent_stage_service.py:143`、`test_agent_stage.py:393/613/651/1038` 等处的「§5.5-①」「§5.4」），重排会连带改坏一批**已验收**的注释口径 → 按「纯追加、章节号不重排」的登记纪律取 **§5.6**。
+
+**① 发现（D2）**：6.5-a 按 §5.3 给两条生成路径接线时，若照 §2.2 原文写 `require_capability(teacher, "generate_draft")`，观察期老师**每收一次学生陈述**就会让该能力被拒一次。
+
+**② 根因：两条各自正确的设计语义，在同一个函数调用上碰头** ——
+- **§5.3 侧（产品语义）**：观察期降级是**产品选择**（「智能体零输出，先交本地骨架给老师用」），不是「你做错了、不许你做」；该格在 §2.3 矩阵与 §2.4 越权语义里**不属于**越权（4a 的口径 B，`agent_stage_service.py:858-862`：那一格「属产品语义，不是权限」）。
+- **§2.4 侧（越权语义）**：闸门**为每一次拒绝**写 `permission_denied` 审计；§3.6 的升阶判定又读取「窗口内越权次数 > `max_permission_denials`（默认 0）」→ `permission_denied_in_window` → **阻断升阶**。
+- **相乘的后果**：`产品语义的降级` × `越权留痕` × `观察期每收一次陈述即触发一次` = 「降级越频繁，越升不出去」→ **自锁**（`observation` → 只能靠手动升阶，且手动升阶前每一次生成都在加深阻断）。这是**两个各自正确的设计**在**同一个函数调用**上耦合出的缺陷，单看任一侧都看不出来。
+
+**③ 修复方式（6.5-a 落地 / 6.5-b 回写）**：把「生成路径要不要降级」这条判定从**闸门**里拆出来，改为**只读**的 `agent_stage_service.generation_degraded(teacher_name)`：
+
+| 面 | `require_capability(t, "generate_draft")` | `generation_degraded(t)` |
+| :---- | :---- | :---- |
+| 结论 | `True` = 放行 / `False` = 拒绝 | `True` = 降级 / `False` = 不降级（= 闸门放行） |
+| 依据 | §2.3 矩阵 + `matrix_enforced`（闸门第 ③④ 步） | 同一份矩阵 + 同一份放宽开关（`_capability_view()`，**同一份判定数据**） |
+| 审计 | 拒绝**同点**写 `permission_denied`（拒绝即留痕） | **零审计**（全程只发 SELECT） |
+| flag off | `generate_draft` 恒放行（§5.1 红线①兼容例外） | 恒 `False`（不降级，与今天 1:1） |
+| 用途 | 权限面：前端置灰、新接口能力闸门 | 产品面：三条既有生成路径的**降级入口** |
+
+- **两者逐格同值**由 ㉓ 组的 `test_generation_degraded_matches_require_capability_on_all_flag_stage_matrix_combinations` 钉住（flag × stage × `matrix_enforced` = 20 格；**唯一差异 = 审计行数**：前者恒 0、后者只在拒绝时恰 1 行）；「体内零 `_stage_audit` / 零 `require_capability`」由同组的 `test_generation_degraded_never_writes_audit` 做源码级 + 行为级双守护。
+- **代价（已知、可接受）**：降级不再在审计面留痕 → 老师端的「我为什么收到的是骨架」由**草案首行提示语**回答（D4：引用照记，样本可识别），不靠审计。
+- **同族残留（指标面，已单列登记为 TD-015）**：降级骨架草案仍走 `insert_draft` 落库 → 会进指标① 的样本池。6.5-b 裁决 **选 (a)**：单列 `skipped_degraded`（首行标记识别），**不进 ① 的均值** —— 与本节同一取向：**产品语义的降级不该被读成「智能体不达标」**（拉低 ① → `template_match_below_threshold` → 同样拖住升阶）。口径已回写进 §3.2（排除样本表 + ① 的 10 键返回体）。
+
+**④ 未来提醒（新增「降级」类语义时必须逐条自问）**：
+1. **区分「权限拒绝」与「功能降级」**：前者=「你不被允许」，必须留痕、必须阻断；后者=「此刻这条路径不产出」，是产品状态，**不得**由权限闸门的审计产出（否则一个降级会污染权限面判据）。
+2. **「产品语义的降级」不得经「权限闸门」的审计面**：闸门的审计是**越权证据**，不是功能开关的记录器。需要可观测性时，用**返回体 / 正文提示 / 单列计数**（本步三处即此三样），不要借道 `permission_denied`。
+3. **凡是「高频自动路径 × 计入判据的审计」，先算一次「耦合后的行为」**：本条的 `observation` 每收一次陈述触发一次生成即属此类 —— 单看「一次降级=一条审计」无害，乘以频次后变成「自己把自己锁死」。
+4. **同族检查清单**：将来任何新事件名若要参与升阶判定（§3.6 的 `can_recommend` 面），都要检查「它会不会由**正常业务流程**高频产生」。已参与判定的：`permission_denied`（越权计数）。**不参与**判定的（可放心高频写）：`suggestion_generated` / `predraft_generated` / `evaluation` 等。
+5. **口径一致性**：`generation_degraded()` 只对 `generate_draft` 成立（它**不在** `_MATRIX_RELAXED_CAPABILITIES` 里，`matrix_enforced=False` 的放宽对它无效）。将来若要给别的能力做「产品语义降级」，**必须**同样先证明「该能力的闸门结论与只读投影逐格同值」，并补 20 格等价用例。
 
 ---
 
@@ -687,6 +728,8 @@ POST /api/transcribe / /api/upload / /api/generate-draft
 40. `test_migration_0003_downgrade_safety` —— 无业务日志时可 `downgrade 0002`；有业务日志时**中止并提示导出**；两个快照列在 downgrade 后仍在。
 
 > 说明：以上 40 项按功能归为 6 组（编号含参数化展开前的条目），落在 `test_agent_stage.py` 中实际约 34 个测试函数。
+>
+> **施工回执（2026-09-30 · step 6.5-b）**：第 **37** 条已落地 —— 实现在 `backend/test_agent_stage.py:6529` 起的 **㉓ 组**（`test_observation_uses_local_skeleton`；同组另含扫描接线 3 条 / 降级链路 2 条 / 自锁守护 2 条 / TD-015 1 条，共 9 个测试函数、参数化后 28 项）。同批落地的 §4.4-③ 接线由本组第 1–3 条覆盖。
 
 ---
 
@@ -727,7 +770,8 @@ POST /api/transcribe / /api/upload / /api/generate-draft
 | 相似度计算在病历过长时变慢 | 低 | 双侧截断 2000 字符 + 样本上限 50；只在 scan / 签字 / 手动触发；目标 < 200 ms |
 | 阶段配置被误调（阈值调到极低即「放水升级」） | 中 | 校验 + 每次改动写 `config_changed` 日志 + 前端显示 `config_source` 角标 + 全局行只能运维改 |
 | 存量老师看到「学习期」卡但指标样本不足 | 低 | `blockers` 明确显示「样本 2/5 份」，不出现「差一点升级」的诱导；`stale` 与 `approx_samples` 如实标注 |
-| 前端误调越权接口导致老师困惑 | 低 | 403 + 繁体原因文案 + 审计联动阻断升级（§2.4） |
+| 前端误调越权接口导致老师困惑 | 低 | 403 + 繁体原因文案 + 审计联动阻断升级（§2.4；**注意**：该联动只适用于**真越权** —— 既有链路自己的「产品语义降级」**不得**借道审计面，否则自锁，见 §5.6） |
+| **「产品语义的降级」被权限闸门记成越权 → 自锁**（`observation` 永远升不出去） | **高**（6.5-a 已实证并掐断） | 生成路径改走**只读**的 `generation_degraded()`（零审计）+ 「逐格同值 / 审计恰差一行」用例；新增任何「降级」类语义必须**先证同值、再接线**（§5.6 ④）+ TD-015 已把指标面的同族残留单列（§3.2） |
 | 迁移在已有库上执行失败 | 低 | 幂等建表 / 探测补列（沿用 0002）；`run_upgrade()` 失败只打日志不阻塞启动（既有行为）；提供离线 SQL 预审 |
 | 「AI 建议」被误当作诊断结论使用 | **中** | 铁律文案固定展示；候选必附 `disclaimer`；采用动作 = 老师本人在编辑框操作；升级必须老师确认 |
 
