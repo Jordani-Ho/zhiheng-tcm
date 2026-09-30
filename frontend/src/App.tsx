@@ -533,6 +533,12 @@ export default function App() {
   const [teacherLineage, setTeacherLineage] = useState<LineageRow | null>(null)
   // 写操作（加入 / 退出）后 +1 → 归属清单 / 视图落地 / 汇总一起重拉（避免写后各写一份刷新逻辑）
   const [lineageTick, setLineageTick] = useState(0)
+  // 【Epic 4 / 批 2 就緒門】師門上下文探测是否已出「終態」（成功 / flag off 404 / 连不上 —— 三种都算終態）。
+  // 语义：只表示「探测跑完了、lineage 上下文可以信了」，**不等于** flag on —— flag off 也置 true，
+  // 以保持「flag off 下请求照发、URL 逐字面不变」。false 期间所有 lineage 相关读取**一律不发**
+  // （避免拿空 `currentLineageId` 去打 → 400 `lineage_required` 错误体）；落地置 true 后，
+  // 依赖成对的门控 effect 自动重跑一次，这一次才带上正确的 `lineage_id`。
+  const [lineageReady, setLineageReady] = useState(false)
 
   // 在門內（active 且归属到真实师门）的归属行；`unassigned=true` 的未歸屬行单独取出（§7.3：不显示、只提示）
   const activeMemberships = studentLineages.filter(r => r.status === 'active' && !!r.lineage_id)
@@ -583,6 +589,9 @@ export default function App() {
   // 整段师门 UI 不渲染、请求也不带 lineage_id（§4.4 零行为变化）。
   useEffect(() => {
     if (!lineageIsTeacher) return
+    // 【Epic 4 / 批 2 就緒門】换角色 / 换老师：先把就绪位复位，避免拿上一个上下文的 lineage_id 抢跑。
+    // 本 effect 是就绪位的「生产者」，依赖数组里**不含** `lineageReady` → 不会自环。
+    setLineageReady(false)
     setStudentLineages([])
     setLineageSummary([])
     setLineageView('')
@@ -591,12 +600,15 @@ export default function App() {
       .then(res => (res.ok ? res.json() : null))
       .then((data: { lineages?: LineageRow[] } | null) => {
         if (cancelled) return
-        if (!data) { setLineageEnabled(false); setTeacherLineage(null); return }
+        // 非 2xx（含 404 `lineage_disabled`）→ 上一行已把 res.json() 短路成 null：flag off 也置 ready=true，
+        // 保证「flag off 下请求照发、URL 逐字面不变」（只晚一个探测 RTT）。
+        if (!data) { setLineageEnabled(false); setTeacherLineage(null); setLineageReady(true); return }
         const rows = Array.isArray(data.lineages) ? data.lineages : []
         setLineageEnabled(true)
         setTeacherLineage(rows.find(row => row.status === 'active') || rows[0] || null)
+        setLineageReady(true)   // 成功路径：与上面两个 state 落在同一次批处理里 → 门控 effect 重跑时上下文已是最终值
       })
-      .catch(() => { if (!cancelled) { setLineageEnabled(false); setTeacherLineage(null) } })
+      .catch(() => { if (!cancelled) { setLineageEnabled(false); setTeacherLineage(null); setLineageReady(true) } })
     return () => { cancelled = true }
   }, [currentRole, selectedTeacher, lineageIsTeacher])
 
@@ -604,16 +616,20 @@ export default function App() {
   // flag off / 接口非 2xx → 整段师门 UI 不渲染；成功则顺带把上次选的视图落地（附录 A3，flag on 才写 localStorage）。
   useEffect(() => {
     if (lineageIsTeacher) return
+    // 【Epic 4 / 批 2 就緒門】同上：换角色 / 换学生 / 写操作后 lineageTick 变化 → 先复位就绪位。
+    setLineageReady(false)
     setTeacherLineage(null)
     let cancelled = false
     const run = async () => {
       try {
         const res = await fetch(`/api/student-lineages?student_name=${encodeURIComponent(selectedPatient)}`)
         if (!res.ok) {
-          if (!cancelled) { setLineageEnabled(false); setStudentLineages([]); setLineageSummary([]); setLineageView('') }
+          if (!cancelled) { setLineageEnabled(false); setStudentLineages([]); setLineageSummary([]); setLineageView(''); setLineageReady(true) }
           return
         }
         const data = await res.json().catch(() => null)
+        // 【就緒門 · 取消分支】这里 return **不置** ready：本次探测已被更新的那次取代，
+        // 而新的一次开头已复位为 false、并由它自己负责置位 —— 旧结果万一把 ready 顶回 true 就会抢跑。
         if (cancelled) return
         const rows: StudentLineageRow[] = data && Array.isArray(data.student_lineages) ? data.student_lineages : []
         setLineageEnabled(true)
@@ -626,8 +642,12 @@ export default function App() {
           : ((selectable.find(r => r.teacher_name === selectedTeacher) || selectable[0] || {}).lineage_id || '')
         setLineageView(next)
         if (next) saveLineageView(selectedPatient, next)
+        // 【配對鐵律】置 ready 放在最后：`lineageView` 与 ready 落在同一次批处理里，
+        // 门控 effect 重跑时这一渲染的 `currentLineageId` 已是最终值 → URL 不会少带 lineage_id。
+        setLineageReady(true)
       } catch {
-        if (!cancelled) { setLineageEnabled(false); setStudentLineages([]); setLineageSummary([]) }
+        // 连不上等异常：同样是「已出终态」→ 置 ready，既不让门控 effect 空转，URL 也回落为不带 lineage_id（与 flag off 同形）
+        if (!cancelled) { setLineageEnabled(false); setStudentLineages([]); setLineageSummary([]); setLineageReady(true) }
       }
     }
     run()
@@ -749,8 +769,13 @@ export default function App() {
       .catch(() => setPatientTeachers([]))
   }, [selectedPatient])
 
+  // 【Epic 4 / 批 2 就緒門】老师端「lineage 相关」首屏读取收在本 effect：teacher-patients 与排班日历
+  // （`fetchCalendar` 内部走 `withLineage`，见 1293 行定义）都门控在 `lineageReady` 之后，依赖成对。
+  // 与师门无关的 schedule / holidays / herbs 拆到下面一个 effect —— 不把 `lineageReady` 传染给它们，
+  // 免得这三条每次就绪位翻转都白跑一遍。
   useEffect(() => {
     if (currentRole === '李老师' || currentRole === '李老师智能体') {
+      if (!lineageReady) return   // 【就緒門】探测未落地 → lineage 相关的一条都不发（400 错误体不再进 state）
       // 【Epic 4 / 批 1 止血】读接口统一「先判 res.ok，再按期望形状取值」：
       // flag on 缺 lineage_id 等 400 的响应体是 `{detail:{error,msg,...}}`，而 `r.json()` **仍会成功**
       // → 不判 ok 就会把错误体当数据 setState，下游 `.filter/.find/[..d]` 立刻抛异常 → 白屏。
@@ -762,9 +787,15 @@ export default function App() {
         })
         .then(data => setTeacherPatients(Array.isArray(data) ? data : []))
         .catch(() => setTeacherPatients([]))
+      fetchCalendar()
+    }
+  }, [currentRole, selectedTeacher, lineageReady])
+
+  // 老师端「与师门无关」的首屏读取：依赖数组与批 2 之前逐字面一致（**不加** `lineageReady`）→ 请求时机不变。
+  useEffect(() => {
+    if (currentRole === '李老师' || currentRole === '李老师智能体') {
       fetchSchedule()
       fetchHolidays()
-      fetchCalendar()
       fetchHerbs()
     }
   }, [currentRole, selectedTeacher])
@@ -787,9 +818,11 @@ export default function App() {
   // 【第56天重构】智能体工作台：进入老师端（含切换老师）时一次性拉取三个接口
   useEffect(() => {
     if (currentRole === '李老师' || currentRole === '李老师智能体') {
+      // 【Epic 4 / 批 2 就緒門】三条请求内部都走 `withLineage`（1180 / 1184 / 1188 行）→ 等探测落地才发。
+      if (!lineageReady) return
       fetchAgentWorkbench()
     }
-  }, [currentRole, selectedTeacher])
+  }, [currentRole, selectedTeacher, lineageReady])
 
   // 【第82天新增 / 老师端待处理陈述】进入「🩺 诊室」页签 / 切换老师时拉一次「待处理陈述」：
   // 与上面 plan_template 的依赖写法完全一致（切页签或换老师才重拉，不在诊室里输入时反复请求）。
@@ -797,26 +830,45 @@ export default function App() {
   useEffect(() => {
     if (currentRole !== '李老师' && currentRole !== '李老师智能体') return
     if (teacherTab !== 'clinic') return
+    // 【Epic 4 / 批 2 就緒門】`fetchPendingComplaints` 内部走 `withLineage`（1203 行）→ 等探测落地才发。
+    if (!lineageReady) return
     fetchPendingComplaints()
-  }, [currentRole, teacherTab, selectedTeacher])
+  }, [currentRole, teacherTab, selectedTeacher, lineageReady])
 
+  // 【Epic 4 / 批 2 就緒門】首屏主读取按「是否依赖师门」一分为二（原来十条挤在一个 effect 里，没法只门控其中几条）。
+  // 本 effect = 与师门无关的四条：URL 都不含 lineage_id（fetchPoints 925 / fetchProfile 940 /
+  // fetchHealthTrend 943 / fetchDailyAdvice 948）→ **不门控**，依赖数组也不变，请求时机与批 2 之前一致。
+  // `setShowHistory(false)` 是纯前端视图复位（不是读取）→ 留在这里 = 切角色 / 切人时立刻收起历史，不看探测脸色。
   useEffect(() => {
-    fetchRoleData()
-    fetchDrafts()
-    fetchPatientRecords()
     fetchPoints()
     fetchProfile()
     fetchHealthTrend()
     fetchDailyAdvice()
-    fetchAppointments()
-    fetchCalendar()
     setShowHistory(false)
   }, [currentRole, selectedPatient, selectedTeacher])
+
+  // 【Epic 4 / 批 2 就緒門】lineage 相关首屏读取：探测落地前一条都不发 → 不可能再出现「拿空 lineage_id 打 400」。
+  // 这五条内部都走 `withLineage`（fetchRoleData 899 / fetchDrafts 910 / fetchPatientRecords 919 /
+  // fetchAppointments 2184 / fetchCalendar 1293）。
+  // **依赖成对（最关键的防回归点）**：`lineageReady` 必须同时进依赖数组 ——
+  // 只加 `if (!lineageReady) return` 而漏依赖 = 本 effect 再也不会重跑 = 首屏永久空数据（另一种白屏）。
+  useEffect(() => {
+    if (!lineageReady) return
+    fetchRoleData()
+    fetchDrafts()
+    fetchPatientRecords()
+    fetchAppointments()
+    fetchCalendar()
+  }, [currentRole, selectedPatient, selectedTeacher, lineageReady])
 
   // 【第70天修复 / 数据串台】切换当前就诊学生（selectedPatient）时，把所有“跟上一个学生绑定”的诊室 state 一次性清空，
   // 再按新学生重新从后端拉取病历草案；否则上一个学生的病历草案 / 施治方案 / 症状标签 / 开方 / 现场记录会串到下一位学生身上。
   // 依赖只有 selectedPatient：老师没切人时（例如只是手动改了开方患者姓名）不会被清掉。
   useEffect(() => {
+    // 【Epic 4 / 批 2 就緒門 · CTO 裁决 ③ 修订版】本 effect **不加首行门、不动依赖数组**：
+    // 清场是纯前端动作（不碰网络），时机必须与批 2 之前逐字面一致 —— 否则「切角色/切老师 + 就绪窗口」
+    // 会多清一次诊室工作台（含 stop() 停录音），窗口内已输入未落库的内容会被清掉。
+    // 真正的抢跑点只有末尾的 `fetchDrafts()`（内部走 withLineage，910 行）→ 只把那一行门控住（见 ⑧）。
     clinicPatientRef.current = selectedPatient   // 先让异步回调知道“现在是谁”（拍照上传播后返回时用它比对）
     // ① 现场辅助记录（工作台第一部分）：文本框内容 / 录音状态 / 原始转写缓冲 / 智能体清洗与整理标记 / 上传中标记
     //    先清缓冲区再停录音：stop() 会触发 onend → flush，缓冲区已空就不会把上一位学生的口述写回文本框
@@ -868,7 +920,11 @@ export default function App() {
     // ⑧ 病历草案重新从后端拉取（GET /api/drafts?teacher_name=...）。
     //    施治方案 / 症状标签 / 开方 / 上传图片 / 现场文本框在后端没有“未签字草稿”接口，因此只做清空；
     //    学生档案 / 积分 / 历史病历已由上面 [currentRole, selectedPatient, selectedTeacher] 的 effect 重新拉取（未改动）
-    fetchDrafts()
+    // 【就緒門 · CTO 裁决 ③】门控只落在这**一行**上：探测未落地时不发请求（不拿空 lineage_id 打 400），
+    // 清场 / 复位一律照跑。此处刻意读「本次渲染的」`lineageReady` 且**不**把它写进依赖数组：
+    // 就绪位翻转后本 effect 无需重跑 —— 上面那个 gated effect（依赖含 selectedPatient 与 lineageReady）
+    // 会用同一上下文补拉一次 drafts，数据不会丢；反之把依赖补上就会多清一次工作台（已被否决）。
+    if (lineageReady) fetchDrafts()
   }, [selectedPatient])
 
   // 【第75天新增 / 改动2】模板套用：老师模板已拉到（planTemplate 非空）、且“当前选中学生”的施治方案为空时，自动填入模板内容。
