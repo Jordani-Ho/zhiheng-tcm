@@ -1,4 +1,4 @@
-"""【Epic 4 step 4.2「服務層隔離讀路徑」】師門隔離守護測試。
+"""【Epic 4 step 4.2「服務層隔離讀路徑」+ step 4.3「7 個新端點」】師門隔離守護測試。
 
 對齊 `docs/epic4-lineage-design-v1.md`：
   §3.2  老師端讀路徑改造清單（P0 / P1）—— 本文件逐條走一遍
@@ -6,8 +6,8 @@
   §4.1  錯誤碼契約（8 碼 → HTTP 狀態碼；統一錯誤體四鍵 `{error, msg, errors, warnings}`）
   §4.3  既有接口改造（路徑不變，只加可選 `lineage_id`）
   §4.4  feature flag `LINEAGE_ENABLED`（默認 off；off = 零行為變化）
-  §8    測試矩陣：③ 組（flag off 逐字節一致）、⑤ 組（隔離正確性，**核心**）、
-        ⑨ 組（默認師門 id 可復現 + 無 `COALESCE(lineage_id` 兜底）
+  §8    測試矩陣：③ 組（flag off 逐字節一致）、④ 組（7 個新接口 = step 4.3 後端）、
+        ⑤ 組（隔離正確性，**核心**）、⑨ 組（默認師門 id 可復現 + 無 `COALESCE(lineage_id` 兜底）
 
 運行（與其它測試同款）：
     cd backend
@@ -26,9 +26,13 @@ fixture 紀律（§8 ⑤ 組：**不許**用「單老師 + 手工改庫」代替
 每個讀點用例都把返回集合與「直接 SQL 按 lineage 過濾」的結果**逐行**比對；
 flag on 缺 `lineage_id` → 4xx（斷言「不存在 4xx 之外的靜默全量」）。
 
+④ 組（7 個新接口 = step 4.3 後端）另立基線：同樣用 `two_lineages`（真兩門 + 暗雷行），
+外加 `lineage_on` 顯式開門；flag off 的判據用**同一個** `client`（同一個 app 實例）
+逐條打 7 個端點，並斷言「一行都不寫」。
+
 本文件**不含**（各歸其子步）：
-  · ④ 組（§4.2 的 7 個新接口 —— `lineage_api.router` 本子步仍為空）；
-  · ⑥ 組（歸屬生命週期 / 寫側落 `lineage_id`：本子步讀路徑已過濾，寫側仍落 `''`）；
+  · ⑥ 組（業務寫側落 `lineage_id`：④ 組只覆蓋**歸屬行**的寫入，病歷 / 草案等業務表的
+    寫側仍落 `''`）；
   · ⑦ 組（模板線 scope 接線 —— `lineage_id` 已在 `template_service._SCOPE_WHERE` 首位，
     本子步只守 `_check_lineage` 兩態）；
   · §3.2 **P2**（`get_draft_samples` / `get_agent_stage_log_stats` 的指標口徑）——
@@ -929,4 +933,589 @@ def test_lineage_error_handler_http_contract(two_lineages, monkeypatch):
     ok = client.get(url, params={"teacher_name": TEACHER_A, "lineage_id": LIN_A})
     assert ok.status_code == 200
     assert sorted(row["name"] for row in ok.json()) == sorted([STUDENT_A1, STUDENT_A2])
+
+
+# ---------------------------------------------------------------------------
+# ④ 組（§4.2 的 7 個新接口 / 前端的「後端 7 端點」子步）
+#   判據一律落在**真 HTTP**（`TestClient` = 真 app + 真路由器）：真狀態碼、統一錯誤體
+#   四鍵（§4.1）、回應鍵集，以及「拒絕時庫內零新行」（= 校驗在寫入之前、寫側唯一寫點）。
+#   7 條路由：GET /api/lineages、POST /api/lineages、POST /api/lineages/{id}/archive、
+#             GET /api/lineages/summary、GET /api/student-lineages、
+#             POST /api/student-lineages、DELETE /api/student-lineages
+#   flag：off 的判據在 ④-1（顯式 `delenv`）；其餘用例一律 `lineage_on` 開門，不依賴
+#   開發機的環境變量（`lineage_enabled()` 每次調用現讀 → 用例內 `setenv` 即生效）。
+# ---------------------------------------------------------------------------
+STUDENT_JOIN = "周敏"          # 自加 → 退出 → 再加入（生命週期用例）
+STUDENT_SELF = "郑海"          # 學生自加：**不建帳號**的那一半語義
+STUDENT_LIMIT = "王磊"         # 上限用例：佔滿 3 門後挑戰第 4 門
+STUDENT_LIMIT2 = "陈曦"        # 上限用例：老師拉入路徑（拒絕時不得建帳號）
+STUDENT_PULL = "蒋楠"          # 老師拉入：**建帳號**的那一半語義
+STUDENT_PULL_DENIED = "沈雪"
+TEACHER_C = "林老师"           # 第 3 門 owner（由接口新建）
+TEACHER_D = "吴老师"           # 第 4 門 owner（由接口新建）
+TEACHER_E = "周老师"           # 「新老師開山門」用例
+
+
+@pytest.fixture
+def lineage_on(monkeypatch):
+    """flag on（§4.4）：④ 組每個用例自己開門，不依賴外部環境。"""
+    monkeypatch.setenv("LINEAGE_ENABLED", "on")
+    return True
+
+
+def _pt_state(names=None):
+    """歸屬行快照 `[(patient, teacher, status, lineage_id)]`（排序）→ 「零新行 / 一字未改」判據。"""
+    sql = "SELECT patient_name, teacher_name, status, lineage_id FROM patient_teachers"
+    params = ()
+    if names is not None:
+        sql += " WHERE patient_name IN (%s)" % ", ".join("?" for _ in names)
+        params = tuple(names)
+    rows = _fetch(sql + " ORDER BY patient_name, teacher_name, lineage_id", params)
+    return [(row["patient_name"], row["teacher_name"], row["status"], row["lineage_id"])
+            for row in rows]
+
+
+def _lineage_count():
+    return _fetch("SELECT COUNT(*) AS n FROM lineage")[0]["n"]
+
+
+def _patient_names():
+    """`patients` 姓名清單（排序）→ 「有沒有建帳號」判據。"""
+    return sorted(row["name"] for row in _fetch("SELECT name FROM patients"))
+
+
+def _assert_error(res, status_code, code):
+    """統一錯誤體判據（§4.1）：真狀態碼 + **恰好四個鍵** + `error` 碼 + 非空人話訊息。
+
+    四鍵之外的形狀（例如 FastAPI 自動的 422 `{"detail": [...]}`）會在 `isinstance`
+    這一關炸 —— 這正是「flag 門前於框架校驗 / 400 不退化成 422」的判據。
+    """
+    detail = res.json().get("detail")
+    assert isinstance(detail, dict), res.text
+    assert sorted(detail) == ["error", "errors", "msg", "warnings"], res.text
+    assert detail["msg"], res.text
+    assert (res.status_code, detail["error"]) == (status_code, code), res.text
+    return detail
+
+
+def _join(client, student, lineage_id, teacher_name=None):
+    """`POST /api/student-lineages`（`teacher_name` 空 = 學生自加；非空 = 老師拉入）。"""
+    body = {"student_name": student, "lineage_id": lineage_id}
+    if teacher_name is not None:
+        body["teacher_name"] = teacher_name
+    return client.post("/api/student-lineages", json=body)
+
+
+def _leave(client, student, lineage_id):
+    """`DELETE /api/student-lineages`：走 query 參數（**不是** body）。"""
+    return client.delete("/api/student-lineages",
+                         params={"student_name": student, "lineage_id": lineage_id})
+
+
+def _open_lineage(client, teacher, name=None):
+    """開山門（測試輔助）：返回 `lineage_id`；狀態碼不對就當場炸（後續斷言不得在錯誤前提下跑）。"""
+    body = {"teacher_name": teacher, "teacher_id": teacher}
+    if name is not None:
+        body["name"] = name
+    res = client.post("/api/lineages", json=body)
+    assert res.status_code == 200, res.text
+    return res.json()["lineage"]["id"]
+
+
+# ---------------------------------------------------------------------------
+# ④-1 flag off（默認）：7 個端點全部 404 `lineage_disabled`（§4.4「零行為變化」）
+# ---------------------------------------------------------------------------
+def test_lineage_api_flag_off_all_endpoints_404(two_lineages, monkeypatch):
+    """7 個端點 flag off → 404；**連缺參數 / 缺欄位的請求也是 404**，且一行都不寫。"""
+    monkeypatch.delenv("LINEAGE_ENABLED", raising=False)
+    client = two_lineages["client"]
+    pt_before, lineage_before = _pt_state(), _lineage_count()
+    cases = (
+        ("get", "/api/lineages", {"params": {"teacher_name": TEACHER_A}}),
+        ("get", "/api/lineages", {}),                                          # 連參數都不帶
+        ("post", "/api/lineages", {"json": {"teacher_name": TEACHER_A, "teacher_id": TEACHER_A}}),
+        ("post", "/api/lineages", {"json": {"teacher_name": TEACHER_A}}),      # 缺 teacher_id
+        ("post", "/api/lineages", {"json": {}}),                               # 空 body（全默認值）
+        ("post", "/api/lineages/%s/archive" % LIN_A,
+         {"json": {"teacher_name": TEACHER_A, "teacher_id": TEACHER_A}}),
+        ("post", "/api/lineages/%s/archive" % LIN_A, {"json": {}}),
+        ("get", "/api/lineages/summary", {"params": {"student_name": STUDENT_A1}}),
+        ("get", "/api/lineages/summary", {}),
+        ("get", "/api/student-lineages", {"params": {"student_name": STUDENT_A1}}),
+        ("get", "/api/student-lineages", {}),
+        ("post", "/api/student-lineages",
+         {"json": {"student_name": STUDENT_A1, "lineage_id": LIN_A}}),
+        ("post", "/api/student-lineages", {"json": {"student_name": STUDENT_A1}}),   # 缺 lineage_id
+        ("delete", "/api/student-lineages",
+         {"params": {"student_name": STUDENT_A1, "lineage_id": LIN_A}}),
+        ("delete", "/api/student-lineages", {}),
+    )
+    for method, url, kwargs in cases:
+        res = getattr(client, method)(url, **kwargs)
+        _assert_error(res, 404, lineage_service.LINEAGE_DISABLED)
+    # flag off = 純 no-op：歸屬行與師門行**零改動**（③ 組「逐字節一致」在接口層的鏡像）
+    assert (_pt_state(), _lineage_count()) == (pt_before, lineage_before)
+
+
+def test_lineage_api_flag_off_never_probes_lineage_store(two_lineages, monkeypatch):
+    """flag off 時**連 `lineage` 表都不探**（樁會炸 = 有探）→ flag 門在存儲檢查之前。"""
+    monkeypatch.delenv("LINEAGE_ENABLED", raising=False)
+    client = two_lineages["client"]
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("flag off 時不得觸碰師門存儲（§4.4 零行為變化）")
+
+    monkeypatch.setattr(lineage_service, "_store_connection", _boom)
+    monkeypatch.setattr(lineage_service, "lineage_store_ready", _boom)
+    monkeypatch.setattr(lineage_service, "load_lineage", _boom)
+    monkeypatch.setattr(lineage_service, "parse_lineage_id", _boom)
+    for method, url, kwargs in (
+        ("get", "/api/lineages", {"params": {"teacher_name": TEACHER_A}}),
+        ("post", "/api/lineages", {"json": {"teacher_name": TEACHER_A, "teacher_id": TEACHER_A}}),
+        ("post", "/api/lineages/%s/archive" % LIN_A,
+         {"json": {"teacher_name": TEACHER_A, "teacher_id": TEACHER_A}}),
+        ("get", "/api/lineages/summary", {"params": {"student_name": STUDENT_A1}}),
+        ("get", "/api/student-lineages", {"params": {"student_name": STUDENT_A1}}),
+        ("post", "/api/student-lineages",
+         {"json": {"student_name": STUDENT_A1, "lineage_id": LIN_A}}),
+        ("delete", "/api/student-lineages",
+         {"params": {"student_name": STUDENT_A1, "lineage_id": LIN_A}}),
+    ):
+        res = getattr(client, method)(url, **kwargs)
+        _assert_error(res, 404, lineage_service.LINEAGE_DISABLED)
+
+
+# ---------------------------------------------------------------------------
+# ④-2 `GET /api/lineages`：兩種視角（老師 = 自己開創的；學生 = 已在門的）
+# ---------------------------------------------------------------------------
+def test_lineage_api_get_lineages_identity_is_exactly_one(two_lineages, lineage_on):
+    """`teacher_name` / `student_name` **恰好一個**：都帶 → 400；都不帶 → 400（不退化成全庫）。"""
+    client = two_lineages["client"]
+    both = client.get("/api/lineages",
+                      params={"teacher_name": TEACHER_A, "student_name": STUDENT_A1})
+    _assert_error(both, 400, lineage_service.LINEAGE_INVALID)
+    _assert_error(client.get("/api/lineages"), 400, lineage_service.LINEAGE_REQUIRED)
+    # 全空白 = 沒帶（不許被 `if teacher_name:` 當成有效身分而回全庫清單）
+    _assert_error(client.get("/api/lineages", params={"teacher_name": "   "}),
+                  400, lineage_service.LINEAGE_REQUIRED)
+    _assert_error(client.get("/api/lineages", params={"student_name": ""}),
+                  400, lineage_service.LINEAGE_REQUIRED)
+
+
+def test_lineage_api_get_lineages_two_views(two_lineages, lineage_on):
+    """老師視角含 `archived`（§7.2）；學生視角只含 active 歸屬，未歸屬 / 已退出 → 空清單。"""
+    client = two_lineages["client"]
+    teacher_view = client.get("/api/lineages", params={"teacher_name": TEACHER_A})
+    assert teacher_view.status_code == 200, teacher_view.text
+    rows = teacher_view.json()["lineages"]
+    assert [row["id"] for row in rows] == [LIN_A]                  # 一師一門（§2.1）
+    assert rows[0]["owner_teacher_name"] == TEACHER_A
+    assert rows[0]["name"] == lineage_service.default_lineage_name(TEACHER_A)
+    assert rows[0]["status"] == lineage_service.LINEAGE_STATUS_ACTIVE
+    assert sorted(rows[0]) == ["created_at", "description", "id", "name",
+                               "owner_teacher_name", "status", "updated_at"]
+
+    student_view = client.get("/api/lineages", params={"student_name": STUDENT_A1})
+    assert student_view.status_code == 200, student_view.text
+    memberships = student_view.json()["lineages"]
+    assert [row["lineage_id"] for row in memberships] == [LIN_A]
+    assert memberships[0]["teacher_name"] == TEACHER_A            # 階段一：歸屬老師 = owner
+    assert memberships[0]["membership_status"] == "active"        # 歸屬行狀態
+    assert memberships[0]["status"] == lineage_service.LINEAGE_STATUS_ACTIVE   # 師門自身狀態
+    assert memberships[0]["name"] == lineage_service.default_lineage_name(TEACHER_A)
+
+    # 未歸屬（陳七 `lineage_id = ''`）/ 已退出（赵六 `inactive`）→ 沒有可切換的師門
+    for name in (STUDENT_A_ORPHAN, STUDENT_B_QUIT):
+        res = client.get("/api/lineages", params={"student_name": name})
+        assert res.status_code == 200, name
+        assert res.json()["lineages"] == [], name
+
+
+# ---------------------------------------------------------------------------
+# ④-3 `POST /api/lineages`：開山門（冪等 / 默認名 / 雙因子）
+# ---------------------------------------------------------------------------
+def test_lineage_api_create_lineage_idempotent_no_second_row(two_lineages, lineage_on):
+    """附錄 A2 裁決：重複開山門 = **200 冪等**（不是 409）+ 零新行；新老師才新建。"""
+    client = two_lineages["client"]
+    before = _lineage_count()
+    for body in ({"teacher_name": TEACHER_A, "teacher_id": TEACHER_A},
+                 {"teacher_name": TEACHER_A, "teacher_id": TEACHER_A, "name": "改名試探"}):
+        res = client.post("/api/lineages", json=body)
+        assert res.status_code == 200, res.text
+        assert res.json()["created"] is False
+        assert res.json()["lineage"]["id"] == LIN_A
+        # A5：階段一名稱不可編輯 → 既有行的名稱不被請求體覆寫
+        assert res.json()["lineage"]["name"] == lineage_service.default_lineage_name(TEACHER_A)
+    assert _lineage_count() == before
+
+    # 新老師 → created=true；`id` 由 `default_lineage_id()` 計算得出（§5.4-6：不落常量）
+    res = client.post("/api/lineages", json={"teacher_name": TEACHER_E, "teacher_id": TEACHER_E})
+    assert res.status_code == 200, res.text
+    assert res.json()["created"] is True
+    assert res.json()["lineage"]["id"] == lineage_service.default_lineage_id(TEACHER_E)
+    assert res.json()["lineage"]["id"].startswith("lin-")
+    assert res.json()["lineage"]["name"] == lineage_service.default_lineage_name(TEACHER_E)
+    assert res.json()["lineage"]["status"] == lineage_service.LINEAGE_STATUS_ACTIVE
+    assert res.json()["lineage"]["description"] == ""
+    assert _lineage_count() == before + 1
+    # 再開一次 → 同一行、零新行（一師一門在服務層成立，DB 層零約束不破）
+    again = client.post("/api/lineages", json={"teacher_name": TEACHER_E, "teacher_id": TEACHER_E})
+    assert again.status_code == 200
+    assert again.json()["created"] is False and again.json()["lineage"]["id"] == \
+        lineage_service.default_lineage_id(TEACHER_E)
+    assert _lineage_count() == before + 1
+    # 老師視角查得回來（同一行）
+    view = client.get("/api/lineages", params={"teacher_name": TEACHER_E})
+    assert [row["id"] for row in view.json()["lineages"]] == \
+        [lineage_service.default_lineage_id(TEACHER_E)]
+
+
+def test_lineage_api_create_lineage_blank_name_400_zero_write(two_lineages, lineage_on):
+    """**顯式**空 `name` → 400 `lineage_invalid`；「不帶該鍵」= 取默認名（兩種入參行為不同）。"""
+    client = two_lineages["client"]
+    before = _lineage_count()
+    for name in ("", "   ", "\t"):
+        _assert_error(client.post("/api/lineages",
+                                  json={"teacher_name": TEACHER_E, "teacher_id": TEACHER_E,
+                                        "name": name}),
+                      400, lineage_service.LINEAGE_INVALID)
+    assert _lineage_count() == before            # 400 在校驗段 → 零新行
+    ok = client.post("/api/lineages", json={"teacher_name": TEACHER_E, "teacher_id": TEACHER_E})
+    assert ok.status_code == 200
+    assert ok.json()["lineage"]["name"] == lineage_service.default_lineage_name(TEACHER_E)
+    # 顯式帶入合法名稱 → 用它（覆寫默認名的唯一入口，階段一前端不傳）
+    named = client.post("/api/lineages", json={"teacher_name": TEACHER_C, "teacher_id": TEACHER_C,
+                                               "name": "  林氏中醫  "})
+    assert named.status_code == 200
+    assert named.json()["lineage"]["name"] == "林氏中醫"       # 去空白後落庫
+
+
+def test_lineage_api_create_lineage_identity_two_factor(two_lineages, lineage_on):
+    """雙因子（§4.2）：缺身分 → 400 `lineage_required`；缺校驗值 → 400；不一致 → 403。"""
+    client = two_lineages["client"]
+    before = _lineage_count()
+    for body, status_code, code in (
+        ({"teacher_name": "", "teacher_id": ""}, 400, lineage_service.LINEAGE_REQUIRED),
+        ({"teacher_name": "   ", "teacher_id": TEACHER_E}, 400, lineage_service.LINEAGE_REQUIRED),
+        ({"teacher_name": TEACHER_E, "teacher_id": ""}, 400, lineage_service.LINEAGE_INVALID),
+        ({"teacher_name": TEACHER_E, "teacher_id": "   "}, 400, lineage_service.LINEAGE_INVALID),
+        ({"teacher_name": TEACHER_E, "teacher_id": TEACHER_C}, 403, lineage_service.LINEAGE_FORBIDDEN),
+        ({"teacher_name": TEACHER_A, "teacher_id": TEACHER_E}, 403, lineage_service.LINEAGE_FORBIDDEN),
+    ):
+        _assert_error(client.post("/api/lineages", json=body), status_code, code)
+    assert _lineage_count() == before            # 全部失敗路徑零新行
+
+
+# ---------------------------------------------------------------------------
+# ④-4 `POST /api/lineages/{id}/archive`：封存（**不提供** DELETE）
+# ---------------------------------------------------------------------------
+def test_lineage_api_archive_lineage_changed_then_idempotent(two_lineages, lineage_on):
+    """封存只改 `lineage.status` / `updated_at`；重複封存 `changed=false` 且時間不動。"""
+    client = two_lineages["client"]
+    pt_before = _pt_state()
+    first = client.post("/api/lineages/%s/archive" % LIN_B,
+                        json={"teacher_name": TEACHER_B, "teacher_id": TEACHER_B})
+    assert first.status_code == 200, first.text
+    assert first.json()["archived"] is True and first.json()["changed"] is True
+    assert first.json()["lineage"]["status"] == lineage_service.LINEAGE_STATUS_ARCHIVED
+    stamped = first.json()["lineage"]["updated_at"]
+    assert stamped and stamped != STAMP          # 真的寫入了新時間（不是原封不動回舊行）
+
+    second = client.post("/api/lineages/%s/archive" % LIN_B,
+                         json={"teacher_name": TEACHER_B, "teacher_id": TEACHER_B})
+    assert second.status_code == 200, second.text
+    assert second.json()["changed"] is False
+    assert second.json()["lineage"]["updated_at"] == stamped       # 連時間都不動
+    assert second.json()["warnings"]                                # 明示「不改變任何欄位」
+    # 封存只回收「可加入」：歸屬行與業務資料零改動（§5.5-3 雙主權）
+    assert _pt_state() == pt_before
+    assert _fetch("SELECT COUNT(*) AS n FROM patient_teachers WHERE lineage_id = ?",
+                  (LIN_B,))[0]["n"] == 2                            # 王五 + 赵六 兩行仍在
+    # 老師視角仍看得到（封存 ≠ 不可見，§7.2 要顯示「已封存」提示條）
+    view = client.get("/api/lineages", params={"teacher_name": TEACHER_B})
+    assert [row["status"] for row in view.json()["lineages"]] == \
+        [lineage_service.LINEAGE_STATUS_ARCHIVED]
+    # 封存後不再接受新加入（歷史讀取不受影響 → 見 ⑤ 組）
+    _assert_error(_join(client, STUDENT_JOIN, LIN_B), 400, lineage_service.LINEAGE_INVALID)
+    # 別門 owner 封存不了（雙因子過關但無權）→ 403，且狀態不被改動
+    _assert_error(client.post("/api/lineages/%s/archive" % LIN_B,
+                              json={"teacher_name": TEACHER_A, "teacher_id": TEACHER_A}),
+                  403, lineage_service.LINEAGE_FORBIDDEN)
+    assert _fetch("SELECT status FROM lineage WHERE id = ?", (LIN_B,))[0]["status"] == \
+        lineage_service.LINEAGE_STATUS_ARCHIVED
+
+
+def test_lineage_api_archive_lineage_404_and_400(two_lineages, lineage_on):
+    """`lineage_id` 不存在 → 404；形狀非法 / 全空白 → 400；三者都不得改動任何狀態。"""
+    client = two_lineages["client"]
+    before = [row["status"] for row in _fetch("SELECT status FROM lineage ORDER BY id")]
+    for lineage_id, status_code, code in (
+        ("lin-no-such-lineage", 404, lineage_service.LINEAGE_NOT_FOUND),
+        ("TCM-001", 400, lineage_service.LINEAGE_INVALID),
+        ("lin-Li-Lao-Shi", 400, lineage_service.LINEAGE_INVALID),   # 大寫 → slug 口徑不合法
+        ("%20", 400, lineage_service.LINEAGE_REQUIRED),             # 全空白 = 沒帶
+    ):
+        res = client.post("/api/lineages/%s/archive" % lineage_id,
+                          json={"teacher_name": TEACHER_B, "teacher_id": TEACHER_B})
+        _assert_error(res, status_code, code)
+    assert [row["status"] for row in _fetch("SELECT status FROM lineage ORDER BY id")] == before
+
+
+# ---------------------------------------------------------------------------
+# ④-5 `POST` / `DELETE /api/student-lineages`：歸屬生命週期（加入 → 退出 → 再加入）
+# ---------------------------------------------------------------------------
+def test_lineage_api_join_leave_rejoin_lifecycle(two_lineages, lineage_on):
+    """加入 → 重複加入（零寫入）→ 退出（**行仍在**）→ 重複退出 → 再加入（`reactivated`）。"""
+    client = two_lineages["client"]
+    join = _join(client, STUDENT_JOIN, LIN_A)
+    assert join.status_code == 200, join.text
+    assert join.json()["joined"] is True and join.json()["changed"] is True
+    assert join.json()["reactivated"] is False
+    membership = join.json()["student_lineage"]
+    assert sorted(membership) == ["joined_at", "lineage_id", "status",
+                                  "student_name", "teacher_name"]
+    assert (membership["student_name"], membership["teacher_name"],
+            membership["lineage_id"], membership["status"]) == \
+        (STUDENT_JOIN, TEACHER_A, LIN_A, "active")
+    assert membership["joined_at"]                      # 首次加入用本次真實時間
+    assert join.json()["warnings"]                      # 「首次加入」明示
+    assert _pt_state([STUDENT_JOIN]) == [(STUDENT_JOIN, TEACHER_A, "active", LIN_A)]
+
+    again = _join(client, STUDENT_JOIN, LIN_A)
+    assert again.status_code == 200, again.text
+    assert again.json()["changed"] is False and again.json()["reactivated"] is False
+    assert len(_pt_state([STUDENT_JOIN])) == 1          # 冪等：零新行
+
+    left = _leave(client, STUDENT_JOIN, LIN_A)
+    assert left.status_code == 200, left.text
+    assert left.json()["left"] is True and left.json()["changed"] is True
+    assert left.json()["student_lineage"]["status"] == "inactive"
+    rows = _pt_state([STUDENT_JOIN])
+    assert rows == [(STUDENT_JOIN, TEACHER_A, "inactive", LIN_A)]   # **退出 ≠ 刪除**
+    twice = _leave(client, STUDENT_JOIN, LIN_A)
+    assert twice.status_code == 200
+    assert twice.json()["changed"] is False and twice.json()["warnings"]
+    assert _pt_state([STUDENT_JOIN]) == rows            # 重複退出也不動任何欄位
+
+    back = _join(client, STUDENT_JOIN, LIN_A)
+    assert back.status_code == 200, back.text
+    assert back.json()["changed"] is True and back.json()["reactivated"] is True
+    assert back.json()["student_lineage"]["status"] == "active"
+    assert back.json()["warnings"]                      # 「再加入」明示：歷史與病歷保留
+    assert len(_pt_state([STUDENT_JOIN])) == 1          # 再加入不新增行
+    # 「我的師門」照樣只有一行（active），退出痕跡不再重複出現（PK 唯一）
+    listed = client.get("/api/student-lineages",
+                        params={"student_name": STUDENT_JOIN}).json()["student_lineages"]
+    assert [(row["lineage_id"], row["status"]) for row in listed] == [(LIN_A, "active")]
+
+
+def test_lineage_api_join_leave_error_matrix(two_lineages, lineage_on):
+    """加入 / 退出的失敗路徑：一律在寫入之前拒絕（庫內零新行），且不建帳號。"""
+    client = two_lineages["client"]
+    pt_before, patients_before = _pt_state(), _patient_names()
+    for body, status_code, code in (
+        ({"student_name": "", "lineage_id": LIN_A}, 400, lineage_service.LINEAGE_REQUIRED),
+        ({"student_name": "   ", "lineage_id": LIN_A}, 400, lineage_service.LINEAGE_REQUIRED),
+        ({"student_name": STUDENT_JOIN}, 400, lineage_service.LINEAGE_REQUIRED),   # 缺 lineage_id
+        ({"student_name": STUDENT_JOIN, "lineage_id": " "}, 400, lineage_service.LINEAGE_REQUIRED),
+        ({"student_name": STUDENT_JOIN, "lineage_id": "TCM-001"},
+         400, lineage_service.LINEAGE_INVALID),
+        ({"student_name": STUDENT_JOIN, "lineage_id": "lin-no-such"},
+         404, lineage_service.LINEAGE_NOT_FOUND),
+        ({"student_name": STUDENT_JOIN, "lineage_id": LIN_A, "teacher_name": TEACHER_B},
+         403, lineage_service.LINEAGE_FORBIDDEN),          # 別門 owner 拉入
+        ({"student_name": STUDENT_JOIN, "lineage_id": "lin-no-such", "teacher_name": TEACHER_B},
+         404, lineage_service.LINEAGE_NOT_FOUND),          # 存在性先於歸屬校驗
+    ):
+        res = client.post("/api/student-lineages", json=body)
+        _assert_error(res, status_code, code)
+    for params, status_code, code in (
+        ({"student_name": STUDENT_JOIN, "lineage_id": LIN_A},
+         403, lineage_service.LINEAGE_FORBIDDEN),          # 不在該門 → 「無可退出的歸屬」
+        ({"student_name": STUDENT_JOIN, "lineage_id": "lin-no-such"},
+         403, lineage_service.LINEAGE_FORBIDDEN),          # 未歸屬行（`lineage_id = ''`）也算不在門內
+        ({"student_name": STUDENT_JOIN, "lineage_id": "TCM-001"},
+         400, lineage_service.LINEAGE_INVALID),
+        ({"student_name": "", "lineage_id": LIN_A}, 400, lineage_service.LINEAGE_REQUIRED),
+        ({"student_name": STUDENT_JOIN, "lineage_id": ""}, 400, lineage_service.LINEAGE_REQUIRED),
+    ):
+        _assert_error(client.delete("/api/student-lineages", params=params), status_code, code)
+    # 以上全部失敗路徑：零新行、零新帳號（雙主權 / §8 ⑥ 組判據）
+    assert (_pt_state(), _patient_names()) == (pt_before, patients_before)
+
+
+# ---------------------------------------------------------------------------
+# ④-6 上限：同時在門 3 個（§2.2，沿用既有「最多 3 位老師」的數值語義）
+# ---------------------------------------------------------------------------
+def test_lineage_api_student_lineage_limit_409_zero_new_row(two_lineages, lineage_on):
+    """第 4 門 → 409 `student_lineage_limit`；判定在**寫入之前** → 庫內零新行、零新帳號。"""
+    client = two_lineages["client"]
+    lin_c = _open_lineage(client, TEACHER_C)
+    lin_d = _open_lineage(client, TEACHER_D)
+    assert len({LIN_A, LIN_B, lin_c, lin_d}) == 4          # 4 個不同 id 才叫「4 門」
+
+    for lineage_id in (LIN_A, LIN_B, lin_c):
+        assert _join(client, STUDENT_LIMIT, lineage_id).status_code == 200, lineage_id
+    assert lineage_service.STUDENT_LINEAGE_MAX == 3        # 上限口徑（數值與 §2.2 一致）
+    assert len(_pt_state([STUDENT_LIMIT])) == 3
+    pt_before, patients_before = _pt_state(), _patient_names()
+    limited = _join(client, STUDENT_LIMIT, lin_d)
+    detail = _assert_error(limited, 409, lineage_service.STUDENT_LINEAGE_LIMIT)
+    assert str(lineage_service.STUDENT_LINEAGE_MAX) in detail["msg"]
+    assert (_pt_state(), _patient_names()) == (pt_before, patients_before)
+
+    # 已在門內的重複加入**先於**上限判定：3 門佔滿時仍是 200 冪等（不 409）
+    inside = _join(client, STUDENT_LIMIT, LIN_A)
+    assert inside.status_code == 200 and inside.json()["changed"] is False
+
+    # 老師拉入同樣受限：**連學生帳號都不建**（校驗在 `teacher_add_student()` 之前）
+    for lineage_id in (LIN_A, LIN_B, lin_c):
+        assert _join(client, STUDENT_LIMIT2, lineage_id).status_code == 200, lineage_id
+    patients_before = _patient_names()
+    pull = _join(client, STUDENT_LIMIT2, lin_d, teacher_name=TEACHER_D)
+    _assert_error(pull, 409, lineage_service.STUDENT_LINEAGE_LIMIT)
+    assert _patient_names() == patients_before
+    assert len(_pt_state([STUDENT_LIMIT2])) == 3
+
+    # 上限只數 `active`：退出一門（行留著）後即可加入第 4 門（行數變 4，active 仍 3）
+    assert _leave(client, STUDENT_LIMIT, lin_c).status_code == 200
+    assert _join(client, STUDENT_LIMIT, lin_d).status_code == 200
+    assert len(_pt_state([STUDENT_LIMIT])) == 4
+    assert len([row for row in _pt_state([STUDENT_LIMIT]) if row[2] == "active"]) == 3
+
+
+# ---------------------------------------------------------------------------
+# ④-7 `GET /api/student-lineages`：我的師門（歸屬 + 退出歷史 + 未歸屬提示）
+# ---------------------------------------------------------------------------
+def test_lineage_api_student_lineages_list_history_and_unassigned(two_lineages, lineage_on):
+    """`§3.4` 表格第 1 行：在門 / 退出歷史 / 未歸屬三態齊全，排序穩定，缺參數 → 400。"""
+    client = two_lineages["client"]
+    url = "/api/student-lineages"
+
+    rows = client.get(url, params={"student_name": STUDENT_A1}).json()["student_lineages"]
+    assert [(r["lineage_id"], r["status"], r["unassigned"]) for r in rows] == \
+        [(LIN_A, "active", False)]
+    assert rows[0]["name"] == lineage_service.default_lineage_name(TEACHER_A)
+    assert rows[0]["owner_teacher_name"] == TEACHER_A
+    assert rows[0]["lineage_status"] == lineage_service.LINEAGE_STATUS_ACTIVE
+    assert rows[0]["teacher_name"] == TEACHER_A
+    assert rows[0]["joined_at"]
+    assert sorted(rows[0]) == ["joined_at", "lineage_id", "lineage_status", "name",
+                               "owner_teacher_name", "status", "student_name",
+                               "teacher_name", "unassigned"]
+
+    # 未歸屬行（`lineage_id = ''`）：照樣返回 + `unassigned=true`，**不猜歸屬**（§2.4 紀律 2）
+    orphan = client.get(url, params={"student_name": STUDENT_A_ORPHAN}).json()["student_lineages"]
+    assert len(orphan) == 1
+    assert orphan[0]["unassigned"] is True
+    assert (orphan[0]["lineage_id"], orphan[0]["name"], orphan[0]["lineage_status"]) == ("", "", "")
+
+    # 退出歷史：歸屬 `inactive` + 師門自身仍 `active`（兩個狀態欄位不可混用）
+    quit_rows = client.get(url, params={"student_name": STUDENT_B_QUIT}) \
+        .json()["student_lineages"]
+    assert [(r["status"], r["lineage_status"], r["lineage_id"]) for r in quit_rows] == \
+        [("inactive", "active", LIN_B)]
+
+    # 排序：在門（active）在前、退出歷史在後（同段內用本次真實 `joined_at`）
+    assert _join(client, STUDENT_JOIN, LIN_A).status_code == 200
+    assert _join(client, STUDENT_JOIN, LIN_B).status_code == 200
+    assert _leave(client, STUDENT_JOIN, LIN_A).status_code == 200
+    mixed = client.get(url, params={"student_name": STUDENT_JOIN}).json()["student_lineages"]
+    assert {r["lineage_id"] for r in mixed} == {LIN_A, LIN_B}
+    # 排序合約 = 「在門（active）在前、退出歷史在後」（同段內按 joined_at、lineage_id；
+    # Windows 時鐘粒度可能讓兩次加入落在同一時間戳 → 本用例只鎖分段，不鎖同段內部順序）
+    assert [r["status"] for r in mixed] == ["active", "inactive"]
+
+    # 缺參數 / 空白 → 400（**不是**全量清單）
+    _assert_error(client.get(url), 400, lineage_service.LINEAGE_REQUIRED)
+    _assert_error(client.get(url, params={"student_name": "   "}),
+                  400, lineage_service.LINEAGE_REQUIRED)
+
+
+# ---------------------------------------------------------------------------
+# ④-8 `GET /api/lineages/summary`：逐師門只讀聚合（**不做**合成段位，§11-4）
+# ---------------------------------------------------------------------------
+def test_lineage_api_lineage_summary_is_lineage_scoped(two_lineages, lineage_on):
+    """聚合口徑 = 同一份「歸屬 = 可見範圍」SQL：未歸屬 / 跨門行**不得**被算進來。"""
+    client = two_lineages["client"]
+    res = client.get("/api/lineages/summary", params={"student_name": STUDENT_A1})
+    assert res.status_code == 200, res.text
+    assert res.json()["student_name"] == STUDENT_A1
+    summary = res.json()["summary"]
+    assert [item["lineage_id"] for item in summary] == [LIN_A]
+    item = summary[0]
+    assert sorted(item) == ["last_visit_at", "lineage_id", "name", "status",
+                            "teacher_name", "unsigned_drafts", "visits"]
+    assert item["name"] == lineage_service.default_lineage_name(TEACHER_A)
+    assert item["teacher_name"] == TEACHER_A
+    assert item["status"] == lineage_service.LINEAGE_STATUS_ACTIVE
+
+    expected = _fetch("SELECT COUNT(*) AS visits, MAX(visit_at) AS last_visit_at "
+                      "FROM patient_records WHERE patient_name = ? AND lineage_id = ?",
+                      (STUDENT_A1, LIN_A))[0]
+    drafts = _fetch("SELECT COUNT(*) AS n FROM drafts "
+                    "WHERE patient_name = ? AND lineage_id = ? AND signed = 0",
+                    (STUDENT_A1, LIN_A))[0]["n"]
+    assert (item["visits"], item["unsigned_drafts"]) == (expected["visits"], drafts)
+    assert item["last_visit_at"] == (expected["last_visit_at"] or "")
+    # 暗雷行確實存在（未歸屬 + 跨門都有就診）但沒有被算進本師門（§2.4 紀律 2）
+    loose = _fetch("SELECT COUNT(*) AS n FROM patient_records WHERE patient_name = ?",
+                   (STUDENT_A1,))[0]["n"]
+    assert loose > item["visits"]
+
+    # 加入第二門 → 多一項；順序 = `list_lineages_by_student()` 的（status, created_at, id）
+    assert _join(client, STUDENT_A1, LIN_B).status_code == 200
+    both = client.get("/api/lineages/summary", params={"student_name": STUDENT_A1}).json()["summary"]
+    assert {row["lineage_id"] for row in both} == {LIN_A, LIN_B}
+    ordered = [row["id"] for row in _fetch(
+        "SELECT id FROM lineage WHERE id IN (?, ?) ORDER BY status, created_at, id",
+        (LIN_A, LIN_B))]
+    assert [row["lineage_id"] for row in both] == ordered
+    for row in both:
+        assert row["visits"] == _fetch(
+            "SELECT COUNT(*) AS n FROM patient_records WHERE patient_name = ? AND lineage_id = ?",
+            (STUDENT_A1, row["lineage_id"]))[0]["n"]
+
+    # 沒有在門師門（未歸屬 / 已退出 / 未曾加入）→ 空清單（**不是**錯誤）
+    for name in (STUDENT_A_ORPHAN, STUDENT_B_QUIT, STUDENT_JOIN):
+        res = client.get("/api/lineages/summary", params={"student_name": name})
+        assert res.status_code == 200, name
+        assert res.json()["summary"] == [], name
+    _assert_error(client.get("/api/lineages/summary"), 400, lineage_service.LINEAGE_REQUIRED)
+
+
+# ---------------------------------------------------------------------------
+# ④-9 老師拉入 vs 學生自加（§7.1 兩個維度並存）：**同一個入口、兩種帳號語義**
+# ---------------------------------------------------------------------------
+def test_lineage_api_teacher_pull_in_accounts_and_owner_guard(two_lineages, lineage_on):
+    """`teacher_name` 非空 = 老師拉入（沿用 `database.teacher_add_student()` 建帳號）；
+    空 = 學生自加（只寫歸屬，**不建帳號**）；別門 owner 拉入 → 403 且不建帳號、不寫歸屬。"""
+    client = two_lineages["client"]
+    patients_before = _patient_names()
+    assert STUDENT_PULL not in patients_before
+
+    pull = _join(client, STUDENT_PULL, LIN_A, teacher_name=TEACHER_A)
+    assert pull.status_code == 200, pull.text
+    assert pull.json()["joined"] is True and pull.json()["changed"] is True
+    assert pull.json()["student_lineage"]["lineage_id"] == LIN_A
+    assert pull.json()["student_lineage"]["teacher_name"] == TEACHER_A
+    # 帳號建好了（`patients` 多一行）—— 沿用既有實現，不另寫一份
+    assert _patient_names() == sorted(patients_before + [STUDENT_PULL])
+    # `teacher_add_student()` 順手插的 `lineage_id = ''` 行已被唯一寫點就地更新 → 只有一行
+    assert _pt_state([STUDENT_PULL]) == [(STUDENT_PULL, TEACHER_A, "active", LIN_A)]
+
+    # 別門 owner 拉入 → 403：**不建帳號、不寫歸屬**（校驗在寫入之前）
+    denied = _join(client, STUDENT_PULL_DENIED, LIN_A, teacher_name=TEACHER_B)
+    _assert_error(denied, 403, lineage_service.LINEAGE_FORBIDDEN)
+    assert STUDENT_PULL_DENIED not in _patient_names()
+    assert _pt_state([STUDENT_PULL_DENIED]) == []
+
+    # 學生自加（`teacher_name` 空）→ **只寫歸屬、不建帳號**（§7.1 語義差異的落地判據）
+    self_join = _join(client, STUDENT_SELF, LIN_A)
+    assert self_join.status_code == 200, self_join.text
+    assert self_join.json()["changed"] is True
+    assert _pt_state([STUDENT_SELF]) == [(STUDENT_SELF, TEACHER_A, "active", LIN_A)]
+    assert STUDENT_SELF not in _patient_names()
+    # 學生自加時歸屬老師一律取師門 owner（不取請求裡的值；階段一一師一門）
+    assert self_join.json()["student_lineage"]["teacher_name"] == TEACHER_A
 

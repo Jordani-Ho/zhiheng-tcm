@@ -54,8 +54,9 @@ app.add_exception_handler(database.TemplateError, template_api.template_error_ha
 #   · `lineage_service.LineageError` → 真實 HTTP 狀態碼 + 統一錯誤體
 #     （400 `lineage_required` / 400 `lineage_invalid` / 403 `lineage_forbidden` /
 #      404 `lineage_not_found` / 503 `lineage_store_unavailable` …，見 lineage_api.lineage_error_handler）；
-#   · **本子步尚未新增路由**：`lineage_api.router` 目前為空（掛載等於無操作），
-#     §4.2 的 7 個新端點由 4.2 的後續子步落地；
+#   · **§4.2 的 7 個新端點已落地於 `lineage_api.py`**（GET/POST `/api/lineages`、
+#     POST `/api/lineages/{id}/archive`、GET `/api/lineages/summary`、
+#     GET/POST/DELETE `/api/student-lineages`）；每個端點的第一道門都是 404 `lineage_disabled`；
 #   · flag `LINEAGE_ENABLED` **默认 off**（§4.4）→ 老師端讀接口既有行為逐字節不變。
 app.include_router(lineage_api.router)
 app.add_exception_handler(lineage_service.LineageError, lineage_api.lineage_error_handler)
