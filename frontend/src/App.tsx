@@ -751,8 +751,16 @@ export default function App() {
 
   useEffect(() => {
     if (currentRole === '李老师' || currentRole === '李老师智能体') {
+      // 【Epic 4 / 批 1 止血】读接口统一「先判 res.ok，再按期望形状取值」：
+      // flag on 缺 lineage_id 等 400 的响应体是 `{detail:{error,msg,...}}`，而 `r.json()` **仍会成功**
+      // → 不判 ok 就会把错误体当数据 setState，下游 `.filter/.find/[..d]` 立刻抛异常 → 白屏。
+      // 写法照抄同文件 fetchPendingComplaints（显式 `if (!res.ok) throw`）+ fetchAgentWorkbench（Array.isArray）。
       fetch(withLineage(`/api/teacher-patients?teacher_name=${selectedTeacher}`))
-        .then(r => r.json()).then(d => setTeacherPatients(d))
+        .then(res => {
+          if (!res.ok) throw new Error(`teacher-patients ${res.status}`)
+          return res.json()
+        })
+        .then(data => setTeacherPatients(Array.isArray(data) ? data : []))
         .catch(() => setTeacherPatients([]))
       fetchSchedule()
       fetchHolidays()
@@ -885,12 +893,27 @@ export default function App() {
     fetch(`/api/patients?guardian_name=${guardian}`).then(r => r.json()).then(d => setPatients(d)).catch(() => setPatients([]))
   }
   const fetchRoleData = () => {
+    // 【Epic 4 / 批 1 止血】400 的错误体 `{detail:{...}}` 会被 `r.json()` 正常解出：
+    // 若不判 `res.ok`，它会被当成 RoleData → `roleData.detail.includes(...)`（2306 / 2329 / 2907 / 3846-3848）
+    // 与「把 detail（对象）当 React child 渲染」两处都会抛异常 → 白屏。故只认 `detail` 为字符串的合法体。
     fetch(withLineage(`/api/role-data?role=${currentRole}&patient_name=${selectedPatient}&teacher_name=${selectedTeacher}`))
-      .then(r => r.json()).then(d => setRoleData(d)).catch(() => setRoleData(null))
+      .then(res => {
+        if (!res.ok) throw new Error(`role-data ${res.status}`)
+        return res.json()
+      })
+      .then((d: RoleData) => setRoleData(d && typeof d.detail === 'string' ? d : null))
+      .catch(() => setRoleData(null))
   }
   const fetchDrafts = () => {
+    // 【Epic 4 / 批 1 止血】本 state 会在渲染期被展开（336 行 `[...drafts, ...]`）：
+    // 错误体是对象、不可迭代 → `TypeError: drafts is not iterable` 抛在渲染期 → 整棵树卸载（白屏）。
     fetch(withLineage(`/api/drafts?teacher_name=${selectedTeacher}`))
-      .then(r => r.json()).then(d => setDrafts(d)).catch(() => setDrafts([]))
+      .then(res => {
+        if (!res.ok) throw new Error(`drafts ${res.status}`)
+        return res.json()
+      })
+      .then(data => setDrafts(Array.isArray(data) ? data : []))
+      .catch(() => setDrafts([]))
   }
   const fetchPatientRecords = () => {
     fetch(withLineage(`/api/patient-records?patient_name=${selectedPatient}&teacher_name=${selectedTeacher}`))
@@ -2156,7 +2179,15 @@ export default function App() {
     // 「老师身份 + 师门」双因子（缺 teacher_name → 400 lineage_required，绝不退化为全量）；
     // flag off → 不补任何参数，URL 与 Epic 4 之前逐字面一致。
     if (lineageEnabled && !currentRole.includes('老师')) url = `${url}&teacher_name=${encodeURIComponent(selectedTeacher)}`
-    fetch(withLineage(url)).then(r => r.json()).then(d => setAppointments(d)).catch(() => setAppointments([]))
+    // 【Epic 4 / 批 1 止血】同 fetchDrafts：400（缺 lineage_id / teacher_name）的错误体不是数组，
+    // 直接 setState 会让渲染期的 `appointments.filter(...)`（2271 / 2318 / 2333 / 3601… ）抛异常。
+    fetch(withLineage(url))
+      .then(res => {
+        if (!res.ok) throw new Error(`appointments ${res.status}`)
+        return res.json()
+      })
+      .then(data => setAppointments(Array.isArray(data) ? data : []))
+      .catch(() => setAppointments([]))
   }
 
   const handleCreateAppointment = () => {
@@ -3190,7 +3221,9 @@ export default function App() {
                 const name = input?.value.trim()
                 if (!name) { alert("请输入学生姓名"); return }
                 fetch('/api/teacher/add-student', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ teacher_name: selectedTeacher, student_name: name }) })
-                  .then(() => { input.value = ''; fetch(withLineage(`/api/teacher-patients?teacher_name=${selectedTeacher}`)).then(r => r.json()).then(d => setTeacherPatients(d)); fetchPatients('张三') })
+                  // 【Epic 4 / 批 1 止血】按钮回调重拉同名接口：同样「先判 res.ok + Array.isArray」，
+                  // 否则 flag on 缺 lineage_id 的 400 错误体会进 teacherPatients（2331/2381/2385 行会抛）
+                  .then(() => { input.value = ''; fetch(withLineage(`/api/teacher-patients?teacher_name=${selectedTeacher}`)).then(r => (r.ok ? r.json() : null)).then((d: any) => setTeacherPatients(Array.isArray(d) ? d : [])).catch(() => setTeacherPatients([])); fetchPatients('张三') })
               }} style={{ padding: '8px 16px', borderRadius: '6px', border: 'none', background: '#5a7d5a', color: '#fff', cursor: 'pointer' }}>+ 添加学生</button>
               <button onClick={handleCreateInvite} style={{ padding: '8px 16px', borderRadius: '6px', border: '1px solid #8b4513', background: 'transparent', color: '#8b4513', cursor: 'pointer' }}>🎫 生成邀请码</button>
             </div>
@@ -3231,7 +3264,8 @@ export default function App() {
                         <button onClick={() => {
                           if (!confirm(`确定要将学生【${s.name}】从您的名单中移除吗？`)) return
                           fetch(`/api/patient-teachers?patient_name=${s.name}&teacher_name=${selectedTeacher}`, { method: 'DELETE' })
-                            .then(() => fetch(withLineage(`/api/teacher-patients?teacher_name=${selectedTeacher}`)).then(r => r.json()).then(d => setTeacherPatients(d)))
+                            // 【Epic 4 / 批 1 止血】同上：移除学生后的重拉同样要「先判 res.ok + Array.isArray」
+                            .then(() => fetch(withLineage(`/api/teacher-patients?teacher_name=${selectedTeacher}`)).then(r => (r.ok ? r.json() : null)).then((d: any) => setTeacherPatients(Array.isArray(d) ? d : [])).catch(() => setTeacherPatients([])))
                         }} style={{ padding: '4px 10px', borderRadius: '12px', border: '1px solid #c0392b', background: 'transparent', color: '#c0392b', cursor: 'pointer', fontSize: '12px' }}>移除</button>
                       )}
                     </div>
