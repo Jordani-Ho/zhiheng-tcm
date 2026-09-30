@@ -3806,6 +3806,74 @@ def _build_predraft(teacher_name, draft, formula_name):
     }
 
 
+# ============================================================================
+# 【施工步骤 6.5-a】生成路径的「观察期降级」判定（§4.4-② / §5.3；CTO 2026-09-30 裁决 D2 = 口径 ①）
+# ----------------------------------------------------------------------------
+# 本段**只追加一个公开符号**：`generation_degraded(teacher_name) -> bool`
+#   = 「该老师此刻走生成路径时，是否必须降级为本地骨架（不调 LLM）」。
+# 供 `main.py` **两处**接线点使用（形态 A，CTO 裁决 D1）：
+#   · `_generate_and_store_llm_draft()`（`/api/transcribe` + `/api/upload` 两条 LLM 路径的共同出口）；
+#   · `POST /api/generate-draft` 端点体（第三条路径，baseline 已是本地骨架）。
+#
+# **为什么接线点用本函数而不是 `require_capability()`**（三条理由；`main.py` 两处接线点逐条复述）：
+#   ① **自锁**：闸门会为拒绝**同点**写一行 `permission_denied` 审计（`require_capability()` 约束 3，
+#      见本文件 961-962 / 997-999）。而 §2.4 / §3.6 把「窗口内 `permission_denied` 次数 >
+#      `max_permission_denials`（内置默认 **0**）」判成 `permission_denied_in_window` → **阻断升阶**
+#      （`_evaluate_blockers()`，本文件 1786-1789）。观察期老师每收一次学生陈述就自动生成一次草案
+#      → 每来一个学生就给自己记一条「越权」，而离开观察期所需的样本恰恰来自这些生成 / 签字
+#      → **永久钉死在观察期**。这条链条必须掐断，故本函数**零审计**。
+#   ② **口径 B**（本文件 858-862 已明文）：`observation` 那格 `generate_draft=False`「表达的不是
+#      『越权门』而是 §5.3 的本地骨架路径（观察期智能体不参与，**属产品语义，不是权限**）」
+#      —— 产品语义不该在审计里长成「越权」。
+#   ③ **先例**：4a 的 `stage_view()` / `effective_capabilities()` 同属只读投影，口径 A 的原话就是
+#      「视图**不调闸门** —— 闸门会为拒绝写 `permission_denied`，一次 GET 会凭空长出审计行」
+#      （本文件 2516-2520）。本函数是同一口径在**生成路径**上的落地。
+#
+# **判定仍是同一份判定**（不新增第二份矩阵 / 不新增第二个阶段读法）：`describe_stage()`（§1.5 唯一
+# 真值读口，只读）+ `_matrix_enforced_now()` + `_capability_view()`（4a 已验收的只读投影，与
+# `require_capability()` 第 ③④ 步**逐格同值**）。
+#
+# **源码级红线**（CTO 命令 B；守护用例归 6.5-b）：函数体内**零** `_stage_audit` 调用、
+# **零** `require_capability` 调用（否则审计自锁会从这条新路径原样长回来）。
+#
+# 【口径回写】设计 §2.2 原话「生成路径接入点**必须经 `require_capability()`**」与 §4.4-② 的伪码，
+# 需按本次裁决改写为「经 `generation_degraded()` 只读判定」并附自锁理由 —— **归 6.5-b**
+# （本步不改设计文档，CTO 铁律）。
+# ============================================================================
+
+# 生成能力键（本段的唯一能力对象；与 `CAPABILITY_MIN_STAGE` / `CAPABILITY_MATRIX` 的键逐字同字）
+_GENERATION_CAPABILITY = "generate_draft"
+
+
+def generation_degraded(teacher_name):
+    """该老师此刻的生成路径**是否降级为本地骨架**（§5.3）—— `True` = 降级；只读、永不抛。
+
+    语义 = 「`require_capability(teacher_name, "generate_draft")` 会不会拒绝」，只差审计：
+
+      · **flag off** → `False`（§5.1 红线①：既有三条生成路径 1:1 不变；**零查询、零写入、零审计**）；
+      · **flag on** → 阶段真值（`describe_stage()`，§1.5 fail-closed 到 `default_stage`）在矩阵里
+        不允许 `generate_draft` → `True`。今天只有 `observation` 一格为 `False`，且它**不在**
+        `_MATRIX_RELAXED_CAPABILITIES`（本文件 879-881）里 → `matrix_enforced=False` 也不解除降级
+        （口径 B：那一格不是可放宽的阶段门）；
+      · 其余阶段（`learning` 及以上）→ `False` → 调用方走既有 LLM 路径，输出与今天一致。
+
+    返回 `bool`、**永不抛**（与三个钩子 / 4a 四符号同款）；`teacher_name` 为空**不特判** ——
+    照 `describe_stage()` 的口径取兜底阶段后再判定，本函数不自己造第二套 fail-closed 口径。
+    未知 / 白名单外的阶段 → 该格恒拒 → `True`（fail-closed 方向 = **不调 LLM**，与「矩阵是数据、
+    缺格即拒」同源）。
+
+    只读保证：全程只发 SELECT（一条状态行查询 + 必要时配置链），零写入、**零审计** ——
+    体内**没有** `_stage_audit`、**没有** `require_capability`（CTO 命令 B 的源码级红线）。
+    """
+    if not agent_stage_enabled():
+        return False
+    stage = describe_stage(teacher_name).get("stage") or _CONSERVATIVE_STAGE
+    return not _capability_view(stage, _matrix_enforced_now(teacher_name, stage)).get(
+        _GENERATION_CAPABILITY, False)
+
+
+
+
 
 
 

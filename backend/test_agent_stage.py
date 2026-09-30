@@ -5942,6 +5942,11 @@ _SERVICE_BLOCK_FUNCTIONS = (
     "_names_suffix", "_suggestion_short_circuit", "_predraft_short_circuit", "_suggestion_detail",
     "_predraft_detail", "_suggestion_disclaimer", "build_suggestion", "_result_list",
     "_build_suggestion", "build_predraft", "_predraft_payload", "_build_predraft",
+    # 【施工步骤 6.5-a 追加】生成路径的「观察期降级」只读判定（`backend/main.py` 两处接线点的
+    # 调用对象）。它落在本块边界内（块口径 = 从 `SUGGESTION_KINDS` 到文件尾），故清单同步一名；
+    # 本块其余断言不受影响（实测：`require_capability` 仍 2 次、`current_stage` 仍 4 次、
+    # `_stage_event` 仍 2 次、`import agent` 仍 2 次、零 SQL 写语句 —— 因为新函数**只读**）。
+    "generation_degraded",
 )
 _AGENT_BLOCK_FUNCTIONS = (
     "_clip_text", "_plain_text", "_load_json_object", "_text_list", "_dose_free", "_herb_name",
@@ -5974,7 +5979,8 @@ def _calls_of(tree, names):
 
 def test_service_block_is_append_only_with_single_write_point():
     """服务层追加块的**源码级守护**（口径：从 `SUGGESTION_KINDS` 到文件尾 = 本步全部新增面）：
-    顶层函数**恰好**是那 20 个（一个不多、一个不少）；块内**没有模块级 import**（延迟 import 纪律）、
+    顶层函数**恰好**是清单里的 21 个（一个不多、一个不少；第 21 名 = 施工步骤 6.5-a 追加的
+    `generation_degraded`）；块内**没有模块级 import**（延迟 import 纪律）、
     **没有一句 SQL 写语句**（`INSERT` / `UPDATE` / `DELETE` / `commit()` / `execute(` 一律不出现）
     —— 唯一写点是 `_stage_event()`（两个入口各一次）；能力闸门 `require_capability()` 也恰好两次
     （服务层绝不自己读阶段做判定 = §2.2 单一收口点）；调 AI 层一律**关键字**（无位置参数、无 `**` 展开：

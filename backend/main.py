@@ -594,6 +594,38 @@ def save_plan_template(input_data: PlanTemplateInput):
 #       `database.get_active_record_template()` 返回 None，三条生成路径**输出与今天逐字节一致**
 #       （§12.2 第 2 条回归红线），`insert_draft` 两列落 0。
 
+# ============ 【Epic 2 §5.3 / 施工步骤 6.5-a】观察期生成降级（只在 flag on + observation 生效）============
+# 接线**两处**（形态 A，CTO 2026-09-30 裁决 D1）：`_generate_and_store_llm_draft()`（覆盖
+# `/api/transcribe` 与 `/api/upload` 图片分支）+ `POST /api/generate-draft` 端点体 ——
+# 两处**共用**下面这一个 helper 产出降级正文（提示语只在这里出现一次）。
+#
+# **为什么用只读判定 `agent_stage_service.generation_degraded()` 而不是 `require_capability()`**：
+#   ① **自锁**：闸门会为拒绝**同点**写一行 `permission_denied`（§2.2 约束 3），而 §2.4 / §3.6 把
+#      「窗口内越权次数 > `max_permission_denials`（内置默认 0）」判成 `permission_denied_in_window`
+#      → **阻断升阶**。观察期老师每收一次学生陈述就自动生成一次草案 → 每来一个学生就给自己记一条
+#      「越权」，而离开观察期所需的样本恰恰来自这些生成 / 签字 → 永久钉死在观察期。
+#   ② **口径 B**（`agent_stage_service.py:858-862` 已明文）：`observation` 那格 `generate_draft=False`
+#      「表达的不是『越权门』而是 §5.3 的本地骨架路径（观察期智能体不参与，**属产品语义，不是权限**）」
+#      —— 产品语义不该在审计里长成「越权」。
+#   ③ **先例**：4a 的 `stage_view()` / `effective_capabilities()` 同属只读投影，口径 A 的原话就是
+#      「视图不调闸门 —— 闸门会为拒绝写 `permission_denied`，一次 GET 会凭空长出审计行」。
+# 判定仍是**同一份**：`generation_degraded()` 复用 `_capability_view()`（与闸门第 ③④ 步逐格同值），
+# 零写入、零审计；flag off 时返回 `False` 且**零 SQL** → 今天行为逐字节不变（§5.1 红线①）。
+# 【口径回写】设计 §2.2「生成路径接入点必须经 `require_capability()`」与 §4.4-② 伪码的改写**归 6.5-b**。
+# ============ 提示语文案照设计 §5.3（第 605 行）**逐字**（繁体）；降级正文 = 首行提示 + 既有本地骨架 ============
+_SKELETON_NOTICE = "【觀察期】智能體尚未參與，以下為本地骨架，請老師自行填寫。"
+
+
+def _skeleton_draft_with_notice(skeleton):
+    """§5.3 降级正文：`_SKELETON_NOTICE` + 换行 + 既有本地骨架（`build_draft_template()`，本文件 121）。
+
+    两处接线点共用这**一个**实现（CTO 裁决 D1）：提示语只在此处出现，6.5-b 的
+    `test_observation_uses_local_skeleton` 按本常量断言（别处不许再拼一遍）。
+    只在**降级**分支被调用 —— `learning` 及以上与 flag off 的既有输出**不含**这行提示（§5.1 红线④）。
+    """
+    return _SKELETON_NOTICE + "\n" + skeleton
+
+
 def _record_template_ref(record_template):
     """active 模板行 → `(template_id, template_version)`；无模板 / 形状异常 → `(0, 0)`。"""
     if not isinstance(record_template, dict):
@@ -610,7 +642,17 @@ def _generate_and_store_llm_draft(transcript_id, patient_name, teacher_name, con
     """
     visit_date = datetime.now().strftime('%Y年%m月%d日')
     record_template = database.get_active_record_template(teacher_name)
-    if record_template is not None:
+    # 【Epic 2 §5.3 / 6.5-a】观察期降级 → 本地骨架（**不调任何 LLM**）。判定用**只读**的
+    # `generation_degraded()` 而非 `require_capability()`：①闸门会为拒绝同点写 `permission_denied`，
+    #   而 §2.4/§3.6 把「窗口内越权次数 > `max_permission_denials`（默认 0）」判成
+    #   `permission_denied_in_window` → **阻断升阶**；观察期老师每收一次陈述就自动走一次本函数
+    #   → 「降级」被记成「越权」→ 永远升不出观察期（自锁）；②口径 B
+    #   （`agent_stage_service.py:858-862`）：这一格「属产品语义，不是权限」；③先例 = 4a
+    #   `stage_view()` 的「口径 A：视图不调闸门」。设计 §2.2 口径回写归 6.5-b。
+    if agent_stage_service.generation_degraded(teacher_name):
+        template = _skeleton_draft_with_notice(
+            build_draft_template(patient_name, content_desc, past_content))
+    elif record_template is not None:
         template = agent.generate_medical_draft(
             patient_name, visit_date, content_desc, past_content,
             section_template=database.record_section_skeleton(record_template))
@@ -702,6 +744,14 @@ def generate_draft(transcript_id: int):
     else:
         content_desc = str(transcript['content'])
     template = build_draft_template(patient_name, content_desc, past_content)
+    # 【Epic 2 §5.3 / 6.5-a】与 `_generate_and_store_llm_draft()` **同一套**降级判定 + 同一 helper：
+    # 本路径本身已是本地骨架（零 LLM），观察期只多出正文首行的繁体提示。用**只读**的
+    # `generation_degraded()` 而非 `require_capability()`，理由同上：①闸门会为拒绝同点写
+    #   `permission_denied` → §2.4/§3.6 的 `permission_denied_in_window` **阻断升阶**（观察期每收一次
+    #   陈述即自动自锁）；②口径 B（`agent_stage_service.py:858-862`）「属产品语义，不是权限」；
+    #   ③先例 = 4a `stage_view()` 的「口径 A：视图不调闸门」。设计 §2.2 口径回写归 6.5-b。
+    if agent_stage_service.generation_degraded(teacher_name):
+        template = _skeleton_draft_with_notice(template)
     # 【Epic 1 §12.2】此路径是纯本地骨架（无 LLM）→ **输出与今天逐字节一致**，只额外记生成引用；
     # 模板骨架提示只作用于 LLM 路径（`section_template` 是给智能体的，不是本地骨架的替换）。
     record_template = database.get_active_record_template(teacher_name)
