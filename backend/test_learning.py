@@ -893,3 +893,341 @@ def test_store_ready_false_without_table(monkeypatch, tmp_path):
     finally:
         conn.close()
     assert tables == [], "探針竟然建了表：%r" % (tables,)
+
+
+# ============================================================================
+# ⑥ step 3.3-a：差異記錄純函數（§3.2 / A8）+ 5 個事件寫入入口（`record_*`）
+# ----------------------------------------------------------------------------
+# CTO 2026-09-30 step 3.3-a 指令要求本組用例釘住五件事：
+#   · R10 口徑（`field` / `before_hash` / `after_hash` / `wording_changed`）逐條寫死期望；
+#   · `field` 的包裹符剝法與 `agent_stage_service._split_heading()` **同一把尺子**（行為對照）；
+#   · flag 門（零 SQL）與存儲門（不建表、不拋、不打日誌）各自獨立可驗；
+#   · best-effort：寫入期任何異常 → 吞掉 + 一行**繁體** `[warn]`，不冒泡、不回退業務；
+#   · `detail` 逐鍵 = 設計 §3.2 的五類骨架（鍵集合不放寬）。
+# 本組**不動** conftest（`LEARNING_ENABLED` 仍默認 off）：需要 flag on 的用例自行 monkeypatch，
+# 用完自動還原 —— 這是為了逐字節保住 ⑨/⑫ 的 flag-off 基線。
+# ============================================================================
+DRAFT_ID = 101                                  # 與 `SPECS` 裡那條草案同號（便於交叉對讀）
+
+# 3.3-a 的樣本正文：**已歸一化**的形態（單空格分隔 = `_normalize_metric_text()` 的產物）
+DIFF_BEFORE = "【主訴（學生原話）】 頭痛三日 【舌象】 舌淡紅 【脈象】"
+DIFF_AFTER = "【主訴（學生原話）】 頭痛三日，夜間加重 【舌象】 舌淡紅 【脈象】"
+STRUCT_BEFORE = "【主訴】 頭痛 【舌象】 舌淡紅"
+STRUCT_AFTER = "【主訴】 頭痛 【脈象】 弦細"
+
+
+def _text_hash(text):
+    """獨立重述 `sha256(文本)`（**不經** `learning_service.sha256_hex()`）：期望值必須來自本文件。"""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _record_all(teacher_name=TEACHER):
+    """把 5 個 `record_*` 各調一次（參數固定）→ `[(函數名, 返回值), ...]`（順序 = §3.1 五類事件）。
+
+    參數刻意用**固定字面量**：happy path 的期望 `detail` 照同一份字面量寫死（見下）。
+    """
+    return [
+        ("record_template_configured", learning_service.record_template_configured(
+            teacher_name, template_id=7, template_type="record", version=2,
+            from_status="draft", to_status="active", lineage_id=LINEAGE_ID)),
+        ("record_draft_generated", learning_service.record_draft_generated(
+            teacher_name, draft_id=DRAFT_ID, template_id=7, template_version=2,
+            content_hash=DETAIL_DRAFT_GENERATED["content_hash"], degraded=False,
+            patient_name=PATIENT_NAME, lineage_id=LINEAGE_ID)),
+        ("record_draft_modified", learning_service.record_draft_modified(
+            teacher_name, DIFF_BEFORE, DIFF_AFTER, draft_id=DRAFT_ID, template_id=7,
+            patient_name=PATIENT_NAME, lineage_id=LINEAGE_ID)),
+        ("record_learning_event_emitted", learning_service.record_learning_event_emitted(
+            teacher_name, source_event_types=("draft_generated", "draft_modified"),
+            difference_kinds=("field_diff", "wording_changed"), sample_count=3,
+            lineage_id=LINEAGE_ID)),
+        ("record_agent_updated", learning_service.record_agent_updated(
+            teacher_name, from_stage="learning", to_stage="apprentice",
+            capability="predict_pattern", metrics_hash=DETAIL_DRAFT_GENERATED["content_hash"],
+            lineage_id=LINEAGE_ID)),
+    ]
+
+
+# ---- 一、純函數：`compute_content_diff` / `split_sections`（無 DB、無 flag）----
+
+def test_content_diff_identical_or_empty_texts_have_no_field_diff():
+    """空串 / 逐字相同 / 非字符串 → `field_diff == []`、`wording_changed is False`（零假陽性）。"""
+    empty = {"field_diff": [], "wording_changed": False}
+    assert learning_service.compute_content_diff("", "") == empty
+    assert learning_service.compute_content_diff(DIFF_BEFORE, DIFF_BEFORE) == empty
+    assert learning_service.compute_content_diff(STRUCT_BEFORE, STRUCT_BEFORE) == empty
+    assert learning_service.compute_content_diff(None, None) == empty          # 非字符串 → 空串，不拋
+    assert learning_service.compute_content_diff(123, 123) == empty
+
+    # 返回體**恆為兩鍵**（設計 §3.2 的骨架：鍵集合不放寬、不加鍵）
+    diff = learning_service.compute_content_diff(DIFF_BEFORE, DIFF_AFTER)
+    assert set(diff) == {"field_diff", "wording_changed"}
+    assert set(learning_service.compute_content_diff("", "").keys()) == {"field_diff", "wording_changed"}
+
+
+def test_content_diff_missing_side_uses_frozen_empty_text_hash():
+    """單側缺失（段被加 / 被刪）→ 缺的那側 = `EMPTY_TEXT_HASH`（寫死 + 獨立重述 `sha256("")`）。"""
+    assert learning_service.EMPTY_TEXT_HASH == _text_hash("")
+    assert learning_service.EMPTY_TEXT_HASH == (
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+    assert learning_service.sha256_hex("") == learning_service.EMPTY_TEXT_HASH
+
+    added = learning_service.compute_content_diff("", "【主訴】 頭痛")
+    assert added == {"field_diff": [{"field": "主訴",
+                                     "before_hash": learning_service.EMPTY_TEXT_HASH,
+                                     "after_hash": _text_hash("頭痛")}],
+                     "wording_changed": False}      # 只有一側有具名標題 → 不聲稱「僅措辭變化」
+
+    removed = learning_service.compute_content_diff("【主訴】 頭痛", "")
+    assert removed["field_diff"] == [{"field": "主訴",
+                                      "before_hash": _text_hash("頭痛"),
+                                      "after_hash": learning_service.EMPTY_TEXT_HASH}]
+    assert removed["wording_changed"] is False
+
+
+def test_content_diff_wording_only_change_is_wording_changed():
+    """標題集合相同、只有正文變 → `wording_changed is True` + 恰好一條 `field_diff`（哈希逐條寫死）。"""
+    diff = learning_service.compute_content_diff(DIFF_BEFORE, DIFF_AFTER)
+    assert diff == {
+        "field_diff": [{"field": "主訴（學生原話）",
+                        "before_hash": _text_hash("頭痛三日"),
+                        "after_hash": _text_hash("頭痛三日，夜間加重")}],
+        "wording_changed": True,
+    }
+    # 段標題逐字保留（剝掉包裹符、其餘一個字都不動）；正文**不出現**在返回體裡（只放哈希 —— A5 取向）
+    literal = json.dumps(diff, ensure_ascii=False)
+    assert "主訴（學生原話）" in literal
+    assert "頭痛三日" not in literal and "舌淡紅" not in literal
+
+
+def test_content_diff_structural_change_is_not_wording_changed():
+    """段增 / 段刪 → `wording_changed is False`；順序 = **after 出現順序在前、before 獨有段在後**。"""
+    diff = learning_service.compute_content_diff(STRUCT_BEFORE, STRUCT_AFTER)
+    assert diff == {
+        "field_diff": [
+            {"field": "脈象", "before_hash": learning_service.EMPTY_TEXT_HASH,
+             "after_hash": _text_hash("弦細")},
+            {"field": "舌象", "before_hash": _text_hash("舌淡紅"),
+             "after_hash": learning_service.EMPTY_TEXT_HASH},
+        ],
+        "wording_changed": False,
+    }
+
+    # 「只加了一段、既有段一字未動」→ 仍是結構變化（標題集合不等），field_diff 只有新增那格
+    added = learning_service.compute_content_diff(STRUCT_BEFORE, STRUCT_BEFORE + " 【脈象】 弦細")
+    assert [item["field"] for item in added["field_diff"]] == ["脈象"]
+    assert added["wording_changed"] is False
+
+
+def test_content_diff_empty_named_section_still_counts_as_structure():
+    """空段（標題在、正文空）**也是一個段** —— 被整段刪掉時**不得**誤判成「僅措辭變化」。"""
+    assert learning_service.split_sections("【主訴】 頭痛 【舌象】") == [
+        ("", ""), ("主訴", "頭痛"), ("舌象", "")]
+    diff = learning_service.compute_content_diff("【主訴】 頭痛 【舌象】", "【主訴】 頭痛啊")
+    assert diff["wording_changed"] is False            # 舌象段沒了 = 結構變化
+    assert [item["field"] for item in diff["field_diff"]] == ["主訴", "舌象"]
+
+
+def test_split_sections_merges_duplicate_titles_and_keeps_untitled_body():
+    """同名段合併（單空格相接）；**沒有包裹符**的 `主訴：…` 認不出來 → 整篇一個無標題段（邊界 ②）。"""
+    assert learning_service.split_sections("【舌象】 舌淡紅 【舌象】 苔薄白") == [
+        ("", ""), ("舌象", "舌淡紅 苔薄白")]
+    assert learning_service.split_sections("主訴：頭痛 舌象：舌淡紅") == [
+        ("", "主訴：頭痛 舌象：舌淡紅")]
+    assert learning_service.split_sections("") == [("", "")]
+    assert learning_service.split_sections(None) == [("", "")]
+    assert learning_service.UNTITLED_FIELD == ""
+
+
+def test_section_field_bracket_table_matches_split_heading():
+    """【同一把尺子】`split_section_field()` ↔ `agent_stage_service._split_heading()`：四對包裹符逐個對照。
+
+    本文件**不 import** 生產模組（CTO 追加 1）→ 「同一個剝法」只能靠**行為對照**釘住：拿對方本尊
+    逐 token 比對，任何一側改了包裹符表 / 剝法，本條立刻紅。
+    """
+    import agent_stage_service
+    for token in ("【主訴（學生原話）】", "[舌象]", "〔脈象〕", "《施治方案》", "舌象", "【主訴】費解"):
+        assert learning_service.split_section_field(token) == agent_stage_service._split_heading(token)[0], token
+    assert learning_service.split_section_field(None) == ""          # 不拋
+    assert learning_service.split_section_field("") == ""
+    assert tuple(learning_service.SECTION_BRACKETS) == (
+        ("【", "】"), ("[", "]"), ("〔", "〕"), ("《", "》"))
+
+
+def test_section_heading_token_caps_field_length_at_twenty():
+    """邊界 ③：標題內層 ≤ `FIELD_MAX_CHARS`（20）才算段標題；超長 `【…】` 一律當正文（正文不進 `field`）。"""
+    assert learning_service.FIELD_MAX_CHARS == 20
+    ok_title = "字" * learning_service.FIELD_MAX_CHARS
+    assert learning_service.split_sections("【%s】 正文" % ok_title) == [("", ""), (ok_title, "正文")]
+
+    long_title = "字" * (learning_service.FIELD_MAX_CHARS + 1)
+    sections = learning_service.split_sections("【%s】 正文" % long_title)
+    assert sections == [("", "【%s】 正文" % long_title)]              # 認不出 → 全歸無標題段
+    assert all(len(field) <= learning_service.FIELD_MAX_CHARS for field, _ in sections)
+
+
+def test_content_diff_normalization_is_caller_side():
+    """CTO 追加 1（方案 c）：歸一化在**調用方** —— 歸一化後無差；直接傳原文 → **假陽性**（docstring 已明寫）。"""
+    import agent_stage_service
+    raw = "【主訴】 頭痛   三日"                  # 段內連續空白（未折疊）＝ 未歸一化
+    normalized = "【主訴】 頭痛 三日"              # 已歸一化
+    assert agent_stage_service._normalize_metric_text(raw) == normalized
+    assert learning_service.compute_content_diff(normalized, normalized) == {
+        "field_diff": [], "wording_changed": False}
+
+    false_positive = learning_service.compute_content_diff(raw, normalized)
+    assert false_positive == {
+        "field_diff": [{"field": "主訴", "before_hash": _text_hash("頭痛   三日"),
+                        "after_hash": _text_hash("頭痛 三日")}],
+        "wording_changed": True,
+    }
+
+    # CRLF 也是調用方折疊的（`\r\n` → 空格）：折疊後段結構與已歸一化文本逐格相同
+    normalized_crlf = agent_stage_service._normalize_metric_text("【主訴】\r\n頭痛\r\n三日")
+    assert normalized_crlf == "【主訴】 頭痛 三日"
+    assert learning_service.split_sections(normalized_crlf) == [("", ""), ("主訴", "頭痛 三日")]
+
+
+def test_content_diff_truncation_belongs_to_caller():
+    """截斷（`_normalize_metric_text(text, limit)`）屬調用方：截斷後不可區分 → 無 diff；不截斷 → 有 diff。
+
+    生產口徑的截斷長度是 2000（`_normalize_metric_text(text, 2000)`，3.3 的適配器決定）；
+    這裡用 `limit = 10` 只是為了讓期望值一眼能數出來 —— 被證的命題（「截斷在調用方」）完全相同。
+    """
+    import agent_stage_service
+    base = "【主訴】 頭痛三日，夜間加重"
+    longer = base + "，納差"
+    limit = 10
+    short_base = agent_stage_service._normalize_metric_text(base, limit)
+    short_longer = agent_stage_service._normalize_metric_text(longer, limit)
+    assert short_base == short_longer == "【主訴】 頭痛三日，"
+    assert learning_service.compute_content_diff(short_base, short_longer) == {
+        "field_diff": [], "wording_changed": False}
+    assert learning_service.compute_content_diff(
+        agent_stage_service._normalize_metric_text(base),
+        agent_stage_service._normalize_metric_text(longer))["field_diff"] != []
+
+
+def test_content_diff_is_pure_and_touches_no_database(monkeypatch, tmp_path, sql_log):
+    """純函數的活證：`DB_PATH` 指向空庫時照樣算得出來，且**零 SQL**、零建表、零寫入。"""
+    void_db = tmp_path / "void.db"
+    monkeypatch.setattr(database, "DB_PATH", str(void_db))
+    diff = learning_service.compute_content_diff(DIFF_BEFORE, DIFF_AFTER)
+    assert diff["wording_changed"] is True
+    assert _statements(sql_log) == []
+    assert (not void_db.exists()) or void_db.stat().st_size == 0
+
+
+# ---- 二、5 個事件寫入入口（`record_*`）：happy path / 兩道門 / best-effort ----
+
+def test_record_entry_points_write_five_event_shapes(db, monkeypatch):
+    """happy path：五個入口各寫一條 —— `detail` 逐鍵 = 設計 §3.2；投影列 / A5 / 鏈自洽一次釘全。"""
+    monkeypatch.setenv("LEARNING_ENABLED", "on")
+    called = _record_all()
+    assert [name for name, _ in called] == [
+        "record_template_configured", "record_draft_generated", "record_draft_modified",
+        "record_learning_event_emitted", "record_agent_updated"]
+    assert [ok for _, ok in called] == [True] * 5
+
+    rows = _rows()
+    assert [row["event_type"] for row in rows] == list(learning_service.EVENT_TYPES)
+    assert [row["seq"] for row in rows] == [1, 2, 3, 4, 5]
+    assert learning_service.verify_learning_chain(TEACHER) == {
+        "ok": True, "checked": 5, "first_bad_seq": None, "reason": "ok"}
+
+    expected_details = [
+        {"template_id": 7, "template_type": "record", "version": 2,
+         "from_status": "draft", "to_status": "active"},
+        {"template_version": 2, "content_hash": DETAIL_DRAFT_GENERATED["content_hash"],
+         "degraded": False},
+        {"field_diff": [{"field": "主訴（學生原話）", "before_hash": _text_hash("頭痛三日"),
+                         "after_hash": _text_hash("頭痛三日，夜間加重")}],
+         "wording_changed": True},
+        {"source_event_types": ["draft_generated", "draft_modified"],
+         "difference_kinds": ["field_diff", "wording_changed"], "sample_count": 3},
+        {"from_stage": "learning", "to_stage": "apprentice", "capability": "predict_pattern",
+         "metrics_hash": DETAIL_DRAFT_GENERATED["content_hash"]},
+    ]
+    expected_projections = [(0, 7), (DRAFT_ID, 7), (DRAFT_ID, 7), (0, 0), (0, 0)]
+    # A5：只落哈希（明文永不落庫）。兩個帶患者上下文的入口 → 具體姓名哈希；
+    # 其餘三類事件不涉及具體患者（接線點無患者上下文）→ 空名哨兵 `sha256("")[:16]`。
+    expected_name_hashes = [FROZEN_EMPTY_NAME_HASH, FROZEN_PATIENT_NAME_HASH,
+                            FROZEN_PATIENT_NAME_HASH, FROZEN_EMPTY_NAME_HASH,
+                            FROZEN_EMPTY_NAME_HASH]
+    for row, detail, projection, name_hash in zip(rows, expected_details,
+                                                  expected_projections, expected_name_hashes):
+        payload = json.loads(row["payload_json"])
+        assert set(payload) == set(learning_service.PAYLOAD_TOP_LEVEL_KEYS)     # 頂層 9 鍵不變
+        assert payload["detail"] == detail                                      # 逐鍵，鍵集合不放寬
+        assert (row["draft_id"], row["template_id"]) == projection               # 投影列 = 同名校驗
+        assert row["patient_name_hash"] == name_hash                            # A5：只落哈希（逐事件期望）
+        assert len(name_hash) == learning_service.PATIENT_NAME_HASH_LEN == 16   # A5 長度見證
+        assert row["patient_name_hash"] == payload["patient_name_hash"]         # 列 = payload 同名鍵
+
+    dumped = json.dumps([dict(row) for row in rows], ensure_ascii=False)
+    assert PATIENT_NAME not in dumped                                            # 明文姓名一個字都不落庫
+
+
+def test_record_entry_points_flag_off_are_zero_sql_and_silent(monkeypatch, capsys, sql_log):
+    """flag 門（§6）：`LEARNING_ENABLED` off → 五個入口一律 `False`，**零 SQL**（連存儲探針都不發）、零輸出。"""
+    monkeypatch.delenv("LEARNING_ENABLED", raising=False)
+    assert [ok for _, ok in _record_all()] == [False] * 5
+    assert _statements(sql_log) == []
+    assert capsys.readouterr().out == ""            # flag off 是正常態，不是異常 → 不打 warn
+
+
+def test_record_entry_points_store_missing_is_silent_false(monkeypatch, tmp_path, capsys):
+    """存儲門（§7）：flag on 但表沒就位 → `False` + **靜默**（不建表、不拋、不打日誌；503 屬 3.5 接口層）。"""
+    void_db = tmp_path / "void.db"
+    monkeypatch.setenv("LEARNING_ENABLED", "on")
+    monkeypatch.setattr(database, "DB_PATH", str(void_db))
+    assert [ok for _, ok in _record_all()] == [False] * 5
+    assert capsys.readouterr().out == ""
+
+    conn = sqlite3.connect(str(void_db))
+    try:
+        tables = [row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")]
+    finally:
+        conn.close()
+    assert tables == [], "寫入入口竟然建了表：%r" % (tables,)
+
+
+def test_record_entry_points_swallow_failures_with_traditional_warning(db, monkeypatch, capsys):
+    """best-effort（§9-聲明一）：真實 `ValueError` 與寫入期任意異常都走同一條出口 ——
+
+    `False` + 一行**繁體** `[warn]`（帶函數名，可定位）、**不冒泡**、**零寫入**（不留「寫一半」的節）。
+    """
+    monkeypatch.setenv("LEARNING_ENABLED", "on")
+    assert learning_service.record_draft_generated("", draft_id=DRAFT_ID, content_hash="x") is False
+    first = capsys.readouterr().out
+    assert "[warn]" in first and "必須給 teacher_name" in first
+    assert _rows() == []
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("庫炸了")
+
+    monkeypatch.setattr(learning_service, "insert_learning_event", boom)
+    assert [ok for _, ok in _record_all()] == [False] * 5
+    out = capsys.readouterr().out
+    assert out.count("[warn]") == 5
+    assert "寫入學習事件失敗" in out and "record_draft_modified" in out
+    assert "業務結果不受影響" in out
+    assert _rows() == []
+
+
+def test_record_detail_coercions_never_put_none_in_payload(db, monkeypatch):
+    """`detail` 兜底：`None` / 怪值一律歸一成基礎類型（`int` / `str` / `list` / `bool`）→ payload 無 `None`。"""
+    monkeypatch.setenv("LEARNING_ENABLED", "on")
+    assert learning_service.record_learning_event_emitted(
+        TEACHER, source_event_types=None, difference_kinds="draft_modified",
+        sample_count="7") is True
+    assert learning_service.record_template_configured(
+        TEACHER, template_id=None, version="x") is True
+
+    details = [json.loads(row["payload_json"])["detail"] for row in _rows()]
+    assert details[0] == {"source_event_types": [], "difference_kinds": ["draft_modified"],
+                          "sample_count": 7}
+    assert details[1] == {"template_id": 0, "template_type": "", "version": 0,
+                          "from_status": "", "to_status": ""}
+    for detail in details:
+        assert None not in detail.values()

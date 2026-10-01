@@ -21,12 +21,29 @@ CTO 2026-09-30 step 3.2 裁決（本文件的施工依據）：
     調用；另加本 Epic 自己的紅線：零 `current_stage` 調用（Epic 2 §2.2 的唯一能力閘門，全倉白名單只含
     `agent_stage_service.py` / `agent_stage_api.py`）、零寫 `agent_stage_log`（A6：兩張表、兩條流，§3.3）。
 
+CTO 2026-09-30 step 3.3-a 裁決（本文件的施工依據 · **追加段**）：
+  · 本步 = **差異記錄純函數 + 5 個事件寫入入口**：`compute_content_diff()`（+ `split_sections()` /
+    `split_section_field()` 兩個純助手）與 5 個 `record_*` 薄封裝。**仍然零接線** ——
+    本文件今天依然不被任何生產模組 import（庫層落點 / 服務層適配器 / 接口層屬 3.3-b → 3.3-f）。
+  · R10 口徑（CTO 批）：`field` / `before_hash` / `after_hash` / `wording_changed` 三件事的定義逐條寫在
+    `compute_content_diff()` 的 docstring；`field` 的包裹符剝法與 `agent_stage_service._split_heading()`
+    **逐字同一套**（差別只是本文件**不 import 它** —— 見下一條）。
+  · CTO 追加 1（方案 c，import 方向）：**歸一化在調用方** —— 調用方先跑
+    `agent_stage_service._normalize_metric_text()`，再把結果傳進 `compute_content_diff()`。
+    理由：本文件保持「純函數 + **零 import 生產模組**」（兩個方向的循環依賴都不成立）。
+    代價（明寫在 docstring，不藏）：傳未歸一化的原文**不保證結果穩定**（用例反向釘住）。
+  · CTO 追加 2（守護歸 3.3-f）：「庫層 → 服務層轉發點唯一」由 `database.py` 的模組級 / 函數體級
+    源碼守護負責，本文件不摻和。
+  · flag / 存儲探針 / 吞異常三件事只在 `_record_event()` 裡各判**一次**（5 個 `record_*` 只負責拼
+    `detail`）—— 「同一個判斷只許有一份實現」，理由見該函數 docstring。
+
 啟用方式（本機 / 生產，PowerShell；**默認 off**）：
     $env:LEARNING_ENABLED = "on"
 """
 import hashlib
 import json
 import os
+import re
 from datetime import datetime
 
 # ---------------------------------------------------------------------------
@@ -349,3 +366,301 @@ def learning_store_ready():
     except Exception:  # noqa: BLE001 —— 表缺失 / 庫不可讀都不是本函數要回答的問題（答案就是「沒就緒」）
         return False
     return True
+
+
+# ============================================================================
+# 【差異記錄】§3.2 / A8：字段級 diff（第一類）+ 措辭變化（第二類）—— 純函數（3.3-a）
+# ----------------------------------------------------------------------------
+# CTO 2026-09-30 step 3.3-a 裁決（R10）逐條落點：
+#   · `field` = 剝掉**配對包裹符**的段標題（與 `agent_stage_service._split_heading()` 同一套表 / 同一剝法）；
+#   · `before_hash` / `after_hash` = `sha256(歸一化段文本)`（**只放哈希，明文正文不入鏈** —— A5 取向）；
+#   · `wording_changed` = 「標題集合相同且僅內容變化」；
+#   · 歸一化**復用** `agent_stage_service._normalize_metric_text()`，但**在調用方做**（追加 1 方案 c）：
+#     本文件零 import 生產模組 → 本函數**不**自行歸一化，入參必須已是歸一化產物。
+#
+# 三條已知邊界（都寫進 `compute_content_diff()` 的 docstring，不藏）：
+#   ① 入參必須已歸一化；傳原文 = 假陽性（用例反向釘住：段內連續空白 / 段內換行沒折疊就會誤報「有變化」）；
+#   ② 段邊界只認**被包裹符包裹的標題 token** —— `_normalize_metric_text()` 把換行折成空格後，
+#      「行首」這個信息已經消失，無包裹符的 `主訴：…` 無法與正文裡的冒號區分；認不出標題時整篇退化成
+#      「無標題段」一格（仍記錄「有變化」，只是不給字段級拆解）；
+#   ③ `field` 長度上限 `FIELD_MAX_CHARS`（20，同 Epic 1 §3.3 段標題 1–20 字）→ 超長的 `【…】` 一律當正文，
+#      防「正文被當成字段名寫進鏈」（`field` 也會進 payload、也會被哈希）。
+# ============================================================================
+FIELD_MAX_CHARS = 20            # 段標題（`field`）長度上限；超過即不視為段標題
+UNTITLED_FIELD = ""             # 「無標題段」的 `field` 值：標題之前的文字 / 整篇沒有標題時的唯一一格
+SECTION_BRACKETS = (            # 與 `_split_heading()` 的包裹符表**逐字同表**（同一把尺子；用例行為釘住）
+    ("【", "】"),
+    ("[", "]"),
+    ("〔", "〕"),
+    ("《", "》"),
+)
+EMPTY_TEXT_HASH = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"   # == sha256_hex("")
+
+
+def _section_heading_token():
+    """段標題 token 的正則（由 `SECTION_BRACKETS` + `FIELD_MAX_CHARS` **生成**，免得兩處漂移）。
+
+    口徑三條：
+      · token 必須**整格**是包裹符對（`【…】` / `[…]` / `〔…〕` / `《…》`），內層 1–`FIELD_MAX_CHARS` 字、
+        不含空白（內層用否定字符類擋住）；
+      · token 必須被**空白界定**（串首 / 串尾 / 前後是空白）—— 換行折成空格後，「行首」的等價物就是這個；
+      · 包裹符一律走 `re.escape()`（`[` / `]` 這對在正則裡有特殊身份：裸寫會變成「嵌套字符類」或
+        「字符類提前閉合」，兩者都是**靜默**的解析差異 —— 所以兩個位置都轉義，字符類的收尾 `]` 才裸寫）。
+    """
+    alternatives = "|".join(
+        "%s[^%s\\s]{1,%d}%s" % (re.escape(start), re.escape(end), FIELD_MAX_CHARS, re.escape(end))
+        for start, end in SECTION_BRACKETS)
+    return re.compile("(?:^|(?<=\\s))(%s)(?=\\s|$)" % alternatives)
+
+
+_HEADING_TOKEN = _section_heading_token()
+
+
+def split_section_field(token):
+    """段標題 token → `field`：剝掉**配對**的包裹符（`【】` / `[]` / `〔〕` / `《》`）。
+
+    剝法與 `agent_stage_service._split_heading()` **逐字一致**（`test_learning.py` 用它本尊做行為對照）：
+    只在「首尾是同一對包裹符且長度 > 兩個包裹符長度之和」時剝，其餘**原樣返回** ——
+    逐字符剝會留下半個 `】`，把標題切壞（Epic 2 step 3.4-a 的 ⑯ 組抓到過這個 bug）。
+    `None` / 非字符串 → `""`（不拋）。
+    """
+    text = "" if token is None else str(token).strip()
+    for start, end in SECTION_BRACKETS:
+        if len(text) > len(start) + len(end) and text.startswith(start) and text.endswith(end):
+            return text[len(start):-len(end)].strip()
+    return text
+
+
+def split_sections(normalized_text):
+    """已歸一化的整篇正文 → `[(field, segment_text), ...]`（**依出現順序**；同名段合併）。
+
+    四條口徑（全部有測試釘住）：
+      · **只認包裹符標題**（見 `_section_heading_token()`）：標題之前的文字歸 `UNTITLED_FIELD`（`""`）；
+      · **空段保留**（標題在、正文空 → `segment_text == ""`）：它的哈希 = `EMPTY_TEXT_HASH` ——
+        好處是「某段被整段刪掉」在 `wording_changed` 上仍算**結構變化**（若把空段丟掉，這一格會消失）；
+      · **同名段合併**成一個 `field`（文本按出現順序以**單空格**相接）—— 同一標題寫兩次不會變成兩筆 diff；
+      · 非字符串 / `None` → `""`（= 一個空的無標題段），**不拋**。
+    """
+    text = "" if normalized_text is None else str(normalized_text)
+    pieces = []
+    body_start = 0
+    current_field = UNTITLED_FIELD
+    for match in _HEADING_TOKEN.finditer(text):
+        pieces.append((current_field, text[body_start:match.start(1)]))
+        current_field = split_section_field(match.group(1))
+        body_start = match.end(1)
+    pieces.append((current_field, text[body_start:]))
+
+    merged = []
+    positions = {}
+    for field, body in pieces:
+        body = body.strip()
+        if field in positions:
+            index = positions[field]
+            existing = merged[index][1]
+            if body:
+                merged[index][1] = (existing + " " + body).strip() if existing else body
+        else:
+            positions[field] = len(merged)
+            merged.append([field, body])
+    return [(field, body) for field, body in merged]
+
+
+def compute_content_diff(normalized_before, normalized_after):
+    """§3.2 / A8 `draft_modified` 的 `detail`（**純函數**：零 SQL、零副作用、同入參同結果）。
+
+    **入參必須已歸一化**（CTO 追加 1 方案 c）：調用方先跑
+    `agent_stage_service._normalize_metric_text(text)`（換行折成空格、連續空白折疊、首尾裁剪、
+    可選截斷）再傳進來。本函數**不**自行歸一化（本文件零 import 生產模組）→
+    **傳未歸一化的原文不保證結果穩定**：段內連續空白 / 段內換行不會被折疊 → 段文本哈希不同 →
+    `field_diff` 憑空多一條（**假陽性**）。`test_learning.py` 有反向用例把這條釘住。
+
+    返回**恆為兩鍵**的 dict（設計 §3.2 的骨架，鍵集合不放寬）：
+      · `field_diff`: `[{field, before_hash, after_hash}, ...]`，只收「哈希不同」的段。三條細則：
+          - 順序 = **after 段的出現順序**在前，其後是「只在 before 出現」的段（依 before 出現順序）
+            → 穩定、可逐條寫死期望；
+          - **單側缺失**（段被刪 / 段被加）→ 缺的那側用 `EMPTY_TEXT_HASH`（= `sha256("")`）；
+            「段不存在」與「段存在但空」在此**同值**，這是刻意的：兩者都答不出正文；
+          - 內容**逐字相同**時 `field_diff == []` → 調用方可據此**跳過寫事件**（別往鏈裡塞空節）；
+      · `wording_changed`: 「**標題集合相同且僅內容變化**」= before / after 的**具名**段標題集合非空且相等，
+        且 `field_diff` 非空。任一側沒有具名標題（整篇無標題 / 標題全被當正文）→ `False`
+        —— 結構信息不可得時**不聲稱**「僅措辭變化」（寧可少報，不虛報）。
+    """
+    before_segments = split_sections(normalized_before)
+    after_segments = split_sections(normalized_after)
+    before = dict(before_segments)
+    after = dict(after_segments)
+
+    field_diff = []
+    for field, body in after_segments:
+        before_hash = sha256_hex(before[field]) if field in before else EMPTY_TEXT_HASH
+        after_hash = sha256_hex(body)
+        if before_hash != after_hash:
+            field_diff.append({"field": field, "before_hash": before_hash, "after_hash": after_hash})
+    for field, body in before_segments:
+        if field in after:
+            continue
+        field_diff.append({"field": field, "before_hash": sha256_hex(body),
+                           "after_hash": EMPTY_TEXT_HASH})
+
+    named_before = {field for field, _ in before_segments if field != UNTITLED_FIELD}
+    named_after = {field for field, _ in after_segments if field != UNTITLED_FIELD}
+    wording_changed = bool(field_diff) and bool(named_before) and named_before == named_after
+    return {"field_diff": field_diff, "wording_changed": wording_changed}
+
+
+# ============================================================================
+# 【事件寫入的服務層入口】5 個 `record_*` 薄封裝（3.3-a；§3.1 五類事件各一）
+# ----------------------------------------------------------------------------
+# 為什麼要這一層：3.3-b → 3.3-e 的接線點（`database` 的三個既有鉤子 + 新增的「改 4」）只許調它 ——
+# 接線點**不**自己拼 `detail`、**不**自己判 flag、**不**自己探存儲、**不**自己吞異常：
+#   · `detail` 的鍵集合是設計 §3.2 的骨架（本文件是它的唯一真相源，逐鍵寫死）；
+#   · flag / 存儲 / 吞異常三件事只在 `_record_event()` 裡各**判一次** —— 散成五處就會出現
+#     「某一處漏判 flag」這種 §6 紅線（flag off 仍寫事件）。
+# 五個入口**一律不拋、一律不回退業務**（§9-聲明一「事件寫入失敗不得回退業務輸出」，
+# 與 `database.sign_draft()` 末尾 `on_draft_signed(...)` 的最佳努力同口徑）：返回 `bool` = 真的寫成功。
+# ============================================================================
+def _as_int(value):
+    """`detail` / 投影列的整數讀數兜底：`None` / 非數字字符串 / 其它怪值 → `0`，**不拋**。"""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _as_str_list(value):
+    """`detail` 的字符串數組欄位：`None` → `[]`；字符串 → `[該串]`（**不**拆成單字符）；其餘按可迭代取。"""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    try:
+        return [str(item) for item in value]
+    except TypeError:
+        return [str(value)]
+
+
+def _record_event(event_name, teacher_name, event_type, detail, lineage_id="", patient_name="",
+                  draft_id=0, template_id=0, created_at=None):
+    """5 個 `record_*` 的**共同體**：唯一一處判 flag / 探存儲 / 吞異常（三步順序即契約）。
+
+      ① **flag 門**（§6 / A4）：`learning_enabled()` 為假 → `return False`，**零 SQL**
+         （連存儲探針那一條只讀語句都不發 —— flag off = 與今天 1:1）；
+      ② **存儲門**（§7）：`learning_store_ready()` 為假（遷移 `0006` 沒跑 / 表被改名 / 庫不可讀）→
+         `return False`。這裡**不建表、不拋、不打日誌**：`503 learning_store_unavailable` 是 3.5
+         接口層的職責（「功能沒開」與「遷移沒跑」兩件事不許合併）；
+      ③ **寫入**：`insert_learning_event()`（本文件唯一的寫入口）。它拋的一切（`ValueError`：
+         `seq` 不連續 / 枚舉外事件 / 空老師名；`IntegrityError`：併發搶號；`OperationalError`：
+         寫入期庫故障）→ **吞掉 + 一行 `[warn]`（繁體）**，`return False`。
+
+    `event_name` 只用在 warn 文案（留名才可定位），不參與 payload。
+    **只用模組內的兩個函數**（`learning_store_ready` / `insert_learning_event`）→ 本文件對
+    `database` 的取用面**不因 3.3-a 增加**（源碼級守護 `_database_attrs` 仍是那四個原語）。
+    """
+    if not learning_enabled():
+        return False
+    try:
+        if not learning_store_ready():
+            return False
+        insert_learning_event(teacher_name, event_type, detail, lineage_id=lineage_id,
+                              patient_name=patient_name, draft_id=draft_id,
+                              template_id=template_id, created_at=created_at)
+        return True
+    except Exception as exc:  # noqa: BLE001 —— best-effort：任何失敗都不得冒泡回業務路徑
+        print("[warn] learning_service.%s 寫入學習事件失敗（已忽略，業務結果不受影響）：%s"
+              % (event_name, exc))
+        return False
+
+
+def record_template_configured(teacher_name, template_id=0, template_type="", version=0,
+                               from_status="", to_status="", lineage_id="", created_at=None):
+    """【`template_configured`】老師發佈 / 歸檔 / 啟用某類模板（接線點 = `template_api` 的三個狀態端點）。
+
+    `detail` 逐鍵 = 設計 §3.2：`{template_id:int, template_type:str, version:int, from_status:str,
+    to_status:str}`；`draft_id` 恆 0（配置事件不指向草案）。
+    """
+    detail = {
+        "template_id": _as_int(template_id),
+        "template_type": str(template_type or ""),
+        "version": _as_int(version),
+        "from_status": str(from_status or ""),
+        "to_status": str(to_status or ""),
+    }
+    return _record_event("record_template_configured", teacher_name, "template_configured", detail,
+                         lineage_id=lineage_id, template_id=template_id, created_at=created_at)
+
+
+def record_draft_generated(teacher_name, draft_id=0, template_id=0, template_version=0,
+                           content_hash="", degraded=False, patient_name="", lineage_id="",
+                           created_at=None):
+    """【`draft_generated`】智能體生成病歷草案並落庫（接線點 = `database.insert_draft()` 末尾）。
+
+    `detail` 逐鍵 = 設計 §3.2：`{template_version:int, content_hash:str, degraded:bool}`；
+    `degraded` = 該草案是否產自觀察期降級骨架（Epic 2 §5.6 / TD-015 的樣本識別口徑，由調用方判定）。
+    `patient_name` 只被拿去算哈希（A5：**明文姓名不入鏈**）。
+    """
+    detail = {
+        "template_version": _as_int(template_version),
+        "content_hash": str(content_hash or ""),
+        "degraded": bool(degraded),
+    }
+    return _record_event("record_draft_generated", teacher_name, "draft_generated", detail,
+                         lineage_id=lineage_id, patient_name=patient_name, draft_id=draft_id,
+                         template_id=template_id, created_at=created_at)
+
+
+def record_draft_modified(teacher_name, normalized_before, normalized_after, draft_id=0,
+                          template_id=0, patient_name="", lineage_id="", created_at=None):
+    """【`draft_modified`】老師修改草案內容（接線點 = `database.update_draft_content()` 末尾，3.3-c）。
+
+    `normalized_before` / `normalized_after` **必須已歸一化**（CTO 追加 1 方案 c）：調用方先各跑一次
+    `agent_stage_service._normalize_metric_text(text)` 再傳進來；本函數**不**替調用方歸一化
+    （本文件零 import 生產模組）。`detail` = `compute_content_diff(...)` 的產物
+    （兩鍵：`field_diff` / `wording_changed`，逐條口徑見該函數 docstring）。
+
+    邊界（留給調用方判，本函數不替它判）：內容**逐字相同** → `field_diff == []` ——
+    接線點據此**跳過寫事件**（§一-1 裁決：冪等分支不寫事件，別往鏈裡塞空節）。
+    `patient_name` 只被拿去算哈希（A5）。
+    """
+    detail = compute_content_diff(normalized_before, normalized_after)
+    return _record_event("record_draft_modified", teacher_name, "draft_modified", detail,
+                         lineage_id=lineage_id, patient_name=patient_name, draft_id=draft_id,
+                         template_id=template_id, created_at=created_at)
+
+
+def record_learning_event_emitted(teacher_name, source_event_types=(), difference_kinds=(),
+                                  sample_count=0, lineage_id="", created_at=None):
+    """【`learning_event_emitted`】一次學習結算**被產出**（接線點 = `agent_stage_service._evaluate()`）。
+
+    `detail` 逐鍵 = 設計 §3.2：`{source_event_types:[str], difference_kinds:[str], sample_count:int}`
+    —— 「本次學習發生了什麼」的**匯總節**（來源事件類型 / 差異種類 / 樣本數）。
+    兩個數組欄位由 `_as_str_list()` 兜底（`None` → `[]`；字符串 → `[該串]`）。
+    """
+    detail = {
+        "source_event_types": _as_str_list(source_event_types),
+        "difference_kinds": _as_str_list(difference_kinds),
+        "sample_count": _as_int(sample_count),
+    }
+    return _record_event("record_learning_event_emitted", teacher_name, "learning_event_emitted",
+                         detail, lineage_id=lineage_id, created_at=created_at)
+
+
+def record_agent_updated(teacher_name, from_stage="", to_stage="", capability="", metrics_hash="",
+                         lineage_id="", created_at=None):
+    """【`agent_updated`】學習結果落實到統計指標 / 階段視圖（接線點 = `agent_stage_service._evaluate()`）。
+
+    `detail` 逐鍵 = 設計 §3.2：`{from_stage:str, to_stage:str, capability:str, metrics_hash:str}`；
+    `metrics_hash` = 本次評估結果快照的哈希（快照本體留在 `agent_stage_state.last_metrics_json`，
+    **不**複製進鏈）。
+
+    §一-4 裁決（CTO 批）：**3.3 只在 `_evaluate()` 寫這一類事件**；升階路徑（`apply_upgrade_confirmation`
+    等）的 `agent_updated` 寫入**留給 3.4** —— 本函數今天只有一個接線點。
+    """
+    detail = {
+        "from_stage": str(from_stage or ""),
+        "to_stage": str(to_stage or ""),
+        "capability": str(capability or ""),
+        "metrics_hash": str(metrics_hash or ""),
+    }
+    return _record_event("record_agent_updated", teacher_name, "agent_updated", detail,
+                         lineage_id=lineage_id, created_at=created_at)
