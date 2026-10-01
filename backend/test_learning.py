@@ -821,7 +821,7 @@ def test_source_guard_zero_sql_zero_audit_zero_capability():
     assert "database" not in top_level, "database 必須在函數內延遲 import"
 
 
-# 【3.3-b 白名單收窄 · 3.3-d 追加接口層】`learning_service` 的**引用白名單**：`{"檔名": ("函數名", ...)}`。
+# 【3.3-b 白名單收窄 · 3.3-d 追加接口層 · 3.3-e 追加 `_evaluate`】`learning_service` 的**引用白名單**：`{"檔名": ("函數名", ...)}`。
 #   為什麼要收窄：3.2 的「任何生產模組零 import」在當時是正確口徑（那時零接線）；3.3-b 起
 #   `agent_stage_service.py` 新增兩個適配器，**函數內**延遲 import 學習服務層是設計的一部分
 #   （白名單唯一處）。守護因此從「零 import」升級成「只許這兩處」——
@@ -831,9 +831,11 @@ def test_source_guard_zero_sql_zero_audit_zero_capability():
 #   `import lineage_service` 同款寫法）→ 白名單追加的就是**這三個函數名**，而不是 `None`（模組頂層）：
 #   頂層 import 照舊紅，這一格因此沒有放寬 3.2 的口徑。
 #   庫層落點（3.3-c）走既有轉發器、對 `learning_service` 零引用，故 `database.py` 至今不在白名單內。
-#   最終形在 3.3-f（`_evaluate` 的 `learning_event_emitted` / `agent_updated` 由 3.3-e 追加收口）。
+#   【3.3-e 追加】`_evaluate`（`learning_event_emitted` / `agent_updated` 兩條事件）函數內延遲 import
+#   —— 本步即該子步的放行（原注「`_evaluate`（3.3-e）的放行由該子步追加」逐字兌現）；
+#   其餘「最終形」（轉發點唯一守護）仍在 3.3-f 收口。
 ALLOWED_WIRING = {
-    "agent_stage_service.py": ("on_draft_generated", "on_draft_modified"),
+    "agent_stage_service.py": ("on_draft_generated", "on_draft_modified", "_evaluate"),
     "template_api.py": ("publish_template", "archive_template", "activate_template"),
 }
 
@@ -874,24 +876,28 @@ def test_no_wiring_in_step_3_2():
     一旦有模組 import 了它（或往接線點的函數體裡塞了寫事件的一行），這個前提就必須重新證明。
 
     兩層守護：
-      · **函數體級**：`database.insert_draft` / `database.update_draft_content` /
-        `agent_stage_service._evaluate` 三段源碼裡零 `learning_service` / `agent_learning_events` /
-        `LEARNING_ENABLED`（本步不得動它們一個字節）；
-      · **模組級（【3.3-b 收窄為白名單形 · 3.3-d 追加接口層】）**：backend 根目錄下**除測試文件與
+      · **函數體級（【3.3-e 收窄：只剩庫層兩個落點】）**：`database.insert_draft` /
+        `database.update_draft_content` 兩段源碼裡零 `learning_service` / `agent_learning_events` /
+        `LEARNING_ENABLED`（庫層只許經唯一轉發器 `_call_agent_stage_hook()`，不許自己碰學習服務層）；
+      · **模組級（【3.3-b 收窄為白名單形 · 3.3-d 追加接口層 · 3.3-e 追加 `_evaluate`】）**：backend 根目錄下**除測試文件與
         `learning_service.py` 本身**，只放行 `ALLOWED_WIRING` 逐項列出的「檔名 → 函數名」——
         今天 = `agent_stage_service.py` 的 `on_draft_generated` / `on_draft_modified`（3.3-b 服務層適配器）
+        + `_evaluate`（3.3-e 的 `learning_event_emitted` / `agent_updated` 收口）
         + `template_api.py` 的 `publish_template` / `archive_template` / `activate_template`（3.3-d 接口層三個
         狀態端點）的**函數體內**延遲 import。**頂層 import（任何模組）/
         白名單外的模組 / 同模組的其他函數體**三條照舊紅 —— 3.2 的口徑因此只是**收窄**，沒有放寬。
         【變更披露 · CTO R4】**本條是既有斷言變更**：原斷言
         `"learning_service" not in _imported_roots(tree)` 表達不了「哪些位置允許」，故改為
         「按最近外層函數歸屬的白名單比對」（判定助手見下方 `_learning_import_owners()`）；
-        庫層落點（3.3-c）走既有轉發器、對 `learning_service` **零引用**（因此不需放行）；
-        `_evaluate`（3.3-e）的放行由該子步追加；**最終形在 3.3-f 收口**。
+        庫層落點（3.3-c）走既有轉發器、對 `learning_service` **零引用**（因此不需放行）。
+        【變更披露 · 3.3-e】**本條再次變更既有斷言**：`guarded` 撤掉 `agent_stage_service.py: ("_evaluate",)`
+        —— 3.2 立的「`_evaluate` 三段源碼零引用」在 3.2 → 3.3-c 期間成立（那時它確實零引用），
+        3.3-e 起 `_evaluate` 由上面的白名單放行（依據 = 本文件原注「`_evaluate`（3.3-e）的放行
+        由該子步追加」）；**庫層那格照舊函數體級守護**，模組級與頂層兩條一條未鬆。
+        **最終形（`database.py` 的「庫層 → 服務層轉發點唯一」守護）仍在 3.3-f 收口。**
     """
     guarded = {
         "database.py": ("insert_draft", "update_draft_content"),
-        "agent_stage_service.py": ("_evaluate",),
     }
     for filename, function_names in guarded.items():
         path = os.path.join(BACKEND_DIR, filename)
@@ -909,6 +915,9 @@ def test_no_wiring_in_step_3_2():
         assert seen == set(function_names), "%s 缺函數：%s" % (filename, sorted(set(function_names) - seen))
 
     # 兩個未來的接線點（3.3 / 3.4）今天連表名都不該出現（database.py 例外：它是庫層落點）
+    # 【3.3-e】`agent_stage_service.py` 的 `_evaluate` 已獲白名單放行「引用 `learning_service`」，
+    #   但**表名字面量照舊不許**（學習事件的表名只屬 `database.py` / 遷移 / 服務層）——
+    #   本條因此一字未改；名單不變 = 這條紅線不隨接線放寬。
     for filename in ("agent_stage_service.py", "template_api.py", "main.py"):
         with open(os.path.join(BACKEND_DIR, filename), encoding="utf-8") as handle:
             source = handle.read()
@@ -920,12 +929,12 @@ def test_no_wiring_in_step_3_2():
         if filename in ("conftest.py", "learning_service.py"):
             continue
         tree = _parse_module(os.path.join(BACKEND_DIR, filename))
-        allowed = ALLOWED_WIRING.get(filename, ())    # 【3.3-b / 3.3-d】白名單（最終形在 3.3-f）
+        allowed = ALLOWED_WIRING.get(filename, ())    # 【3.3-b / 3.3-d / 3.3-e】白名單（最終形在 3.3-f）
         offenders = sorted((owner or "<模組頂層>", lineno)
                            for owner, lineno in _learning_import_owners(tree)
                            if owner not in allowed)
         assert offenders == [], \
-            ("%s 出現了白名單外的 learning_service 引用：%r（3.3-d 白名單 = %r；"
+            ("%s 出現了白名單外的 learning_service 引用：%r（3.3-e 白名單 = %r；"
              "頂層 import / 白名單外的模組 / 同模組的其他函數體一律紅，最終形在 3.3-f）"
              % (filename, offenders, ALLOWED_WIRING))
 
@@ -1880,4 +1889,353 @@ def test_flag_off_keeps_response_shape_identical_and_writes_zero_rows(client, mo
     assert [r.json()["template"]["status"] for r in on] == [r.json()["template"]["status"] for r in off]
     assert [d["from_status"] + " → " + d["to_status"] for d in _detail_list()] == [
         "draft → active", "active → archived", "archived → active"], "僅 flag on 那趟落鏈"
+
+
+# ============================================================================
+# ⑩ step 3.3-e：`agent_stage_service._evaluate()` 的兩類學習事件（評估鏈 → 學習鏈的收口）
+# ----------------------------------------------------------------------------
+# 【分組編號說明】`⑩` 沿本檔 ⑦/⑧/⑨ 的排版慣例；模組 docstring `:22` 的 `⑩` 另指 step 3.2 清單的
+# 「源碼級守護」—— 「雙用」是既有現象（同一聲明見 ⑨ 組段頭 `:1707`–`:1710`）。
+# 對齊：CTO 2026-09-30 step 3.3-e 指令 + 設計 §3.1（一次評估 = 兩節的事件流）/ §3.2（兩類 detail 的
+#   三鍵 / 四鍵形狀）/ §一-4（3.3 只在 `_evaluate()` 寫 `agent_updated`）/ §一-1（不寫空節）/
+#   §6（flag off = 與今天 1:1、零新 SQL）/ §9-聲明一（best-effort，失敗不回退業務）/
+#   §9-聲明二（零階段面：只寫學習表）。
+# 站位：本檔 ⑦→⑧→⑨ 逐層釘「服務層適配器 / 庫層落點 / 接口層端點」，本組釘**最後一個落點** ——
+#   `evaluate()` → `_evaluate()` 內那段【施工步驟 3.3-e】（wiring 段頭在服務層 `:2118` 起；
+#   工具鏈側的段頭在同檔 `:4033`「施工步驟 3.3-e」）。
+# 六件事（編號 ↔ CTO 清單，逐件一用例）：
+#   ① flag off → 評估照跑（階段面照寫）、學習鏈**零行**、階段面**逐字節不變**（狀態口徑；按 CTO 修正重寫）；
+#   ② flag on → 一次評估**恰好 +2 節**（順序：`learning_event_emitted` → `agent_updated`），且第一節
+#      三鍵 = 「本週期真讀到什麼」（空池不虛報 / 有樣本才報 / 逐字相同就不報段級差異）；
+#   ③ 先手工種一條 `seq = 1` 的既有節 → 新兩節接著 `seq = 2` / `3`（`prev_hash` 接得上 → 鏈校驗 ok）；
+#   ④ `agent_updated` 的 `from_stage == to_stage == describe_stage()["stage"]`（約束 3：評估不改階段）；
+#   ⑤ `metrics_hash` 可**獨立重算**（= `sha256(canonical(快照))`；快照本體只留狀態行、**不**複製進鏈）；
+#   ⑥ 返回體仍是 **18 鍵 + `changed`**（既有斷言在 `test_agent_stage.py` 的 `_EVALUATE_SNAPSHOT_KEYS`，
+#      本組只**確認未破**：逐鍵字面量 + flag off / on 兩趟的**業務值**逐鍵相同（身份 / 時刻欄位不比））。
+# 造數口徑（為什麼本組不造真實樣本池）：本組測的是「**已算好的兩份指標**如何落鏈」，樣本池的樣貌屬
+#   ⑦ / ⑯ / ⑰ 組。需要「有樣本」的那兩趟改為注入 ①② 兩個純函數的**讀數**（骨架取自服務層自己的
+#   `_blank_*()` → 形狀不與實現漂移）：被測面（那段 3.3-e 接線）零改動、零新 SQL、零新窗口定義。
+# ============================================================================
+
+# `evaluate()` 返回體的逐鍵契約：18 鍵快照 + `changed`（與 `test_agent_stage.py` 的
+# `_EVALUATE_SNAPSHOT_KEYS`（當時 `:3605`）**逐字同表**；本檔不 import 測試模組 → 重述一份，
+# 「兩處同時紅」才叫真的漂移）
+EVALUATE_SNAPSHOT_KEYS = (
+    "teacher_name", "skipped", "reason",
+    "stage", "stage_label", "stage_since", "stage_source", "pending_stage", "pending_task_id",
+    "degraded", "metrics", "metrics_reason", "thresholds", "config_source", "next_stage",
+    "blockers", "evaluated_at", "metrics_ttl_hours",
+)
+CHANGED_KEYS = ("stage_changed", "recommended", "demoted", "reason")
+
+# 返回體的**業務值**鍵集 = 18 鍵去掉「身份」（`teacher_name`）與「時刻」（`stage_since` / `evaluated_at`）。
+# ⑥ 的兩趟比對只吃這一組：同一格連跑兩趟時，`stage_since`（首趟寫下的時刻）與 `evaluated_at` 必然不同。
+STABLE_BODY_KEYS = tuple(
+    key for key in EVALUATE_SNAPSHOT_KEYS
+    if key not in ("teacher_name", "stage_since", "evaluated_at"))
+
+# 學習鏈的**唯一**表名。判據：學習鏈每一條語句的 SQL 文本都自帶這個表名（`database.py` 的
+# `next_seq` / `get_last_learning_event` / `insert_learning_event` 三處都以 `+ LEARNING_EVENTS_TABLE`
+# 拼接）→ 這**一個**判據就足以把學習鏈的 SQL 整批挑出來。
+LEARNING_TABLE_NAME = "agent_learning_events"
+
+# 本組第三位老師：同一格要換三種指標讀數 → 三條互不干擾的鏈（各自 seq 從 1 起）
+THIRD_TEACHER = "学习链测试老师丁"
+
+
+@pytest.fixture
+def stage_gate(monkeypatch):
+    """⑩ 組公共前置（照 `test_agent_stage.py` 的同名前置）：打開階段總閘（`evaluate()` 的第一道門）
+    + Epic 1 病歷模板通道（① 的基準來源）。
+
+    **刻意不開學習總閘**：那正是本組要逐條切的開關（要 flag off 的用例各自 `delenv`）。
+    """
+    monkeypatch.setenv("AGENT_STAGE_ENABLED", "on")
+    monkeypatch.setenv("TEMPLATE_API_ENABLED", "on")
+
+
+def _learning_statements(statements):
+    """從語句清單裡挑出**學習鏈**的那些（判據見 `LEARNING_TABLE_NAME` 的註釋）。"""
+    return [sql for sql in statements if LEARNING_TABLE_NAME in sql]
+
+
+def _details(teacher_name=TEACHER):
+    """該老師鏈上全部事件的 `detail`（`_rows()` 已按 `seq` 升序）。
+
+    ⑨ 組的 `_detail_list()` 只服務 `TEACHER`；本組三位老師各看一次 → 這裡多一個 `teacher_name`。
+    """
+    return [json.loads(row["payload_json"])["detail"] for row in _rows(teacher_name)]
+
+
+def _patch_metric_readings(monkeypatch, match_samples, consistency_samples, consistency_min):
+    """把 ①② 兩個**純函數**的讀數換成指定值（**入參注入**，不是期望值自證）。
+
+    骨架取自服務層自己的 `_blank_template_match()`（10 鍵）/ `_blank_modification_consistency()`（6 鍵）
+    → 日後加鍵 / 改鍵名，本助手不必跟著改。`_evaluate()` 只吃這兩個返回值，注入不影響被測面。
+    """
+    import agent_stage_service
+
+    match = agent_stage_service._blank_template_match()
+    match.update({"value": 1.0, "samples": match_samples, "hit_rate": 1.0, "order_rate": 1.0})
+    consistency = agent_stage_service._blank_modification_consistency()
+    consistency.update({"value": consistency_min, "samples": consistency_samples,
+                        "min": consistency_min})
+    monkeypatch.setattr(agent_stage_service, "compute_template_match",
+                        lambda teacher_name, cfg: dict(match))
+    monkeypatch.setattr(agent_stage_service, "compute_modification_consistency",
+                        lambda teacher_name, cfg: dict(consistency))
+
+
+# `agent_stage_log` 的**內容列**：身份（`teacher_name`）/ 自增 `id` / 時刻（`created_at`）按定義不同
+# → 不比；其餘列（含兩個 JSON 串的**原樣字節**）才是「階段面沒被 flag 影響」的證據。
+STAGE_LOG_CONTENT_COLUMNS = ("event_type", "from_stage", "to_stage", "capability",
+                             "task_id", "metrics_json", "detail")
+
+
+def _stage_log_rows(teacher_name):
+    """該老師在 `agent_stage_log` 的全部行 → `[(內容列值, ...)]`（按寫入序；裸 sqlite3 讀，不碰 `sql_log`）。"""
+    conn = sqlite3.connect(database.DB_PATH)
+    try:
+        rows = conn.execute(
+            "SELECT %s FROM agent_stage_log WHERE teacher_name = ? ORDER BY id"
+            % ", ".join(STAGE_LOG_CONTENT_COLUMNS), (teacher_name,)).fetchall()
+    finally:
+        conn.close()
+    return [tuple(row) for row in rows]
+
+
+# ---- ① flag off：學習鏈零痕（狀態口徑：零行 + 階段面逐字節不變）----
+
+def test_evaluate_flag_off_adds_no_learning_rows(db, monkeypatch, capsys, stage_gate):
+    """① §6：`LEARNING_ENABLED` off → 評估照跑（階段面照寫）、學習鏈**零行**，階段面**逐字節不變**。
+
+    【按 CTO 修正重寫】原斷言比的是「兩趟的 SQL 條數差」，那條口徑的前提不成立：flag off 時學習路徑在
+    **寫入前的總閘那一格**就短路掉（總閘只由 `learning_service._record_event()` 判**一次**，見服務層
+    `:2121-2123`）—— 去數一條「根本沒走到」的路徑上可能多出來的語句，紅綠都不說明行為。
+    可驗收的事實只有兩件，本條逐件釘：
+
+      · 學習表**零行**（另用裸 SQL 複查一次，防 `learning_service` 這一層自己騙自己）；
+      · 階段面（`agent_stage_log` 的**內容列**）在 flag off / on 兩趟裡**逐字節相同** —— 兩位**同構**
+        老師（都無狀態行、無樣本池、無配置行）各跑一趟、只差學習總閘；flag on 那趟**另外**落兩節
+        學習事件（否則本條會因「兩趟都沒寫」而假綠）。
+
+    「逐字節」比的是庫裡的原樣字串（`metrics_json` / `detail` 直接比 JSON 串，不解析後再比）；只排除
+    三列 —— `id`（自增）/ `teacher_name`（身份）/ `created_at`（時刻），它們按定義不同。
+    """
+    import agent_stage_service
+
+    monkeypatch.delenv("LEARNING_ENABLED", raising=False)
+    off = agent_stage_service.evaluate(TEACHER)
+    off_log = _stage_log_rows(TEACHER)
+
+    assert (off["skipped"], off["reason"]) == (False, "blocked"), \
+        "flag off 也要真的走進評估實體（本條測的是「照常評估、但學習鏈不長痕」，不是 flag 的短路體）"
+    assert _rows() == [], "flag off：學習鏈零行、零 seq"
+    assert _raw_scalar("SELECT COUNT(*) FROM agent_learning_events") == 0, "裸 SQL 複查同一件事"
+    assert off_log, "階段面照寫（`evaluation` 審計那一行必須在）—— 否則下面的比對是空斷言"
+
+    monkeypatch.setenv("LEARNING_ENABLED", "on")
+    on = agent_stage_service.evaluate(OTHER_TEACHER)
+    on_log = _stage_log_rows(OTHER_TEACHER)
+
+    assert on["skipped"] is False
+    assert [row["event_type"] for row in _rows(OTHER_TEACHER)] == \
+        ["learning_event_emitted", "agent_updated"], \
+        "對照組必須真的落鏈（否則「兩趟階段面一樣」可能只是兩趟都沒寫）"
+    assert on_log == off_log, \
+        ("flag 只決定「要不要寫學習表」：階段面（`agent_stage_log` 內容列）逐字節不變；"
+         "flag on 那趟 = %r" % (on_log,))
+    assert "學習事件轉發失敗" not in capsys.readouterr().out, \
+        "兩趟都不許出現學習側告警（flag off 的旁路尤其必須完全靜默）"
+
+
+# ---- ② flag on：恰好 +2 節，且第一節只報「真讀到什麼」----
+
+def test_evaluate_flag_on_appends_exactly_two_nodes_and_reports_what_it_read(db, monkeypatch,
+                                                                            sql_log, stage_gate):
+    """② §3.1 / §3.2：一次評估落**恰好兩節**，且第一節只報「本週期真讀到什麼」（三鍵口徑 G / H / I）。
+
+    三趟換三種指標讀數（趟一 = 真實空樣本池；趟二 / 趟三 = 注入讀數），逐格釘 payload：
+    空池不虛報、有樣本就兩類都報、`sample_count` = 兩池相加、② 最差一份逐字相同就不報段級差異。
+    """
+    import agent_stage_service
+
+    monkeypatch.setenv("LEARNING_ENABLED", "on")
+    mark = len(_statements(sql_log))
+
+    assert agent_stage_service.evaluate(TEACHER)["skipped"] is False
+
+    rows = _rows()
+    assert len(rows) == 2, "一次評估恰好 +2 節（不是 1 節、也不是「每類指標各一節」）"
+    assert [row["event_type"] for row in rows] == ["learning_event_emitted", "agent_updated"]
+    assert [row["seq"] for row in rows] == [1, 2]
+    writes = [sql for sql in _learning_statements(_statements(sql_log)[mark:])
+              if sql.lstrip().upper().startswith("INSERT")]
+    assert len(writes) == 2, "學習表恰好 2 條 INSERT（其餘學習語句是 `seq` / 鏈尾的只讀讀數）"
+    assert _details()[0] == {"source_event_types": [], "difference_kinds": [], "sample_count": 0}, \
+        "空樣本池：沒讀到就不虛報（`[]` / `[]` / 0，而不是編一個 `draft_generated`）"
+
+    # 趟二：①② 各 3 / 2 份樣本、② 最差一份 0.5 → 兩類源事件都報 + 段級差異
+    _patch_metric_readings(monkeypatch, 3, 2, 0.5)
+    assert agent_stage_service.evaluate(OTHER_TEACHER)["skipped"] is False
+    assert _details(OTHER_TEACHER)[0] == {
+        "source_event_types": ["draft_generated", "draft_modified"],
+        "difference_kinds": ["field_diff"], "sample_count": 5}, "`sample_count` = 兩池相加"
+
+    # 趟三：同樣兩份樣本，但 ② 的 `min == 1.0`（逐字相同）→ 段級差異為空（§一-1：不塞空節）
+    _patch_metric_readings(monkeypatch, 3, 2, 1.0)
+    assert agent_stage_service.evaluate(THIRD_TEACHER)["skipped"] is False
+    assert _details(THIRD_TEACHER)[0] == {
+        "source_event_types": ["draft_generated", "draft_modified"],
+        "difference_kinds": [], "sample_count": 5}
+
+
+# ---- ③ 兩節 seq 連續、接在既有鏈尾 ----
+
+def test_evaluate_two_new_nodes_continue_the_existing_chain(db, monkeypatch, stage_gate):
+    """③ §2.4 / §2.5：新兩節接在**既有鏈尾**上 —— 先手工種下**恰好一條** `seq = 1` 的既有節，評估後
+    新兩節必須是 `seq = 2` / `3`，且指紋逐節接得上（`verify_learning_chain()` 單遍覆核整條三節鏈）。
+
+    【按 CTO 修正重寫】前置態由本條**現造**（`_insert(0)` → 落那一條 `seq = 1`）並斷言「鏈上恰好這一條」
+    之後才評估 —— 不假設庫裡本來就有節；`seq` 用**字面量** `2` / `3` 釘死（不是 `N + 1` 這種相對式）。
+    另修一處本條自身的口徑錯誤：`prev_hash` 的前驅輸入是**前一節的 `prev_hash` 列**（累積指紋），
+    不是前一節的 `payload_hash`（見 `compute_link_hash()` 的「列名留痕」與 `verify_learning_chain()`）。
+    """
+    import agent_stage_service
+
+    monkeypatch.setenv("LEARNING_ENABLED", "on")
+
+    _insert(0)                                   # 凍結樣本第 0 條：`template_configured`，seq = 1
+    seeds = _rows()
+    assert [(row["seq"], row["event_type"]) for row in seeds] == [(1, "template_configured")], \
+        "前置態恰好這一條（seq 從 1 起、隻身一節）"
+    head = seeds[0]
+
+    assert agent_stage_service.evaluate(TEACHER)["skipped"] is False
+
+    rows = _rows()
+    assert [row["seq"] for row in rows] == [1, 2, 3], \
+        "既有 1 → 新兩節接著 2、3（按老師單鏈、步長 1）"
+    assert [row["event_type"] for row in rows] == [
+        "template_configured", "learning_event_emitted", "agent_updated"]
+    first_new, second_new = rows[1], rows[2]
+    assert (first_new["seq"], second_new["seq"]) == (2, 3)
+    assert first_new["prev_hash"] == learning_service.compute_link_hash(
+        first_new["seq"], first_new["event_type"], first_new["payload_hash"], head["prev_hash"]), \
+        "接在既有鏈尾（不是每趟重起一條鏈）"
+    assert second_new["prev_hash"] == learning_service.compute_link_hash(
+        second_new["seq"], second_new["event_type"], second_new["payload_hash"],
+        first_new["prev_hash"]), "兩節之間也接得上"
+    assert learning_service.verify_learning_chain(TEACHER) == {
+        "ok": True, "checked": 3, "first_bad_seq": None, "reason": "ok"}
+
+
+# ---- ④ agent_updated 的階段一對：from == to == 階段真值視圖 ----
+
+def test_evaluate_agent_updated_stage_pair_equals_the_stage_view(db, monkeypatch, stage_gate):
+    """④ §一-4 / 約束 3：`_evaluate()` **不改階段** → `from_stage == to_stage`，且與階段真值同源。
+
+    三路同源（鏈上 `detail` / 返回體 `stage` / 評估後**獨立再讀一次** `describe_stage()`）：任一路
+    自己拼階段名（寫死 `"learning"`、把 `pending_stage` 當 `to_stage`、把升階前後當 from / to）這條
+    立刻紅。
+    """
+    import agent_stage_service
+
+    monkeypatch.setenv("LEARNING_ENABLED", "on")
+
+    result = agent_stage_service.evaluate(TEACHER)
+
+    detail = _details()[1]
+    assert result["stage"] == agent_stage_service.describe_stage(TEACHER)["stage"] != ""
+    assert result["stage"] == agent_stage_service.DEFAULT_STAGE_CONFIG["default_stage"], \
+        "無狀態行的老師：兜底階段（`_ensure_state_row()` 落的零 delta 那一格）"
+    assert detail["from_stage"] == result["stage"], "取值與快照的 `stage` 同源（不是自拼的常量）"
+    assert detail["to_stage"] == result["stage"], "本步不改階段 → 恆 `from == to`"
+    assert detail["capability"] == "", "3.3 只寫「指標 / 階段視圖落實」，不報能力名（§一-4）"
+    assert detail["to_stage"] != result["pending_stage"], \
+        "`to_stage` 不是「將要升入的階段」（那是 `pending_stage`，屬 3.4-c 的確認路徑）"
+    assert result["changed"] == {"stage_changed": False, "recommended": False, "demoted": False,
+                                 "reason": "blocked"}
+
+
+# ---- ⑤ metrics_hash：可從狀態行獨立重算 ----
+
+def test_evaluate_agent_updated_metrics_hash_is_independently_recomputable(db, monkeypatch,
+                                                                         stage_gate):
+    """⑤ §3.2 / §一-4：`metrics_hash` = **本次評估快照**的 canonical sha256 —— 可獨立重算。
+
+    三件事：
+      · 重算：`compute_payload_hash(json.loads(last_metrics_json))` == 鏈上那一格；
+      · 再獨立一層：`sha256(canonical 串)`（不經 `compute_payload_hash()` 的實現）逐字相同；
+      · 快照本體**不進鏈**（§3.2 明文）：鏈上只有那 4 個鍵，`metrics` / `thresholds` / `blockers`
+        這些大對象與文本一概不上鏈；另附一條口徑差 —— 落庫字串（`json.dumps` 默認分隔符）**不是**
+        canonical 串，哈希吃的是 canonical 那一份（`database._agent_stage_column_value` 那側不變）。
+    """
+    import agent_stage_service
+
+    monkeypatch.setenv("LEARNING_ENABLED", "on")
+
+    assert agent_stage_service.evaluate(TEACHER)["skipped"] is False
+
+    raw_json = _raw_scalar(
+        "SELECT last_metrics_json FROM agent_stage_state WHERE teacher_name = ?", (TEACHER,))
+    snapshot = json.loads(raw_json)
+    detail = _details()[1]
+
+    assert sorted(detail) == ["capability", "from_stage", "metrics_hash", "to_stage"], \
+        "`agent_updated` 的 detail 恰好 4 鍵（§3.2；快照本體不得複製進鏈）"
+    assert detail["metrics_hash"] == learning_service.compute_payload_hash(snapshot)
+    canonical = learning_service.canonical_json(snapshot)
+    assert detail["metrics_hash"] == hashlib.sha256(canonical.encode("utf-8")).hexdigest(), \
+        "獨立重述一層：canonical 串 → sha256（不經被測實現）"
+    assert len(detail["metrics_hash"]) == 64
+    assert raw_json != canonical, \
+        "落庫字串（默認分隔符）≠ canonical 串：哈希吃的是後者（口徑差寫在這裡）"
+
+
+# ---- ⑥ 返回體契約：18 鍵 + changed（確認未被 3.3-e 弄破）----
+
+def test_evaluate_return_body_keeps_eighteen_plus_changed_keys(db, monkeypatch, stage_gate):
+    """⑥ 返回體仍是 **18 鍵快照 + `changed`**，且 flag off / on 兩趟的**業務值**逐鍵相同（事件是旁路）。
+
+    既有斷言在 `test_agent_stage.py`（`_EVALUATE_SNAPSHOT_KEYS` 逐鍵字面量、「快照 = 返回體去
+    `changed`」、「接口層直出 18 鍵 + changed」）—— 本條不重複那三條，只確認 3.3-e **沒把它弄破**：
+    鍵集逐字（本檔自帶同一份凍結表）+ `changed` 四鍵 + **業務值**逐鍵相同。
+
+    【按 CTO 修正重寫】比對集 = 18 鍵去掉**身份**（`teacher_name`）與**時刻**（`stage_since` /
+    `evaluated_at`）→ 兩趟必然不同的三格一律不比（同一格連跑兩趟時，`stage_since` 也會由 `""` 變成
+    首趟寫下的真時刻）。CTO 點名的欄位逐一落點：`stage` / `metrics` / `blockers` / `next_stage` /
+    `degraded` / `config_source` / `thresholds` 全在比對集內（下方 `named` 斷言逐名核對）；
+    `capabilities` / `stale` 兩名**不在本返回體的 18 鍵契約內** —— 本契約用單值 `stage` 表達階段、
+    用 `stage_since` + `metrics_ttl_hours` 表達證據新舊（欄名以 `_EVALUATE_SNAPSHOT_KEYS` 為唯一真相源，
+    不為比對另造別名）。
+
+    本條用兩位**同構**老師（都無狀態行 / 無樣本池 / 無配置行）承接兩趟：兩趟的業務值（含階段真值視圖）
+    因此都能直接逐鍵比，不靠任何 mock。
+    """
+    import agent_stage_service
+
+    monkeypatch.delenv("LEARNING_ENABLED", raising=False)
+    off = agent_stage_service.evaluate(TEACHER)
+
+    monkeypatch.setenv("LEARNING_ENABLED", "on")
+    on = agent_stage_service.evaluate(OTHER_TEACHER)
+
+    assert len(EVALUATE_SNAPSHOT_KEYS) == 18
+    assert sorted(off) == sorted(on) == sorted(EVALUATE_SNAPSHOT_KEYS + ("changed",))
+    assert sorted(off["changed"]) == sorted(on["changed"]) == sorted(CHANGED_KEYS)
+    assert off["changed"] == {"stage_changed": False, "recommended": False, "demoted": False,
+                              "reason": "blocked"}
+
+    named = ("stage", "metrics", "blockers", "next_stage", "degraded", "config_source",
+             "thresholds")
+    assert set(named) <= set(STABLE_BODY_KEYS), "CTO 點名的欄位必須都在比對集內"
+    assert len(STABLE_BODY_KEYS) == 15, "18 鍵 - 身份 1 - 時刻 2 = 15"
+    assert (off["teacher_name"], on["teacher_name"]) == (TEACHER, OTHER_TEACHER), \
+        "身份兩趟本該不同（因此不入比對集）"
+    assert [row["event_type"] for row in _rows(OTHER_TEACHER)] == \
+        ["learning_event_emitted", "agent_updated"], "flag 真的翻過去了（否則本條是空比對）"
+    assert {key: off[key] for key in STABLE_BODY_KEYS} == \
+        {key: on[key] for key in STABLE_BODY_KEYS}, \
+        "flag 不參與返回體組裝：寫鏈與否不改評估結果（學習事件是旁路）"
 

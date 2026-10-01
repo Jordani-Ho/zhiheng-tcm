@@ -1547,10 +1547,15 @@ _NON_CONTENT_CHARS = " \t\u3000\r\n（）()[]［］【】<>《》←→-—*·:�
 #   口径 F「冷却期读不懂时刻 → 不阻断」：库层给不出可解析的 `last_at` → 只告警、不阻断
 #     （「读不懂脏时间」≠「确实在冷却中」；且推荐仍需老师确认，不构成放权方向的风险）。
 #
-# 本段写点清单（**四类，无第五类**）：`_ensure_state_row()`（仅无行时补 `stage` 一次，零 delta）、
+# 本段写点清单（**四类，无第五类** —— 均指**阶段面**（`agent_stage_*`）那张表的写点）：
+# `_ensure_state_row()`（仅无行时补 `stage` 一次，零 delta）、
 # 指标快照（`last_evaluated_at` / `last_metrics_json`）、推荐时的 `pending_stage` 一对、
 # 两类日志（`evaluation` 每次 + 推荐时的 `upgrade_recommended` 与 `agent_action_log`）。
 # **不动 `stage`**（口径见约束 3）。降级（`rule_demote` / `rule_reset`）与三个钩子属 3.4-c。
+# 【3.3-e 同步】`_evaluate()` 之后另加**两类学习事件写点**（`learning_event_emitted` /
+# `agent_updated`；写的是**学习链**的表，不是阶段面那五张）：它们**不属于**上面四类、也**不**
+# 改变上面的计数与「无第五类」口径 —— 学习链是**旁路**（A6：两张表、两条流），
+# 落点 / 顺序 / 口径见本文件文末「施工步骤 3.3-e」段头。
 # ============================================================================
 
 # 评估相关的审计事件名（§1.3 契约名 10 类里的 3 类；`permission_denied` 复用 3.3 段已落的常量）
@@ -2043,7 +2048,10 @@ def _evaluate(teacher_name):
       ② 十条全真 → `_recommend_upgrade()`（内部**先写 pending 对、后建单**）；
       ③ 指标快照 `last_evaluated_at` / `last_metrics_json`：判定与推荐**都跑完之后只落一次**
          → 落库的就是最终那一份（含推荐后的 `pending_stage`，不会出现「两种口径的快照」）；
-      ④ `evaluation` 审计一行（`metrics_json` = 指标快照、`task_id` = 本次请示 id、`detail` = 结论人话）。
+      ④ `evaluation` 审计一行（`metrics_json` = 指标快照、`task_id` = 本次请示 id、`detail` = 结论人话）；
+      ⑤ 【3.3-e】两类学习事件（先 `learning_event_emitted`、后 `agent_updated`）：写的是**学习链**
+         的表（A6：两张表、两条流），**旁路** —— 不入返回体、失败只告警（口径 G/H/I 见文末
+         「施工步骤 3.3-e」段头；落点见本函数内那段【施工步骤 3.3-e】注释）。
 
     快照 = 返回体去掉 `changed`（口径 D）：`changed` 是「本次调用做了什么」，属调用结果而非快照。
     """
@@ -2106,6 +2114,37 @@ def _evaluate(teacher_name):
                                       last_metrics_json=snapshot)
     _stage_event(_LOG_EVENT_EVALUATION, teacher_name, view.get("stage"),
                  _evaluation_detail(snapshot), metrics=metrics, task_id=task_id)
+
+    # 【施工步骤 3.3-e】学习事件两条（**旁路**：不参与 `result` 组装、失败不回退本次评估）。
+    #   · 顺序 = `learning_event_emitted` → `agent_updated`（设计 §3.1 闭环的逻辑先后：先「本次
+    #     学习发生了什么」、后「智能体因此变成了什么」）；
+    #   · 闸门**不在这里判**：阶段闸由 `evaluate()` 首行判（本函数是 flag on 的内层），学习总闸 /
+    #     存储就绪由 `learning_service._record_event()` 各自判**一次** —— 这里多判一次等于给
+    #     「为什么没写事件」长出第二个归因面（3.3-b 段头同一纪律）；
+    #   · 三个入参的口径（G / H / I）逐条写在文末「施工步骤 3.3-e」段头，本处只读**已算好的**
+    #     两份指标（`template_match` / `consistency`）→ 零新 SQL、零新窗口定义。
+    import learning_service                       # 【3.3-e 白名单】函数内延迟 import
+    try:
+        match_samples = _metric_int(template_match.get("samples"), 0)
+        consistency_samples = _metric_int(consistency.get("samples"), 0)
+        learning_service.record_learning_event_emitted(
+            teacher_name,
+            source_event_types=tuple(
+                name for name, counted in (("draft_generated", match_samples),
+                                           ("draft_modified", consistency_samples))
+                if counted > 0),
+            difference_kinds=("field_diff",) if (
+                consistency_samples > 0
+                and _metric_float(consistency.get("min"), 1.0) < 1.0) else (),
+            sample_count=match_samples + consistency_samples)
+        learning_service.record_agent_updated(
+            teacher_name,
+            from_stage=view.get("stage"),         # 约束 3：`_evaluate` 不改 stage → 恒 from == to；
+            to_stage=view.get("stage"),           # 取值与快照的 `stage` 同源（`view` 的同一个键）
+            capability="",                        # 3.3 只写「指标 / 阶段视图落实」，不报能力名（§一-4）
+            metrics_hash=learning_service.compute_payload_hash(snapshot))
+    except Exception as exc:                      # best-effort：学习事件失败绝不回退评估结果
+        _config_warn("學習事件轉發失敗（_evaluate / %s）：評估結果不受影響" % (exc,))
 
     result = dict(snapshot)
     result["changed"] = {
@@ -3990,6 +4029,52 @@ def on_draft_modified(teacher_name, draft_id=0, patient_name="", normalized_befo
         _config_warn("學習事件轉發失敗（on_draft_modified / %s）：業務結果不受影響" % (exc,))
     return None
 
+
+# ============================================================================
+# 【施工步骤 3.3-e】学习事件收口：`_evaluate()` 追加 `learning_event_emitted` / `agent_updated`
+# ----------------------------------------------------------------------------
+# CTO 2026-09-30 step 3.3-e 施工令（本步的唯一依据）：
+#   · **落点** = `_evaluate()` 内、`upsert_agent_stage_state()`（指标快照）与 `evaluation` 审计都
+#     写完之后、`result = dict(snapshot)` **之前**（段内注释即口径；本步只动那一处 + 注释）；
+#   · **顺序** = 先 `record_learning_event_emitted()` 再 `record_agent_updated()`（设计 §3.1 的闭环
+#     逻辑先后：先「本次学习发生了什么」、后「智能体因此变成了什么」）；
+#   · **本处不判 flag**：阶段闸由 `evaluate()` 首行判（`_evaluate()` 是 flag on 的内层）；学习总闸 /
+#     存储就绪由 `learning_service._record_event()` 各判**一次** —— 接线段多判一次 = 给「为什么没写
+#     事件」长出第二个归因面（与 3.3-b 适配器同一条纪律）；
+#   · **旁路**：两条事件不参与 `result` 组装（返回体 18 键 + `changed` **一字不变**）、异常本地吞掉
+#     + 一行繁体 `_config_warn`（学习事件写失败绝不回退评估结果 —— 与 3.3-b/c/d 的 best-effort 同款）；
+#   · **零改动**：`database.py` / `template_api.py` / `learning_service.py` 的生产逻辑一字未动；
+#     `_evaluate()` 的判定 / 快照 / 审计 / 组装顺序一字未动；3.3-a…3.3-d 已验收代码一字未动。
+#
+# 三项口径定稿（本步自钉；`_evaluate()` 段内注释同步写死）：
+#   口径 G「本周期」= 本次评估**读样本的窗口**（`cfg` 的 `window_days` / `max_samples`，与 ①② 同源）
+#     —— 不另读库、不另立第二个「周期」定义（「同一个判断只许有一份实现」）；
+#   口径 H「`source_event_types` / `difference_kinds` 只报**本周期真读到**的」：
+#     · `draft_generated` ⟸ ① 池有入选样本（AI 原始快照）；`draft_modified` ⟸ ② 池有入选配对样本
+#       （AI 快照 ↔ 已签署正文的前后对照）；两池皆空 → `()`（本期没读到任何源事件）；
+#     · `difference_kinds` 只声称 `field_diff`（A8 第一类），且仅在「② 池有样本 **且** 最差一份样本
+#       的相似度 < 1.0」时 —— 归一化文本只要不同，段级哈希必至少差一段（该蕴含成立，故**不**虚报）；
+#       第二类 `wording_changed`（标题集合相同、仅内容变化）**需段级明细**，本步不读链、不重算段级
+#       diff → **不声称**（宁少报，不虚报；升级留给 3.4 / 见证入口）；
+#   口径 I「`sample_count` = ① + ② 两次读样的入选样本**合计**」：答的是「本次结算读了多少条样本
+#     读数」（同一份草案可能两池各计一次），**不是**「涉及几份草案」。
+#
+# `metrics_hash` = `learning_service.compute_payload_hash(snapshot)` —— 即设计 §2.3 的
+# `sha256_hex(canonical_json(payload))`（**复用唯一哈希出口**，不另写一份组合）。
+# 口径差（明写不藏）：链上存的是**快照对象**的 canonical 哈希；`agent_stage_state.last_metrics_json`
+# 存的是 `json.dumps(..., ensure_ascii=False)` 的**另一串字节**（`database._agent_stage_column_value()`）
+# → `metrics_hash` **不**等于「落库字串的 sha256」，两者用途不同（链上 = 指纹，行上 = 回读展示）。
+# 快照本体仍只留 `last_metrics_json` 一处，**不**复制进链（设计 §3.2）。
+#
+# 白名单（`test_learning.py` 的 `ALLOWED_WIRING`）：本步把 `_evaluate` 追加进
+# `agent_stage_service.py` 的放行名单，并**同步撤掉** 3.2 的「`_evaluate` 函数体级零引用」那一条
+# （依据 = 该文件原注「`_evaluate`（3.3-e）的放行由该子步追加」）；「转发点唯一守护 +
+# `ALLOWED_WIRING` 最终形」仍留 **3.3-f** 收口。
+#
+# 回退（纯回退，无数据面）：① `LEARNING_ENABLED=off`（首选，事件停写、评估逐字节不变）→
+# ② 删本段 + `_evaluate()` 内那一段（含 `import learning_service`）→ ③ 复原
+# `test_learning.py` 的 `guarded` / `ALLOWED_WIRING` 两处（见该文件【变更披露 · 3.3-e】）。
+# ============================================================================
 
 
 
