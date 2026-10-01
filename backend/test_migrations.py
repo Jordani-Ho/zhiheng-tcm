@@ -1098,3 +1098,161 @@ def test_migration_0004_adds_patient_record_template_refs(tmp_path):
         _names(_read(str(db), "PRAGMA table_info('patient_records')"))
     )
 
+
+# ===========================================================================
+# 【Epic 2 step-7 补测 · CTO 裁决 A】迁移 0003 守护测试：幂等重跑 + downgrade 审计安全闸
+# 对齐：docs/epic2-agent-stage-design-v1.md §6.6 第 39 条（计划名 `test_migration_0003_idempotent`）
+#       / 第 40 条（计划名 `test_migration_0003_downgrade_safety`）
+#       / §1.4（DDL 唯一真相源 = 迁移 · 可重跑 · downgrade 带安全闸 + 两个快照列不删）
+#       / §7.1-①（两个快照列）②（存量老师种子 = learning，脚本名 SEED_STAGE）。
+# 纪律：tmp_path 自建独立 SQLite 文件，**绝不碰** backend/zhiheng.db 与 backend/test.db；
+#       回退只到 **0002（本 revision 的上游）** → 隔离 0003 自身，不牵动 0004 / 0005 各自的回退闸
+#       （与 0004 用例「只回退到 0003」、0005 用例「只回退到 PREVIOUS_REVISION」同一口径）。
+# ===========================================================================
+
+STAGE_TABLES = ("agent_stage_state", "agent_stage_log", "agent_stage_config")
+STAGE_INDEXES = ("idx_agent_stage_state_scope", "idx_agent_stage_log_teacher_time")
+STAGE_SNAPSHOT_COLUMNS = (("drafts", "ai_original_content"), ("patient_records", "ai_original_text"))
+
+
+def _stage_snapshot(db_path):
+    """0003 的「不变面」一次性取样：三表是否在 / 行数、两索引是否在、两快照列各出现几次。
+
+    刻意**不含**时间列（`stage_since` / `updated_at` / `created_at` 每次种子按当时时刻落，属预期变化，
+    与 0005 段的 `_survivors()` 同一取舍），也刻意不含 `alembic_version`（版本号各处单独断言）；
+    表不存在时行数取 `None`（`_count()` 依赖 `_one()`，表缺失会断言失败，故先探表再计数）。
+    """
+    tables = _tables(db_path)
+    indexes = _indexes(db_path)
+    return {
+        "tables": {table: table in tables for table in STAGE_TABLES},
+        "counts": {table: (_count(db_path, table) if table in tables else None) for table in STAGE_TABLES},
+        "indexes": {name: name in indexes for name in STAGE_INDEXES},
+        "columns": {table: _columns_of(db_path, table).count(column)
+                    for table, column in STAGE_SNAPSHOT_COLUMNS},
+    }
+
+
+def _stage_seed_db(tmp_path, monkeypatch, name):
+    """造一份「`init_db()` 起库 + 2 位老师」的最小库，并升级到 **0003**（不继续升到 0004 / 0005）。
+
+    用 `init_db()` 而非手抄 DDL：`teachers` / `drafts` / `patient_records` 三张宿主表与真机同形，
+    零 DDL 复制（避免夹具漂移）；`INSERT OR IGNORE` + 主键去重 → 老师数恒 2（种子 ① 才有区分度，
+    1 位老师时「种子重复」与「种子 1 行」无法区分）。
+    """
+    import database
+
+    db_file = tmp_path / name
+    monkeypatch.setattr(database, "DB_PATH", str(db_file))
+    database.init_db()
+
+    conn = sqlite3.connect(str(db_file))
+    try:
+        for teacher in ("李老师", "王老师"):
+            conn.execute(
+                "INSERT OR IGNORE INTO teachers (name, description, status, last_active_at, created_at) "
+                "VALUES (?, '', 'active', '2026-09-01T00:00:00', '2026-09-01T00:00:00')",
+                (teacher,),
+            )
+        conn.commit()
+        teachers = conn.execute("SELECT COUNT(*) FROM teachers").fetchone()[0]
+    finally:
+        conn.close()
+    # 夹具硬前置（与 `_seed_baseline_db` 的「基线失真」同款）：init_db() 的默认种子一旦漂移就当场失败
+    assert teachers == 2, "夹具失真：teachers 应恰好 2 位（init_db 默认 1 位 + 本用例 1 位），实测 %d 位" % teachers
+
+    db = str(db_file)
+    assert migrations_runner.run_upgrade("0003_add_agent_stage", db_file=db) is True
+    assert _one(db, "SELECT version_num FROM alembic_version")["version_num"] == "0003_add_agent_stage"
+    return db
+
+
+def test_0003_upgrade_is_idempotent(tmp_path, monkeypatch):
+    """§6.6 第 39 条 / §1.4「可重跑」：建表 / 补列 / 种子全幂等 —— 重跑后三表行数与种子都不翻倍。
+
+    三段：① 已在 0003 再 upgrade = no-op；② **真正重跑本 revision**（回上游 0002 → 再 upgrade）；
+    ③ 重跑后与首跑逐项一致（种子不重复），且两个快照列**恰好一列**（不重复 ADD COLUMN）。
+    """
+    db = _stage_seed_db(tmp_path, monkeypatch, "m14.db")
+    first = _stage_snapshot(db)
+
+    # 首跑就位：三表 + 两索引 + 两快照列；种子 ① 每位老师一行（stage='learning' / source='default'）；
+    # 种子 ② 全局配置行（teacher_name=''）恰好 1 行且 config_json='{}'（§7.1-② / §3.5）
+    assert first["tables"] == {table: True for table in STAGE_TABLES}
+    assert first["indexes"] == {name: True for name in STAGE_INDEXES}
+    assert first["columns"] == {"drafts": 1, "patient_records": 1}
+    assert first["counts"] == {"agent_stage_state": 2, "agent_stage_log": 0, "agent_stage_config": 1}
+    assert {row["stage"] for row in _read(db, "SELECT stage FROM agent_stage_state")} == {"learning"}
+    assert {row["stage_source"] for row in _read(db, "SELECT stage_source FROM agent_stage_state")} == {"default"}
+    global_row = _one(db, "SELECT teacher_name, config_json FROM agent_stage_config")
+    assert global_row["teacher_name"] == "" and global_row["config_json"] == "{}"
+
+    # ① 已在 0003 再 upgrade 一次 = no-op（不重复建表 / 不重复补列 / 不重复种子；返回 True 即无异常）
+    assert migrations_runner.run_upgrade("0003_add_agent_stage", db_file=db) is True
+    assert _stage_snapshot(db) == first
+
+    # ② 真正重跑本 revision：回上游 0002 → 三表与两索引消失，两个快照列按 §1.4 **保留**（列里有历史快照）
+    migrations_runner.run_downgrade("0002_add_draft_template_refs", db_file=db)
+    rolled_back = _stage_snapshot(db)
+    assert rolled_back["tables"] == {table: False for table in STAGE_TABLES}
+    assert rolled_back["counts"] == {table: None for table in STAGE_TABLES}
+    assert rolled_back["indexes"] == {name: False for name in STAGE_INDEXES}
+    assert rolled_back["columns"] == {"drafts": 1, "patient_records": 1}
+
+    assert migrations_runner.run_upgrade("0003_add_agent_stage", db_file=db) is True
+    # ③ 与首跑逐项一致 —— 种子不重复（状态行 = 老师数 2，而不是 4）、全局行仍 1 行、两列仍各 1 列
+    assert _stage_snapshot(db) == first
+    assert _one(db, "SELECT version_num FROM alembic_version")["version_num"] == "0003_add_agent_stage"
+
+
+def test_0003_downgrade_aborts_with_audit_events(tmp_path, monkeypatch):
+    """§6.6 第 40 条 / §1.4 安全闸：`agent_stage_log` 有审计事件时拒绝降级（不静默吃掉治理留痕）。
+
+    三段：① 无日志时放行见 `test_0003_upgrade_is_idempotent` 的 ②/③ 段（本用例不重复）；
+    ② 插 1 行审计事件 → **中止 + 提示导出**，且零副作用（三表 / 两索引 / 两快照列 / 审计行一字未动，
+    版本号仍停在 0003）；③ 清空审计表后放行 → 证明闸门是唯一阻塞点，两快照列在 downgrade 后仍在。
+    """
+    db = _stage_seed_db(tmp_path, monkeypatch, "m15.db")
+
+    conn = sqlite3.connect(db)
+    try:
+        conn.execute(
+            "INSERT INTO agent_stage_log (teacher_name, event_type, from_stage, to_stage, capability, "
+            "task_id, metrics_json, detail, created_at) "
+            "VALUES ('李老师', 'upgrade_confirmed', 'learning', 'apprentice', 'draft_generation', "
+            "7, '{}', '审计留痕', '2026-09-29T10:00:00')"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    blocked = _stage_snapshot(db)
+    assert blocked["counts"]["agent_stage_log"] == 1
+
+    with pytest.raises(Exception) as excinfo:
+        migrations_runner.run_downgrade("0002_add_draft_template_refs", db_file=db)
+    assert "downgrade 已中止" in str(excinfo.value)
+    assert "导出" in str(excinfo.value)  # 闸门必须给出「先导出留档」的处置提示，不是干瘪报错
+
+    # ② 中止 = 零副作用：三表 / 两索引 / 两快照列 / 审计行原样，版本号仍停在 0003
+    assert _stage_snapshot(db) == blocked
+    audit_row = _one(db, "SELECT * FROM agent_stage_log")
+    assert audit_row["event_type"] == "upgrade_confirmed" and audit_row["detail"] == "审计留痕"
+    assert _one(db, "SELECT version_num FROM alembic_version")["version_num"] == "0003_add_agent_stage"
+
+    # ③ 清空审计表 → 闸门放行（证明闸门是唯一阻塞点）；两快照列按 §1.4 保留
+    conn = sqlite3.connect(db)
+    try:
+        conn.execute("DELETE FROM agent_stage_log")
+        conn.commit()
+    finally:
+        conn.close()
+
+    migrations_runner.run_downgrade("0002_add_draft_template_refs", db_file=db)
+    passed = _stage_snapshot(db)
+    assert passed["tables"] == {table: False for table in STAGE_TABLES}
+    assert passed["indexes"] == {name: False for name in STAGE_INDEXES}
+    assert passed["columns"] == {"drafts": 1, "patient_records": 1}
+    assert _one(db, "SELECT version_num FROM alembic_version")["version_num"] == (
+        "0002_add_draft_template_refs"
+    )
