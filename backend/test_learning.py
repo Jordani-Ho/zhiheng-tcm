@@ -20,7 +20,12 @@ CTO 2026-09-30 step 3.2 指令要求的十類核心用例，本文件逐條落�
   ⑧ 零審計 → `test_ten_writes_keep_audit_tables_untouched`
   ⑨ flag off → `test_flag_off_values_and_zero_sql` / `test_flag_on_values`
   ⑩ 源碼級守護 → `test_source_guard_zero_sql_zero_audit_zero_capability`
-另加本步自身要找死的兩條結構守護：**零接線**（`test_no_wiring_in_step_3_2`）與
+另加本步自身要找死的兩條結構守護：**接線白名單 + 庫層函數體標記**（3.3-f 拆成四條：
+`test_learning_service_references_stay_on_the_wiring_whitelist` /
+`test_database_landing_points_stay_free_of_learning_identifiers` /
+`test_learning_table_name_never_leaks_outside_the_data_layer` /
+`test_database_bridges_to_the_service_layer_only_through_one_forwarder`；
+原名 `test_no_wiring_in_step_3_2` 表達的是 3.2 的「零接線」口徑 —— 3.3-b 起接線是設計的一部分）與
 **遷移 0006 雙向口徑對齊**（`test_constants_align_with_migration_0006`）。
 
 運行方式（Windows，串行；見 pytest.ini）：
@@ -821,45 +826,52 @@ def test_source_guard_zero_sql_zero_audit_zero_capability():
     assert "database" not in top_level, "database 必須在函數內延遲 import"
 
 
-# 【3.3-b 白名單收窄 · 3.3-d 追加接口層 · 3.3-e 追加 `_evaluate`】`learning_service` 的**引用白名單**：`{"檔名": ("函數名", ...)}`。
-#   為什麼要收窄：3.2 的「任何生產模組零 import」在當時是正確口徑（那時零接線）；3.3-b 起
-#   `agent_stage_service.py` 新增兩個適配器，**函數內**延遲 import 學習服務層是設計的一部分
-#   （白名單唯一處）。守護因此從「零 import」升級成「只許這兩處」——
-#   頂層 import（任何模組）/ 白名單外的模組 / 同模組的其他函數體，三條照舊紅。
-#   【3.3-d 追加】接口層 `template_api.py` 的三個狀態端點（`publish` / `archive` / `activate`）各在
-#   **函數體內**延遲 import 並調一次 `record_template_configured()`（與同檔 `_check_lineage()` 的
-#   `import lineage_service` 同款寫法）→ 白名單追加的就是**這三個函數名**，而不是 `None`（模組頂層）：
-#   頂層 import 照舊紅，這一格因此沒有放寬 3.2 的口徑。
-#   庫層落點（3.3-c）走既有轉發器、對 `learning_service` 零引用，故 `database.py` 至今不在白名單內。
-#   【3.3-e 追加】`_evaluate`（`learning_event_emitted` / `agent_updated` 兩條事件）函數內延遲 import
-#   —— 本步即該子步的放行（原注「`_evaluate`（3.3-e）的放行由該子步追加」逐字兌現）；
-#   其餘「最終形」（轉發點唯一守護）仍在 3.3-f 收口。
+# 【3.3-f 收口：不變量 + 白名單】`learning_service` 的**引用白名單**：`{"檔名": ("函數名", ...)}`。
+#   **不變量**：`learning_service` 只許在白名單列的「檔名 × 函數體」內被**延遲 import** ——
+#   頂層 import（任何模組）/ 白名單外的模組 / 同模組的其他函數體，三條一律紅。
+#   沿革（一行）：3.2 落骨架時口徑 = 「任何生產模組零 import」（那時零接線，正確）；3.3-b 起
+#   `agent_stage_service.py` 的兩個適配器、3.3-d 起 `template_api.py` 三個狀態端點、3.3-e 起
+#   `_evaluate()` 都在函數體內延遲 import（接線設計本身）→ 口徑**只收窄、從未放寬**；
+#   3.3-f 拆成「掃描 + 凍結」兩件事（本字典 + `FROZEN_ALLOWED_WIRING`）。
+#   庫層落點（3.3-c）走既有轉發器 `_call_agent_stage_hook()`、對 `learning_service` 零引用
+#   → `database.py` 不在白名單內（庫層那一側由庫層自己的守護看著）。
 ALLOWED_WIRING = {
     "agent_stage_service.py": ("on_draft_generated", "on_draft_modified", "_evaluate"),
     "template_api.py": ("publish_template", "archive_template", "activate_template"),
 }
 
+# 【3.3-f 凍結字面量】**手寫**一份與上面逐字相同的期望值（不由 `ALLOWED_WIRING` 生成 —— 否則實現改了
+# 用例跟著改，凍結等於零）：日後放行新位置必須同時改兩處，於是「白名單被無聲放寬」立刻紅。
+FROZEN_ALLOWED_WIRING = {
+    "agent_stage_service.py": ("on_draft_generated", "on_draft_modified", "_evaluate"),
+    "template_api.py": ("publish_template", "archive_template", "activate_template"),
+}
 
-def _imports_learning_service(node):
-    """該 AST 節點是否為 `import learning_service` / `from learning_service …`（按**根模組名**判定）。"""
+
+def _dotted_import_matches(node, module_name):
+    """該 AST 節點是否為 `import <module_name>` / `from <module_name> …`（按**根模組名**判定）。"""
     if isinstance(node, ast.Import):
-        return any(alias.name.split(".")[0] == "learning_service" for alias in node.names)
+        return any(alias.name.split(".")[0] == module_name for alias in node.names)
     if isinstance(node, ast.ImportFrom):
-        return (node.module or "").split(".")[0] == "learning_service"
+        return (node.module or "").split(".")[0] == module_name
     return False
 
 
-def _learning_import_owners(tree):
-    """每個 `… learning_service` 節點 → 它的**最近外層函數名**（模組頂層 → `None`）之集合。
+def _import_owners(tree, module_name):
+    """每個 `… <module_name>` import 節點 → 它的**最近外層函數名**（模組頂層 → `None`）之集合。
 
     歸屬必須按「最近」而非「任意外層」：`ast.walk()` 不分層，若直接拿它當「所在函數」，巢狀函數裡的
     import 會被記到外層函數名下 —— 那樣白名單就漏了一格（內層函數偷偷 import 也算數）。故這裡自己
     遞迴下潛：進入 `FunctionDef` 時**換 owner**（內層覆蓋外層），回到同層時自然回到外層的 owner。
+
+    【3.3-f】由 3.2 的 `_imports_learning_service()` + `_learning_import_owners()` 參數化而來
+    （模組名成了入參）：同一份實現服務「學習服務層白名單」與「服務層延遲 import 位置白名單」兩處，
+    行為與 3.2 起逐字相同。
     """
     sites = set()
 
     def _walk(node, owner):
-        if _imports_learning_service(node):
+        if _dotted_import_matches(node, module_name):
             sites.add((owner, node.lineno))
         for child in ast.iter_child_nodes(node):
             _walk(child, child.name
@@ -869,35 +881,89 @@ def _learning_import_owners(tree):
     return sites
 
 
-def test_no_wiring_in_step_3_2():
-    """【本步鐵律】3.2 只落骨架：四個待接線點與**任何**生產模組都不得引用 `learning_service`（零接線）。
+def _learning_import_owners(tree):
+    """`_import_owners()` 的學習服務層用法（【3.3-f】模組名參數化的薄包裝）。"""
+    return _import_owners(tree, "learning_service")
 
-    為什麼要能一眼看出「沒接線」：本步的驗收前提是「flag off = 與今天 1:1」——
-    一旦有模組 import 了它（或往接線點的函數體裡塞了寫事件的一行），這個前提就必須重新證明。
 
-    兩層守護：
-      · **函數體級（【3.3-e 收窄：只剩庫層兩個落點】）**：`database.insert_draft` /
-        `database.update_draft_content` 兩段源碼裡零 `learning_service` / `agent_learning_events` /
-        `LEARNING_ENABLED`（庫層只許經唯一轉發器 `_call_agent_stage_hook()`，不許自己碰學習服務層）；
-      · **模組級（【3.3-b 收窄為白名單形 · 3.3-d 追加接口層 · 3.3-e 追加 `_evaluate`】）**：backend 根目錄下**除測試文件與
-        `learning_service.py` 本身**，只放行 `ALLOWED_WIRING` 逐項列出的「檔名 → 函數名」——
-        今天 = `agent_stage_service.py` 的 `on_draft_generated` / `on_draft_modified`（3.3-b 服務層適配器）
-        + `_evaluate`（3.3-e 的 `learning_event_emitted` / `agent_updated` 收口）
-        + `template_api.py` 的 `publish_template` / `archive_template` / `activate_template`（3.3-d 接口層三個
-        狀態端點）的**函數體內**延遲 import。**頂層 import（任何模組）/
-        白名單外的模組 / 同模組的其他函數體**三條照舊紅 —— 3.2 的口徑因此只是**收窄**，沒有放寬。
-        【變更披露 · CTO R4】**本條是既有斷言變更**：原斷言
-        `"learning_service" not in _imported_roots(tree)` 表達不了「哪些位置允許」，故改為
-        「按最近外層函數歸屬的白名單比對」（判定助手見下方 `_learning_import_owners()`）；
-        庫層落點（3.3-c）走既有轉發器、對 `learning_service` **零引用**（因此不需放行）。
-        【變更披露 · 3.3-e】**本條再次變更既有斷言**：`guarded` 撤掉 `agent_stage_service.py: ("_evaluate",)`
-        —— 3.2 立的「`_evaluate` 三段源碼零引用」在 3.2 → 3.3-c 期間成立（那時它確實零引用），
-        3.3-e 起 `_evaluate` 由上面的白名單放行（依據 = 本文件原注「`_evaluate`（3.3-e）的放行
-        由該子步追加」）；**庫層那格照舊函數體級守護**，模組級與頂層兩條一條未鬆。
-        **最終形（`database.py` 的「庫層 → 服務層轉發點唯一」守護）仍在 3.3-f 收口。**
+def _production_module_names(exclude=()):
+    """backend 根目錄下的**生產**模組（排除用例文件與 `conftest.py`）→ 排序好的檔名清單。
+
+    【3.3-f】把原本寫在掃描迴圈裡的兩條排除條件抽出來，供「白名單掃描」與「唯一轉發點掃描」共用 ——
+    兩處若各寫一份，日後漏排一個文件時只有一邊失守。
+    """
+    return sorted(filename for filename in os.listdir(BACKEND_DIR)
+                  if filename.endswith(".py")
+                  and not filename.startswith("test_")
+                  and filename != "conftest.py"
+                  and filename not in exclude)
+
+
+# ============================================================================
+# 【3.3-f 拆條】原 `test_no_wiring_in_step_3_2` 一個用例管三個不變量（全倉白名單 / 庫層函數體標記 /
+# 表名不外溢）→ 紅了歸因面太大。3.3-f 按不變量拆成三條 + 新增「庫層唯一轉發點」一條：
+#   ① `test_learning_service_references_stay_on_the_wiring_whitelist` —— 白名單掃描 + 逐字凍結；
+#   ② `test_database_landing_points_stay_free_of_learning_identifiers` —— 庫層函數體標記（【G4】名單擴張）；
+#   ③ `test_learning_table_name_never_leaks_outside_the_data_layer` —— 學習事件表名不外溢；
+#   ④ `test_database_bridges_to_the_service_layer_only_through_one_forwarder` —— 庫層唯一轉發點
+#      （本檔 3.2 起那句「最終形仍在 3.3-f 收口」的兌現）。
+# 名字裡的步號（`_in_step_3_2`）換成**不變量**：3.2 的口徑是「零接線」，3.3-b 起接線是設計的一部分，
+# 步號留在名字上會誤導讀者（以為今天仍該零接線）。
+# ============================================================================
+def test_learning_service_references_stay_on_the_wiring_whitelist():
+    """【不變量】`learning_service` 的引用只許落在 `ALLOWED_WIRING` 列出的「檔名 × 函數體」內。
+
+    兩件事一起釘：
+      · **凍結**：`ALLOWED_WIRING` 必須**逐字**等於手寫的 `FROZEN_ALLOWED_WIRING` ——
+        日後放行新位置卻只改了一邊（或白名單被無聲放寬），這裡立刻紅；
+      · **掃描**：backend 根目錄下所有生產模組（除用例文件 / `conftest.py` / `learning_service.py` 本身），
+        每個 `import learning_service` / `from learning_service …` 的**最近外層函數**必須在白名單內
+        —— 模組頂層（`None` → `<模組頂層>`）/ 白名單外的模組 / 同模組的其他函數體，三條一律紅。
+
+    【變更披露 · CTO R4】3.2 的原斷言 `"learning_service" not in _imported_roots(tree)` 表達不了
+    「哪些位置允許」，3.3-b 起改為「按最近外層函數歸屬的白名單比對」（助手 `_import_owners()`，
+    3.3-f 把模組名參數化）；【變更披露 · 3.3-f】本條 = 原用例第一段 + 新增凍結斷言，**語義一字未變**。
+    """
+    assert ALLOWED_WIRING == FROZEN_ALLOWED_WIRING, \
+        "白名單漂移：放行新位置必須同步改凍結字面量（本步的「只收窄、不放寬」口徑）"
+
+    for filename in _production_module_names(exclude=("learning_service.py",)):
+        tree = _parse_module(os.path.join(BACKEND_DIR, filename))
+        allowed = ALLOWED_WIRING.get(filename, ())    # 不在白名單 → 空 tuple：任何引用都算越界
+        offenders = sorted((owner or "<模組頂層>", lineno)
+                           for owner, lineno in _learning_import_owners(tree)
+                           if owner not in allowed)
+        assert offenders == [], \
+            ("%s 出現了白名單外的 learning_service 引用：%r（白名單 = %r；"
+             "頂層 import / 白名單外的模組 / 同模組的其他函數體一律紅）"
+             % (filename, offenders, ALLOWED_WIRING))
+
+
+# 【庫層函數體標記守護的**名單**（3.3-f 定稿）】庫層「不碰學習面 / 階段面」的邊界函數：
+#   · 兩個草案落點 `insert_draft()` / `update_draft_content()`（3.3-c 的學習事件接線點）；
+#   · 三個既有轉發點 `sign_draft()`（改 2b）/ `resolve_agent_task()`（改 3）+ 唯一轉發器
+#     `_call_agent_stage_hook()`（兩態判斷與延遲 import 都只該有一份）；
+#   · 快照閘門 `_agent_stage_snapshot_enabled()`（另一條邊：階段面）。
+# **為什麼不含四個學習庫層原語**（`next_seq` / `get_last_learning_event` / `get_learning_events` /
+# `insert_learning_event`）：它們是 `learning_service.py` 四個薄封裝的**唯一下游**（段頭逐字），
+# 其 docstring 依約指名服務層（`learning_service.insert_learning_event` / `verify_learning_chain` /
+# `canonical_json`）—— 那屬「提到可以、import 不行」的既有口徑，不是接線。
+DATABASE_GUARDED_FUNCTIONS = ("insert_draft", "update_draft_content", "sign_draft",
+                              "resolve_agent_task", "_call_agent_stage_hook",
+                              "_agent_stage_snapshot_enabled")
+
+
+def test_database_landing_points_stay_free_of_learning_identifiers():
+    """【不變量】庫層那批邊界函數的**源碼**（含註釋 / docstring）裡零 `learning_service` /
+    `agent_learning_events` / `LEARNING_ENABLED`：庫層只許經唯一轉發器 `_call_agent_stage_hook()`
+    轉發 —— 自己不 import 學習服務層、不碰學習表、不判學習總閘。
+
+    【變更披露 · 3.3-f】**名單擴張**（既有斷言變更）：3.2 只守兩個草案落點，3.3-f 擴到
+    `DATABASE_GUARDED_FUNCTIONS` 的 6 個（三個轉發點 + 閘門也進範圍）→ 斷言形式與文案一字未改，
+    覆蓋面**收緊**。
     """
     guarded = {
-        "database.py": ("insert_draft", "update_draft_content"),
+        "database.py": DATABASE_GUARDED_FUNCTIONS,
     }
     for filename, function_names in guarded.items():
         path = os.path.join(BACKEND_DIR, filename)
@@ -911,32 +977,153 @@ def test_no_wiring_in_step_3_2():
                 segment = ast.get_source_segment(source, node)
                 for marker in ("learning_service", "agent_learning_events", "LEARNING_ENABLED"):
                     assert marker not in segment, \
-                        "%s::%s 已被 3.2 接線（出現 %s）" % (filename, node.name, marker)
+                        "%s::%s 已被學習鏈接線（出現 %s）" % (filename, node.name, marker)
         assert seen == set(function_names), "%s 缺函數：%s" % (filename, sorted(set(function_names) - seen))
 
-    # 兩個未來的接線點（3.3 / 3.4）今天連表名都不該出現（database.py 例外：它是庫層落點）
-    # 【3.3-e】`agent_stage_service.py` 的 `_evaluate` 已獲白名單放行「引用 `learning_service`」，
-    #   但**表名字面量照舊不許**（學習事件的表名只屬 `database.py` / 遷移 / 服務層）——
-    #   本條因此一字未改；名單不變 = 這條紅線不隨接線放寬。
+
+def test_learning_table_name_never_leaks_outside_the_data_layer():
+    """【不變量】學習事件表名 `agent_learning_events` 只屬庫層 / 遷移 / 學習服務層。
+
+    `database.py` **不在名單內**（庫層原語與 §2.1 的 DDL 真相源本來就在那裡）；服務層 / 接口層 / 入口
+    一律零表名 —— 跨層直接拼表名 = 繞過庫層原語（分層紅線）。3.3-e 起 `agent_stage_service.py` 的
+    `_evaluate` 雖獲白名單放行「引用 `learning_service`」，但**表名字面量照舊不許** → 本條名單不變，
+    這條紅線**不隨接線放寬**。3.3-f 只把它從原用例裡搬出來獨立成條（斷言一字未改）。
+    """
     for filename in ("agent_stage_service.py", "template_api.py", "main.py"):
         with open(os.path.join(BACKEND_DIR, filename), encoding="utf-8") as handle:
             source = handle.read()
         assert "agent_learning_events" not in source, "%s 出現學習事件表名" % filename
 
-    for filename in sorted(os.listdir(BACKEND_DIR)):
-        if not filename.endswith(".py") or filename.startswith("test_"):
-            continue                                          # 用例文件本來就該引用它
-        if filename in ("conftest.py", "learning_service.py"):
-            continue
-        tree = _parse_module(os.path.join(BACKEND_DIR, filename))
-        allowed = ALLOWED_WIRING.get(filename, ())    # 【3.3-b / 3.3-d / 3.3-e】白名單（最終形在 3.3-f）
-        offenders = sorted((owner or "<模組頂層>", lineno)
-                           for owner, lineno in _learning_import_owners(tree)
-                           if owner not in allowed)
-        assert offenders == [], \
-            ("%s 出現了白名單外的 learning_service 引用：%r（3.3-e 白名單 = %r；"
-             "頂層 import / 白名單外的模組 / 同模組的其他函數體一律紅，最終形在 3.3-f）"
-             % (filename, offenders, ALLOWED_WIRING))
+
+# ============================================================================
+# 【3.3-f 最終形】庫層 → 服務層的**唯一轉發點**守護（設計 §10.1-1 紅線）—— 本檔自 3.2 起那句
+# 「最終形（`database.py` 的『庫層 → 服務層轉發點唯一』守護）仍在 3.3-f 收口」的逐字兌現。
+# 凍結清單 = 今天**實測**的 5 處真實調用「函數 × 鉤子名」——**行號不進清單**（行號必漂，本冊 TD-019）：
+DATABASE_HOOK_CALL_SITES = (
+    ("insert_draft", "on_draft_generated"),                 # Epic 3 §4.2 改 1（3.3-c 落線）
+    ("update_draft_content", "on_draft_modified"),          # §4.2 改 4（3.3-c 落線）
+    ("sign_draft", "on_draft_signed"),                      # §4.2 改 2b（Epic 2）
+    ("resolve_agent_task", "apply_upgrade_confirmation"),   # §4.2 改 3（approved）
+    ("resolve_agent_task", "decline_upgrade"),              # §4.2 改 3（rejected）
+)
+# 庫層允許**直接取用**的服務層符號（`agent_stage_service.<名>` 與 `getattr(agent_stage_service, "<名>")`）：
+#   · `_normalize_metric_text` —— 兩個草案落點的「歸一化在調用方」（CTO 3.3-a 追加 1 方案 c）；
+#   · `agent_stage_enabled` —— 快照閘門（CTO 裁決②「方案 B」：flag 真相源在服務層）。
+# 其餘一律經唯一轉發器**按名字**派發 → 動態 `getattr(agent_stage_service, <變量>)` 恰一處。
+DATABASE_SERVICE_SYMBOLS = ("_normalize_metric_text", "agent_stage_enabled")
+# 庫層「函數內延遲 import 服務層」的**位置白名單**（模組級 import 一律紅 = 循環依賴）：
+#   閘門 + 唯一轉發器 + 兩個草案落點（後兩者只為取 `_normalize_metric_text`）。
+DATABASE_LAZY_IMPORT_OWNERS = ("_agent_stage_snapshot_enabled", "_call_agent_stage_hook",
+                               "insert_draft", "update_draft_content")
+
+
+def _hook_call_sites(tree, callee_name="_call_agent_stage_hook"):
+    """全樹收集 `<callee_name>(...)` 調用點 → `[(最近外層函數, 首參字面量 or None, 行號)]`。
+
+    首參不是 `str` 常量（寫成變量 / 缺參）→ 記 `None`：那樣的調用活不過上面的凍結比對。
+    """
+    sites = []
+
+    def _walk(node, owner):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id == callee_name):
+            first = node.args[0] if node.args else None
+            literal = first.value if (isinstance(first, ast.Constant)
+                                      and isinstance(first.value, str)) else None
+            sites.append((owner, literal, node.lineno))
+        for child in ast.iter_child_nodes(node):
+            _walk(child, child.name
+                  if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) else owner)
+
+    _walk(tree, None)
+    return sites
+
+
+def _service_symbol_sites(tree):
+    """庫層直接取用服務層符號的點 → `(屬性名 → 取用點集合, [(函數, 名字 or None, 行號)])`。
+
+    兩種形態各收一份（owner 歸屬與 `_import_owners()` 同款：最近外層函數優先）：
+      · `agent_stage_service.<attr>`（`ast.Attribute`）—— 直接屬性取用；
+      · `getattr(agent_stage_service, <名>[, 缺省])` —— 按名字派發：`<名>` 是 `str` 常量 = 指名符號；
+        是變量 = **動態**派發 → 恰該只在唯一轉發器裡出現一次。
+    """
+    attrs, getattrs = {}, []
+
+    def _walk(node, owner):
+        if (isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)
+                and node.value.id == "agent_stage_service"):
+            attrs.setdefault(node.attr, set()).add((owner, node.lineno))
+        elif (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+              and node.func.id == "getattr" and len(node.args) >= 2
+              and isinstance(node.args[0], ast.Name)
+              and node.args[0].id == "agent_stage_service"):
+            second = node.args[1]
+            name = second.value if (isinstance(second, ast.Constant)
+                                    and isinstance(second.value, str)) else None
+            getattrs.append((owner, name, node.lineno))
+        for child in ast.iter_child_nodes(node):
+            _walk(child, child.name
+                  if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) else owner)
+
+    _walk(tree, None)
+    return attrs, getattrs
+
+
+def test_database_bridges_to_the_service_layer_only_through_one_forwarder():
+    """【3.3-f 最終形】庫層 → 服務層的**唯一**轉發點（設計 §10.1-1 紅線；AST 級）。
+
+    四條斷言各接一種漂移：
+      · **調用點凍結**：全 backend 生產模組的真實 `_call_agent_stage_hook("…")` 調用點，
+        「最近外層函數 × 首參字面量」集合 == `DATABASE_HOOK_CALL_SITES` 且**總數 == 5**
+        → 多掛一處（= 長出第二個轉發點）/ 改錯鉤子名 / 鉤子名寫成變量（字面量收成 `None`）/
+        把調用挪進另一個函數，四種都紅；
+      · **派發形態**：動態 `getattr(agent_stage_service, <變量>)` **恰一處**且落在
+        `_call_agent_stage_hook()` 體內（唯一「按名字」派發的入口）；
+      · **符號白名單**：`database.py` 直接取用的服務層符號 ⊆ `DATABASE_SERVICE_SYMBOLS`
+        → 直呼 `agent_stage_service.on_draft_generated(...)`（或任何白名單外符號）當場紅；
+      · **延遲 import 位置**：`import agent_stage_service` 的最近外層函數集合 ==
+        `DATABASE_LAZY_IMPORT_OWNERS`（模組級 import 一律紅 = 循環依賴）—— 與
+        `test_agent_stage.py::test_database_module_never_imports_agent_stage_service_at_module_level`
+        互為交叉（那條管「模組級零 + 延遲 ≥ 2」，這條管**位置清單**，兩條不重複也不衝突）。
+    """
+    sites = []
+    for filename in _production_module_names():
+        for owner, literal, lineno in _hook_call_sites(
+                _parse_module(os.path.join(BACKEND_DIR, filename))):
+            sites.append((filename, owner, literal, lineno))
+
+    strays = sorted({filename for filename, _, _, _ in sites} - {"database.py"})
+    assert strays == [], "唯一轉發點只許在庫層（實測另有：%r）" % (strays,)
+    assert len(sites) == 5, "真實轉發調用點必須恰好 5 處（實測 %d 處：%r）" % (len(sites), sites)
+    # 比對前先把兩側歸一成**字符串鍵**：首參不是字面量時 `literal is None`，直接排序 tuple 會
+    # `TypeError`（把「鉤子名寫成變量」報成崩潰，掩蓋真因）→ 這裡保證任何漂移都是乾淨的斷言失敗。
+    collected = sorted("%r|%r" % (owner, literal) for _, owner, literal, _ in sites)
+    expected = sorted("%r|%r" % (owner, literal) for owner, literal in DATABASE_HOOK_CALL_SITES)
+    assert collected == expected, \
+        "庫層鉤子清單漂移（多了 / 少了 / 名字或函數歸屬改了 / 首參不是字面量）：%r" % (sites,)
+
+    tree = _parse_module(os.path.join(BACKEND_DIR, "database.py"))
+    attrs, getattrs = _service_symbol_sites(tree)
+    symbols = set(attrs) | {name for _, name, _ in getattrs if name is not None}
+    extras = sorted(symbols - set(DATABASE_SERVICE_SYMBOLS))
+    assert extras == [], \
+        ("庫層直呼了白名單外的服務層符號：%r（只許 %r —— 其餘一律經唯一轉發器按名字派發）"
+         % (extras, DATABASE_SERVICE_SYMBOLS))
+
+    dynamic = sorted((owner or "<模組頂層>", lineno)
+                     for owner, name, lineno in getattrs if name is None)
+    assert len(dynamic) == 1 and dynamic[0][0] == "_call_agent_stage_hook", \
+        ("「按名字」的動態 getattr 必須恰一處，且落在唯一轉發器 `_call_agent_stage_hook()` 內：%r"
+         % (dynamic,))
+
+    owners = _import_owners(tree, "agent_stage_service")
+    assert {owner for owner, _ in owners} == set(DATABASE_LAZY_IMPORT_OWNERS), \
+        ("`import agent_stage_service` 只許在 %r 這幾個函數體內延遲 import（模組級 = 循環依賴）；"
+         "實測落點：%r" % (DATABASE_LAZY_IMPORT_OWNERS,
+                        sorted((owner or "<模組頂層>", lineno) for owner, lineno in owners)))
+    assert len(owners) == len(DATABASE_LAZY_IMPORT_OWNERS), \
+        "延遲 import 的處數也凍結（實測 %d 處：%r）" % (
+            len(owners), sorted((owner or "<模組頂層>", lineno) for owner, lineno in owners))
 
 
 # ============================================================================
@@ -1559,8 +1746,9 @@ def test_database_forwarder_reaches_the_adapters_and_the_two_landings_call_it_on
 #   · 兩處都 **best-effort**（§9-聲明一）：鉤子炸了 / 草案不存在 → 業務結果與返回值一字不改、
 #     零事件、不拋，只留 `[warn]`；
 #   · flag off = 與今天 1:1：零 `agent_learning_events` 語句、零行（A4）。
-# 源碼級守護：本檔 `test_no_wiring_in_step_3_2` 的函數體級斷言（零 `learning_service` /
-# `agent_learning_events` / `LEARNING_ENABLED`）+ ⑦ 組改寫後那條（恰好一處、名字正確）—— 兩處交叉。
+# 源碼級守護（3.3-f 拆四條）：本檔
+# `test_database_landing_points_stay_free_of_learning_identifiers` 的函數體級斷言（零 `learning_service` /
+# `agent_learning_events` / `LEARNING_ENABLED`）+ ⑦ 組那條（恰好一處、名字正確）—— 兩處交叉。
 # ============================================================================
 
 RAW_BODY = "【主訴】  頭痛   三日\r\n【舌象】  舌淡紅"
@@ -1704,16 +1892,19 @@ def test_update_draft_content_missing_draft_is_quiet_and_keeps_update_statement(
 # ============================================================================
 # ⑨ step 3.3-d：接口層三個狀態端點（`template_api.publish` / `archive` / `activate`）
 # ----------------------------------------------------------------------------
-# 【分組編號 / 子步標籤說明】`⑨` 沿本文件 `⑦`（3.3-b 服務層適配器，段頭 `:1298`）/ `⑧`（3.3-c 庫層落點，段頭
-# `:1541`）的排版慣例 —— 這三號在模組 docstring（`:19`–`:21`）另指 CTO 要求 ⑦/⑧/⑨，「**雙用**」是既有現象；
-# 設計文件 §10 只細分到 3.1–3.5（**沒有** 3.3-a…3.3-f 小節），`3.3-d` 是施工細分標籤（倉庫內前向引用在
-# `agent_stage_service.py:3917/3925`）。
+# 【分組編號 / 子步標籤說明】`⑨` 沿本文件 `⑦`（3.3-b 服務層適配器）/ `⑧`（3.3-c 庫層落點）兩組段頭的排版
+# 慣例（**不引段頭行號**：行號隨插入漂移，3.3-f 起一律只留組名）—— 這三號在模組 docstring（`:19`–`:21`）
+# 另指 CTO 要求 ⑦/⑧/⑨，「**雙用**」是既有現象；
+# 設計文件 §10 只細分到 3.1–3.5（**沒有** 3.3-a…3.3-f 小節），`3.3-d` 是施工細分標籤（倉庫內舊前向引用
+# 原把庫層兩個草案落點統稱「3.3-c / 3.3-d」，3.3-f 收口時已收攏為 `3.3-c`；見 `agent_stage_service.py`
+# 的 3.3-b 段頭。行號一律不引）。
 # 對齊（照本文件 ⑦ 組的寫法：CTO 子步指令 + 設計條文；指令原文不在倉庫內 → 把**可查**依據逐條列出）：
 #   · §3.1 第 1 行（逐字）：`template_configured` = 「老师**发布 / 归档 / 启用**某类模板（`template_api.py`
 #     的 publish `:244` / archive `:266` / activate `:281`）」（落地步 = 3.3）—— 三個端點名的**唯一**出處；
 #   · §3.2 第 1 行（逐字）：`detail` = `{"template_id": int, "template_type": str, "version": int,
 #     "from_status": str, "to_status": str}`（复用 Epic 1 §3.5 的模板事件形状）；
-#   · §一-1 裁決（冪等分支不寫空節；同 `learning_service.py:622` / `agent_stage_service.py:3970` 的既有寫法）；
+#   · §一-1 裁決（冪等分支不寫空節；同 `learning_service.record_draft_modified()` 的 docstring /
+#     `agent_stage_service.on_draft_modified()` 的既有寫法 —— **只引函數名，不引行號**）；
 #   · §6（flag off = 與今天 1:1：零行、響應一字不改）+ §2.5-5（flag off 不寫事件、不分配 `seq`）。
 # 本組**走真 HTTP**（`client` = conftest 的 `TestClient`，`TEMPLATE_API_ENABLED=on` 由 conftest 統一打開）——
 # 守四件事：
@@ -1895,14 +2086,14 @@ def test_flag_off_keeps_response_shape_identical_and_writes_zero_rows(client, mo
 # ⑩ step 3.3-e：`agent_stage_service._evaluate()` 的兩類學習事件（評估鏈 → 學習鏈的收口）
 # ----------------------------------------------------------------------------
 # 【分組編號說明】`⑩` 沿本檔 ⑦/⑧/⑨ 的排版慣例；模組 docstring `:22` 的 `⑩` 另指 step 3.2 清單的
-# 「源碼級守護」—— 「雙用」是既有現象（同一聲明見 ⑨ 組段頭 `:1707`–`:1710`）。
+# 「源碼級守護」—— 「雙用」是既有現象（同一聲明見 ⑨ 組段頭，**不引行號**）。
 # 對齊：CTO 2026-09-30 step 3.3-e 指令 + 設計 §3.1（一次評估 = 兩節的事件流）/ §3.2（兩類 detail 的
 #   三鍵 / 四鍵形狀）/ §一-4（3.3 只在 `_evaluate()` 寫 `agent_updated`）/ §一-1（不寫空節）/
 #   §6（flag off = 與今天 1:1、零新 SQL）/ §9-聲明一（best-effort，失敗不回退業務）/
 #   §9-聲明二（零階段面：只寫學習表）。
 # 站位：本檔 ⑦→⑧→⑨ 逐層釘「服務層適配器 / 庫層落點 / 接口層端點」，本組釘**最後一個落點** ——
-#   `evaluate()` → `_evaluate()` 內那段【施工步驟 3.3-e】（wiring 段頭在服務層 `:2118` 起；
-#   工具鏈側的段頭在同檔 `:4033`「施工步驟 3.3-e」）。
+#   `evaluate()` → `_evaluate()` 內那段【施工步驟 3.3-e】（wiring 段頭 = `_evaluate()` 內的
+#   【施工步驟 3.3-e】注釋；工具鏈側的段頭 = 同檔的「施工步驟 3.3-e」段頭 —— 兩處**只引段名、不引行號**）。
 # 六件事（編號 ↔ CTO 清單，逐件一用例）：
 #   ① flag off → 評估照跑（階段面照寫）、學習鏈**零行**、階段面**逐字節不變**（狀態口徑；按 CTO 修正重寫）；
 #   ② flag on → 一次評估**恰好 +2 節**（順序：`learning_event_emitted` → `agent_updated`），且第一節

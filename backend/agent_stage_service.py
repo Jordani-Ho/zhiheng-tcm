@@ -3952,16 +3952,19 @@ def generation_degraded(teacher_name):
 #   · **首行只判学习总闸** `learning_service.learning_enabled()`：阶段链的闸在**这两个函数体内一个字
 #     都不许出现**（Epic 3 §3.3 A6：两张表、两条流）—— 学习事件在阶段闸 off 时照写、反之亦然；
 #     多判一次只会给「为什么没写事件」多加一个假归因面。
-#   · **零接线**（本步不碰任何既有行）：`database.insert_draft()`（改 1）/
-#     `update_draft_content()`（改 4）今天仍**零** `on_draft_*` 调用 —— 接线的落点在 3.3-c / 3.3-d；
-#     本步只有用例直接调这两个适配器（行为级用例 = `test_learning.py` ⑦ 组）。
+#   · **零接线**（本步不碰任何既有行 —— 这是 3.3-b 当时的事实记述）：`database.insert_draft()`（改 1）/
+#     `update_draft_content()`（改 4）的接线落点 = **3.3-c**（两个库层落点同属 3.3-c，`3.3-d` 只指接口层
+#     三个状态端点）；【3.3-f 收口】本条旧前向引用原写「3.3-c / 3.3-d」，已收拢为 `3.3-c`，并去掉行号
+#     （只留函数名 —— 行号随插入必漂，本册 TD-019）；3.3-b 本步当时只有用例直接调这两个适配器
+#     （行为级用例 = `test_learning.py` ⑦ 组）。
 #   · 红线（设计 §9-声明二）：**零**阶段审计 / **零**能力闸门 / **零**拒绝留痕，也**不**调既有的
 #     三个状态转移钩子（`on_draft_signed` / `apply_upgrade_confirmation` / `decline_upgrade`）与
 #     `evaluate()` —— 适配器只转发学习事件，不碰阶段面（否则会污染升阶判据面）。
 #   · `degraded` **现场读**（`generation_degraded(teacher_name)`，只读、永不抛）：不缓存、不预判
 #     —— 降级态是可变的（观察期进出），写进链的必须是**事件发生时刻**的判定（§5.3 / TD-015 口径）。
 #   · 归一化**不在本段**（CTO 3.3-a 追加 1 方案 c：归一化在调用方）：正文原样交给
-#     `compute_content_diff()`，`_normalize_metric_text()` 由 3.3-c / 3.3-d 的接线点先跑。
+#     `compute_content_diff()`，`_normalize_metric_text()` 由 3.3-c 的接线点先跑
+#     （`database.insert_draft()` / `database.update_draft_content()` 各一次）。
 #   · 留痕走 `_config_warn()`（本文件唯一的告警出口，不新增 `print`；文案一律繁体）。
 # ============================================================================
 
@@ -4068,12 +4071,17 @@ def on_draft_modified(teacher_name, draft_id=0, patient_name="", normalized_befo
 #
 # 白名单（`test_learning.py` 的 `ALLOWED_WIRING`）：本步把 `_evaluate` 追加进
 # `agent_stage_service.py` 的放行名单，并**同步撤掉** 3.2 的「`_evaluate` 函数体级零引用」那一条
-# （依据 = 该文件原注「`_evaluate`（3.3-e）的放行由该子步追加」）；「转发点唯一守护 +
-# `ALLOWED_WIRING` 最终形」仍留 **3.3-f** 收口。
+# （依据 = 该文件原注「`_evaluate`（3.3-e）的放行由该子步追加」）。
+# 【3.3-f 收口 · 已兌现】原注「转发点唯一守护 + `ALLOWED_WIRING` 最终形仍留 3.3-f」已落地：
+# `test_learning.py` 把白名单守護拆成四條（白名单扫描 + 凍結字面量 + 庫層函數體標記 + 表名不外溢），
+# 並新增 `test_database_bridges_to_the_service_layer_only_through_one_forwarder` —— 庫層 5 處真實
+# 轉發調用點「函數 × 鉤子名」凍結 + 服務層符號白名单（`agent_stage_enabled` /
+# `_normalize_metric_text`）+ 延遲 import 位置白名单。
 #
 # 回退（纯回退，无数据面）：① `LEARNING_ENABLED=off`（首选，事件停写、评估逐字节不变）→
 # ② 删本段 + `_evaluate()` 内那一段（含 `import learning_service`）→ ③ 复原
-# `test_learning.py` 的 `guarded` / `ALLOWED_WIRING` 两处（见该文件【变更披露 · 3.3-e】）。
+# `test_learning.py` 的 `guarded` / `ALLOWED_WIRING` 两处（见该文件【变更披露 · 3.3-e】；
+# 3.3-f 起 `guarded` 已更名為 `DATABASE_GUARDED_FUNCTIONS`，白名單另加 `FROZEN_ALLOWED_WIRING` 凍結）。
 # ============================================================================
 
 

@@ -253,7 +253,8 @@ def publish_template(template_id: int, data: TemplateActionInput):
     _validated_schema(row["type"], row["schema_json"], for_publish=True)
     updated, archived_ids, changed = database.set_template_active(template_id)
     # 【Epic 3 §3.1 · 施工步驟 3.3-d（子步標籤：設計文件 §10 只細分到 3.1–3.5，沒有 3.3-a…3.3-f 小節；
-    #   倉庫內的前向引用在 `agent_stage_service.py:3917/3925`）】§3.1 第 1 行逐字把本事件的三條路徑定為
+    #   `3.3-d` 只指本檔這三個端點 —— 倉庫內舊前向引用原把「庫層兩個草案落點」統稱「3.3-c / 3.3-d」，
+    #   3.3-f 收口時已收攏為 `3.3-c`（見 `agent_stage_service.py` 的 3.3-b 段頭）；行號一律不引）】§3.1 第 1 行逐字把本事件的三條路徑定為
     #   「`template_api.py` 的 publish `:244` / archive `:266` / activate `:281`」→ 本檔就這三處接線。
     # 狀態真的改了才記 `template_configured` 一節（§一-1 同款紀律：
     # `changed=False` = 本來就 `active` 的冪等分支 → 零事件，別往鏈裡塞空節）。`detail` 五值全取自**庫裡讀到的行**：
