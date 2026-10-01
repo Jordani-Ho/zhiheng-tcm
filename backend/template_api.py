@@ -252,6 +252,30 @@ def publish_template(template_id: int, data: TemplateActionInput):
     # 發佈級校驗（草稿允許半成品，發佈必須完整，§9.0）
     _validated_schema(row["type"], row["schema_json"], for_publish=True)
     updated, archived_ids, changed = database.set_template_active(template_id)
+    # 【Epic 3 §3.1 · 施工步驟 3.3-d（子步標籤：設計文件 §10 只細分到 3.1–3.5，沒有 3.3-a…3.3-f 小節；
+    #   倉庫內的前向引用在 `agent_stage_service.py:3917/3925`）】§3.1 第 1 行逐字把本事件的三條路徑定為
+    #   「`template_api.py` 的 publish `:244` / archive `:266` / activate `:281`」→ 本檔就這三處接線。
+    # 狀態真的改了才記 `template_configured` 一節（§一-1 同款紀律：
+    # `changed=False` = 本來就 `active` 的冪等分支 → 零事件，別往鏈裡塞空節）。`detail` 五值全取自**庫裡讀到的行**：
+    #   · `from_status` **必須**用 `_load_owned()` 的 `row["status"]`（切換**前**的讀數）—— `updated` 是
+    #     COMMIT 之後重讀的行，它的 `status` 已經是 `active`，拿它當 `from_status` 會寫出「active → active」
+    #     這種自相矛盾的節；
+    #   · `version` 不隨狀態切換變（`set_template_active()` 只改 `status` / `updated_at`）→ 用切換前的讀數。
+    # 本函數**不**自己判 flag / 探存儲 / 吞異常（`record_template_configured()` 一條龍負責，恆不拋、不回退業務）；
+    # import 放函數體內 —— 與本檔 `_check_lineage()` 的 `import lineage_service` 同款延遲 import，模組頂層維持
+    # 零新增 import（3.3-b 起的白名單守護只放行 `ALLOWED_WIRING` 函數體內的引用）。
+    if changed:
+        import learning_service
+
+        learning_service.record_template_configured(
+            data.teacher_name,
+            template_id=template_id,
+            template_type=row["type"],
+            version=row["version"],
+            from_status=row["status"],
+            to_status=updated["status"],
+            lineage_id=row["lineage_id"],
+        )
     return {
         "template": updated,
         "archived_ids": archived_ids,
@@ -271,8 +295,22 @@ def archive_template(template_id: int, data: TemplateActionInput):
     """
     _guard()
     _check_identity(data.teacher_name, data.teacher_id)
-    _load_owned(template_id, data.teacher_id)
+    # 【Epic 3 施工步驟 3.3-d】`_load_owned()` 的返回值**必須**綁定：歸屬校驗照舊（404 / 403 由它拋），
+    # 而 `template_configured` 的 `from_status` / `template_type` / `version` 只能從這個**切換前**的讀數取
+    # （`updated` 是切換後重讀的行，`status` 已經是 `archived`，拿它當 `from_status` 會寫出「archived → archived」）。
+    row = _load_owned(template_id, data.teacher_id)
     updated, changed = database.archive_template(template_id)
+    if changed:                       # 冪等分支（本來就 `archived`）→ 零事件（勿往鏈裡塞空節）
+        import learning_service       # 函數內延遲 import（理由同 `publish_template()`）
+        learning_service.record_template_configured(
+            data.teacher_name,
+            template_id=template_id,
+            template_type=row["type"],
+            version=row["version"],
+            from_status=row["status"],
+            to_status=updated["status"],
+            lineage_id=row["lineage_id"],
+        )
     return {"template": updated, "changed": changed}
 
 
@@ -283,8 +321,21 @@ def activate_template(template_id: int, data: TemplateActionInput):
     """§11.3：`archived → active`，同事務自動歸檔舊 `active`；**不校驗** `schema_json`。"""
     _guard()
     _check_identity(data.teacher_name, data.teacher_id)
-    _load_owned(template_id, data.teacher_id)
+    # 【Epic 3 施工步驟 3.3-d】與 `archive_template()` 同款：`_load_owned()` 的返回值綁定成 `row` —— 歸屬校驗
+    # 照舊，事件的 `from_status` / `template_type` / `version` 取切換**前**的讀數（見 `publish_template()` 的長注）。
+    row = _load_owned(template_id, data.teacher_id)
     updated, archived_ids, changed = database.set_template_active(template_id)
+    if changed:                       # 冪等分支（本來就 `active`）→ 零事件
+        import learning_service       # 函數內延遲 import（理由同 `publish_template()`）
+        learning_service.record_template_configured(
+            data.teacher_name,
+            template_id=template_id,
+            template_type=row["type"],
+            version=row["version"],
+            from_status=row["status"],
+            to_status=updated["status"],
+            lineage_id=row["lineage_id"],
+        )
     return {"template": updated, "archived_ids": archived_ids, "changed": changed}
 
 

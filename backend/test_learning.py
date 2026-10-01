@@ -821,13 +821,21 @@ def test_source_guard_zero_sql_zero_audit_zero_capability():
     assert "database" not in top_level, "database 必須在函數內延遲 import"
 
 
-# 【3.3-b 白名單收窄】`learning_service` 的**引用白名單**：`{"檔名": ("函數名", ...)}`。
+# 【3.3-b 白名單收窄 · 3.3-d 追加接口層】`learning_service` 的**引用白名單**：`{"檔名": ("函數名", ...)}`。
 #   為什麼要收窄：3.2 的「任何生產模組零 import」在當時是正確口徑（那時零接線）；3.3-b 起
 #   `agent_stage_service.py` 新增兩個適配器，**函數內**延遲 import 學習服務層是設計的一部分
 #   （白名單唯一處）。守護因此從「零 import」升級成「只許這兩處」——
 #   頂層 import（任何模組）/ 白名單外的模組 / 同模組的其他函數體，三條照舊紅。
-#   最終形在 3.3-f（本步只放行這兩個適配器；庫層落點與接口層的放行各自由 3.3-c / 3.3-e 追加收口）。
-ALLOWED_WIRING = {"agent_stage_service.py": ("on_draft_generated", "on_draft_modified")}
+#   【3.3-d 追加】接口層 `template_api.py` 的三個狀態端點（`publish` / `archive` / `activate`）各在
+#   **函數體內**延遲 import 並調一次 `record_template_configured()`（與同檔 `_check_lineage()` 的
+#   `import lineage_service` 同款寫法）→ 白名單追加的就是**這三個函數名**，而不是 `None`（模組頂層）：
+#   頂層 import 照舊紅，這一格因此沒有放寬 3.2 的口徑。
+#   庫層落點（3.3-c）走既有轉發器、對 `learning_service` 零引用，故 `database.py` 至今不在白名單內。
+#   最終形在 3.3-f（`_evaluate` 的 `learning_event_emitted` / `agent_updated` 由 3.3-e 追加收口）。
+ALLOWED_WIRING = {
+    "agent_stage_service.py": ("on_draft_generated", "on_draft_modified"),
+    "template_api.py": ("publish_template", "archive_template", "activate_template"),
+}
 
 
 def _imports_learning_service(node):
@@ -869,16 +877,17 @@ def test_no_wiring_in_step_3_2():
       · **函數體級**：`database.insert_draft` / `database.update_draft_content` /
         `agent_stage_service._evaluate` 三段源碼裡零 `learning_service` / `agent_learning_events` /
         `LEARNING_ENABLED`（本步不得動它們一個字節）；
-      · **模組級（【3.3-b 收窄為白名單形】）**：backend 根目錄下**除測試文件與
+      · **模組級（【3.3-b 收窄為白名單形 · 3.3-d 追加接口層】）**：backend 根目錄下**除測試文件與
         `learning_service.py` 本身**，只放行 `ALLOWED_WIRING` 逐項列出的「檔名 → 函數名」——
-        今天 = `agent_stage_service.py` 的 `on_draft_generated` / `on_draft_modified`
-        **函數體內**的延遲 import（3.3-b 的服務層適配器 = 白名單唯一處）。**頂層 import（任何模組）/
+        今天 = `agent_stage_service.py` 的 `on_draft_generated` / `on_draft_modified`（3.3-b 服務層適配器）
+        + `template_api.py` 的 `publish_template` / `archive_template` / `activate_template`（3.3-d 接口層三個
+        狀態端點）的**函數體內**延遲 import。**頂層 import（任何模組）/
         白名單外的模組 / 同模組的其他函數體**三條照舊紅 —— 3.2 的口徑因此只是**收窄**，沒有放寬。
         【變更披露 · CTO R4】**本條是既有斷言變更**：原斷言
         `"learning_service" not in _imported_roots(tree)` 表達不了「哪些位置允許」，故改為
         「按最近外層函數歸屬的白名單比對」（判定助手見下方 `_learning_import_owners()`）；
-        庫層落點（3.3-c）與接口層（3.3-e）的放行各自由後續子步往 `ALLOWED_WIRING` 追加，
-        **最終形在 3.3-f 收口**。
+        庫層落點（3.3-c）走既有轉發器、對 `learning_service` **零引用**（因此不需放行）；
+        `_evaluate`（3.3-e）的放行由該子步追加；**最終形在 3.3-f 收口**。
     """
     guarded = {
         "database.py": ("insert_draft", "update_draft_content"),
@@ -911,12 +920,12 @@ def test_no_wiring_in_step_3_2():
         if filename in ("conftest.py", "learning_service.py"):
             continue
         tree = _parse_module(os.path.join(BACKEND_DIR, filename))
-        allowed = ALLOWED_WIRING.get(filename, ())    # 【3.3-b】白名單收窄（最終形在 3.3-f）
+        allowed = ALLOWED_WIRING.get(filename, ())    # 【3.3-b / 3.3-d】白名單（最終形在 3.3-f）
         offenders = sorted((owner or "<模組頂層>", lineno)
                            for owner, lineno in _learning_import_owners(tree)
                            if owner not in allowed)
         assert offenders == [], \
-            ("%s 出現了白名單外的 learning_service 引用：%r（3.3-b 白名單 = %r；"
+            ("%s 出現了白名單外的 learning_service 引用：%r（3.3-d 白名單 = %r；"
              "頂層 import / 白名單外的模組 / 同模組的其他函數體一律紅，最終形在 3.3-f）"
              % (filename, offenders, ALLOWED_WIRING))
 
@@ -1681,3 +1690,194 @@ def test_update_draft_content_missing_draft_is_quiet_and_keeps_update_statement(
     assert _rows() == []
     assert ("UPDATE drafts SET content = ? WHERE id = ?", ("無主正文", 987654)) in sql_log[0].calls, \
         "既有 UPDATE 語句文本 / 參數順序一字不改"
+
+
+# ============================================================================
+# ⑨ step 3.3-d：接口層三個狀態端點（`template_api.publish` / `archive` / `activate`）
+# ----------------------------------------------------------------------------
+# 【分組編號 / 子步標籤說明】`⑨` 沿本文件 `⑦`（3.3-b 服務層適配器，段頭 `:1298`）/ `⑧`（3.3-c 庫層落點，段頭
+# `:1541`）的排版慣例 —— 這三號在模組 docstring（`:19`–`:21`）另指 CTO 要求 ⑦/⑧/⑨，「**雙用**」是既有現象；
+# 設計文件 §10 只細分到 3.1–3.5（**沒有** 3.3-a…3.3-f 小節），`3.3-d` 是施工細分標籤（倉庫內前向引用在
+# `agent_stage_service.py:3917/3925`）。
+# 對齊（照本文件 ⑦ 組的寫法：CTO 子步指令 + 設計條文；指令原文不在倉庫內 → 把**可查**依據逐條列出）：
+#   · §3.1 第 1 行（逐字）：`template_configured` = 「老师**发布 / 归档 / 启用**某类模板（`template_api.py`
+#     的 publish `:244` / archive `:266` / activate `:281`）」（落地步 = 3.3）—— 三個端點名的**唯一**出處；
+#   · §3.2 第 1 行（逐字）：`detail` = `{"template_id": int, "template_type": str, "version": int,
+#     "from_status": str, "to_status": str}`（复用 Epic 1 §3.5 的模板事件形状）；
+#   · §一-1 裁決（冪等分支不寫空節；同 `learning_service.py:622` / `agent_stage_service.py:3970` 的既有寫法）；
+#   · §6（flag off = 與今天 1:1：零行、響應一字不改）+ §2.5-5（flag off 不寫事件、不分配 `seq`）。
+# 本組**走真 HTTP**（`client` = conftest 的 `TestClient`，`TEMPLATE_API_ENABLED=on` 由 conftest 統一打開）——
+# 守四件事：
+#   · 三個端點各發**恰好一節**，`from_status` 取**切換前**的讀數（`draft → active` / `active → archived` /
+#     `archived → active`）、`to_status` 取切換後（拿 `updated` 當 `from_status` 就會寫出「active → active」
+#     這種自相矛盾的節 —— 這一格把該反例釘死）；
+#   · 冪等分支（`changed=false`：本來就 `active` / 本來就 `archived`）→ **零新節**（§一-1）；
+#   · flag off → 三個端點照常切狀態、響應體**鍵集 / 鍵序**與 flag on 逐字節相同、鏈上零行；
+#   · `lineage_id` **取自模板行**（不臆造：行上是 `''` 就寫 `''`，是師門 id 就寫師門 id）。
+# ============================================================================
+def _auth(**extra):
+    """接口層雙欄位鑑權（§10.1：`teacher_name` + `teacher_id` 必須同一個人）。"""
+    body = {"teacher_name": TEACHER, "teacher_id": TEACHER}
+    body.update(extra)
+    return body
+
+
+def _publishable(template_type):
+    """§9.0 發佈級完整性：問診至少 1 項必問 / 施治內容非空（其餘兩類默認骨架即滿足）。"""
+    schema = database.default_template_schema(template_type)
+    if template_type == "inquiry":
+        schema["fields"][0]["required"] = True
+    elif template_type == "treatment":
+        schema["content"] = "疏肝理氣，健脾和胃；忌生冷。"
+    return schema
+
+
+def _draft(client, template_type="record"):
+    """建一份**可發佈**的草稿 → 返回模板 id（走真接口，與前端同一條路徑）。"""
+    created = client.post("/api/templates",
+                          json=_auth(type=template_type, schema_json=_publishable(template_type)))
+    assert created.status_code == 201, created.text
+    return created.json()["template"]["id"]
+
+
+def _detail_list():
+    """該老師鏈上全部事件的 `detail`（`_rows()` 已按 `seq` 升序）。"""
+    return [json.loads(row["payload_json"])["detail"] for row in _rows()]
+
+
+def test_publish_endpoint_records_one_event_from_pre_switch_status(client, monkeypatch):
+    """`POST /publish` → 恰好一節：`draft → active`；`from_status` 是**切換前**的讀數（不是 `active → active`）。
+
+    `detail` 五鍵逐字寫死（§3.2）：`template_id` / `template_type` / `version` 取自模板行，
+    `version` 不隨狀態切換變（`set_template_active()` 只改 `status` / `updated_at`）。
+    """
+    monkeypatch.setenv("LEARNING_ENABLED", "on")
+    template_id = _draft(client)
+
+    response = client.post("/api/templates/%d/publish" % template_id, json=_auth())
+
+    assert response.status_code == 200, response.text
+    assert response.json()["changed"] is True
+    rows = _rows()
+    assert [row["event_type"] for row in rows] == ["template_configured"]
+    assert (rows[0]["seq"], rows[0]["template_id"], rows[0]["draft_id"]) == (1, template_id, 0), \
+        "單鏈從 1 起；配置事件不指向草案（draft_id 恆 0）"
+    assert rows[0]["teacher_name"] == TEACHER
+    assert rows[0]["lineage_id"] == "", "行上沒有師門（未歸屬哨兵 `''`）→ 不臆造"
+    assert _detail_list() == [{"template_id": template_id, "template_type": "record", "version": 1,
+                               "from_status": "draft", "to_status": "active"}]
+
+
+def test_archive_endpoint_records_one_event_and_keeps_response_shape(client, monkeypatch):
+    """`POST /archive` → 恰好一節：`active → archived`；響應體仍是既有那兩鍵（鍵序不變）。"""
+    monkeypatch.setenv("LEARNING_ENABLED", "on")
+    template_id = _draft(client)
+    assert client.post("/api/templates/%d/publish" % template_id, json=_auth()).status_code == 200
+
+    response = client.post("/api/templates/%d/archive" % template_id, json=_auth())
+
+    assert response.status_code == 200, response.text
+    assert list(response.json().keys()) == ["template", "changed"], "既有響應鍵集 / 鍵序一字不改"
+    assert response.json()["changed"] is True
+    assert _detail_list() == [
+        {"template_id": template_id, "template_type": "record", "version": 1,
+         "from_status": "draft", "to_status": "active"},
+        {"template_id": template_id, "template_type": "record", "version": 1,
+         "from_status": "active", "to_status": "archived"},
+    ]
+
+
+def test_activate_endpoint_records_one_event_from_archived_to_active(client, monkeypatch):
+    """`POST /activate` → 恰好一節：`archived → active`（鏈上第三節）；三鍵響應體鍵序不變。"""
+    monkeypatch.setenv("LEARNING_ENABLED", "on")
+    template_id = _draft(client)
+    for path in ("publish", "archive"):
+        assert client.post("/api/templates/%d/%s" % (template_id, path), json=_auth()).status_code == 200
+
+    response = client.post("/api/templates/%d/activate" % template_id, json=_auth())
+
+    assert response.status_code == 200, response.text
+    assert list(response.json().keys()) == ["template", "archived_ids", "changed"]
+    assert response.json()["changed"] is True
+    details = _detail_list()
+    assert [d["from_status"] + " → " + d["to_status"] for d in details] == [
+        "draft → active", "active → archived", "archived → active"]
+    assert details[2] == {"template_id": template_id, "template_type": "record", "version": 1,
+                          "from_status": "archived", "to_status": "active"}
+
+
+def test_idempotent_state_branches_emit_no_event(client, monkeypatch):
+    """§一-1：三個端點的**冪等分支**（`changed=false`）各發零新節 —— 重複點同一顆按鈕不在鏈上長空節。
+
+    每一段都是「先真切換一次（+1 節）→ 再對**同一個端點**做一次（`changed=false`）」：
+    只有同一端點連做兩次才落在冪等分支上（跨端點的第二輪不是冪等：`archive` 接在 `activate` 之後
+    是真的 `active → archived`）。
+    """
+    monkeypatch.setenv("LEARNING_ENABLED", "on")
+    template_id = _draft(client)
+    url = "/api/templates/%d/%%s" % template_id
+
+    for path, expected_events in (("publish", 1), ("archive", 2), ("activate", 3)):
+        first = client.post(url % path, json=_auth())
+        assert (first.status_code, first.json()["changed"]) == (200, True), path
+        assert len(_rows()) == expected_events, "%s 真切換應 +1 節" % path
+
+        again = client.post(url % path, json=_auth())
+        assert (again.status_code, again.json()["changed"]) == (200, False), \
+            "%s 的冪等分支：仍是 200（業務語義不變）+ changed=false" % path
+        assert len(_rows()) == expected_events, "%s 的冪等分支：零新節" % path
+
+    assert [d["from_status"] + " → " + d["to_status"] for d in _detail_list()] == [
+        "draft → active", "active → archived", "archived → active"], "三節＝三次真切換，沒有空節"
+
+
+def test_event_lineage_id_comes_from_the_template_row(client, monkeypatch):
+    """`lineage_id` **取自模板行**（不臆造）：行上是師門 id 就寫師門 id（`''` 那格見 publish 用例）。
+
+    造法：建草稿後用**裸 SQL** 把行上的 `lineage_id` 填成正規師門 id —— 狀態端點（publish / archive /
+    activate）**不**校驗師門（`_check_lineage()` 只掛在 create / update / derive），所以這一格測的正是
+    「事件投影從行上取，而不是自己拼一個空串」。
+    """
+    monkeypatch.setenv("LEARNING_ENABLED", "on")
+    template_id = _draft(client)
+    _raw_execute("UPDATE templates SET lineage_id = ? WHERE id = ?", (LINEAGE_ID, template_id))
+
+    assert client.post("/api/templates/%d/publish" % template_id, json=_auth()).status_code == 200
+
+    assert _rows()[0]["lineage_id"] == LINEAGE_ID
+
+
+def test_flag_off_keeps_response_shape_identical_and_writes_zero_rows(client, monkeypatch):
+    """§6 flag off = 與今天 1:1：三個端點照常切狀態、響應體**鍵集 / 鍵序**與 flag on 逐字節相同、鏈上零行。
+
+    兩趟對照：flag off 一趟（`record`）+ flag on 一趟（`treatment`，避免與上一趟的 scope 打架）——
+    比的是**響應形狀**（鍵序 = 客戶端可見契約）與「zero 行」。
+    """
+    monkeypatch.delenv("LEARNING_ENABLED", raising=False)
+    off_id = _draft(client)
+    off = [client.post("/api/templates/%d/%s" % (off_id, path), json=_auth())
+           for path in ("publish", "archive", "activate")]
+
+    assert [r.status_code for r in off] == [200, 200, 200]
+    assert [list(r.json().keys()) for r in off] == [
+        ["template", "archived_ids", "changed", "event", "warnings"],
+        ["template", "changed"],
+        ["template", "archived_ids", "changed"],
+    ]
+    assert [r.json()["changed"] for r in off] == [True, True, True]
+    assert off[0].json()["event"] == "template_configured", "Epic 1 §3.5 的預留鍵一字不改"
+    assert [r.json()["template"]["status"] for r in off] == ["active", "archived", "active"]
+    assert _rows() == [], "flag off：零行、零 seq（`learning_enabled()` 在寫入前就擋掉）"
+
+    monkeypatch.setenv("LEARNING_ENABLED", "on")
+    on_id = _draft(client, "treatment")
+    on = [client.post("/api/templates/%d/%s" % (on_id, path), json=_auth())
+          for path in ("publish", "archive", "activate")]
+
+    assert [list(r.json().keys()) for r in on] == [list(r.json().keys()) for r in off], \
+        "flag on / off 的響應鍵集與鍵序逐字節相同（flag 不參與響應組裝）"
+    assert [r.json()["changed"] for r in on] == [r.json()["changed"] for r in off]
+    assert [r.json()["template"]["status"] for r in on] == [r.json()["template"]["status"] for r in off]
+    assert [d["from_status"] + " → " + d["to_status"] for d in _detail_list()] == [
+        "draft → active", "active → archived", "archived → active"], "僅 flag on 那趟落鏈"
+
