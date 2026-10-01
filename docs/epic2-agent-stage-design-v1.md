@@ -722,6 +722,8 @@ POST /api/transcribe / /api/upload / /api/generate-draft
 37. `test_observation_uses_local_skeleton` —— 观察期老师生成 → 草案含『【觀察期】』提示、`llm` 未被调用（monkeypatch 断言）、仍可编辑签字。
 38. `test_epic1_and_legacy_suites_still_pass` —— 由 CI/命令行整体跑（`pytest backend -q`），`test_templates.py` 与 `test_api.py` 零改动零失败。
 
+> **施工回执 ③：哈希基线 vs 源码级守护。** 原计划 `test_prompts_unchanged`（prompt 字面量哈希）未落地，以 `test_agent_block_is_append_only_and_never_touches_database`（`backend/test_agent_stage.py:6039`）+ prompt 契约断言替代。**理由**：哈希基线会阻止任何 prompt 微调（演进成本高），源码级守护能挡住结构性问题（函数集数量、零 import、签名、占位符与免责声明在位）。**CTO 裁决（2026-09-30）：以源码级 + 契约级替代哈希基线。**
+
 ### 6.6 迁移（2 条）
 
 39. `test_migration_0003_idempotent` —— `run_upgrade()` 连跑两次无异常；三表存在、两列存在、种子 1 行不重复。
@@ -730,6 +732,15 @@ POST /api/transcribe / /api/upload / /api/generate-draft
 > 说明：以上 40 项按功能归为 6 组（编号含参数化展开前的条目），落在 `test_agent_stage.py` 中实际约 34 个测试函数。
 >
 > **施工回执（2026-09-30 · step 6.5-b）**：第 **37** 条已落地 —— 实现在 `backend/test_agent_stage.py:6529` 起的 **㉓ 组**（`test_observation_uses_local_skeleton`；同组另含扫描接线 3 条 / 降级链路 2 条 / 自锁守护 2 条 / TD-015 1 条，共 9 个测试函数、参数化后 28 项）。同批落地的 §4.4-③ 接线由本组第 1–3 条覆盖。
+
+> **施工回执 ④：计划用例名 ↔ 落地名映射。** 落地名以代码为准；本表用于「在文档里搜计划名 → 直接定位用例」。
+
+| 计划名（§6.5 / §6.6） | 落地名 | 说明 |
+| :---- | :---- | :---- |
+| §6.6-39 `test_migration_0003_idempotent` | `test_0003_upgrade_is_idempotent` | 命名与 `test_0005_*` 家族一致（`backend/test_migrations.py:1170`；2026-09-30 · step 7 落地） |
+| §6.6-40 `test_migration_0003_downgrade_safety` | `test_0003_downgrade_aborts_with_audit_events` | 同上（`backend/test_migrations.py:1208`）；按 §6.6-40 判据钉住「中止 + 提示导出」的处置文案与**零副作用** |
+| §6.5-35 `test_prompts_unchanged` | **等价守护（见回执 ③）** | 判据由等价用例承担，本名不再落地 |
+| §6.5-33 / 34 / 36 | **等价守护（本名未落地）** | 7 端点 404 = `test_api_flag_off_all_seven_routes_404_agent_stage_disabled`（`backend/test_agent_stage.py:4912`）；flag off 逐字节 = `test_insert_draft_flag_off_is_byte_identical_*` / `test_sign_draft_flag_off_is_byte_identical` / `test_resolve_agent_task_flag_off_*`；既有全流程 = Epic 1 `test_api.py` 零改动全绿 |
 
 ---
 
