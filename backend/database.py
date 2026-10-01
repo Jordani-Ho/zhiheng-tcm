@@ -844,6 +844,27 @@ def insert_draft(transcript_id, patient_name, teacher_name, content, template_id
     conn.commit()
     draft_id = cursor.lastrowid
     conn.close()
+
+    # 【Epic 3 §4.2 改 1 · 施工步骤 3.3-c】草案已落库 → best-effort 追加 `draft_generated` 学习事件。
+    # 纪律五条（与 `sign_draft()` 末尾那段同款，转发器本体见 `_call_agent_stage_hook`）：
+    #   · **只经唯一转发点** `_call_agent_stage_hook()`（钩子名 = `on_draft_generated`，按**名字**
+    #     `getattr` 派发）—— 库层不 import 学习服务层、不判 flag、不拼 payload、不自行吞写入异常；
+    #   · 放在 commit/close **之后**：事件写入失败绝不回滚草案落库，`return draft_id` 一字不改
+    #     （§9-声明一 / 与 §5.1 红线③ 同口径）；
+    #   · **归一化在调用方做**（CTO 3.3-a 追加 1 方案 c）：`_normalize_metric_text(text, 2000)`
+    #     —— 只为它在本函数内**局部** import 服务层（本档模块顶层不新增 import）；
+    #   · **参数按位置传**（转发器签名是 `(hook_name, *args)`，没有 kwargs）：第 6 位 = 适配器的
+    #     `content_hash` 槽，3.3-c 口径 = **归一化后的正文**（截断 2000，不是哈希）；
+    #     `template_id` / `template_version` 与落库口径一致（`or 0`）；
+    #   · 整段 try/except 静默兜底 —— 钩子缺失 / 归一化拿不到服务层时都只是「不发事件」，绝不影响
+    #     上面那个返回值。
+    try:
+        import agent_stage_service
+        normalized_content = agent_stage_service._normalize_metric_text(content, 2000)
+        _call_agent_stage_hook("on_draft_generated", teacher_name, draft_id, patient_name,
+                               template_id or 0, template_version or 0, normalized_content)
+    except Exception:
+        pass
     return draft_id
 
 def get_drafts(teacher_name=None, lineage_id=None):
@@ -886,10 +907,45 @@ def get_drafts(teacher_name=None, lineage_id=None):
     return [dict(r) for r in rows]
 
 def update_draft_content(draft_id, content):
+    """【Epic 3 §4.2 改 4 · 施工步骤 3.3-c】老师修改草案正文 → best-effort 追加 `draft_modified` 学习事件。
+
+    既有语义**零变化**（Epic 2 §5.1 红线③）：`UPDATE` 语句文本、`commit`、`close`、返回 `None`
+    一概一字不改。本步只加两件事，位置固定：
+
+      · **UPDATE 之前**：一条**只读** `SELECT * FROM drafts WHERE id = ?`（`draft_modified` 是四环节里
+        唯一零既有落点的环节，`before` 只能在这里现读）→ 取老师改之前的正文与事件定位键
+        （`teacher_name` / `patient_name`）。读失败 / 草案不存在（今天那次 UPDATE 也只是静默 0 行）
+        → `before = None`：UPDATE 照发，事件**不发**；
+      · **commit/close 之后**：经唯一转发点 `_call_agent_stage_hook()`（钩子名 = `on_draft_modified`）
+        追加事件：两侧正文各跑一次 `_normalize_metric_text(text, 2000)`（归一化在调用方做 ——
+        CTO 3.3-a 追加 1 方案 c；适配器**不**代劳，传原文会造成假阳性）。逐字相同的编辑由适配器
+        自己的幂等分支跳过，库层不替它判（同一判断只许有一份实现）。参数按位置传（转发器是
+        `(hook_name, *args)`）。
+
+    best-effort：整段 try/except 静默兜底（含服务层不可用）—— 老师的修改结果与返回值不受影响。
+    """
     conn = get_connection()
+    before = None
+    try:
+        before = conn.execute("SELECT * FROM drafts WHERE id = ?", (draft_id,)).fetchone()
+    except Exception:
+        before = None
     conn.execute("UPDATE drafts SET content = ? WHERE id = ?", (content, draft_id))
     conn.commit()
     conn.close()
+
+    # 【施工步骤 3.3-c】改了才说得上「有变化」：没有 before 就没有可比的基准 → 不发事件。
+    if before is not None:
+        try:
+            import agent_stage_service                       # 仅归一化用（函数内局部 import）
+            template_id = before["template_id"] if "template_id" in before.keys() else 0
+            normalized_before = agent_stage_service._normalize_metric_text(before["content"], 2000)
+            normalized_after = agent_stage_service._normalize_metric_text(content, 2000)
+            _call_agent_stage_hook("on_draft_modified", before["teacher_name"], draft_id,
+                                   before["patient_name"], normalized_before, normalized_after,
+                                   template_id)
+        except Exception:
+            pass
 
 def sign_draft(draft_id, final_plan, final_content=None):
     """【第45天修改】签字时同时保存 AI 原草案与老师最终版（学习轨迹）

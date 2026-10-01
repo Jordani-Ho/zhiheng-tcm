@@ -1289,9 +1289,10 @@ def test_record_detail_coercions_never_put_none_in_payload(db, monkeypatch):
 # ⑦ step 3.3-b：服務層適配器（`agent_stage_service.on_draft_generated` / `on_draft_modified`）
 # ----------------------------------------------------------------------------
 # 對齊：CTO 2026-09-30 step 3.3-b 指令 + 設計 §一-1（冪等跳過）/ §3.3 A5 A6 / §9-聲明二。
-# 3.3-b 只落**服務層適配器**，仍然**零接線**：`database.insert_draft()`（3.3-c 的「改 1」）/
-# `update_draft_content()`（3.3-d 的「改 4」）今天仍是零 `on_draft_*` 調用 —— 本組因此用兩條視角釘住它：
-# **直接調適配器**（①-⑥）+ **走庫層唯一轉發點 `database._call_agent_stage_hook()`**（⑦）。
+# 3.3-b 落**服務層適配器**（【3.3-c 已把兩個庫層落線點接上】）：`database.insert_draft()`（改 1）/
+# `update_draft_content()`（改 4）經唯一轉發點 `database._call_agent_stage_hook()` 各發一節 ——
+# 本組因此用兩條視角釘住它：**直接調適配器**（①-⑥）+ **走庫層唯一轉發點**（⑦ 的直調 +
+# ⑧ 組的兩個真實業務路徑端到端）。
 # 六件事（每件一個用例）：
 #   · 閘門只認學習總閘：`LEARNING_ENABLED` off（階段閘刻意 on）→ 零 SQL、零行、恆 `None`；
 #   · 階段閘 off / on 學習鏈**照寫**；`degraded` **現場**讀（每次調用現場讀一次，讀數換 → 內容換）；
@@ -1491,15 +1492,19 @@ def test_adapter_writes_only_learning_events_and_no_stage_table(db, monkeypatch,
     assert _raw_scalar("SELECT COUNT(*) FROM agent_learning_events") == before_events + 2
 
 
-def test_database_forwarder_reaches_the_adapters_and_nothing_wires_them_yet(db, monkeypatch):
-    """庫層唯一轉發點 ↔ 適配器：`database._call_agent_stage_hook()` 按**名字**取到就轉發、回 `True`；
-    **今天**兩個接線點（`insert_draft` / `update_draft_content`）仍是零調用 —— 「3.3-b 零接線」。
+def test_database_forwarder_reaches_the_adapters_and_the_two_landings_call_it_once(db, monkeypatch):
+    """庫層唯一轉發點 ↔ 適配器 ↔ 兩個落線點（**【3.3-c 落線後改寫】本檔唯一既有斷言變更**）。
 
-      · 前兩句：適配器掛上去之後，庫層那一行 `getattr` 真的找得到它、`hook(*args)` 真的落下一節
-        （前四參按位置傳，`args` 的形狀就是 3.3-c / 3.3-d 接線時的形狀）→ 名字 / 簽名對不上時這裡紅；
-      · 第三句：兩個接線點體內既無 `on_draft_*` 也無 `_call_agent_stage_hook` —— 本步**不碰既有行**。
-        **本句在 3.3-c / 3.3-d 落線時必須同步改寫**（那時它守的就不再是「零調用」，而是「恰好一處、
-        位置正確」）；這條與本文件的 `ALLOWED_WIRING` 同期收口（最終形 3.3-f）。
+    3.3-b 的「兩個接線點仍是零調用」守護到此結束 —— 現在守的是「落了線，而且落得對」：
+      · 前兩句（沿用 3.3-b）：`_call_agent_stage_hook()` 按**名字**取到適配器就轉發、回 `True`、
+        落下真實一節（前四參按**位置**傳，`args` 的形狀就是兩個落線點的形狀）→ 名字 / 簽名對不上
+        時這裡紅；
+      · 第三句（改寫）：兩個落線點體內**恰好一處**真實調用（`source.count('_call_agent_stage_hook("')`，
+        與 `test_agent_stage.py` ⑫ 組同一套「只數真實調用」口徑 —— 註釋 / docstring 寫的是
+        `_call_agent_stage_hook()`，括號後不帶引號，故不計入），且**不得**直呼
+        `agent_stage_service.on_draft_*`（繞過唯一入口 = 第二個轉發點，設計 §10.1-1 紅線）；
+      · 第四句（新增）：庫層不自己判學習總閘 —— `LEARNING_ENABLED` 一字不出現在這兩個函數體裡
+        （flag 只在閘門函數裡判一次；payload 也歸適配器 / `learning_service`）。
     """
     import inspect
 
@@ -1510,7 +1515,169 @@ def test_database_forwarder_reaches_the_adapters_and_nothing_wires_them_yet(db, 
     assert [row["event_type"] for row in rows] == ["draft_generated"]
     assert (rows[0]["draft_id"], rows[0]["template_id"]) == (DRAFT_ID, 7)
 
-    for name in ("insert_draft", "update_draft_content"):
+    landed = {"insert_draft": "on_draft_generated", "update_draft_content": "on_draft_modified"}
+    for name, hook_name in landed.items():
         source = inspect.getsource(getattr(database, name))
-        assert "on_draft_" not in source and "_call_agent_stage_hook" not in source, \
-            "%s 已經接了學習事件 → 那是 3.3-c / 3.3-d 的落點（本步零接線）" % name
+        assert source.count('_call_agent_stage_hook("') == 1, \
+            "%s 必須恰好一處真實轉發（唯一入口，按名字）" % name
+        assert source.count('_call_agent_stage_hook("%s"' % hook_name) == 1, \
+            "%s 的鉤子名必須是 %s（位置 / 名字錯 = 靜默丟事件）" % (name, hook_name)
+        assert "agent_stage_service.on_draft_" not in source, \
+            "%s 直呼服務層鉤子 → 繞過唯一轉發點（§10.1-1 紅線）" % name
+        assert "LEARNING_ENABLED" not in source, \
+            "%s 不許自己判學習總閘（flag 只在閘門裡判一次）" % name
+
+
+# ============================================================================
+# ⑧ step 3.3-c：庫層兩個落線點（`database.insert_draft` / `database.update_draft_content`）
+# ----------------------------------------------------------------------------
+# 對齊：CTO 2026-09-30 step 3.3-c 指令 + 設計 §3.1（事件流）/ §4.2 改 1、改 4 / §9-聲明一 / §10.1。
+# 本步把「服務層適配器」（3.3-b）接到**兩個真實業務路徑**上，因此守護是**端到端**視角：
+#   · `insert_draft()` → `draft_generated` 一節：定位鍵取自返回值（`draft_id`）與落庫的模板引用；
+#     第 6 位（適配器的 `content_hash` 槽）= **已歸一化**的正文（截斷 2000）—— 歸一化在調用方做
+#     （CTO 3.3-a 追加 1 方案 c）；庫層原樣落庫，不改老師看到的正文；
+#   · `update_draft_content()` → UPDATE **之前**一條只讀 SELECT 取 `before` → `draft_modified` 一節
+#     （兩側正文各歸一化一次）；逐字相同的編輯由適配器自己的冪等分支跳過（§一-1），庫層不替它判；
+#   · 兩處都 **best-effort**（§9-聲明一）：鉤子炸了 / 草案不存在 → 業務結果與返回值一字不改、
+#     零事件、不拋，只留 `[warn]`；
+#   · flag off = 與今天 1:1：零 `agent_learning_events` 語句、零行（A4）。
+# 源碼級守護：本檔 `test_no_wiring_in_step_3_2` 的函數體級斷言（零 `learning_service` /
+# `agent_learning_events` / `LEARNING_ENABLED`）+ ⑦ 組改寫後那條（恰好一處、名字正確）—— 兩處交叉。
+# ============================================================================
+
+RAW_BODY = "【主訴】  頭痛   三日\r\n【舌象】  舌淡紅"
+NORMALIZED_BODY = "【主訴】 頭痛 三日 【舌象】 舌淡紅"      # 上面那份原文的歸一化產物（換行 → 空格、連續空白折疊）
+
+
+def _draft_content(draft_id):
+    """草案當前的 `content`（直連庫文件讀，不污染 `sql_log` 的語句級斷言）。"""
+    return _raw_scalar("SELECT content FROM drafts WHERE id = ?", (draft_id,))
+
+
+def test_insert_draft_emits_draft_generated_event(db, monkeypatch):
+    """改 1 端到端：`insert_draft()` 落庫後追加 `draft_generated` 一節，帶著**歸一化後的正文**。
+
+    四件事一起釘：① 草案落庫的仍是**原文**（庫層不替老師改正文）；② 事件定位鍵 = 返回值
+    （`draft_id`）與落庫的模板引用；③ 第 6 位拿到的是 `_normalize_metric_text()` 的產物
+    （換行折成空格 + 段內連續空白折疊）；④ A5：明文姓名不入鏈（只留 `patient_name_hash`）。
+    """
+    monkeypatch.setenv("LEARNING_ENABLED", "on")
+
+    draft_id = db.insert_draft(0, PATIENT_NAME, TEACHER, RAW_BODY, template_id=7, template_version=2)
+
+    assert isinstance(draft_id, int), "返回值語義不變（仍是 draft_id）"
+    assert _draft_content(draft_id) == RAW_BODY, "落庫的正文是原文，歸一化只發生在事件那一側"
+    rows = _rows()
+    assert [row["event_type"] for row in rows] == ["draft_generated"]
+    assert (rows[0]["draft_id"], rows[0]["template_id"]) == (draft_id, 7)
+    assert (rows[0]["seq"], rows[0]["lineage_id"]) == (1, ""), "單鏈從 1 起；定位鍵不臆造"
+    assert rows[0]["patient_name_hash"] == FROZEN_PATIENT_NAME_HASH
+    assert PATIENT_NAME not in rows[0]["payload_json"], "A5：明文姓名不入鏈"
+    assert json.loads(rows[0]["payload_json"])["detail"] == {
+        "template_version": 2, "content_hash": NORMALIZED_BODY, "degraded": False}
+
+
+def test_insert_draft_event_body_is_normalized_and_truncated_at_2000(db, monkeypatch):
+    """歸一化口徑落到事件上：換行折成空格 + 截斷 **2000**（與 ② 指標同一個函數、同一個上限）。
+
+    正文 = `"A" * 2500 + 換行 + "B" * 10` → 歸一化後 2511 字 → 截斷 2000 ⇒ `"A" * 2000`
+    （期望值**獨立**算出，不由實現代勞）。
+    """
+    monkeypatch.setenv("LEARNING_ENABLED", "on")
+
+    db.insert_draft(0, PATIENT_NAME, TEACHER, "A" * 2500 + "\r\n" + "B" * 10)
+
+    detail = json.loads(_rows()[0]["payload_json"])["detail"]
+    assert detail == {"template_version": 0, "content_hash": "A" * 2000, "degraded": False}
+
+
+def test_insert_draft_flag_off_is_zero_learning_sql(db, sql_log):
+    """flag off = 與今天 1:1（§6 / A4）：`insert_draft()` 的語句序列裡**一句**學習表都不出現。
+
+    零 SQL 來自閘門（`LEARNING_ENABLED` 默認 off，本檔不動 conftest）—— 庫層自己不判 flag，
+    所以這一格同時是「庫層沒有第二個 flag 判斷」的行為面證據。
+    """
+    draft_id = db.insert_draft(0, PATIENT_NAME, TEACHER, "AI 原稿")
+
+    assert isinstance(draft_id, int) and _draft_content(draft_id) == "AI 原稿"
+    assert [sql for sql in _statements(sql_log) if "agent_learning_events" in sql] == []
+    assert _rows() == []
+
+
+def test_two_landings_are_best_effort_when_hooks_raise(db, monkeypatch, capsys):
+    """§9-聲明一：鉤子炸了**絕不**回退業務 —— 業務結果 / 返回值一字不改，只留 `[warn]`、零半節。
+
+    兩個落線點各炸一次；第二個刻意走**真的 `before`**（草案存在）—— 證明事件段是真的被兜住，
+    不是「因為沒進到那一段才沒炸」。
+    """
+    import agent_stage_service
+
+    monkeypatch.setenv("LEARNING_ENABLED", "on")
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("適配器炸了（用例注入）")
+
+    monkeypatch.setattr(agent_stage_service, "on_draft_generated", _boom)
+    monkeypatch.setattr(agent_stage_service, "on_draft_modified", _boom)
+
+    draft_id = db.insert_draft(0, PATIENT_NAME, TEACHER, "AI 原稿")
+    assert _draft_content(draft_id) == "AI 原稿", "草案照樣落庫"
+    assert db.update_draft_content(draft_id, "老師改後的正文") is None
+    assert _draft_content(draft_id) == "老師改後的正文", "修改照樣落庫"
+
+    out = capsys.readouterr().out
+    assert out.count("[warn]") == 2, out                     # 每個落線點恰好一行，不靜默也不囉嗦
+    assert "on_draft_generated" in out and "on_draft_modified" in out   # 可定位
+    assert _rows() == [], "吞掉異常 ≠ 留半節"
+
+
+def test_update_draft_content_emits_draft_modified_event(db, monkeypatch):
+    """改 4 端到端：UPDATE 前只讀讀 `before` → 追加 `draft_modified` 一節（兩側都**已歸一化**）。
+
+    期望 `detail` 逐條寫死：`field` = 段標題（`主訴`）、兩個哈希 = 段文本的 `sha256`；
+    `before` 段文本 = `"頭痛 三日"`（段內連續空白已折疊）、`after` 段文本 = `"頭痛三日"`。
+    """
+    draft_id = db.insert_draft(0, PATIENT_NAME, TEACHER, "【主訴】 頭痛   三日",
+                               template_id=7, template_version=2)      # flag off：這一步不發事件
+    monkeypatch.setenv("LEARNING_ENABLED", "on")
+
+    assert db.update_draft_content(draft_id, "【主訴】 頭痛三日") is None
+
+    rows = _rows()
+    assert [row["event_type"] for row in rows] == ["draft_modified"]
+    assert (rows[0]["draft_id"], rows[0]["template_id"]) == (draft_id, 7), "定位鍵取自草案行"
+    assert rows[0]["patient_name_hash"] == FROZEN_PATIENT_NAME_HASH
+    assert json.loads(rows[0]["payload_json"])["detail"] == {
+        "field_diff": [{"field": "主訴", "before_hash": _text_hash("頭痛 三日"),
+                        "after_hash": _text_hash("頭痛三日")}],
+        "wording_changed": True}
+    assert _draft_content(draft_id) == "【主訴】 頭痛三日", "既有 UPDATE 語義與落庫值不變"
+
+
+def test_update_draft_content_skips_event_when_normalized_body_is_unchanged(db, monkeypatch):
+    """§一-1 冪等：歸一化後逐字相同 → **不寫事件**（反覆保存同一份正文不在鏈上長空節）。
+
+    兩次編輯只差「段內連續空白」—— 歸一化後一模一樣；`drafts.content` 仍照原文更新（業務不變）。
+    """
+    draft_id = db.insert_draft(0, PATIENT_NAME, TEACHER, "【主訴】 頭痛 三日")
+    monkeypatch.setenv("LEARNING_ENABLED", "on")
+
+    assert db.update_draft_content(draft_id, "【主訴】 頭痛   三日") is None
+
+    assert _rows() == []
+    assert _draft_content(draft_id) == "【主訴】 頭痛   三日", "業務寫入照做，只是不發事件"
+
+
+def test_update_draft_content_missing_draft_is_quiet_and_keeps_update_statement(db, monkeypatch, sql_log):
+    """草案不存在（今天那 0 行 UPDATE）：不拋、不發事件，且**既有 UPDATE 語句逐字不變**。
+
+    這一格同時守住兩件事：「讀不到 `before` 就不發事件」與「UPDATE 語句 / 參數順序沒被本步改動」
+    （§5.1 紅線③ —— 本步在 UPDATE **之前**新增的那條只讀 SELECT 不改變既有語句）。
+    """
+    monkeypatch.setenv("LEARNING_ENABLED", "on")
+
+    assert db.update_draft_content(987654, "無主正文") is None
+
+    assert _rows() == []
+    assert ("UPDATE drafts SET content = ? WHERE id = ?", ("無主正文", 987654)) in sql_log[0].calls, \
+        "既有 UPDATE 語句文本 / 參數順序一字不改"
