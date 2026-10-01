@@ -2868,6 +2868,132 @@ def test_require_capability_body_has_no_capability_branches():
         "§2.5 的放宽范围必须逐项枚举（且不含 generate_draft：那是 §5.3 的本地骨架路径）"
 
 
+# ---- 3.3-b 追加：学习事件适配器的源码级守护（纯追加，不动 ⑮ 组既有用例）----
+#
+# CTO 2026-09-30 step 3.3-b 只落「服务层适配器」（`agent_stage_service.on_draft_generated` /
+# `on_draft_modified`）：库层转发段 `database._call_agent_stage_hook()` 按**名字** `getattr` 取它们
+# → 名字 / 签名 / 闸门形状 / 恒 `None` 都是契约；又因为它们站在「学习链的入口」，三条红线必须由源码级
+# 守护钉死（行为级用例在 `test_learning.py` ⑦ 组，两处互为交叉验证）：
+#   ① 签名契约：前四参按位置传（`teacher_name, draft_id, patient_name, …`），其余一律带缺省值；
+#   ② 首行闸门**只认学习总闸**（`learning_service.learning_enabled()`）—— 阶段链的闸不在这里判
+#      （Epic 3 §3.3 A6：两表两流；判两次 = 给「为什么没写事件」多加一个假归因面）；
+#   ③ 体内**零阶段面**（设计 §9-声明二）：不写阶段审计 / 不借道拒绝留痕 / 不问能力闸门，也不调三个
+#      既有状态转移钩子（`_HOOK_NAMES`，与 3.4-c 的「钩子互不调用」同口径）与 `evaluate()`。
+_ADAPTER_NAMES = ("on_draft_generated", "on_draft_modified")
+
+
+def _adapter_ast(name):
+    """取适配器的 `(AST 函数节点, 源码, 模块对象)`（只认**模块级 `def`**）。
+
+    适配器是库层按名字取用的符号 → lambda / 类方法 / `async def` 都是形状漂移，直接算红。
+    """
+    import ast
+    import inspect
+
+    import agent_stage_service
+
+    adapter = getattr(agent_stage_service, name, None)
+    assert callable(adapter), "%s 必须存在（3.3-b 适配器；库层转发段按名字取，缺了就静默 no-op）" % name
+    source = inspect.getsource(adapter)
+    node = ast.parse(source).body[0]
+    assert isinstance(node, ast.FunctionDef) and node.name == name, \
+        "%s 必须是模块级 def（实测 %s）" % (name, type(node).__name__)
+    return node, source, agent_stage_service
+
+
+def test_learning_adapters_exist_with_the_first_four_parameter_contract():
+    """【3.3-b ①】两个适配器齐备 + 前四参逐参对表 + `teacher_name` 必填、其余一律带缺省值。
+
+    前四参是**库层转发段 / 未来接线点按位置传**的那四个（加参数只许往 `*_after` 之后追加）；
+    `*args` / `**kwargs` 一律不接受 —— 那会让「按位置传参」失去检查面。
+    """
+    import inspect
+
+    import agent_stage_service
+
+    expected = {
+        "on_draft_generated": ("teacher_name", "draft_id", "patient_name", "template_id"),
+        "on_draft_modified": ("teacher_name", "draft_id", "patient_name", "normalized_before"),
+    }
+    for name, first_four in expected.items():
+        adapter = getattr(agent_stage_service, name, None)
+        assert callable(adapter), "%s 必须存在（库层转发段按名字取）" % name
+        parameters = list(inspect.signature(adapter).parameters.values())
+        assert tuple(item.name for item in parameters)[:4] == first_four, \
+            "%s 前四参漂移（实测 %r）" % (name, [item.name for item in parameters])
+        assert not any(item.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
+                       for item in parameters), \
+            "%s 不许 *args / **kwargs（「按位置传前四参」的契约会因此失去检查面）" % name
+        assert parameters[0].default is inspect.Parameter.empty, "%s 的 teacher_name 必填" % name
+        assert all(item.default is not inspect.Parameter.empty for item in parameters[1:]), \
+            "%s 只有 teacher_name 必填，其余一律带缺省值（库层今天只传前四个）" % name
+
+
+def test_learning_adapters_gate_first_on_the_learning_flag_only():
+    """【3.3-b ②】跳过 docstring / 函数内 import 之后的**第一条语句**必须是
+    `if not learning_service.learning_enabled(): return None`；且体内**一个** `agent_stage_enabled`
+    都不许有 —— 阶段链的闸不参与「学习事件写与不写」（Epic 3 §3.3 A6）。
+
+    末尾 `return None` 同点钉住「恒 `None`」契约：返回值不参与任何业务判定。
+    """
+    import ast
+
+    for name in _ADAPTER_NAMES:
+        node, source, _module = _adapter_ast(name)
+        body = list(node.body)
+        index = 0
+        if (body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant)
+                and isinstance(body[0].value.value, str)):
+            index += 1                                          # docstring
+        while index < len(body) and isinstance(body[index], ast.Import):
+            names = [alias.name for alias in body[index].names]
+            assert names == ["learning_service"], \
+                "%s 的函数内 import 只许是 `import learning_service`（实测 %r）" % (name, names)
+            index += 1
+        assert index < len(body), "%s 除 docstring / import 之外没有语句" % name
+
+        gate = body[index]
+        assert isinstance(gate, ast.If) and gate.orelse == [], \
+            "%s 的第一条语句必须是「首行闸门」（实测 %s）" % (name, type(gate).__name__)
+        condition = ast.get_source_segment(source, gate.test)
+        assert condition == "not learning_service.learning_enabled()", \
+            "%s 的闸门条件必须逐字是 `not learning_service.learning_enabled()`（实测 %r）" \
+            % (name, condition)
+        assert len(gate.body) == 1 and isinstance(gate.body[0], ast.Return) \
+            and isinstance(gate.body[0].value, ast.Constant) and gate.body[0].value.value is None, \
+            "%s 的闸门命中时必须恒 `return None`" % name
+        assert "agent_stage_enabled" not in source, \
+            "%s 不得判阶段链的总闸（学习事件在阶段闸 off 时照写 —— A6 两条链）" % name
+        ret = node.body[-1]
+        assert isinstance(ret, ast.Return), "%s 的末尾必须 return" % name
+        assert isinstance(ret.value, ast.Constant) and ret.value.value is None, \
+            "%s 的末尾必须 `return None`（恒 None 契约）" % name
+
+
+def test_learning_adapters_never_touch_the_stage_surface():
+    """【3.3-b ③】体内零阶段面（设计 §9-声明二）：不写阶段审计 / 不借道拒绝留痕 / 不问能力闸门，
+    也不调三个既有状态转移钩子与 `evaluate()` —— 学习事件不借道权限面（否则会污染升阶判据面）。
+    """
+    import ast
+
+    forbidden_markers = ("_stage_audit", "require_capability", "permission_denied")
+    forbidden_calls = set(_HOOK_NAMES) | {"evaluate"}
+    for name in _ADAPTER_NAMES:
+        node, source, _module = _adapter_ast(name)
+        for marker in forbidden_markers:
+            assert marker not in source, "%s 出现 %s（事件写不得借道权限面）" % (name, marker)
+        called = set()
+        for inner in ast.walk(node):
+            if isinstance(inner, ast.Call):
+                if isinstance(inner.func, ast.Name):
+                    called.add(inner.func.id)
+                elif isinstance(inner.func, ast.Attribute):
+                    called.add(inner.func.attr)
+        assert called.isdisjoint(forbidden_calls), \
+            "%s 调用了阶段面符号：%r" % (name, sorted(called & forbidden_calls))
+
+
+
 # ============ ⑯ 【施工步骤 3.4-a】指标层：① 模板匹配度 + ② 病历修改一致率 ============
 #
 # CTO 2026-09-29 放行 step 3.4-a 的边界，本组逐条落地（本组即「⑯ 组」）：
@@ -5967,6 +6093,13 @@ _SERVICE_BLOCK_FUNCTIONS = (
     # 本块其余断言不受影响（实测：`require_capability` 仍 2 次、`current_stage` 仍 4 次、
     # `_stage_event` 仍 2 次、`import agent` 仍 2 次、零 SQL 写语句 —— 因为新函数**只读**）。
     "generation_degraded",
+    # 【施工步骤 3.3-b 追加】库层转发段 `database._call_agent_stage_hook()` 按**名字** `getattr`
+    # 取的两个学习事件适配器。它们同样落在本块边界内（块口径 = 到文件尾），故清单同步两名；
+    # 本块其余断言不受影响（实测：`require_capability` 仍 2 次、`current_stage` 仍 4 次、
+    # `_stage_event` 仍 2 次、`import agent` 仍 2 次、零 SQL 写语句 —— 因为适配器只转发学习事件、
+    # 只延迟 `import learning_service`（块内仍零模块级 import），阶段面一名都不碰）。
+    "on_draft_generated",
+    "on_draft_modified",
 )
 _AGENT_BLOCK_FUNCTIONS = (
     "_clip_text", "_plain_text", "_load_json_object", "_text_list", "_dose_free", "_herb_name",
@@ -5999,8 +6132,9 @@ def _calls_of(tree, names):
 
 def test_service_block_is_append_only_with_single_write_point():
     """服务层追加块的**源码级守护**（口径：从 `SUGGESTION_KINDS` 到文件尾 = 本步全部新增面）：
-    顶层函数**恰好**是清单里的 21 个（一个不多、一个不少；第 21 名 = 施工步骤 6.5-a 追加的
-    `generation_degraded`）；块内**没有模块级 import**（延迟 import 纪律）、
+    顶层函数**恰好**是清单里的 23 个（一个不多、一个不少；第 21 名 = 施工步骤 6.5-a 追加的
+    `generation_degraded`；第 22 / 23 名 = 施工步骤 3.3-b 追加的两个学习事件适配器
+    `on_draft_generated` / `on_draft_modified`）；块内**没有模块级 import**（延迟 import 纪律）、
     **没有一句 SQL 写语句**（`INSERT` / `UPDATE` / `DELETE` / `commit()` / `execute(` 一律不出现）
     —— 唯一写点是 `_stage_event()`（两个入口各一次）；能力闸门 `require_capability()` 也恰好两次
     （服务层绝不自己读阶段做判定 = §2.2 单一收口点）；调 AI 层一律**关键字**（无位置参数、无 `**` 展开：

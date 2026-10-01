@@ -821,6 +821,44 @@ def test_source_guard_zero_sql_zero_audit_zero_capability():
     assert "database" not in top_level, "database 必須在函數內延遲 import"
 
 
+# 【3.3-b 白名單收窄】`learning_service` 的**引用白名單**：`{"檔名": ("函數名", ...)}`。
+#   為什麼要收窄：3.2 的「任何生產模組零 import」在當時是正確口徑（那時零接線）；3.3-b 起
+#   `agent_stage_service.py` 新增兩個適配器，**函數內**延遲 import 學習服務層是設計的一部分
+#   （白名單唯一處）。守護因此從「零 import」升級成「只許這兩處」——
+#   頂層 import（任何模組）/ 白名單外的模組 / 同模組的其他函數體，三條照舊紅。
+#   最終形在 3.3-f（本步只放行這兩個適配器；庫層落點與接口層的放行各自由 3.3-c / 3.3-e 追加收口）。
+ALLOWED_WIRING = {"agent_stage_service.py": ("on_draft_generated", "on_draft_modified")}
+
+
+def _imports_learning_service(node):
+    """該 AST 節點是否為 `import learning_service` / `from learning_service …`（按**根模組名**判定）。"""
+    if isinstance(node, ast.Import):
+        return any(alias.name.split(".")[0] == "learning_service" for alias in node.names)
+    if isinstance(node, ast.ImportFrom):
+        return (node.module or "").split(".")[0] == "learning_service"
+    return False
+
+
+def _learning_import_owners(tree):
+    """每個 `… learning_service` 節點 → 它的**最近外層函數名**（模組頂層 → `None`）之集合。
+
+    歸屬必須按「最近」而非「任意外層」：`ast.walk()` 不分層，若直接拿它當「所在函數」，巢狀函數裡的
+    import 會被記到外層函數名下 —— 那樣白名單就漏了一格（內層函數偷偷 import 也算數）。故這裡自己
+    遞迴下潛：進入 `FunctionDef` 時**換 owner**（內層覆蓋外層），回到同層時自然回到外層的 owner。
+    """
+    sites = set()
+
+    def _walk(node, owner):
+        if _imports_learning_service(node):
+            sites.add((owner, node.lineno))
+        for child in ast.iter_child_nodes(node):
+            _walk(child, child.name
+                  if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) else owner)
+
+    _walk(tree, None)
+    return sites
+
+
 def test_no_wiring_in_step_3_2():
     """【本步鐵律】3.2 只落骨架：四個待接線點與**任何**生產模組都不得引用 `learning_service`（零接線）。
 
@@ -831,8 +869,16 @@ def test_no_wiring_in_step_3_2():
       · **函數體級**：`database.insert_draft` / `database.update_draft_content` /
         `agent_stage_service._evaluate` 三段源碼裡零 `learning_service` / `agent_learning_events` /
         `LEARNING_ENABLED`（本步不得動它們一個字節）；
-      · **模組級**：backend 根目錄下**除測試文件與 `learning_service.py` 本身**，
-        沒有任何模組 import 過 `learning_service`（接線屬 3.3 / 3.4 / 3.5）。
+      · **模組級（【3.3-b 收窄為白名單形】）**：backend 根目錄下**除測試文件與
+        `learning_service.py` 本身**，只放行 `ALLOWED_WIRING` 逐項列出的「檔名 → 函數名」——
+        今天 = `agent_stage_service.py` 的 `on_draft_generated` / `on_draft_modified`
+        **函數體內**的延遲 import（3.3-b 的服務層適配器 = 白名單唯一處）。**頂層 import（任何模組）/
+        白名單外的模組 / 同模組的其他函數體**三條照舊紅 —— 3.2 的口徑因此只是**收窄**，沒有放寬。
+        【變更披露 · CTO R4】**本條是既有斷言變更**：原斷言
+        `"learning_service" not in _imported_roots(tree)` 表達不了「哪些位置允許」，故改為
+        「按最近外層函數歸屬的白名單比對」（判定助手見下方 `_learning_import_owners()`）；
+        庫層落點（3.3-c）與接口層（3.3-e）的放行各自由後續子步往 `ALLOWED_WIRING` 追加，
+        **最終形在 3.3-f 收口**。
     """
     guarded = {
         "database.py": ("insert_draft", "update_draft_content"),
@@ -865,8 +911,14 @@ def test_no_wiring_in_step_3_2():
         if filename in ("conftest.py", "learning_service.py"):
             continue
         tree = _parse_module(os.path.join(BACKEND_DIR, filename))
-        assert "learning_service" not in _imported_roots(tree), \
-            "%s 在 step 3.2 就 import 了 learning_service（接線屬 3.3 / 3.4）" % filename
+        allowed = ALLOWED_WIRING.get(filename, ())    # 【3.3-b】白名單收窄（最終形在 3.3-f）
+        offenders = sorted((owner or "<模組頂層>", lineno)
+                           for owner, lineno in _learning_import_owners(tree)
+                           if owner not in allowed)
+        assert offenders == [], \
+            ("%s 出現了白名單外的 learning_service 引用：%r（3.3-b 白名單 = %r；"
+             "頂層 import / 白名單外的模組 / 同模組的其他函數體一律紅，最終形在 3.3-f）"
+             % (filename, offenders, ALLOWED_WIRING))
 
 
 # ============================================================================
@@ -1231,3 +1283,234 @@ def test_record_detail_coercions_never_put_none_in_payload(db, monkeypatch):
                           "from_status": "", "to_status": ""}
     for detail in details:
         assert None not in detail.values()
+
+
+# ============================================================================
+# ⑦ step 3.3-b：服務層適配器（`agent_stage_service.on_draft_generated` / `on_draft_modified`）
+# ----------------------------------------------------------------------------
+# 對齊：CTO 2026-09-30 step 3.3-b 指令 + 設計 §一-1（冪等跳過）/ §3.3 A5 A6 / §9-聲明二。
+# 3.3-b 只落**服務層適配器**，仍然**零接線**：`database.insert_draft()`（3.3-c 的「改 1」）/
+# `update_draft_content()`（3.3-d 的「改 4」）今天仍是零 `on_draft_*` 調用 —— 本組因此用兩條視角釘住它：
+# **直接調適配器**（①-⑥）+ **走庫層唯一轉發點 `database._call_agent_stage_hook()`**（⑦）。
+# 六件事（每件一個用例）：
+#   · 閘門只認學習總閘：`LEARNING_ENABLED` off（階段閘刻意 on）→ 零 SQL、零行、恆 `None`；
+#   · 階段閘 off / on 學習鏈**照寫**；`degraded` **現場**讀（每次調用現場讀一次，讀數換 → 內容換）；
+#   · `field_diff == []` → **跳過寫事件**（§一-1：逐字相同的編輯不往鏈裡塞空節）；
+#   · best-effort：任何異常 → 只留一行**繁體** `[warn]`（帶適配器名，可定位）、不冒泡、**恆 `None`**；
+#   · **不代勞歸一化**（方案 c：歸一化在調用方）→ 傳原文會**假陽性**、傳 `_normalize_metric_text()`
+#     的產物才跳過（⑥ 組 `test_content_diff_normalization_is_caller_side` 的**適配器層**版本）；
+#   · 零階段面（§9-聲明二）：只寫 `agent_learning_events`，階段三表 / 業務兩表**一行都沒動**。
+# 造數 / 斷言助手一律復用 ⑥ 組（`_rows` / `_statements` / `_raw_scalar` / `_text_hash` / `DIFF_*`…）；
+# 源碼級守護在 `test_agent_stage.py` ⑮ 組追加的三條（兩處互為交叉驗證）。
+# ============================================================================
+
+def test_adapter_generated_flag_off_is_zero_sql_and_returns_none(db, monkeypatch, sql_log):
+    """flag 門（A6 第一條）：`LEARNING_ENABLED` off（**階段閘刻意 on**）→ 兩個適配器都零 SQL、零行、`None`。
+
+    「階段閘 on 也解不開學習事件」是本條的另一半：兩條鏈的閘各管各的流，判兩次只會多一個假歸因面。
+    """
+    import agent_stage_service
+
+    monkeypatch.setenv("AGENT_STAGE_ENABLED", "on")            # 階段閘 on 不許解鎖學習事件
+    monkeypatch.delenv("LEARNING_ENABLED", raising=False)      # 學習總閘默認 off
+    mark = len(_statements(sql_log))
+
+    assert agent_stage_service.on_draft_generated(
+        TEACHER, DRAFT_ID, PATIENT_NAME, 7, 2, "content-hash", LINEAGE_ID) is None
+    assert agent_stage_service.on_draft_modified(
+        TEACHER, DRAFT_ID, PATIENT_NAME, DIFF_BEFORE, DIFF_AFTER) is None
+
+    assert _statements(sql_log)[mark:] == [], "學習閘 off 時連存儲探針都不該發"
+    assert _rows() == []
+
+
+def test_adapter_writes_on_both_stage_flag_states_and_reads_degraded_live(db, monkeypatch):
+    """A6（兩條鏈）+ `degraded` 現場讀：階段閘 off / on 都照寫；三次調用三次現場讀。
+
+    第一次**不換任何讀數**：真 `generation_degraded()` 在階段閘 off 時只能是 `False`（§5.1 紅線①）。
+    第二次把 `generation_degraded` 換成「記錄入參、回 `True`」的替身 → 事件裡的 `degraded` 必須跟著變
+    `True`（若適配器改成預判 / 緩存結果 / 拿別的入參，這一格立刻紅）；第三次再換回 `False`。
+    """
+    import agent_stage_service
+
+    monkeypatch.setenv("LEARNING_ENABLED", "on")
+    monkeypatch.delenv("AGENT_STAGE_ENABLED", raising=False)   # 階段閘 off → 學習鏈照寫
+    assert agent_stage_service.on_draft_generated(
+        TEACHER, DRAFT_ID, PATIENT_NAME, 7, 2, "content-hash", LINEAGE_ID) is None
+
+    seen = []
+
+    def _degraded(teacher_name):
+        seen.append(teacher_name)
+        return True
+
+    monkeypatch.setattr(agent_stage_service, "generation_degraded", _degraded)
+    assert agent_stage_service.on_draft_generated(
+        TEACHER, DRAFT_ID + 1, PATIENT_NAME, 7, 2, "content-hash", LINEAGE_ID) is None
+
+    monkeypatch.setenv("AGENT_STAGE_ENABLED", "on")             # 階段閘 on → 學習鏈照寫（兩條鏈）
+    monkeypatch.setattr(agent_stage_service, "generation_degraded", lambda teacher_name: False)
+    assert agent_stage_service.on_draft_modified(
+        TEACHER, DRAFT_ID, PATIENT_NAME, DIFF_BEFORE, DIFF_AFTER) is None
+
+    assert seen == [TEACHER], "`degraded` 必須現場讀「該老師」（不得緩存 / 不得換入參）"
+    rows = _rows()
+    assert [row["event_type"] for row in rows] == [
+        "draft_generated", "draft_generated", "draft_modified"]
+    details = [json.loads(row["payload_json"])["detail"] for row in rows]
+    assert details[0] == {"template_version": 2, "content_hash": "content-hash", "degraded": False}
+    assert details[1] == {"template_version": 2, "content_hash": "content-hash", "degraded": True}
+    assert details[2]["wording_changed"] is True
+    assert [item["field"] for item in details[2]["field_diff"]] == ["主訴（學生原話）"]
+    assert learning_service.verify_learning_chain(TEACHER) == {
+        "ok": True, "checked": 3, "first_bad_seq": None, "reason": "ok"}
+
+
+def test_adapter_modified_skips_empty_field_diff_without_writing(db, monkeypatch, sql_log):
+    """§一-1 冪等分支：`field_diff == []`（逐字相同 / 兩側都空 / 都不傳）→ **不寫事件**、零 SQL、`None`。"""
+    import agent_stage_service
+
+    monkeypatch.setenv("LEARNING_ENABLED", "on")
+    mark = len(_statements(sql_log))
+
+    assert agent_stage_service.on_draft_modified(
+        TEACHER, DRAFT_ID, PATIENT_NAME, DIFF_BEFORE, DIFF_BEFORE) is None     # 逐字相同
+    assert agent_stage_service.on_draft_modified(TEACHER, DRAFT_ID, PATIENT_NAME) is None
+    assert agent_stage_service.on_draft_modified(
+        TEACHER, DRAFT_ID, PATIENT_NAME, "", "") is None                       # 兩側都空
+
+    assert _statements(sql_log)[mark:] == [], "空節不該產生任何 SQL（連 seq 都不分配）"
+    assert _rows() == []
+
+    # 對照組：同一對樣本正文真的改了 → 寫 1 節（證明上面三條是「跳過」而非「寫不進去」）
+    assert agent_stage_service.on_draft_modified(
+        TEACHER, DRAFT_ID, PATIENT_NAME, DIFF_BEFORE, DIFF_AFTER) is None
+    rows = _rows()
+    assert [row["event_type"] for row in rows] == ["draft_modified"]
+    assert rows[0]["seq"] == 1
+
+
+def test_adapter_swallows_failures_with_traditional_warning_and_no_partial_write(db, monkeypatch, capsys):
+    """§9-聲明一（best-effort）：三個失敗點**各自**被適配器這一層兜住 → 一行**繁體** `[warn]`、不冒泡、零行。
+
+    為什麼挑「適配器這一層」的失敗點：`learning_service._record_event()` 自己就會吞掉寫入期異常（並留一行
+    `record_*` 名下的 warn），**只**把庫層寫入換掉根本走不進適配器的 `except`。所以這裡逐個換掉
+    `record_draft_generated` / `record_draft_modified` / `compute_content_diff` —— 正是適配器 docstring
+    說的「import / 調用形狀這一層的意外」；而「差異計算」也在同一層兜底之列（不在 `record_*` 裡面）。
+    """
+    import agent_stage_service
+
+    monkeypatch.setenv("LEARNING_ENABLED", "on")
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("壞了")
+
+    original_generated = learning_service.record_draft_generated
+    monkeypatch.setattr(learning_service, "record_draft_generated", boom)
+    assert agent_stage_service.on_draft_generated(TEACHER, DRAFT_ID, PATIENT_NAME, 7) is None
+    monkeypatch.setattr(learning_service, "record_draft_generated", original_generated)
+
+    original_modified = learning_service.record_draft_modified
+    monkeypatch.setattr(learning_service, "record_draft_modified", boom)
+    assert agent_stage_service.on_draft_modified(
+        TEACHER, DRAFT_ID, PATIENT_NAME, DIFF_BEFORE, DIFF_AFTER) is None
+    monkeypatch.setattr(learning_service, "record_draft_modified", original_modified)
+
+    monkeypatch.setattr(learning_service, "compute_content_diff", boom)    # 差異計算期炸
+    assert agent_stage_service.on_draft_modified(
+        TEACHER, DRAFT_ID, PATIENT_NAME, DIFF_BEFORE, DIFF_AFTER) is None
+
+    out = capsys.readouterr().out
+    assert out.count("[warn]") == 3, out                                  # 每次失敗恰一行，不靜默也不囉嗦
+    assert "學習事件轉發失敗" in out and "業務結果不受影響" in out            # 適配器自己的文案（非 `record_*` 的）
+    assert "on_draft_generated" in out and "on_draft_modified" in out       # 可定位：帶函數名
+    assert _rows() == [], "吞掉異常 ≠ 留半節"
+
+
+def test_adapter_does_not_normalize_bodies_itself(db, monkeypatch):
+    """方案 c（歸一化在**調用方**）：同一對正文，**傳原文 → 假陽性寫入**；傳歸一化產物 → 跳過、不寫。
+
+    適配器**不**代勞 `_normalize_metric_text()`，所以接線點（3.3-c / 3.3-d）漏了歸一化就會在鏈上留下
+    假陽性節 —— 本條把這個後果**主動**寫出來（而不是靠 docstring 口頭約定）。用戶側字面量與 ⑥ 組的
+    `test_content_diff_normalization_is_caller_side` **逐字相同**（同一對樣本正文）。
+    """
+    import agent_stage_service
+
+    monkeypatch.setenv("LEARNING_ENABLED", "on")
+    raw = "【主訴】 頭痛   三日"                  # 段內連續空白（未折疊）＝ 未歸一化
+    normalized = "【主訴】 頭痛 三日"              # 已歸一化（= `_normalize_metric_text()` 的產物）
+    assert agent_stage_service._normalize_metric_text(raw) == normalized
+
+    assert agent_stage_service.on_draft_modified(
+        TEACHER, DRAFT_ID, PATIENT_NAME, raw, normalized) is None
+    rows = _rows()
+    assert [row["event_type"] for row in rows] == ["draft_modified"], \
+        "適配器只轉發 → 傳原文必然假陽性（= 調用方漏歸一化的後果）"
+    assert json.loads(rows[0]["payload_json"])["detail"] == {
+        "field_diff": [{"field": "主訴", "before_hash": _text_hash("頭痛   三日"),
+                        "after_hash": _text_hash("頭痛 三日")}],
+        "wording_changed": True}
+
+    # 正確姿勢（3.3-c / 3.3-d）：調用方先歸一化 → 逐字相同 → 不寫第二節
+    assert agent_stage_service.on_draft_modified(
+        TEACHER, DRAFT_ID, PATIENT_NAME,
+        agent_stage_service._normalize_metric_text(raw),
+        agent_stage_service._normalize_metric_text(normalized)) is None
+    assert len(_rows()) == 1
+
+
+def test_adapter_writes_only_learning_events_and_no_stage_table(db, monkeypatch, sql_log):
+    """§9-聲明二（零階段面）：適配器只寫 `agent_learning_events` —— 階段三表 / 業務兩表**一行沒動**。
+
+    階段面開著（`AGENT_STAGE_ENABLED=on`）時更硬：`degraded` 的現場讀會**只讀**地查狀態行 / 配置鏈
+    （READ 允許），但**寫語句**清單裡一個階段表都不許出現。表集合沿用 ⑧ 組的 `audited` 五張。
+    """
+    import agent_stage_service
+
+    monkeypatch.setenv("LEARNING_ENABLED", "on")
+    monkeypatch.setenv("AGENT_STAGE_ENABLED", "on")
+    audited = ("agent_stage_state", "agent_stage_config", "agent_stage_log",
+               "drafts", "patient_records")
+    before = {table: _raw_scalar("SELECT COUNT(*) FROM %s" % table) for table in audited}
+    before_events = _raw_scalar("SELECT COUNT(*) FROM agent_learning_events")
+    mark = len(_statements(sql_log))
+
+    assert agent_stage_service.on_draft_generated(
+        TEACHER, DRAFT_ID, PATIENT_NAME, 7, 2, "content-hash", LINEAGE_ID) is None
+    assert agent_stage_service.on_draft_modified(
+        TEACHER, DRAFT_ID, PATIENT_NAME, DIFF_BEFORE, DIFF_AFTER) is None
+
+    writes = [sql for sql in _statements(sql_log)[mark:]
+              if re.search(r"\b(INSERT|UPDATE|DELETE)\b", sql, re.I)]
+    assert writes, "學習鏈本身要寫（否則本條失去對照組）"
+    assert all("agent_learning_events" in sql for sql in writes), \
+        "適配器只許寫學習表（實測另有：%r）" % [sql for sql in writes
+                                              if "agent_learning_events" not in sql]
+    after = {table: _raw_scalar("SELECT COUNT(*) FROM %s" % table) for table in audited}
+    assert after == before, "適配器動了階段面 / 業務表"
+    assert _raw_scalar("SELECT COUNT(*) FROM agent_learning_events") == before_events + 2
+
+
+def test_database_forwarder_reaches_the_adapters_and_nothing_wires_them_yet(db, monkeypatch):
+    """庫層唯一轉發點 ↔ 適配器：`database._call_agent_stage_hook()` 按**名字**取到就轉發、回 `True`；
+    **今天**兩個接線點（`insert_draft` / `update_draft_content`）仍是零調用 —— 「3.3-b 零接線」。
+
+      · 前兩句：適配器掛上去之後，庫層那一行 `getattr` 真的找得到它、`hook(*args)` 真的落下一節
+        （前四參按位置傳，`args` 的形狀就是 3.3-c / 3.3-d 接線時的形狀）→ 名字 / 簽名對不上時這裡紅；
+      · 第三句：兩個接線點體內既無 `on_draft_*` 也無 `_call_agent_stage_hook` —— 本步**不碰既有行**。
+        **本句在 3.3-c / 3.3-d 落線時必須同步改寫**（那時它守的就不再是「零調用」，而是「恰好一處、
+        位置正確」）；這條與本文件的 `ALLOWED_WIRING` 同期收口（最終形 3.3-f）。
+    """
+    import inspect
+
+    monkeypatch.setenv("LEARNING_ENABLED", "on")
+    assert database._call_agent_stage_hook(
+        "on_draft_generated", TEACHER, DRAFT_ID, PATIENT_NAME, 7) is True
+    rows = _rows()
+    assert [row["event_type"] for row in rows] == ["draft_generated"]
+    assert (rows[0]["draft_id"], rows[0]["template_id"]) == (DRAFT_ID, 7)
+
+    for name in ("insert_draft", "update_draft_content"):
+        source = inspect.getsource(getattr(database, name))
+        assert "on_draft_" not in source and "_call_agent_stage_hook" not in source, \
+            "%s 已經接了學習事件 → 那是 3.3-c / 3.3-d 的落點（本步零接線）" % name

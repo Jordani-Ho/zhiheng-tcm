@@ -3903,6 +3903,94 @@ def generation_degraded(teacher_name):
         _GENERATION_CAPABILITY, False)
 
 
+# ============================================================================
+# 【施工步骤 3.3-b】学习事件适配器：`on_draft_generated` / `on_draft_modified`（纯追加）
+# ----------------------------------------------------------------------------
+# CTO 2026-09-30 step 3.3-b 裁决（本段的施工依据）：
+#   · 适配器 = 业务层与学习链之间**唯一**的桥：库层转发段 `database._call_agent_stage_hook()`
+#     按**名字** `getattr` 取这两个符号 → 「名字 / 签名 / 恒 `None` / 不抛」四件事即契约
+#     （源码级守护见 `test_agent_stage.py` ⑮ 组追加的三条）。
+#   · **首行只判学习总闸** `learning_service.learning_enabled()`：阶段链的闸在**这两个函数体内一个字
+#     都不许出现**（Epic 3 §3.3 A6：两张表、两条流）—— 学习事件在阶段闸 off 时照写、反之亦然；
+#     多判一次只会给「为什么没写事件」多加一个假归因面。
+#   · **零接线**（本步不碰任何既有行）：`database.insert_draft()`（改 1）/
+#     `update_draft_content()`（改 4）今天仍**零** `on_draft_*` 调用 —— 接线的落点在 3.3-c / 3.3-d；
+#     本步只有用例直接调这两个适配器（行为级用例 = `test_learning.py` ⑦ 组）。
+#   · 红线（设计 §9-声明二）：**零**阶段审计 / **零**能力闸门 / **零**拒绝留痕，也**不**调既有的
+#     三个状态转移钩子（`on_draft_signed` / `apply_upgrade_confirmation` / `decline_upgrade`）与
+#     `evaluate()` —— 适配器只转发学习事件，不碰阶段面（否则会污染升阶判据面）。
+#   · `degraded` **现场读**（`generation_degraded(teacher_name)`，只读、永不抛）：不缓存、不预判
+#     —— 降级态是可变的（观察期进出），写进链的必须是**事件发生时刻**的判定（§5.3 / TD-015 口径）。
+#   · 归一化**不在本段**（CTO 3.3-a 追加 1 方案 c：归一化在调用方）：正文原样交给
+#     `compute_content_diff()`，`_normalize_metric_text()` 由 3.3-c / 3.3-d 的接线点先跑。
+#   · 留痕走 `_config_warn()`（本文件唯一的告警出口，不新增 `print`；文案一律繁体）。
+# ============================================================================
+
+
+def on_draft_generated(teacher_name, draft_id=0, patient_name="", template_id=0,
+                       template_version=0, content_hash="", lineage_id="", created_at=None):
+    """【3.3-b 适配器】`draft_generated`：智能体生成草案并落库（接线点 = `database.insert_draft()` 末尾）。
+
+    契约四条（缺一即断链；源码级守护 = `test_agent_stage.py` ⑮ 组追加的三条）：
+
+      ① **签名固定**：前四参 `(teacher_name, draft_id, patient_name, template_id)` 按**位置**被库层
+         转发段 / 未来的接线点调用，其余参数一律带缺省值（加参数只许往后追加）；
+      ② **首行只判学习总闸**：`if not learning_service.learning_enabled(): return None` ——
+         阶段链的闸（`agent_stage_` 前缀那支）不参与这个判断（A6：两条链各自的闸管各自的流）；
+      ③ **恒回 `None`**（不是 `bool`）：返回值不参与任何业务判定，`sign_draft()` 那类 best-effort
+         语义（「钩子失败绝不回滚业务」）由此在类型上成立；
+      ④ **不抛**：`record_draft_generated()` 自身已吞写入期异常，本段再兜一层 —— 防的是
+         「import / 调用形状」这一层的意外。
+
+    `degraded` 由 `generation_degraded(teacher_name)` **现场**取（§5.3 / TD-015 的样本识别口径）：
+    阶段闸 off → `False`；观察期 → `True`。`patient_name` 只被 `learning_service` 拿去算哈希
+    （A5：明文姓名不入链）。
+    """
+    import learning_service                       # 【3.3-b 白名单唯一处】函数内延迟 import
+    if not learning_service.learning_enabled():
+        return None
+    try:
+        learning_service.record_draft_generated(
+            teacher_name, draft_id=draft_id, template_id=template_id,
+            template_version=template_version, content_hash=content_hash,
+            degraded=generation_degraded(teacher_name), patient_name=patient_name,
+            lineage_id=lineage_id, created_at=created_at)
+    except Exception as exc:                      # best-effort：学习事件失败绝不回退草案落库
+        _config_warn("學習事件轉發失敗（on_draft_generated / %s）：業務結果不受影響" % (exc,))
+    return None
+
+
+def on_draft_modified(teacher_name, draft_id=0, patient_name="", normalized_before="",
+                      normalized_after="", template_id=0, lineage_id="", created_at=None):
+    """【3.3-b 适配器】`draft_modified`：老师修改草案内容（接线点 = `database.update_draft_content()` 末尾）。
+
+    契约与 `on_draft_generated` 同款（签名 / 只判学习总闸 / 恒 `None` / 不抛），多一条**幂等分支**：
+
+      · `compute_content_diff(normalized_before, normalized_after)["field_diff"] == []` →
+        **直接 `return None`、不写事件**（§一-1 裁决：逐字相同的编辑不往链里塞空节 —— 老师反复保存
+        同一份正文，不该在链上长出「没发生什么」的节）；
+      · 两个入参名字里的 `normalized_` 前缀是**契约**：归一化（`_normalize_metric_text()`）由
+        3.3-c / 3.3-d 的接线点先做，本段**不**代劳（本文件零 import 生产模块的反向代价 = 调用方
+        必须先归一化）。传原文 → 段内连续空白未被折叠 → **假阳性**（用例反向钉住）。
+
+    `patient_name` 只被 `learning_service` 拿去算哈希（A5）。
+    """
+    import learning_service                       # 【3.3-b 白名单唯一处】函数内延迟 import
+    if not learning_service.learning_enabled():
+        return None
+    try:
+        diff = learning_service.compute_content_diff(normalized_before, normalized_after)
+        if diff["field_diff"] == []:
+            return None
+        learning_service.record_draft_modified(
+            teacher_name, normalized_before, normalized_after, draft_id=draft_id,
+            template_id=template_id, patient_name=patient_name, lineage_id=lineage_id,
+            created_at=created_at)
+    except Exception as exc:                      # best-effort：学习事件失败绝不回退草案编辑
+        _config_warn("學習事件轉發失敗（on_draft_modified / %s）：業務結果不受影響" % (exc,))
+    return None
+
+
 
 
 
