@@ -2437,3 +2437,174 @@ def process_complaint(complaint_id):
     conn.close()
     return True
 
+
+# ============================================================================
+# 【Epic 3 step 3.2】学习事件（agent_learning_events）库层原语
+# ----------------------------------------------------------------------------
+# CTO 2026-09-30 裁决（step 3.2 补充 2）：Epic 3 全程走「SQL 全在 database.py、服务层
+# `learning_service.py` 零 SQL 字面量 + 零直接 sqlite3 调用」的分层（Epic 1 / Epic 2 模式）。
+# Epic 4 `lineage_service` 自己写 SQL 属偏离，已由 CTO 登记 TD-018；本 Epic 不跟随，也不动它。
+#
+# 本段四个函数 = `learning_service.py` 四个薄封装的**唯一下游**（设计 §2.5 / §2.6）：
+#   next_seq / get_last_learning_event / get_learning_events / insert_learning_event
+#
+# 三条纪律：
+#   · **零 DDL**：表 + 2 个索引的唯一真相源 = 迁移 `0006_add_agent_learning_events`；
+#     `init_db()` 不建本表（与 0003 / 0005 同款）。
+#   · **只增 + 只读**：本段零 UPDATE / 零 DELETE —— 链的「不可改」是它唯一的价值
+#     （设计 §4-② 口径冻结声明：改 / 删只能走 CTO 单独裁决 + 数据迁移方案）。
+#   · **本段不做哈希、不分配 seq、不校准 prev_hash**：链的口径唯一真相源是 `learning_service`
+#     （纯函数）+ 迁移 0006（冻结常量）；库层多算一次就是长出第二个真相。
+# ============================================================================
+
+# 表名（唯一真相源 = 迁移 0006 的 `EVENTS_TABLE`；本常量只供本段 SQL 复用）
+LEARNING_EVENTS_TABLE = "agent_learning_events"
+
+# INSERT 白名单：与迁移 0006 的 `ALL_COLUMNS` 去掉 `id` / `teacher_name` / `event_type` 后**逐列一一对应**
+# （`test_learning.py` 有逐列一致性守护）。`id` 由 AUTOINCREMENT 分配；`teacher_name` / `event_type`
+# 走位置参数；`created_at` 未传则自动补当前时间（与 templates / lineage 同款）。
+LEARNING_EVENT_INSERT_FIELDS = (
+    "seq",
+    "lineage_id",
+    "patient_name_hash",
+    "draft_id",
+    "template_id",
+    "payload_json",
+    "payload_hash",
+    "prev_hash",
+    "created_at",
+)
+
+# 必填四列（其余列都有 DDL DEFAULT：`''` / `0`）
+LEARNING_EVENT_REQUIRED_FIELDS = ("seq", "payload_json", "payload_hash", "prev_hash")
+
+
+def next_seq(teacher_name):
+    """【A2 / 设计 §2.5-2】分配该老师链上的下一个 `seq`：`SELECT COALESCE(MAX(seq), 0) + 1 ...`。
+
+    三条口径（写死在这里，后续子步不得改）：
+      · **按老师各自一条链**：`teacher_name = ''` 也算一位「老师」（空名由服务层拒绝），
+        返回 1 表示「空链的下一个号」；
+      · **只读、单语句**：不写任何行、不开显式事务、不预留号 —— 「分配 + INSERT 的原子性」
+        由调用方（`learning_service.insert_learning_event`）负责；真并发下的兜底是**索引级**的
+        （迁移 0006 的 `uq_agent_learning_events_teacher_seq`）：抢到同一个号时后到者 `IntegrityError`，
+        **绝不静默丢事件**（§2.5-3）；
+      · 跳号 / 复用的唯一可能来源是「人手 SQL 改库」，链校验（`verify_learning_chain`）会报 `seq_gap`。
+    """
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT COALESCE(MAX(seq), 0) + 1 FROM " + LEARNING_EVENTS_TABLE
+            + " WHERE teacher_name = ?",
+            (teacher_name or "",),
+        ).fetchone()
+    finally:
+        conn.close()
+    return int(row[0])
+
+
+def get_last_learning_event(teacher_name):
+    """该老师链上 **`seq` 最大**的一行 → dict；一次都没有 → None（= 空链，调用方以 `GENESIS_HASH` 起链）。
+
+    为什么不是「按 `created_at` 取最近」：链的先后由 `seq` 定义（§2.5-4），`created_at` 只是审计时间；
+    同一微秒内两次写入用时间排序会得到不确定的行。
+    """
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT * FROM " + LEARNING_EVENTS_TABLE
+            + " WHERE teacher_name = ? ORDER BY seq DESC LIMIT 1",
+            (teacher_name or "",),
+        ).fetchone()
+    finally:
+        conn.close()
+    return dict(row) if row is not None else None
+
+
+def get_learning_events(teacher_name, limit=20):
+    """按 **`seq` 升序**（= 链序）读该老师的事件 → `[dict]`；`limit` 为 `None` / `<= 0` → **全量**。
+
+    为什么要留全量口子：链校验必须看到**整条链**（`LIMIT` 会静默截断 → 缺行被误判成 ok，§2.4）。
+    因此「必带 LIMIT」的纪律落成：默认 20，**只有显式传 None** 才全量 —— 调用点必须把这个意图写出来
+    （`learning_service.verify_learning_chain` 是当前唯一的全量调用点）。
+    倒序 / 时间窗（`created_at DESC` 索引）展示由调用方自行排序，本原语只承诺链序。
+    """
+    if not teacher_name:
+        return []
+    conn = get_connection()
+    try:
+        if limit is None or limit <= 0:
+            rows = conn.execute(
+                "SELECT * FROM " + LEARNING_EVENTS_TABLE
+                + " WHERE teacher_name = ? ORDER BY seq ASC",
+                (teacher_name,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM " + LEARNING_EVENTS_TABLE
+                + " WHERE teacher_name = ? ORDER BY seq ASC LIMIT ?",
+                (teacher_name, int(limit)),
+            ).fetchall()
+    finally:
+        conn.close()
+    return [dict(r) for r in rows]
+
+
+def insert_learning_event(teacher_name, event_type, **fields):
+    """【只增】往 `agent_learning_events` 追加一条事件，返回新行 `id`（`lastrowid`）。
+
+    形制照 `insert_agent_stage_log`：白名单外的键 → `ValueError`；必填四列缺一 → `ValueError`；
+    `created_at` 未传 → 自动补 `datetime.now().isoformat()`。
+
+    【两条不得放宽的硬口径】
+      1. `seq` / `payload_json` / `payload_hash` / `prev_hash` **必须由调用方算好传进来** ——
+         本函数不做哈希、不分配 `seq`、不校准 `prev_hash`（见段头第三条纪律）。
+      2. `payload_json` **必须是非空 `str`**（= `learning_service.canonical_json()` 的产物），
+         **不接受 dict**：`json.dumps(dict)` 会按插入序输出，与 canonical 字节不同 →
+         `payload_hash` 与 `payload_json` **当场对不上**（链第 1 层校验必红）。
+         宁可在这里报错，也不写进一条自相矛盾的行（§2.3 的 canonical 字节是链的基石）。
+    """
+    if not teacher_name:
+        raise ValueError("insert_learning_event 必须给 teacher_name（按老师单链，§2.5）")
+    if not event_type:
+        raise ValueError("insert_learning_event 必须给 event_type")
+    unknown = [key for key in fields if key not in LEARNING_EVENT_INSERT_FIELDS]
+    if unknown:
+        raise ValueError("insert_learning_event 不支持这些字段：%s" % ", ".join(sorted(unknown)))
+
+    missing = [name for name in LEARNING_EVENT_REQUIRED_FIELDS
+               if fields.get(name) is None or fields.get(name) == ""]
+    if missing:
+        raise ValueError("insert_learning_event 缺少必填字段：%s" % ", ".join(missing))
+
+    payload_json = fields["payload_json"]
+    if not isinstance(payload_json, str):
+        raise ValueError(
+            "insert_learning_event 的 payload_json 必须是字符串（canonical_json() 的产物），"
+            "不接受 %s：否则 payload_hash 与 payload_json 对不上" % type(payload_json).__name__
+        )
+    for name in ("payload_hash", "prev_hash"):
+        if not isinstance(fields[name], str):
+            raise ValueError("insert_learning_event 的 %s 必须是字符串" % name)
+    if not isinstance(fields["seq"], int) or isinstance(fields["seq"], bool) or fields["seq"] < 1:
+        raise ValueError("insert_learning_event 的 seq 必须是 >= 1 的 int（§2.5）")
+
+    values = [(name, fields[name]) for name in LEARNING_EVENT_INSERT_FIELDS if name in fields]
+    if "created_at" not in fields:
+        values.append(("created_at", datetime.now().isoformat()))
+
+    columns = ", ".join(["teacher_name", "event_type"] + [name for name, _ in values])
+    placeholders = ", ".join("?" for _ in range(len(values) + 2))
+
+    conn = get_connection()
+    try:
+        cursor = conn.execute(
+            "INSERT INTO " + LEARNING_EVENTS_TABLE + " (%s) VALUES (%s)" % (columns, placeholders),
+            tuple([teacher_name, str(event_type)] + [value for _, value in values]),
+        )
+        conn.commit()
+        row_id = cursor.lastrowid
+    finally:
+        conn.close()
+    return row_id
+
