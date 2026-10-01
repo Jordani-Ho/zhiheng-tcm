@@ -430,6 +430,82 @@ REAL_LINEAGE_ID = "lin-ua8739bc7"  # 'lin-' + sha1('李老师')[:8]（真机 1 �
 REAL_LINEAGE_NAME = "李老师師門"
 PREVIOUS_REVISION = "0004_add_patient_record_template_refs"  # 0005 的上一版（基线夹具停在 / downgrade 回到这里）
 
+# ---------------------------------------------------------------------------
+# 【Epic 3 step 3.1】迁移 0006（`agent_learning_events`）的路径 / 夹具常量 / 冻结契约字面量
+# ---------------------------------------------------------------------------
+# 纪律：下面的 `FROZEN_*` 是**独立书写的契约字面量**（来源 = docs/epic3-learning-design-v1.md
+#       §2.1 / §2.2 / §2.3 / §3.1 / §6），**不是**从迁移模块复制出来的。用例断言「迁移常量 == 本处字面量」
+#       → 把「设计文档 ↔ 迁移 0006」这条漂移路径钉死（迁移是本组的比对标的，而非它的复制品）。
+MIGRATION_0006_PATH = os.path.join(
+    BACKEND_DIR, "alembic", "versions", "0006_add_agent_learning_events.py"
+)
+PREVIOUS_REVISION_0006 = "0005_add_lineage"  # 0006 的上一版（downgrade 只回到这里，隔离本 revision）
+EVENTS_TABLE = "agent_learning_events"
+EVENTS_INDEXES = (
+    "uq_agent_learning_events_teacher_seq",
+    "idx_agent_learning_events_teacher_time",
+)
+DESIGN_0006_PATH = os.path.join(
+    os.path.dirname(BACKEND_DIR), "docs", "epic3-learning-design-v1.md"
+)
+ARTIFACT_0006_PATH = os.path.join(
+    os.path.dirname(BACKEND_DIR), "docs", "migrations", "0006_add_agent_learning_events.sql"
+)
+
+FROZEN_COLUMNS = (
+    "id",
+    "teacher_name",
+    "seq",
+    "event_type",
+    "lineage_id",
+    "patient_name_hash",
+    "draft_id",
+    "template_id",
+    "payload_json",
+    "payload_hash",
+    "prev_hash",
+    "created_at",
+)
+# §2.2 两分法：投影列（每个都对应一个**同名 payload 顶层键**）/ 链元列（不属于 payload）
+FROZEN_PROJECTION_COLUMNS = (
+    "teacher_name",
+    "seq",
+    "event_type",
+    "lineage_id",
+    "patient_name_hash",
+    "draft_id",
+    "template_id",
+    "created_at",
+)
+FROZEN_CHAIN_META_COLUMNS = ("id", "payload_json", "payload_hash", "prev_hash")
+# §2.3 payload 顶层 9 键 = 参与哈希的键集合
+FROZEN_PAYLOAD_TOP_LEVEL_KEYS = (
+    "seq",
+    "event_type",
+    "teacher_name",
+    "created_at",
+    "lineage_id",
+    "patient_name_hash",
+    "draft_id",
+    "template_id",
+    "detail",
+)
+# §3.1 五类事件（逐字含顺序）
+FROZEN_EVENT_TYPES = (
+    "template_configured",
+    "draft_generated",
+    "draft_modified",
+    "learning_event_emitted",
+    "agent_updated",
+)
+# §2.4 / §5.2 口径常量
+FROZEN_GENESIS_HASH = "0" * 64
+FROZEN_PATIENT_NAME_HASH_LEN = 16        # A5：sha256(patient_name)[:16]
+# §6 A4 flag
+FROZEN_FLAG_NAME = "LEARNING_ENABLED"
+FROZEN_FLAG_VALUES = ("on", "1", "true", "yes")
+FROZEN_FLAG_DEFAULT = "off"
+
 # 与 database.py init_db() 逐字一致的建表语句（0005 只补列 / 只回填，不改这些表的形状）
 LINEAGE_BASE_DDL = (
     """
@@ -614,6 +690,59 @@ def _load_migration_0005():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def _load_migration_0006():
+    """按文件路径载入迁移 0006（alembic 也是按路径载入的），用于核对 DDL / 索引 / 口径常量。"""
+    assert os.path.exists(MIGRATION_0006_PATH), "迁移 0006 尚未创建：%s" % MIGRATION_0006_PATH
+    spec = importlib.util.spec_from_file_location(
+        "migration_0006_add_agent_learning_events", MIGRATION_0006_PATH
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+# ---------------------------------------------------------------------------
+# 【Epic 3 step 3.1】0006 组专用取样辅助（不改 0005 组的既有辅助，纯追加）
+# ---------------------------------------------------------------------------
+def _events_snapshot(db_path):
+    """0006 的「不变面」一次性取样：表在不在 / 2 个索引在不在 / 行数 / 列集合。
+
+    表不存在时行数与列集合取 `None`（`_count()` / `_columns_of()` 依赖真表，先探表再取值）。
+    """
+    tables = _tables(db_path)
+    indexes = _indexes(db_path)
+    present = EVENTS_TABLE in tables
+    return {
+        "table": present,
+        "indexes": {name: name in indexes for name in EVENTS_INDEXES},
+        "rows": (_count(db_path, EVENTS_TABLE) if present else None),
+        "columns": (tuple(_columns_of(db_path, EVENTS_TABLE)) if present else None),
+    }
+
+
+def _columns_snapshot(db_path, exclude=()):
+    """「表 → 列元组」全库快照（0006 的「不动既有表结构」断言用）；`exclude` 用于剔除本 revision 新表。"""
+    return {
+        table: tuple(_columns_of(db_path, table))
+        for table in sorted(_tables(db_path))
+        if table not in exclude
+    }
+
+
+def _unique_indexes(db_path, table):
+    """`PRAGMA index_list` 里 `unique = 1` 的索引名集合（A2「UNIQUE(teacher_name, seq)」的行为级守护）。"""
+    conn = sqlite3.connect(db_path)
+    try:
+        return {row[1] for row in conn.execute("PRAGMA index_list('%s')" % table).fetchall() if row[2]}
+    finally:
+        conn.close()
+
+
+def _index_columns(db_path, index_name):
+    """某个索引的列顺序（形如 `("teacher_name", "seq")`）—— 钉住 UNIQUE 索引的**列与顺序**。"""
+    return tuple(row["name"] for row in _read(db_path, "PRAGMA index_info('%s')" % index_name))
 
 
 def _lineage_row(db_path):
@@ -1256,3 +1385,394 @@ def test_0003_downgrade_aborts_with_audit_events(tmp_path, monkeypatch):
     assert _one(db, "SELECT version_num FROM alembic_version")["version_num"] == (
         "0002_add_draft_template_refs"
     )
+
+
+# ===========================================================================
+# 【Epic 3 step 3.1】迁移 0006 守护测试（`agent_learning_events`，照 0005 十条范式）
+# 对齐：docs/epic3-learning-design-v1.md §2.1（DDL 唯一真相源）/ §2.2（列全集 + 投影列两分法）/
+#       §2.3（canonical 口径）/ §2.4（A3 链节指纹 + GENESIS_HASH）/ §2.5（A2 按老师单链）/
+#       §2.6（索引）/ §3.1（5 类事件）/ §3.3（A6 不动 agent_stage_log）/ §6（A4 flag）/
+#       §8（回退方案）/ 附录 A（交付物清单）。
+#       CTO 2026-09-30「Epic 3 调研验收 + A1–A8 裁决」；TD-003（downgrade 只回收结构）。
+# 纪律：tmp_path 自建独立 SQLite 文件，**绝不碰** backend/zhiheng.db 与 backend/test.db；
+#       回退只到 **0005_add_lineage（本 revision 的上游）** → 隔离 0006 自身，不牵动 0001–0005
+#       各自的回退闸（与 0004 用例「只回退到 0003」、0005 用例「只回退到 PREVIOUS_REVISION」同一口径）。
+# ===========================================================================
+
+
+def test_0006_source_keeps_epic3_redlines():
+    """§2.1 / §3.3 / §8 + A6：只建 1 张表 + 2 个索引；零 ALTER、零删列、零 UPDATE/DELETE、不碰阶段表。"""
+    module = _load_migration_0006()
+    source = open(MIGRATION_0006_PATH, encoding="utf-8").read()
+    upper = source.upper()
+
+    assert module.revision == "0006_add_agent_learning_events"
+    assert module.down_revision == PREVIOUS_REVISION_0006       # 单链，不断链
+    assert module.EVENTS_TABLE == EVENTS_TABLE
+
+    # 【A6】`agent_stage_log` 不纳入同链 → 本迁移**零补列**（既不补链列，也不补任何列）
+    assert "ALTER TABLE" not in upper, "0006 必须零 ALTER（本 revision 只有 CREATE）"
+    assert "ALTER TABLE agent_stage_log" not in source
+    assert "DROP COLUMN" not in upper, "0006 无既有列可删，产物与源码都不得出现删列语句"
+    # 「事件表只增不改不删」的迁移侧守护（§0.3-2）
+    assert "UPDATE " not in upper and "DELETE " not in upper
+
+    # 「不偷偷多建」的计数闸：1 张表 + 1 个唯一索引 + 1 个普通索引
+    assert upper.count("CREATE TABLE IF NOT EXISTS") == 1
+    assert upper.count("CREATE UNIQUE INDEX IF NOT EXISTS") == 1
+    assert upper.count("CREATE INDEX IF NOT EXISTS") == 1
+    assert len(module.INDEX_DDL) == len(module.INDEX_NAMES) == 2
+    assert set(module.INDEX_NAMES) == set(EVENTS_INDEXES)
+
+
+def test_0006_frozen_contract_matches_design_literals():
+    """§2.2 / §2.3 / §2.4 / §3.1 / §6：迁移 0006 的口径常量 == 设计文档的**独立字面量**（逐字/逐序）。"""
+    module = _load_migration_0006()
+
+    # §2.2 列全集 + 两分法
+    assert tuple(module.ALL_COLUMNS) == FROZEN_COLUMNS
+    assert tuple(module.PROJECTION_COLUMNS) == FROZEN_PROJECTION_COLUMNS
+    assert tuple(module.CHAIN_META_COLUMNS) == FROZEN_CHAIN_META_COLUMNS
+    assert set(FROZEN_PROJECTION_COLUMNS) | {"detail"} == set(FROZEN_PAYLOAD_TOP_LEVEL_KEYS)
+    assert set(module.PROJECTION_COLUMNS) | {"detail"} == set(module.PAYLOAD_TOP_LEVEL_KEYS)
+    assert set(FROZEN_PROJECTION_COLUMNS).isdisjoint(FROZEN_CHAIN_META_COLUMNS)
+    assert set(module.PROJECTION_COLUMNS).isdisjoint(module.CHAIN_META_COLUMNS)
+    assert set(FROZEN_PROJECTION_COLUMNS) | set(FROZEN_CHAIN_META_COLUMNS) == set(FROZEN_COLUMNS)
+
+    # §2.3 canonical 口径（逐参冻结）+ 参与哈希的键集合（顶层 9 键）
+    assert module.CANONICAL_SORT_KEYS is True
+    assert tuple(module.CANONICAL_SEPARATORS) == (",", ":")
+    assert module.CANONICAL_ENSURE_ASCII is False
+    assert tuple(module.PAYLOAD_TOP_LEVEL_KEYS) == FROZEN_PAYLOAD_TOP_LEVEL_KEYS
+    assert len(module.PAYLOAD_TOP_LEVEL_KEYS) == 9
+
+    # §2.4 GENESIS_HASH（A3）+ 摘要算法 + §5.2 A5 长度
+    assert module.GENESIS_HASH == FROZEN_GENESIS_HASH
+    assert len(module.GENESIS_HASH) == 64 and set(module.GENESIS_HASH) == {"0"}
+    assert module.PAYLOAD_HASH_ALGO == "sha256"
+    assert module.PATIENT_NAME_HASH_LEN == FROZEN_PATIENT_NAME_HASH_LEN == 16
+
+    # §3.1 五类事件（逐字含顺序、无重复）
+    assert tuple(module.EVENT_TYPES) == FROZEN_EVENT_TYPES
+    assert len(module.EVENT_TYPES) == len(set(module.EVENT_TYPES)) == 5
+
+    # §6 A4 flag
+    assert module.FLAG_NAME == FROZEN_FLAG_NAME
+    assert tuple(module.FLAG_VALUES) == FROZEN_FLAG_VALUES
+    assert module.FLAG_DEFAULT == FROZEN_FLAG_DEFAULT
+
+
+def test_0006_upgrade_creates_table_indexes_and_unique(tmp_path):
+    """§2.1 / §2.2 / §2.5 / §2.6：upgrade → 表 + 2 个索引（列与顺序逐字）；A2 的 UNIQUE 行为级生效。"""
+    db = str(tmp_path / "m22.db")
+    _seed_legacy_db(db, [(REAL_TEACHER, "疏肝理氣，健脾和胃。", "2026-09-01T00:00:00")])
+
+    assert migrations_runner.run_upgrade(db_file=db) is True
+
+    snap = _events_snapshot(db)
+    assert snap["table"] is True
+    assert snap["indexes"] == {name: True for name in EVENTS_INDEXES}
+    assert snap["columns"] == FROZEN_COLUMNS       # 列与顺序逐字（12 列）
+    assert snap["rows"] == 0                       # 本步零业务逻辑：迁移不写任何事件
+
+    # §2.6 / A2：唯一索引按**列与顺序**就位，且 sqlite 认它是 unique（不是普通索引）
+    assert _index_columns(db, "uq_agent_learning_events_teacher_seq") == ("teacher_name", "seq")
+    assert _index_columns(db, "idx_agent_learning_events_teacher_time") == (
+        "teacher_name",
+        "created_at",
+    )
+    assert _unique_indexes(db, EVENTS_TABLE) == {"uq_agent_learning_events_teacher_seq"}
+
+    conn = sqlite3.connect(db)
+    try:
+        conn.execute(
+            "INSERT INTO %s (teacher_name, seq, event_type, created_at) VALUES (?, 1, ?, ?)"
+            % EVENTS_TABLE,
+            (REAL_TEACHER, "draft_generated", "2026-09-30T00:00:00"),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    conn = sqlite3.connect(db)
+    try:
+        # A2 行为级：同 (teacher_name, seq) 第二行 → IntegrityError（「按老师单链」是真的硬约束）
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO %s (teacher_name, seq, event_type) VALUES (?, 1, ?)" % EVENTS_TABLE,
+                (REAL_TEACHER, "draft_modified"),
+            )
+        # 另一位老师从**自己的** seq=1 起 —— 单链互不冲突（A2：链按老师各自起算）
+        conn.execute(
+            "INSERT INTO %s (teacher_name, seq, event_type) VALUES (?, 1, ?)" % EVENTS_TABLE,
+            ("王老师", "draft_generated"),
+        )
+        # teacher_name NOT NULL 兜底：NULL 在 UNIQUE 索引里不去重，故必须由 NOT NULL 挡住
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO %s (teacher_name, seq, event_type) VALUES (NULL, 2, 'agent_updated')"
+                % EVENTS_TABLE
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    assert _count(db, EVENTS_TABLE) == 2
+
+    assert _one(db, "SELECT version_num FROM alembic_version")["version_num"] == ALEMBIC_HEAD
+
+    # 可重跑：已在 head 再 upgrade = no-op（不重复建表 / 建索引，也不丢既有行）
+    assert migrations_runner.run_upgrade(db_file=db) is True
+    again = _events_snapshot(db)
+    assert again["columns"] == FROZEN_COLUMNS
+    assert again["indexes"] == {name: True for name in EVENTS_INDEXES}
+    assert again["rows"] == 2
+
+
+def test_0006_upgrade_is_idempotent_and_round_trips(tmp_path):
+    """§2.1 / §8：head 再 upgrade = no-op；downgrade→upgrade 往返后表 / 索引 / 列逐项一致。"""
+    db = str(tmp_path / "m23.db")
+    _seed_legacy_db(db, [(REAL_TEACHER, "疏肝理氣，健脾和胃。", "2026-09-01T00:00:00")])
+    assert migrations_runner.run_upgrade(db_file=db) is True
+
+    first = _events_snapshot(db)
+    columns_before = _columns_snapshot(db, exclude=(EVENTS_TABLE,))
+
+    assert migrations_runner.run_upgrade(db_file=db) is True     # 已在 head：no-op
+    assert _events_snapshot(db) == first
+
+    # 真正重跑本 revision：回 0005（只回收本表与 2 个索引；既有表结构一字不动）
+    migrations_runner.run_downgrade(PREVIOUS_REVISION_0006, db_file=db)
+    rolled = _events_snapshot(db)
+    assert rolled["table"] is False and rolled["rows"] is None and rolled["columns"] is None
+    assert rolled["indexes"] == {name: False for name in EVENTS_INDEXES}
+    assert _columns_snapshot(db) == columns_before
+    assert _one(db, "SELECT version_num FROM alembic_version")["version_num"] == PREVIOUS_REVISION_0006
+
+    assert migrations_runner.run_upgrade(db_file=db) is True
+    assert _events_snapshot(db) == first                          # 与首跑逐项一致（不翻倍、不少建）
+    assert _columns_snapshot(db, exclude=(EVENTS_TABLE,)) == columns_before
+    assert _one(db, "SELECT version_num FROM alembic_version")["version_num"] == ALEMBIC_HEAD
+
+
+def test_0006_downgrade_drops_structure_only(tmp_path, monkeypatch):
+    """§8.1 ②/③ + TD-003：downgrade 只回收新表与新索引 —— **零既有表 / 零既有列 / 零既有行改动**。"""
+    import database
+
+    db_file = tmp_path / "m24.db"
+    monkeypatch.setattr(database, "DB_PATH", str(db_file))
+    database.init_db()
+    db = str(db_file)
+
+    assert migrations_runner.run_upgrade(db_file=db) is True      # 全链 head（含 0006）
+    assert _events_snapshot(db)["table"] is True
+
+    columns_before = _columns_snapshot(db, exclude=(EVENTS_TABLE,))
+    rows_before = {t: _count(db, t) for t in sorted(_tables(db)) if t != EVENTS_TABLE}
+
+    migrations_runner.run_downgrade(PREVIOUS_REVISION_0006, db_file=db)
+
+    snap = _events_snapshot(db)
+    assert snap["table"] is False
+    assert snap["indexes"] == {name: False for name in EVENTS_INDEXES}
+    assert _columns_snapshot(db) == columns_before                # 既有表列集合一字未动
+    assert {t: _count(db, t) for t in sorted(_tables(db)) if t != EVENTS_TABLE} == rows_before
+    assert _one(db, "SELECT version_num FROM alembic_version")["version_num"] == PREVIOUS_REVISION_0006
+
+    # 往返可用：再 upgrade → 表 / 索引回来、0 行、列逐字
+    assert migrations_runner.run_upgrade(db_file=db) is True
+    back = _events_snapshot(db)
+    assert back["table"] is True and back["rows"] == 0
+    assert back["indexes"] == {name: True for name in EVENTS_INDEXES}
+    assert back["columns"] == FROZEN_COLUMNS
+
+
+def test_0006_downgrade_safety_gate_aborts_with_events(tmp_path, monkeypatch):
+    """§8.2 安全闸：表内有链节（**不可重建**的证据）→ 中止 + 提示导出 + 零副作用；清空后放行。"""
+    import database
+
+    db_file = tmp_path / "m25.db"
+    monkeypatch.setattr(database, "DB_PATH", str(db_file))
+    database.init_db()
+    db = str(db_file)
+    assert migrations_runner.run_upgrade(db_file=db) is True
+
+    conn = sqlite3.connect(db)
+    try:
+        conn.execute(
+            "INSERT INTO %s (teacher_name, seq, event_type, payload_json, payload_hash, "
+            "prev_hash, created_at) VALUES (?, 1, ?, ?, ?, ?, ?)" % EVENTS_TABLE,
+            (
+                REAL_TEACHER,
+                "draft_generated",
+                "{}",
+                "a" * 64,
+                FROZEN_GENESIS_HASH,
+                "2026-09-30T09:00:00",
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    blocked = _events_snapshot(db)
+    assert blocked["rows"] == 1
+
+    with pytest.raises(Exception) as excinfo:
+        migrations_runner.run_downgrade(PREVIOUS_REVISION_0006, db_file=db)
+    message = str(excinfo.value)
+    assert "downgrade 已中止" in message
+    assert "导出" in message                          # 闸门必须给出「先导出留档」的处置提示
+    assert "LEARNING_ENABLED=off" in message          # 并指向 flag 回退（**不必**删表）
+
+    # 零副作用：表 / 索引 / 链节 / 版本号一字未动
+    assert _events_snapshot(db) == blocked
+    kept = _one(db, "SELECT event_type, prev_hash FROM %s" % EVENTS_TABLE)
+    assert kept["event_type"] == "draft_generated" and kept["prev_hash"] == FROZEN_GENESIS_HASH
+    assert _one(db, "SELECT version_num FROM alembic_version")["version_num"] == ALEMBIC_HEAD
+
+    # 清空 → 放行（证明闸门是唯一阻塞点）
+    conn = sqlite3.connect(db)
+    try:
+        conn.execute("DELETE FROM %s" % EVENTS_TABLE)
+        conn.commit()
+    finally:
+        conn.close()
+    migrations_runner.run_downgrade(PREVIOUS_REVISION_0006, db_file=db)
+    assert _events_snapshot(db)["table"] is False
+
+
+def test_0006_does_not_touch_epic2_and_epic4_structures(tmp_path):
+    """A6 / §3.3 / §8.1③：0006 只能**新增 1 张表** —— Epic 2（阶段三表 + 快照列）与
+    Epic 4（lineage + 12 张表 lineage_id）的结构与数据**逐项不变**。
+
+    夹具直接复用 0005 组的真机同形基线（`_seed_baseline_db`：已跑到 0004 + 基线签名硬前置），
+    先升到 0005、取样、再升到 0006、再取样 → 两次取样必须**逐项相等**（除新表本身）。
+    """
+    db = _seed_baseline_db(str(tmp_path / "m26.db"))
+    assert migrations_runner.run_upgrade(PREVIOUS_REVISION_0006, db_file=db) is True
+
+    def _sample():
+        tables = sorted(_tables(db))
+        return {
+            "agent_stage_log_cols": tuple(_columns_of(db, "agent_stage_log")),
+            "agent_stage_state_cols": tuple(_columns_of(db, "agent_stage_state")),
+            "agent_stage_config_rows": _count(db, "agent_stage_config"),
+            "lineage_rows": _count(db, "lineage"),
+            "filled": _filled_counts(db),
+            "lineage_id_cols": {
+                table: _columns_of(db, table).count("lineage_id")
+                for table in LINEAGE_ID_TABLES
+                if table in _tables(db)
+            },
+            "columns": _columns_snapshot(db, exclude=(EVENTS_TABLE,)),
+            "counts": {table: _count(db, table) for table in tables if table != EVENTS_TABLE},
+        }
+
+    before = _sample()
+    # 夹具硬前置：0005 的口径在升 0006 之前就已成立（否则本用例的「不变」断言会掩盖 0005 的漂移）
+    assert before["lineage_rows"] == 1
+    assert before["filled"]["patient_teachers"] == 10 and before["filled"]["drafts"] == 1
+    assert before["lineage_id_cols"]["agent_stage_log"] == 1     # 0005 补的那一列
+    assert "prev_hash" not in before["agent_stage_log_cols"]     # A6：链列**不进**治理审计表
+
+    assert migrations_runner.run_upgrade(db_file=db) is True     # 0005 → 0006
+
+    # 除新表外，一切逐项相同（结构 + 行数 + lineage_id 值分布）
+    assert _sample() == before
+    assert set(_tables(db)) == set(before["counts"]) | {EVENTS_TABLE}
+
+    snap = _events_snapshot(db)
+    assert snap["table"] is True and snap["rows"] == 0
+    assert snap["columns"] == FROZEN_COLUMNS
+    assert snap["indexes"] == {name: True for name in EVENTS_INDEXES}
+
+
+def test_0006_init_db_then_upgrade(tmp_path, monkeypatch):
+    """§8.3 组①「空库」：`init_db()` → 全链 `upgrade head` 跑通；新表 0 行、0005 的师门口径仍成立。"""
+    import database
+
+    db_file = tmp_path / "m27.db"
+    monkeypatch.setattr(database, "DB_PATH", str(db_file))
+    database.init_db()
+
+    assert migrations_runner.run_upgrade(db_file=str(db_file)) is True
+
+    db = str(db_file)
+    snap = _events_snapshot(db)
+    assert snap["table"] is True and snap["rows"] == 0
+    assert snap["columns"] == FROZEN_COLUMNS
+    assert snap["indexes"] == {name: True for name in EVENTS_INDEXES}
+    assert _count(db, "lineage") == _count(db, "teachers")       # 0005 的默认师门种子仍生效
+    assert _one(db, "SELECT version_num FROM alembic_version")["version_num"] == ALEMBIC_HEAD
+
+
+def test_0006_offline_sql_artifact_matches_migration():
+    """附录 A / TD-016 范式：`docs/migrations/0006_add_agent_learning_events.sql` 与迁移内联常量逐字一致。
+
+    与 0005 的产物不同：本 revision **无种子 / 无回填 / 不读库** → 产物里不得出现任何 `ALTER TABLE`
+    （连补列都没有），也不得出现任何删列语句，且结构语句可**逐字节复现**。
+    """
+    module = _load_migration_0006()
+    assert os.path.exists(ARTIFACT_0006_PATH), "离线产物缺失：%s" % ARTIFACT_0006_PATH
+    text = open(ARTIFACT_0006_PATH, encoding="utf-8-sig").read().replace("\r\n", "\n")
+
+    assert module.TABLE_DDL.strip() + ";" in text
+    for ddl in module.INDEX_DDL:
+        assert ddl + ";" in text, "产物缺索引语句：%s" % ddl
+    # 降级段在产物里是**注释**形式（`-- DROP ...;`），子串比对仍成立（与 0005 产物同一口径）
+    for ddl in module.DROP_INDEX_DDL:
+        assert ddl + ";" in text, "产物缺降级索引语句：%s" % ddl
+    for ddl in module.DROP_TABLE_DDL:
+        assert ddl + ";" in text, "产物缺降级表语句：%s" % ddl
+    for name in module.INDEX_NAMES:
+        assert name in text, "产物缺索引名：%s" % name
+    assert module.EVENTS_TABLE in text
+
+    # 本 revision 零 ALTER、零删列 —— 产物里一个都不许有（0005 的产物有 ADD COLUMN，这里**必须没有**）
+    assert "ALTER TABLE" not in text.upper()
+    assert "ADD COLUMN" not in text.upper()
+    assert "DROP COLUMN" not in text.upper()
+    # 且不得出现任何「种子 / 回填」痕迹：除 alembic 自带的版本号推进语句外，产物里**零**写数据语句
+    for statement in ("INSERT INTO", "UPDATE ", "DELETE "):
+        offenders = [
+            line
+            for line in text.split("\n")
+            if statement in line.upper() and "alembic_version" not in line
+        ]
+        assert offenders == [], "产物出现写数据语句：%s" % offenders
+
+
+def test_0006_design_doc_keeps_frozen_literals():
+    """设计文档 ↔ 实现漂移守护（TD-016 ③ 同款取向）：Epic 3 设计文档必须保留本步冻结的契约字面量。"""
+    assert os.path.exists(DESIGN_0006_PATH), "设计文档缺失：%s" % DESIGN_0006_PATH
+    doc = open(DESIGN_0006_PATH, encoding="utf-8").read()
+
+    for literal in (
+        "0006_add_agent_learning_events.py",
+        "agent_learning_events",
+        "learning_api.py",
+        "GENESIS_HASH",
+        "sort_keys",
+        "separators",
+        "ensure_ascii",
+        "UNIQUE(teacher_name, seq)",
+        "prev_hash",
+        "payload_hash",
+        "LEARNING_ENABLED",
+        "structural_coverage",
+        "inquiry_preference_consistency",
+        "（結構覆蓋率）",
+        "問診模板結構覆蓋率",
+        "epic4-lineage-design-v1.md:620",
+        "一经落地即为见证入口复用基准，变更须 CTO 单独裁决 + 数据迁移方案",
+        "permission_denied",
+        "TD-017",
+        "§5.6",
+    ):
+        assert literal in doc, "设计文档缺契约字面量：%s" % literal
+    for event_type in FROZEN_EVENT_TYPES:
+        assert event_type in doc, "设计文档缺事件类型：%s" % event_type
+    # §2.2 的关键不变式必须在文档里写明（列 = payload 顶层键的投影，权威源恒为 payload）
+    assert "权威源" in doc and "投影" in doc
+    # §1.2 的「12 项要求」对照表必须存在（本步的验收口径就写在里面）
+    assert "12 项要求" in doc
