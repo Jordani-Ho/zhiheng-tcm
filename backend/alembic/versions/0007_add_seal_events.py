@@ -1,4 +1,4 @@
-"""add seal_events table + 1 index (B 板块「数据主权」step B5-a · 数据封存数据底座)
+"""add seal_events table + 1 index (B 板块「数据主权」step B4-a · 数据封存数据底座)
 
 B 板块「数据主权」子项 5（数据封存）第一步：**数据底座**（1 张新表 + 1 个索引），零业务逻辑
 （查询 API / 手动触发属后续步；链上填充属阶段四）。

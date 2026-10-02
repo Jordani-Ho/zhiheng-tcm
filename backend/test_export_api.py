@@ -1,4 +1,4 @@
-"""B 板塊 B4-1「學生數據導出 API」端點最小驗收用例集。
+"""B 板塊 B5-1「學生數據導出 API」端點最小驗收用例集。
 
 對齊：`export_api.py`（`GET /api/export/patient`）——門衛 → 身份校驗 → 統一錯誤體 → bundle 形狀。
 本文件只驗**接口層**，不碰任何業務服務層（與 test_crypto_api.py 同款定位）。

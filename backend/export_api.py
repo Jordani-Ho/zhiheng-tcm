@@ -1,4 +1,4 @@
-"""B 板塊 B4-1「學生數據導出 API」：一次性打包某位學生的全部資料（前綴 `/api/export`）。
+"""B 板塊 B5-1「學生數據導出 API」：一次性打包某位學生的全部資料（前綴 `/api/export`）。
 
 設計要點：
   · feature flag `EXPORT_ENABLED`（**默認 off**）：off → 端點一律 404 `export_disabled`，

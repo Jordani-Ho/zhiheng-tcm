@@ -1,4 +1,4 @@
-"""B 板塊 B5-b「數據封存 API」端點最小驗收用例集。
+"""B 板塊 B4-b「數據封存 API」端點最小驗收用例集。
 
 對齊：`seal_api.py`（`GET /api/seal/events` + `POST /api/seal/trigger`）——
 門衛 → 入參校驗 → 統一錯誤體 → 寫入 / 讀取形狀。
