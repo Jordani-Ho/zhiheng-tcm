@@ -1048,6 +1048,8 @@ _SAMPLE_SOURCE_DRAFT = "draft"      # 未签字草案（`drafts`）
 _BLOCKER_TEMPLATE_MATCH_NO_SAMPLES = "template_match_no_samples"
 _BLOCKER_MODIFICATION_NO_SAMPLES = "modification_consistency_no_samples"
 _BLOCKER_NO_ACTIVE_TEMPLATE = "no_active_record_template"
+_BLOCKER_INQUIRY_NO_ACTIVE_TEMPLATE = "no_active_inquiry_template"
+_BLOCKER_INQUIRY_NO_SAMPLES = "inquiry_coverage_no_samples"
 
 # 【施工步骤 6.5-b / TD-015】① 的样本池识别用：觀察期降級骨架的**首行标记**。
 #   为什么不是一个 blocker：它不是「算不出来」，而是「这一类样本不算」（§3.2「排除样本」的第四类计数）。
@@ -1291,6 +1293,19 @@ def _blank_modification_consistency():
     }
 
 
+def _blank_inquiry_coverage():
+    """③ 問診模板結構覆蓋率的返回體骨架（7 鍵；短路 / 成功 / 空結果三條路徑共用）。"""
+    return {
+        "value": None,                       # 空集 → None（**不是 0**）
+        "basis": "structural_coverage",      # ③ 的語義標識（與 ①② 的「同源一致性」區分）
+        "samples": 0,                        # 參與計算的 complaints 樣本數
+        "fields_total": 0,                   # active inquiry 模板的結構項總數
+        "fields_covered": 0,                 # 被樣本覆蓋的結構項數
+        "skipped_empty": 0,                  # 空 / 非字符串文本的樣本數
+        "blockers": [],
+    }
+
+
 def _template_match_sample(text, metas, weights):
     """单样本 ①（§3.2）：返回 `(match, hit_rate, order_rate, violation)`。
 
@@ -1511,6 +1526,99 @@ def compute_modification_consistency(teacher_name, cfg):
     result["value"] = sum(similarities) / len(similarities)
     result["min"] = min(similarities)
     return result
+
+
+def compute_inquiry_coverage(teacher_name, cfg):
+    """③ 問診模板結構覆蓋率（§3.1 / §6.3-27）—— 只算不判（判定 / 落盘 / 事件属 evaluate）。
+
+    返回體 7 鍵（形狀即契約）：value / basis / samples / fields_total /
+    fields_covered / skipped_empty / blockers。
+
+    語義 = 「該老師當前生效的 inquiry 模板裡，有多少結構項在其名下的 complaints
+    樣本中被提及過」。
+
+    數據源（不引入新表、不新增庫函數）：
+      · inquiry 模板：template_service.get_active_template(teacher_name, "inquiry")
+      · complaints：database.get_complaints(teacher_name, status="")
+
+    覆蓋判定：
+      · 每個結構項取 fields[].label（純中文標籤，如「寒熱」「汗」）；
+      · label 與 complaint.content 都用 _normalize_metric_text() 歸一化；
+      · 若歸一化後的 label 是非空字串，且是歸一化後的 content 的子串 → 該結構項被該樣本覆蓋；
+      · 一個結構項被至少一個樣本覆蓋即算覆蓋（跨樣本累計）；
+      · 覆蓋率 = 被覆蓋的結構項數 / 結構項總數。
+
+    三條降級（都不拋、都不寫庫，返回體形狀不變）：
+      · 無 active inquiry 模板 / schema_json 非對象 / fields 為空 → value=None +
+        blockers=["no_active_inquiry_template"]（不算 0 分：無參照系時空值語義誠實）；
+      · 有模板但無 complaint 樣本 → value=0.0 + blockers=["inquiry_coverage_no_samples"]
+        （有基準、無樣本 = 零覆蓋）；
+      · 讀樣本拋 sqlite3.Error → 一行告警 → 按「無樣本」處理（fail-closed）。
+
+    ③ 不進入 can_recommend（本步不做 blocker 化，留 Epic 4/5 單獨裁決）。
+    """
+    import database
+    import template_service
+
+    config = cfg if isinstance(cfg, dict) else {}
+    result = _blank_inquiry_coverage()
+
+    try:
+        template_row = template_service.get_active_template(teacher_name, "inquiry")
+    except Exception as exc:
+        _config_warn("讀取 inquiry 模板失敗（%s）：③ 本次按「無生效模板」處理" % (exc,))
+        template_row = None
+
+    labels = []
+    if isinstance(template_row, dict):
+        schema = template_row.get("schema_json")
+        if isinstance(schema, dict):
+            for field in schema.get("fields") or []:
+                if not isinstance(field, dict):
+                    continue
+                label = field.get("label")
+                if isinstance(label, str):
+                    normalized = _normalize_metric_text(label)
+                    if normalized:
+                        labels.append(normalized)
+
+    if not labels:
+        result["blockers"].append(_BLOCKER_INQUIRY_NO_ACTIVE_TEMPLATE)
+        return result
+
+    result["fields_total"] = len(labels)
+
+    try:
+        rows = database.get_complaints(teacher_name, status="")
+    except sqlite3.Error as exc:
+        _config_warn("讀取 complaints 樣本失敗（%s）：③ 本次按「無樣本」處理" % (exc,))
+        rows = []
+
+    max_samples = _metric_int(config.get("max_samples"), DEFAULT_STAGE_CONFIG["max_samples"])
+    if max_samples <= 0:
+        max_samples = DEFAULT_STAGE_CONFIG["max_samples"]
+
+    covered = set()
+    sampled = 0
+    for row in (rows or [])[:max_samples]:
+        content = row.get("content") if isinstance(row, dict) else ""
+        normalized = _normalize_metric_text(content)
+        if not normalized:
+            result["skipped_empty"] += 1
+            continue
+        sampled += 1
+        for index, label in enumerate(labels):
+            if label in normalized:
+                covered.add(index)
+
+    result["samples"] = sampled
+    result["fields_covered"] = len(covered)
+    if sampled == 0:
+        result["value"] = 0.0
+        result["blockers"].append(_BLOCKER_INQUIRY_NO_SAMPLES)
+        return result
+    result["value"] = len(covered) / len(labels)
+    return result
 _NON_CONTENT_CHARS = " \t\u3000\r\n（）()[]［］【】<>《》←→-—*·:：、,，。.。;；|丨"
 
 
@@ -1605,6 +1713,23 @@ def _blank_config_source():
     return {"global": False, "teacher_override": False, "env_override": []}
 
 
+def _metrics_reason(metrics):
+    """metrics_reason 動態生成：
+      · ③ 有值（正常）→ 空 dict（沒有 deferral）；
+      · ③ 無 active 模板（value=None + blocker no_active_inquiry_template）→ 保留 deferred_to_epic3；
+      · ③ 有模板但無樣本（value=0.0 + blocker inquiry_coverage_no_samples）→ 改為 no_complaints_samples；
+      · 短路路徑（flag off / 評估失敗，③ 骨架 + 短路 blocker）→ 保留 deferred_to_epic3（默認）。
+    """
+    inquiry = (metrics or {}).get("inquiry_preference_consistency")
+    inquiry = inquiry if isinstance(inquiry, dict) else {}
+    blockers = inquiry.get("blockers") or []
+    if inquiry.get("value") is not None:
+        return {}
+    if _BLOCKER_INQUIRY_NO_SAMPLES in blockers:
+        return {"inquiry_preference_consistency": "no_complaints_samples"}
+    return dict(_METRICS_DEFERRED)
+
+
 def _blank_metrics_snapshot(blocker):
     """三个指标键的骨架：①② 用 3.4-a 的空骨架 + 一个原因 blocker，③ 恒为 `None` 占位。
 
@@ -1612,12 +1737,14 @@ def _blank_metrics_snapshot(blocker):
     """
     template_match = _blank_template_match()
     consistency = _blank_modification_consistency()
+    inquiry = _blank_inquiry_coverage()
     template_match["blockers"].append(blocker)
     consistency["blockers"].append(blocker)
+    inquiry["blockers"].append(blocker)
     return {
         "template_match": template_match,
         "modification_consistency": consistency,
-        "inquiry_preference_consistency": None,
+        "inquiry_preference_consistency": inquiry,
     }
 
 
@@ -1985,6 +2112,7 @@ def _snapshot_short_circuit(teacher_name, blocker, skipped):
     `stage` 一族的空串是诚实的：短路路径**没有**读状态行（flag off 不许读库），
     故不编造阶段；接口层在 flag off 时本来就 404 `agent_stage_disabled`。
     """
+    metrics = _blank_metrics_snapshot(blocker)
     return {
         "teacher_name": teacher_name,
         "skipped": skipped,
@@ -1996,8 +2124,8 @@ def _snapshot_short_circuit(teacher_name, blocker, skipped):
         "pending_stage": "",
         "pending_task_id": 0,
         "degraded": False,
-        "metrics": _blank_metrics_snapshot(blocker),
-        "metrics_reason": dict(_METRICS_DEFERRED),
+        "metrics": metrics,
+        "metrics_reason": _metrics_reason(metrics),
         "thresholds": {},
         "config_source": _blank_config_source(),
         "next_stage": None,
@@ -2063,10 +2191,11 @@ def _evaluate(teacher_name):
 
     template_match = compute_template_match(teacher_name, cfg)
     consistency = compute_modification_consistency(teacher_name, cfg)
+    inquiry = compute_inquiry_coverage(teacher_name, cfg)
     metrics = {
         "template_match": template_match,
         "modification_consistency": consistency,
-        "inquiry_preference_consistency": None,   # ③ 占位键（§3.1：Epic 2 恒为 null）
+        "inquiry_preference_consistency": inquiry,
     }
 
     blockers = _evaluate_blockers(teacher_name, cfg, view, template_match, consistency)
@@ -2100,7 +2229,7 @@ def _evaluate(teacher_name):
         "pending_task_id": task_id or _metric_int(view.get("pending_task_id"), 0),
         "degraded": bool(view.get("degraded")),
         "metrics": metrics,
-        "metrics_reason": dict(_METRICS_DEFERRED),
+        "metrics_reason": _metrics_reason(metrics),
         "thresholds": _thresholds_snapshot(cfg),
         "config_source": source,
         "next_stage": next_stage,

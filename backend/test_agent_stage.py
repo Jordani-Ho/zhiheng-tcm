@@ -3705,8 +3705,8 @@ def test_evaluate_short_circuit_shape_matches_normal_path(db, monkeypatch):
         set(full["metrics"]["modification_consistency"])
 
 
-def test_evaluate_third_metric_is_null_placeholder(db, stage_gate):
-    """§6.3-27：③ `inquiry_preference_consistency` 恒为 `null` + `reason = deferred_to_epic3`；
+def test_evaluate_third_metric_is_structural_coverage(db, stage_gate):
+    """§6.3-27（Epic 3 A1 转正）：③ `inquiry_preference_consistency` 语义 = **問診模板結構覆蓋率**（鍵名保留）；
     ①② 的阈值一并回显（`thresholds`），前端据此逐条解释「差多少」。"""
     import agent_stage_service
 
@@ -3715,7 +3715,8 @@ def test_evaluate_third_metric_is_null_placeholder(db, stage_gate):
 
     result = agent_stage_service.evaluate(TEACHER)
 
-    assert result["metrics"]["inquiry_preference_consistency"] is None
+    assert result["metrics"]["inquiry_preference_consistency"]["basis"] == "structural_coverage", \
+        "③ 的語義標識（§3.1 / Epic 3 A1：結構覆蓋率，鍵名保留）"
     assert result["metrics_reason"] == {"inquiry_preference_consistency": "deferred_to_epic3"}
     assert set(result["metrics"]) == {"template_match", "modification_consistency",
                                       "inquiry_preference_consistency"}
@@ -4047,7 +4048,8 @@ def test_evaluate_recommendation_writes_state_before_task_and_keeps_pair(db, sta
     assert action["config_source"] == result["config_source"]
     assert set(action["metrics"]) == {"template_match", "modification_consistency",
                                       "inquiry_preference_consistency"}
-    assert action["metrics"]["inquiry_preference_consistency"] is None
+    assert action["metrics"]["inquiry_preference_consistency"]["basis"] == "structural_coverage", \
+        "③ 的語義標識（§3.1 / Epic 3 A1：結構覆蓋率）"
 
 
 def test_evaluate_recommendation_logs_stage_event_and_action_log(db, stage_gate):
@@ -5115,7 +5117,8 @@ def test_api_stage_view_shape_and_capabilities_for_default_stage(client):
     assert set(view["capabilities"]) == set(_GATE_CAPS), "能力面五键（§2.3 的列）"
     assert view["capabilities"] == _LEARNING_CAPABILITIES
     assert set(view["metrics"]) == set(_METRIC_KEYS)
-    assert view["metrics"]["inquiry_preference_consistency"] is None, "③ 占位键恒为 null（§3.1）"
+    assert view["metrics"]["inquiry_preference_consistency"]["basis"] == "structural_coverage", \
+        "③ 結構覆蓋率骨架的語義標識（§3.1 / Epic 3 A1）"
     assert len(view["thresholds"]) == 13, "§4.6-① 的 thresholds 是 `_THRESHOLD_KEYS` 十三键（快照回显）"
     assert view["thresholds"]["min_template_match"] == \
         agent_stage_service.DEFAULT_STAGE_CONFIG["min_template_match"]
