@@ -3030,6 +3030,57 @@ def _stage_view(teacher_name):
     }
 
 
+def learning_metrics_view(teacher_name):
+    """learning/metrics 的服务侧视图：读快照 + 配置链 → 5 键（供 learning_api 直出）。
+
+    **只读**：全程只发 SELECT（读状态行 + 读配置链），零写入、零审计。
+    短路路径（flag off / 空名）返回零值骨架，形状与正常路径**逐键一致**。
+
+    与 `/api/agent/stage` 的关系（设计 §7.4-1/2）：本函数**不重新 evaluate**，只**读上次快照**
+    ——「同一份计算」= 同一份算法 + 同一份数据源（快照里存的就是 evaluate 算的）。
+    """
+    name = teacher_name or ""
+    blank_samples = {
+        "template_match": 0,
+        "modification_consistency": 0,
+        "inquiry_preference_consistency": 0,
+    }
+    if not agent_stage_enabled():
+        blank = _blank_metrics_snapshot(_BLOCKER_DISABLED)
+        return {
+            "metrics": blank,
+            "inquiry_preference_consistency_basis": "structural_coverage",
+            "samples": dict(blank_samples),
+            "window_days": 0,
+            "evaluated_at": "",
+        }
+    if not name:
+        blank = _blank_metrics_snapshot(_BLOCKER_TEACHER_REQUIRED)
+        return {
+            "metrics": blank,
+            "inquiry_preference_consistency_basis": "structural_coverage",
+            "samples": dict(blank_samples),
+            "window_days": 0,
+            "evaluated_at": "",
+        }
+    cfg = load_stage_config(name)
+    snapshot, evaluated_at = _last_snapshot(name)
+    metrics = _snapshot_metrics(snapshot)
+    inquiry = metrics.get("inquiry_preference_consistency") or {}
+    return {
+        "metrics": metrics,
+        "inquiry_preference_consistency_basis": inquiry.get("basis", "structural_coverage"),
+        "samples": {
+            "template_match": _metric_int((metrics.get("template_match") or {}).get("samples"), 0),
+            "modification_consistency": _metric_int(
+                (metrics.get("modification_consistency") or {}).get("samples"), 0),
+            "inquiry_preference_consistency": _metric_int(inquiry.get("samples"), 0),
+        },
+        "window_days": _metric_int(cfg.get("window_days"), DEFAULT_STAGE_CONFIG["window_days"]),
+        "evaluated_at": evaluated_at,
+    }
+
+
 def stage_view(teacher_name):
     """【§4.6-① / §3.8】`GET /api/agent/stage` 的**服务侧主体**（接口层直出，不做二次加工）。
 

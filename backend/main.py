@@ -11,6 +11,7 @@ import template_api
 import lineage_api
 import lineage_service
 import agent_stage_api
+import learning_api
 import agent_stage_service
 import os
 import shutil
@@ -76,6 +77,8 @@ app.add_exception_handler(lineage_service.LineageError, lineage_api.lineage_erro
 #     FastAPI 默认 404，无任何行为变化）。
 app.include_router(agent_stage_api.router)
 app.add_exception_handler(agent_stage_service.AgentStageError, agent_stage_api.agent_stage_error_handler)
+
+app.include_router(learning_api.router)
 
 class TranscriptionInput(BaseModel):
     patient_name: str

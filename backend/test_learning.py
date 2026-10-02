@@ -838,6 +838,7 @@ def test_source_guard_zero_sql_zero_audit_zero_capability():
 ALLOWED_WIRING = {
     "agent_stage_service.py": ("on_draft_generated", "on_draft_modified", "_evaluate"),
     "template_api.py": ("publish_template", "archive_template", "activate_template"),
+    "learning_api.py": ("_guard", "get_learning_events", "verify_chain"),
 }
 
 # 【3.3-f 凍結字面量】**手寫**一份與上面逐字相同的期望值（不由 `ALLOWED_WIRING` 生成 —— 否則實現改了
@@ -845,6 +846,7 @@ ALLOWED_WIRING = {
 FROZEN_ALLOWED_WIRING = {
     "agent_stage_service.py": ("on_draft_generated", "on_draft_modified", "_evaluate"),
     "template_api.py": ("publish_template", "archive_template", "activate_template"),
+    "learning_api.py": ("_guard", "get_learning_events", "verify_chain"),
 }
 
 

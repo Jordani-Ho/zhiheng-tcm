@@ -155,11 +155,21 @@ export interface StageModificationMetric {
   blockers: string[]
 }
 
-/** ① ② ③ 三鍵；③ **恆為 `null`**（Epic 2 不計算；`deferred_to_epic3` 的理由只在 #2 的 `metrics_reason`）。 */
+export interface StageInquiryMetric {
+  value: number | null
+  basis: 'structural_coverage'
+  samples: number
+  fields_total: number
+  fields_covered: number
+  skipped_empty: number
+  blockers: string[]
+}
+
+/** ① ② ③ 三鍵；③ 語義 = 問診模板結構覆蓋率（Epic 3 §3.1 轉正；`basis` 恆為 `structural_coverage`）。 */
 export interface StageMetrics {
   template_match: StageTemplateMatchMetric
   modification_consistency: StageModificationMetric
-  inquiry_preference_consistency: null
+  inquiry_preference_consistency: StageInquiryMetric
 }
 
 /** 門檻回顯（13 鍵 = 服務層 `_THRESHOLD_KEYS` 逐鍵；`matrix_enforced=false` = 臨時放寬，6b 顯紅字）。 */
@@ -472,15 +482,6 @@ const AGENT_STAGE_METRIC_LABELS = {
   modification_consistency: '② 病歷修改一致率',
   inquiry_preference_consistency: '③ 問診偏好一致率'
 }
-
-/**
- * ③ 的固定文案：`inquiry_preference_consistency` 在 **Epic 2 恆為 `null`**
- * （服務層 `_METRICS_DEFERRED = {"inquiry_preference_consistency": "deferred_to_epic3"}`，
- * `agent_stage_service.py:1555-1556`；測試 `test_inquiry_metric_is_null_placeholder` 釘住）。
- * 刻意**不**顯示「0%」也**不**顯示「—」：占位鍵要一眼看出是「還沒算」而不是「算出來是零」。
- */
-const AGENT_STAGE_INQUIRY_PLACEHOLDER = '待 Epic 3（尚未計算）'
-
 /**
  * 「樣本不足」的括號寫法：`樣本不足（2/5）` = 有效樣本 2 份 / 門檻 5 份（設計 §6.6：「样本 2/5 份」）。
  * `min_samples` 缺失（後端違約，契約上不可能）時退化為「樣本 N 份」—— **不**印「3/0」這種假分數。
@@ -1090,6 +1091,8 @@ export default function AgentStagePanel({
   const thresholds: Partial<StageThresholds> = view.thresholds || {}
   const templateMatch = metrics.template_match
   const modification = metrics.modification_consistency
+  const inquiry = metrics.inquiry_preference_consistency
+
   const minSamples = typeof thresholds.min_samples === 'number' ? thresholds.min_samples : 0
   const configBadge = configSourceBadge(view.config_source)
   // 【6d】能力區的五鍵：`Partial` 兜底（理由同 `metrics` / `thresholds` —— 後端違約時退化成
@@ -1173,10 +1176,17 @@ export default function AgentStagePanel({
             <span style={ASP_METRIC_HINT}>最差樣本 {ratioPercentText(modification.min)}</span>
           )}
         </div>
-        {/* ③ 問診偏好一致率：Epic 2 恆為 `null`（佔位）→ **固定文案**，不顯示 0% / 不顯示破折號。 */}
+        {/* ③ 問診偏好一致率（Epic 3 §3.1 轉正）：語義 = 問診模板結構覆蓋率。
+            值域：null = 無 active inquiry 模板（顯示「—」）；0.0 = 有模板無樣本；0~1 = 覆蓋率。
+            與 ①② 同構（數值卡 + 副標題）。 */}
         <div style={ASP_METRIC_ROW}>
           <span style={ASP_METRIC_LABEL}>{AGENT_STAGE_METRIC_LABELS.inquiry_preference_consistency}</span>
-          <span style={ASP_METRIC_HINT}>{AGENT_STAGE_INQUIRY_PLACEHOLDER}</span>
+          <span style={ASP_METRIC_VALUE}>
+            {inquiry && typeof inquiry.value === 'number'
+              ? `${ratioPercentText(inquiry.value)}（樣本 ${inquiry.samples} 份）`
+              : '—'}
+          </span>
+          <span style={ASP_METRIC_HINT}>（結構覆蓋率）</span>
         </div>
 
         {/* 13 鍵閾值：預設收起（老師的日常視線是徽章 + 指標；閾值是備查 / 對賬用）。
