@@ -1,12 +1,11 @@
 # 阶段二「数据主权落地」设计文档
 
 **文件**：`docs/phase2-data-sovereignty-design.md`
-**版本**：v1.2（v1.1 落盘版 + C 板块 v0.5 联动修订）
+**版本**：v1.3（v1.2 + B5 patch 合并）
 **状态**：定稿，待实现
 **作者**：B 板块 CTO
 **审阅**：发起人（知衡）
 **约束**：本文档只碰 `docs/`，zero code change
-**v1.3 修订**：见 `phase2-data-sovereignty-design-v1.3-patch.md`（合并前为准，合并后删除）
 
 ---
 
@@ -405,88 +404,90 @@
 
 #### 3.5.1 是什么
 
-数据封存 = 客户端下线。下线 = 不再对外服务，不再参与社区交互。数据不删除、不篡改、不审查。数据仍在客户端本地，只有当事人自己能访问。
+阶段二只做「封存事件记录 + 查询 + 手动触发」。封存（客户端下线）的完整语义保留给阶段四。
 
-#### 3.5.2 封存语义
+**阶段二做**：
 
-- 封存的是**客户端**，不是数据。
-- 数据从未离开客户端。
+- `seal_events` 事件表（新）
+- 查询 API（列出某主体的封存 / 重新接纳历史）
+- 手动触发封存 / 重新接纳（老师或本人发起）
 
-#### 3.5.3 触发条件
+**阶段二不做**：
 
-封存是**动作**，除名是**原因**，两者独立。
+- 不自动判定「所有老师都除名」——除名事件未定义，是 C 板块的活
+- 不读 `agent_stage_log`——里面没有除名事件
+- 不做全站拦截——封存 ≠ 拒绝服务
+- 不实际上链——链上事件接口预留，阶段四落地
 
-| 触发路径 | 原因 | 动作 |
-| :---- | :---- | :---- |
-| 老师被社区除名 | 除名 | 智能体封存 |
-| 学生被所有老师除名 | 社区除名 | 客户端封存 |
-| 老师不活跃下线 | 不活跃 | 客户端下线 |
+#### 3.5.2 为什么不读 agent_stage_log
 
-#### 3.5.4 「学生被所有老师除名」的判定口径
+原设计（v1.1 §3.5.5）假设 `agent_stage_log` 有除名记录。调研证实：
 
-**判定口径**：
+- `agent_stage_log` 现有 10 类事件（`stage_upgraded` / `stage_demoted` / `upgrade_recommended` / `upgrade_declined` / `permission_denied` / `evaluation` / `config_changed` / `suggestion_generated` / `predraft_generated` / `permission_relaxed`），**无一是除名**
+- `event_type` 列无 CHECK、无白名单
+- `patient_teachers.status='inactive'` 同时表示「退师」和「除名」，DB 层无法区分
 
-「所有老师」= 该学生在 `patient_teachers` 表（概念名：`student_lineage`，Epic 4 交付）中**当前 active 状态**的全部老师。
+**结论**：除名事件的定义是 C 板块治理机制的产物。B 板块不定义，不假设。
 
-**判定流程**：
+#### 3.5.3 为什么不拦截
 
-1. 查询 `patient_teachers` 表，找出该学生当前所有 active 状态的老师。
-2. 逐一检查每位老师是否已将该学生除名（记录在 `agent_stage_log`）。
-3. 若**全部 active 老师均已除名**，则触发社区除名。
-4. 若尚有任一 active 老师未除名，则不触发。
+白皮书 §4.6 说「数据封存 = 客户端下线」。这是**客户端优先架构**的概念。阶段二还在服务端 SQLite 架构，没有「客户端」可下线。
 
-**对齐 Epic 4 表结构**：
+服务端拦截封存用户 = 封号，不是白皮书说的封存。白皮书说封存是「数据保留在客户端，只有当事人自己能访问」——保护数据，不拒绝服务。
 
-- `patient_teachers` 是 Epic 4 交付的 SQLite 本地表，概念名 `student_lineage`。
-- Epic 4 §2.2 决策：概念名 `student_lineage`，实现名 `patient_teachers`。
-- B 板块以此对齐，**不新建表**。
-- 若 Epic 4 表结构有变更，B 板块对齐变更，不另建状态。
+改 78+31 端点做封存拦截，是为一个阶段二不该做的事付出的代价。
 
-#### 3.5.5 数据源
+#### 3.5.4 seal_events 表结构
 
-- B4 数据封存读取 **Epic 2 交付的 `agent_stage_log`** 的除名记录。
-- `agent_stage_log` 目前为 SQLite 本地表。
-- **不另建状态**。
+```sql
+CREATE TABLE IF NOT EXISTS seal_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    subject_type TEXT NOT NULL,        -- 'patient' | 'teacher'
+    subject_name TEXT NOT NULL,        -- 患者名 / 老师名
+    action TEXT NOT NULL,              -- 'seal' | 'readmit'
+    reason TEXT,                       -- 原因（文本）
+    operator TEXT,                     -- 操作者（老师名 / 本人）
+    created_at TEXT NOT NULL,          -- ISO 时间戳
+    chain_ready BOOLEAN DEFAULT FALSE, -- 阶段四预留：是否已上链
+    chain_hash TEXT                    -- 阶段四预留：链上交易哈希
+)
+```
 
-#### 3.5.6 封存状态归属
+#### 3.5.5 除名依赖
 
-| 存放位置 | 存什么 | 阶段 |
-| :---- | :---- | :---- |
-| 客户端本地 | 封存标志（`sealed = true`）+ 加密数据保留 | 阶段二落地 |
-| 本地 SQLite | 封存事件记录（谁、何时、原因） | 阶段二落地 |
-| 链上 | 封存事件（谁、何时、原因） | **接口预留，阶段四上链** |
-| 服务端 | 不存 | 与「数据不上云」冲突 |
+「除名」的定义归 C 板块。C 板块 v0.5 已落盘（commit `827dc13`，953 行），但**未定义除名事件**。C 板块现有事件（引荐链、存活门限、协议底线封存）中无「除名」。
 
-**阶段二口径**：
+B 板块**不定义除名事件**。`seal_events.action` 的取值只含 `seal` / `readmit`，不含 `remove`。
 
-- 客户端本地标志 + 本地 SQLite 事件记录。
-- **预留封存事件接口**（阶段四上链）。
-- 阶段二**不实际上链**。
+若 C 板块未来定义除名事件，B 板块在 v1.4 中重新对齐。
 
-#### 3.5.7 封存期间
+#### 3.5.6 API 契约
 
-- 不对外服务。
-- 不参与社区交互。
-- 数据本地可访问。
+| 端点 | 方法 | 参数 | 返回 |
+| :---- | :---- | :---- | :---- |
+| `/api/seal/events` | GET | `subject_type`, `subject_name` | `{"events": [...]}` |
+| `/api/seal/trigger` | POST | `{"subject_type", "subject_name", "action", "reason", "operator"}` | `{"event_id": int}` |
 
-#### 3.5.8 申诉恢复
+**flag**：`SEAL_ENABLED`，默认 off。
 
-- **恢复原状、全部权限**。
-- **重新接纳记录方式（阶段二）**：本地 SQLite 记录（谁接纳、何时）。
-- **预留重新接纳接口**（阶段四上链）。
-- 阶段二**不实际上链**。
-- 恢复不依赖客户端本地标志，可追溯。
+**错误码**：
 
-#### 3.5.9 永久封存
+- `seal_disabled` → 404
+- `subject_required` → 400
+- `subject_mismatch` → 403
+- `action_invalid` → 400
+- `subject_not_found` → 404
 
-- 触碰协议底线且情节极重者，永久封存。
-- 永久封存 = 永久下线。
-- 保留申诉权，申诉方式不变。
-- **社区不设「永久」的技术锁**。永久不永久，由老师们的集体沉默决定。
+#### 3.5.7 阶段四预留
 
-#### 3.5.10 与白皮书的对应
+- 自动判定（依赖 C 板块除名事件定义）
+- 全站拦截（依赖客户端优先架构）
+- 链上事件（依赖 E 板块区块链集成）
+- `seal_events.chain_ready` / `chain_hash` 填充（阶段四写入）
 
-§4.6、§5.5.3、§6.4.2。
+#### 3.5.8 与白皮书的对应
+
+§4.6、§5.5.3、§6.4.2。阶段二只落地「事件记录」部分，其余为阶段四预留。
 
 ---
 
@@ -763,7 +764,7 @@ Epic 4 已闭环，交付 `docs/epic4-lineage-design-v1.md`。lineage 表目前�
 
 ### 9.1 本文档状态
 
-本文档为**定稿 v1.2**。落盘后，B 板块从设计阶段闭环。
+本文档为**定稿 v1.3**。落盘后，B 板块从设计阶段闭环。
 
 ### 9.2 B 板块闭环条件
 
@@ -843,6 +844,22 @@ B 板块 §5.1 选定 Ed25519 作为身份签名算法，§3.3.3 定义被照护
 
 **登记状态**：待定（等 D 板块回复）。
 
+### C.3 向 C 板块提出的需求：「除名」事件定义
+
+**需求**：
+
+B 板块 §3.5.5 明确：「除名」的定义归 C 板块。
+
+**现状**：C 板块 v0.5 已落盘（commit `827dc13`），但未定义除名事件。C 板块现有事件（引荐链、存活门限、协议底线封存）中无「除名」。`agent_stage_log` 亦无除名事件。`patient_teachers.status='inactive'` 无法区分退师与除名。
+
+**待 C 板块回复**：
+
+- 除名在治理机制中的正式事件名？
+- 写入哪张表？（扩 `agent_stage_log` / 新表？）
+- 与「退师」如何区分？
+
+**登记状态**：待 C 板块 v0.5 补丁或 v0.6 定义除名事件后对齐。
+
 ---
 
-**本文档为 v1.2 定稿，落盘 `docs/phase2-data-sovereignty-design.md`。**
+**本文档为 v1.3 定稿，落盘 `docs/phase2-data-sovereignty-design.md`。**
