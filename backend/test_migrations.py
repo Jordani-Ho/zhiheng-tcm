@@ -440,6 +440,12 @@ MIGRATION_0006_PATH = os.path.join(
     BACKEND_DIR, "alembic", "versions", "0006_add_agent_learning_events.py"
 )
 PREVIOUS_REVISION_0006 = "0005_add_lineage"  # 0006 的上一版（downgrade 只回到这里，隔离本 revision）
+# 【0007 落地后修正 2026-10-02】迁移 0007_add_seal_events 落地后 head 由 0006 变为 0007_add_seal_events：
+# 0006 组用例原先把「升到 head」当作「升到 0006」，head 一变，升级会顺带把 0007 的 seal_events 也建出来
+# （既污染「既有表逐列不变」的全库取样，也让「downgrade 中止后版本号未前进」的断面从 0006 变成 0007）。
+# 故本组统一显式钉住本 revision 字符串、**绝不回落到 head**：语义与原先 head==0006 时一字不差，
+# 且此后新增任何 revision 都不必再回头改本组（断言口径 / 强度 / 原始意图均不变）。
+REVISION_0006 = "0006_add_agent_learning_events"  # 0006 自身 revision id = 本组用例的唯一升级目标
 EVENTS_TABLE = "agent_learning_events"
 EVENTS_INDEXES = (
     "uq_agent_learning_events_teacher_seq",
@@ -1529,15 +1535,16 @@ def test_0006_upgrade_creates_table_indexes_and_unique(tmp_path):
 
 
 def test_0006_upgrade_is_idempotent_and_round_trips(tmp_path):
-    """§2.1 / §8：head 再 upgrade = no-op；downgrade→upgrade 往返后表 / 索引 / 列逐项一致。"""
+    """§2.1 / §8：已在 0006 再 upgrade = no-op；downgrade→upgrade 往返后表 / 索引 / 列逐项一致。"""
     db = str(tmp_path / "m23.db")
     _seed_legacy_db(db, [(REAL_TEACHER, "疏肝理氣，健脾和胃。", "2026-09-01T00:00:00")])
-    assert migrations_runner.run_upgrade(db_file=db) is True
+    # 【0007 修正】只升到本 revision（0006）：head 已是 0007，升 head 会顺带建出 seal_events
+    assert migrations_runner.run_upgrade(REVISION_0006, db_file=db) is True
 
     first = _events_snapshot(db)
     columns_before = _columns_snapshot(db, exclude=(EVENTS_TABLE,))
 
-    assert migrations_runner.run_upgrade(db_file=db) is True     # 已在 head：no-op
+    assert migrations_runner.run_upgrade(REVISION_0006, db_file=db) is True     # 已在 0006：no-op
     assert _events_snapshot(db) == first
 
     # 真正重跑本 revision：回 0005（只回收本表与 2 个索引；既有表结构一字不动）
@@ -1548,10 +1555,10 @@ def test_0006_upgrade_is_idempotent_and_round_trips(tmp_path):
     assert _columns_snapshot(db) == columns_before
     assert _one(db, "SELECT version_num FROM alembic_version")["version_num"] == PREVIOUS_REVISION_0006
 
-    assert migrations_runner.run_upgrade(db_file=db) is True
+    assert migrations_runner.run_upgrade(REVISION_0006, db_file=db) is True
     assert _events_snapshot(db) == first                          # 与首跑逐项一致（不翻倍、不少建）
     assert _columns_snapshot(db, exclude=(EVENTS_TABLE,)) == columns_before
-    assert _one(db, "SELECT version_num FROM alembic_version")["version_num"] == ALEMBIC_HEAD
+    assert _one(db, "SELECT version_num FROM alembic_version")["version_num"] == REVISION_0006
 
 
 def test_0006_downgrade_drops_structure_only(tmp_path, monkeypatch):
@@ -1563,7 +1570,7 @@ def test_0006_downgrade_drops_structure_only(tmp_path, monkeypatch):
     database.init_db()
     db = str(db_file)
 
-    assert migrations_runner.run_upgrade(db_file=db) is True      # 全链 head（含 0006）
+    assert migrations_runner.run_upgrade(REVISION_0006, db_file=db) is True      # 只升到 0006（本组只针对本 revision）
     assert _events_snapshot(db)["table"] is True
 
     columns_before = _columns_snapshot(db, exclude=(EVENTS_TABLE,))
@@ -1579,7 +1586,7 @@ def test_0006_downgrade_drops_structure_only(tmp_path, monkeypatch):
     assert _one(db, "SELECT version_num FROM alembic_version")["version_num"] == PREVIOUS_REVISION_0006
 
     # 往返可用：再 upgrade → 表 / 索引回来、0 行、列逐字
-    assert migrations_runner.run_upgrade(db_file=db) is True
+    assert migrations_runner.run_upgrade(REVISION_0006, db_file=db) is True
     back = _events_snapshot(db)
     assert back["table"] is True and back["rows"] == 0
     assert back["indexes"] == {name: True for name in EVENTS_INDEXES}
@@ -1594,7 +1601,8 @@ def test_0006_downgrade_safety_gate_aborts_with_events(tmp_path, monkeypatch):
     monkeypatch.setattr(database, "DB_PATH", str(db_file))
     database.init_db()
     db = str(db_file)
-    assert migrations_runner.run_upgrade(db_file=db) is True
+    # 【0007 修正】只升到本 revision（0006）：0007 不在本组范围内，且中止后版本号应停在 0006
+    assert migrations_runner.run_upgrade(REVISION_0006, db_file=db) is True
 
     conn = sqlite3.connect(db)
     try:
@@ -1628,7 +1636,7 @@ def test_0006_downgrade_safety_gate_aborts_with_events(tmp_path, monkeypatch):
     assert _events_snapshot(db) == blocked
     kept = _one(db, "SELECT event_type, prev_hash FROM %s" % EVENTS_TABLE)
     assert kept["event_type"] == "draft_generated" and kept["prev_hash"] == FROZEN_GENESIS_HASH
-    assert _one(db, "SELECT version_num FROM alembic_version")["version_num"] == ALEMBIC_HEAD
+    assert _one(db, "SELECT version_num FROM alembic_version")["version_num"] == REVISION_0006
 
     # 清空 → 放行（证明闸门是唯一阻塞点）
     conn = sqlite3.connect(db)
@@ -1675,7 +1683,7 @@ def test_0006_does_not_touch_epic2_and_epic4_structures(tmp_path):
     assert before["lineage_id_cols"]["agent_stage_log"] == 1     # 0005 补的那一列
     assert "prev_hash" not in before["agent_stage_log_cols"]     # A6：链列**不进**治理审计表
 
-    assert migrations_runner.run_upgrade(db_file=db) is True     # 0005 → 0006
+    assert migrations_runner.run_upgrade(REVISION_0006, db_file=db) is True     # 0005 → 0006（只升到本 revision）
 
     # 除新表外，一切逐项相同（结构 + 行数 + lineage_id 值分布）
     assert _sample() == before
