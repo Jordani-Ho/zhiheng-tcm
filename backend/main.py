@@ -17,6 +17,7 @@ import os
 import shutil
 import uuid
 import crypto_api
+import export_api
 
 app = FastAPI(title="zhiheng-tcm-backend")
 
@@ -81,6 +82,10 @@ app.add_exception_handler(agent_stage_service.AgentStageError, agent_stage_api.a
 
 app.include_router(learning_api.router)
 app.include_router(crypto_api.router)
+# 【B 板塊 B4-1 新增】學生數據導出接口：`/api/export/patient`（GET，唯讀）。
+# flag `EXPORT_ENABLED` **默認 off** → 404 `export_disabled`，不影響既有鏈路；
+# 用 `HTTPException` 直出，無自定義異常類 → 不需要 add_exception_handler。
+app.include_router(export_api.router)
 
 class TranscriptionInput(BaseModel):
     patient_name: str

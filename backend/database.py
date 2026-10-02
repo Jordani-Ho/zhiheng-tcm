@@ -2664,3 +2664,121 @@ def insert_learning_event(teacher_name, event_type, **fields):
         conn.close()
     return row_id
 
+
+# ============================================================================
+# 【B 板塊 B4-1】學生數據導出：唯讀查詢原語（純新增，不動上方任何函數）
+# ----------------------------------------------------------------------------
+# 本段只服務 `export_api.py`（`GET /api/export/patient` 的「一次性打包」）：
+#   · 全部 `SELECT`：零寫入 / 零 DDL / 零事務；
+#   · 命名一律 `<資源>_by_patient(patient_name)`，與上方既有的窄口徑讀函數
+#     （帶 `teacher_name` / `lineage_id` 過濾，服務端入口用）並存、互不影響；
+#   · 既有同名函數（`get_patient_profile` / `get_patient_teachers` / `get_patients`）
+#     直接復用，不在此重複定義。
+# ============================================================================
+
+def get_patient_by_name(patient_name):
+    """按主鍵 `patients.name` 取一行 → dict；不存在 → None（導出端據此回 404）。"""
+    conn = get_connection()
+    row = conn.execute("SELECT * FROM patients WHERE name = ?", (patient_name,)).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def get_transcriptions_by_patient(patient_name):
+    """該患者的全部轉述（**含已處理 / 未處理**，導出要全量而非「待處理」）。"""
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT * FROM transcriptions WHERE patient_name = ? ORDER BY id DESC",
+        (patient_name,)
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_drafts_by_patient(patient_name):
+    """該患者的全部病歷草案（含已簽 / 未簽）。"""
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT * FROM drafts WHERE patient_name = ? ORDER BY id DESC",
+        (patient_name,)
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_patient_records_by_patient(patient_name):
+    """該患者的全部健康檔案（已簽病歷）。"""
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT * FROM patient_records WHERE patient_name = ? ORDER BY id DESC",
+        (patient_name,)
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_prescriptions_by_patient(patient_name):
+    """該患者的全部藥方（不分老師）。"""
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT * FROM prescriptions WHERE patient_name = ? ORDER BY id DESC",
+        (patient_name,)
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_homework_by_patient(patient_name):
+    """該患者的全部作業（不分老師 / 不分狀態）。"""
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT * FROM homework WHERE patient_name = ? ORDER BY id DESC",
+        (patient_name,)
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_appointments_by_patient(patient_name):
+    """該患者的全部預約（不分老師 / 不分狀態）。"""
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT * FROM appointments WHERE patient_name = ? "
+        "ORDER BY scheduled_date, scheduled_time",
+        (patient_name,)
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_record_tags_by_patient(patient_name):
+    """該患者病歷上的全部標籤。
+
+    注意：`record_tags` 表**沒有** `patient_name` 列（見 `init_db()` 的 record_tags：
+    只有 `record_id` / `teacher_name` / `tag_type` / `tag_value` / `created_at`，
+    遷移 0005 另補 `lineage_id`），故不能照其他 `_by_patient` 那樣直接
+    `WHERE patient_name = ?`（會 `no such column`）。這裡經
+    `record_tags.record_id = patient_records.id` 關聯到患者，語義等價於
+    「先在 `patient_records` 取本患者的 id、再查其標籤」。
+    """
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT rt.* FROM record_tags rt "
+        "INNER JOIN patient_records pr ON rt.record_id = pr.id "
+        "WHERE pr.patient_name = ? ORDER BY rt.id DESC",
+        (patient_name,)
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_complaints_by_patient(patient_name):
+    """該患者的全部學生陳述（不分老師 / 不分狀態）。"""
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT * FROM complaints WHERE patient_name = ? ORDER BY created_at DESC, id DESC",
+        (patient_name,)
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
