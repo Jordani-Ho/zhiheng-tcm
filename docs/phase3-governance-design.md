@@ -17,7 +17,7 @@
 | :-- | :-- | :-- |
 | `agent_stage_log` | Epic 2 | ✅ 已闭环 |
 | `lineage_id` | Epic 4 | ✅ 已闭环 |
-| `docs/phase2-data-sovereignty-design.md` | B 板块 | v1.1 |
+| `docs/phase2-data-sovereignty-design.md` | B 板块 | v1.3 |
 | `docs/epic4-lineage-design-v1.md` | Epic 4 | v1 |
 | `docs/whitepaper-v1.0.md` | 白皮书 1.0 | ✅ 已落库 |
 | `docs/whitepaper-v2.0.md` | 白皮书 2.0 | ✅ 已落库，唯一真相源 |
@@ -96,7 +96,7 @@
 
 ## 2. 与现有系统的关系
 
-**接口定义以 `docs/phase2-data-sovereignty-design.md` v1.1 + `docs/epic4-lineage-design-v1.md` v1 为准，C 板块不重定义。**
+**接口定义以 `docs/phase2-data-sovereignty-design.md` v1.3 + `docs/epic4-lineage-design-v1.md` v1 为准，C 板块不重定义。**
 
 ### 2.1 复用清单
 
