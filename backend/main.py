@@ -16,6 +16,7 @@ import agent_stage_service
 import os
 import shutil
 import uuid
+import crypto_api
 
 app = FastAPI(title="zhiheng-tcm-backend")
 
@@ -79,6 +80,7 @@ app.include_router(agent_stage_api.router)
 app.add_exception_handler(agent_stage_service.AgentStageError, agent_stage_api.agent_stage_error_handler)
 
 app.include_router(learning_api.router)
+app.include_router(crypto_api.router)
 
 class TranscriptionInput(BaseModel):
     patient_name: str
