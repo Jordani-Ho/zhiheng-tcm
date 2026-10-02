@@ -2,11 +2,14 @@ alembic==1.16.5
 annotated-doc==0.0.5
 annotated-types==0.8.0
 anyio==4.15.1
+argon2-cffi>=23.1
+bip-utils>=2.9
 certifi==2026.7.22
 charset-normalizer==3.5.1
 click==8.5.0
 cnlunar==0.2.4
 colorama==0.4.6
+cryptography>=42.0
 distro==1.9.0
 fastapi==0.141.1
 greenlet==3.5.6
