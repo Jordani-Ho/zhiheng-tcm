@@ -2782,3 +2782,92 @@ def get_complaints_by_patient(patient_name):
     conn.close()
     return [dict(r) for r in rows]
 
+
+# ============================================================================
+# 【B 板塊 B5-b】數據封存事件：寫入 + 讀取原語（純新增，不動上方任何函數）
+# ----------------------------------------------------------------------------
+# 對齊 docs/phase2-data-sovereignty-design.md §3.5（數據封存）：
+#   · 表結構唯一真相源 = 遷移 0007（`seal_events`）；本段只做增 / 讀，**零 DDL**；
+#   · §3.5.5：`action` 取值只含 `seal` / `readmit`（**不含** `remove` —— B 板塊不定義除名事件）；
+#   · 「只增」由代碼層強制：本段**永不**提供 update / delete；
+#   · 階段二不判定、不攔截、不實際上鏈：`chain_ready` / `chain_hash` 本步**不填**
+#     （走建表默認 FALSE / NULL），填充歸階段四（§3.5.7 / IR-4）。
+# ============================================================================
+
+# 表名（唯一真相源 = 遷移 0007 的 `SEAL_EVENTS_TABLE`；本常量只供本段 SQL 復用）
+SEAL_EVENTS_TABLE = "seal_events"
+
+# 主體類型白名單（§3.5.4：只允許「患者」與「老師」兩類主體）
+SEAL_SUBJECT_TYPES = ("patient", "teacher")
+
+# 動作白名單（§3.5.5：**不含** `remove`）
+SEAL_ACTIONS = ("seal", "readmit")
+
+
+def insert_seal_event(subject_type, subject_name, action, reason=None, operator=None):
+    """【只增】往 `seal_events` 追加一條事件，返回新行 `id`（`lastrowid`）。
+
+    形制照 `insert_agent_stage_log`：入參先過白名單 / 非空校驗（不合法 → `ValueError`），
+    再 `try/finally` 關連接；`created_at` 自動補 `datetime.now().isoformat()`（全庫 TEXT 時間慣例）。
+
+    【階段二硬口徑】（§3.5.1 / §3.5.5 / §3.5.7）
+      · `subject_type` ∈ {'patient', 'teacher'}，`action` ∈ {'seal', 'readmit'}（**不含** remove）；
+      · `subject_name` 非空（空主體名無法回溯「封存了誰」）；
+      · `reason` / `operator` 可省（None → 落 NULL）；
+      · `chain_ready` / `chain_hash` 本步**不寫**（建表默認 FALSE / NULL），填充歸階段四；
+      · 本區段永不提供 update / delete —— 「只增」由代碼層強制。
+    """
+    if subject_type not in SEAL_SUBJECT_TYPES:
+        raise ValueError(
+            "insert_seal_event 的 subject_type 必須是 patient 或 teacher，實得：%r" % (subject_type,)
+        )
+    if not subject_name:
+        raise ValueError("insert_seal_event 必須給 subject_name")
+    if action not in SEAL_ACTIONS:
+        raise ValueError(
+            "insert_seal_event 的 action 必須是 seal 或 readmit，實得：%r" % (action,)
+        )
+
+    conn = get_connection()
+    try:
+        cursor = conn.execute(
+            "INSERT INTO " + SEAL_EVENTS_TABLE
+            + " (subject_type, subject_name, action, reason, operator, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (subject_type, subject_name, action, reason, operator, datetime.now().isoformat()),
+        )
+        conn.commit()
+        event_id = cursor.lastrowid
+    finally:
+        conn.close()
+    return event_id
+
+
+def get_seal_events(subject_type, subject_name, limit=None):
+    """按 `subject_type` + `subject_name` 查封存事件 → `[dict]`，**`id` 倒序**（最近事件在前）。
+
+    形制照 `get_learning_events`：空參數（缺類型或名字）**短路**返回 `[]`（不發 SQL）；
+    `limit` 預設 `None`（**全量**），`None` / `<= 0` 亦視為全量 —— 封存歷史是數據主權的
+    見證記錄（何時 / 由誰 / 為何），讀取口徑默認不截斷（與 `idx_seal_events_subject` 的
+    `(subject_type, subject_name, id DESC)` 讀路徑同口徑）。
+    """
+    if not subject_type or not subject_name:
+        return []
+    conn = get_connection()
+    try:
+        if limit is None or limit <= 0:
+            rows = conn.execute(
+                "SELECT * FROM " + SEAL_EVENTS_TABLE
+                + " WHERE subject_type = ? AND subject_name = ? ORDER BY id DESC",
+                (subject_type, subject_name),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM " + SEAL_EVENTS_TABLE
+                + " WHERE subject_type = ? AND subject_name = ? ORDER BY id DESC LIMIT ?",
+                (subject_type, subject_name, int(limit)),
+            ).fetchall()
+    finally:
+        conn.close()
+    return [dict(r) for r in rows]
+
