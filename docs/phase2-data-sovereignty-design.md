@@ -6,6 +6,7 @@
 **作者**：B 板块 CTO
 **审阅**：发起人（知衡）
 **约束**：本文档只碰 `docs/`，zero code change
+**v1.3 修订**：见 `phase2-data-sovereignty-design-v1.3-patch.md`（合并前为准，合并后删除）
 
 ---
 
