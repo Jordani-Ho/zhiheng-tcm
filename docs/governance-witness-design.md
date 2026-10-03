@@ -1,7 +1,7 @@
 # 知衡 · 治理见证入口设计
 
 **板块**：D
-**版本**：v1.3（设计阶段定稿）
+**版本**：v1.3.1（设计阶段定稿）
 **日期**：2026-10-01
 **作者**：知衡 CTO
 **状态**：设计阶段定稿
@@ -473,6 +473,13 @@ RO 连接**只读**，不写、不建、不删、不迁移。
 
 **不需要等 A 板块 3.5。** 哈希口径已锁，D 板块直接引用。
 
+**复用范围**：
+
+- 复用 Epic 3 §2.3 的 `canonical_json` + `sha256_hex` **函数**。
+- **不复用** Epic 3 的 9 键结构（那是 `agent_learning_events` 专属）。
+- D 快照使用独立的 **8 键**哈希集（见 §6.2）。
+- **import 声明**：D 代码只 import `GENESIS_HASH` / `canonical_json` / `sha256_hex` 三项。`PAYLOAD_HASH_ALGO` / `CANONICAL_SORT_KEYS` 是 Epic 3 §2.3 的常量，其语义已被上述函数内部实现吸收，D 代码**不显式 import**。
+
 ### 6.2 快照内容与结构
 
 JSON schema（草案）：
@@ -484,12 +491,27 @@ JSON schema（草案）：
   "event_source": "C 板块",
   "lineage_id": "...",
   "event_payload_hash": "...",
-  "canonical_sort_keys": [...],
+  "canonical_sort_keys": true,
   "genesis_hash": "...",
   "timestamp": "...",
-  "witness_seats": [...]
+  "witness_seats": [...],
+  "snapshot_hash": "..."
 }
 ```
+
+**哈希范围**：
+
+- **参与**快照哈希的字段 = `D_SNAPSHOT_HASH_KEYS`（8 键，见 `backend/witness_hash.py`）：
+  `snapshot_id` / `event_type` / `event_source` / `lineage_id` / `event_payload_hash` / `canonical_sort_keys` / `genesis_hash` / `timestamp`。
+- **不参与**快照哈希的字段：
+  - `witness_seats` —— 随席位变更 / 休眠变化，纳入会破坏确定性。
+  - `snapshot_hash` —— 快照自含哈希，纳入自身哈希构成自指。
+
+**字段语义**：
+
+- `canonical_sort_keys` = **布尔** `true`，与 Epic 3 §2.3 的 `CANONICAL_SORT_KEYS` 同源。语义为"哈希时按 sort_keys 排序"，**非键集列表**。
+- `snapshot_hash` 由写入方（M2 / M3）在计算快照哈希后追加。本字段**不参与**自身哈希。
+- 快照 hash schema 未来版本锚定使用 `hash_schema_version` 字段（**待启用**），不挤进 `canonical_sort_keys`。
 
 ### 6.3 生成时机
 
@@ -698,6 +720,7 @@ RO 连接 ≠ 数据可见。字段级脱敏（§4.6）。
 | v1.1 | 2026-10-01 | 叠加修订：休眠分席（§3.2.3）、席位过少保护（§3.3.3）、扫描归属（§3.3.2）、`event_payload_hash`（§6.2）、公共池定案（§10.5）、R-C-002 编号说明（§8.2） |
 | v1.2 | 2026-10-01 | 叠加修订：§5.5 证据模式开启程序（R-009 硬伤补入）、术语表补「社区运营管理委员会」、三项 D 板块自拟加标注、R-011 回流登记 |
 | v1.3 | 2026-10-02 | 叠加修订（TD-021）：§3.3.3 明确「活跃席位 = 推举席位中的活跃席位」+ 加自拟标注；§5.1.1 / §5.2.1 补回 R-009 场景标签；§5.3 改为双轴并行；§10.8 新增两轴冲突优先级 |
+| v1.3.1 | 2026-10-02 | M4 落盘联动修订：§6.1 追加「复用范围」段；§6.2 schema 修正 `canonical_sort_keys` 为布尔 + 补 `snapshot_hash` 字段；§6.2 schema 后追加「哈希范围」+「字段语义」两段 |
 
 ---
 
