@@ -1,6 +1,7 @@
 import { useEffect, useState, useRef } from 'react'
 // 【Epic 1 子任務 4】老師端模板配置卡片（📜 模板傳承（四類））：新檔 components 風格獨立，App.tsx 只做 import + 掛載
 import TemplateStudio from './TemplateStudio'
+import { ReferralStudio } from './ReferralStudio'
 import SealPanel from './SealPanel'
 // 【Epic 2 步驟 6a】老師端 🏠 首頁「🧭 智能體階段」卡（階段畫像 + 一致率；flag off / 探測失敗 → 整卡不渲染）
 import AgentStagePanel from './AgentStagePanel'
@@ -3860,6 +3861,11 @@ export default function App() {
             flag on → 非空 → 模板三處必帶入口（GET 列表 / POST 新建 / POST 衍生）自動帶上當前師門。 */}
         {isTeacherRole && teacherTab === 'manage' && (
           <TemplateStudio teacherName={selectedTeacher} teacherId={selectedTeacher} lineageId={currentLineageId} />
+        )}
+
+        {/* 【C 板塊 0008 新增】引薦管理（設計 §10.1）：老師端「管理」頁籤 */}
+        {isTeacherRole && teacherTab === 'manage' && (
+          <ReferralStudio teacherId={selectedTeacher} />
         )}
 
         {/* 【第51天新增 / 第62天调整】中药材库存（合并进「管理」页签，排在学生卡片下方） */}
