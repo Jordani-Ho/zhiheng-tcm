@@ -2,6 +2,7 @@ import sqlite3
 import os
 import json
 import re
+import uuid
 from datetime import datetime, timedelta
 DB_PATH = os.path.join(os.path.dirname(__file__), os.environ.get("ZHIENG_DB", "zhiheng.db"))
 
@@ -2871,3 +2872,202 @@ def get_seal_events(subject_type, subject_name, limit=None):
         conn.close()
     return [dict(r) for r in rows]
 
+# ---------- referral_chain（C 板块 0008） ----------
+REFERRAL_CHAIN_TABLE = "referral_chain"
+REFERRAL_REFERRER_TYPES = ("TEACHER", "STUDENT")
+REFERRAL_REFEREE_TYPES = ("TEACHER", "STUDENT", "DEPENDENT")
+REFERRAL_ANNUAL_QUOTA = 3
+
+
+def insert_referral_chain(referrer_id, referrer_type, referee_id, referee_type,
+                          lineage_id=None, referral_reason=None, created_at=None):
+    """【只增】往 referral_chain 追加一条引荐记录，返回新生成的 referral_id。
+
+    形制照 insert_seal_event：入参先过白名单 / 非空校验（不合法 → ValueError），
+    再 try/finally 关连接。
+
+    【C 板块 0008 硬口径】（docs/phase3-governance-design.md §3.1 / §3.2 / §3.3）
+      · referrer_type ∈ {'TEACHER', 'STUDENT'}；
+      · referee_type ∈ {'TEACHER', 'STUDENT', 'DEPENDENT'}；
+      · referrer_id / referee_id 非空；
+      · referrer_id != referee_id（不得自引荐，§3.2）；
+      · referrer_type='TEACHER' 时 referral_reason 必填（§3.2）；
+      · lineage_id 可空（学生引荐亲友可能暂无师门归属）；
+      · chain_ready / chain_hash 本步不写（建表默认 FALSE / NULL），填充归阶段四；
+      · 本区段永不提供 update / delete —— 「只增」由代码层强制
+        （撤回走 revoke_referral，不删行）。
+    """
+    if referrer_type not in REFERRAL_REFERRER_TYPES:
+        raise ValueError(
+            "insert_referral_chain 的 referrer_type 必须是 TEACHER 或 STUDENT，实得：%r"
+            % (referrer_type,)
+        )
+    if referee_type not in REFERRAL_REFEREE_TYPES:
+        raise ValueError(
+            "insert_referral_chain 的 referee_type 必须是 TEACHER / STUDENT / DEPENDENT，实得：%r"
+            % (referee_type,)
+        )
+    if not referrer_id:
+        raise ValueError("insert_referral_chain 必须给 referrer_id")
+    if not referee_id:
+        raise ValueError("insert_referral_chain 必须给 referee_id")
+    if referrer_id == referee_id:
+        raise ValueError(
+            "insert_referral_chain 禁止自引荐：referrer_id == referee_id == %r" % (referrer_id,)
+        )
+    if referrer_type == "TEACHER" and not referral_reason:
+        raise ValueError("insert_referral_chain：老师引荐必须给 referral_reason（一句话理由）")
+
+    referral_id = "ref-" + uuid.uuid4().hex[:16]
+    if created_at is None:
+        created_at = datetime.now().isoformat()
+
+    conn = get_connection()
+    try:
+        conn.execute(
+            "INSERT INTO " + REFERRAL_CHAIN_TABLE
+            + " (referral_id, referrer_id, referrer_type, referee_id, referee_type, "
+            "  lineage_id, referral_reason, created_at, chain_ready) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)",
+            (referral_id, referrer_id, referrer_type, referee_id, referee_type,
+             lineage_id, referral_reason, created_at),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return referral_id
+
+
+def get_referral(referral_id):
+    """按 referral_id 查单条，无则返回 None。"""
+    if not referral_id:
+        return None
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT * FROM " + REFERRAL_CHAIN_TABLE + " WHERE referral_id = ?",
+            (referral_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+    return dict(row) if row else None
+
+
+def get_referrals_by_referrer(referrer_id, limit=None):
+    """查某引荐人引荐过谁 → [dict]，按 created_at 倒序（最近在前）。
+
+    limit=None / <= 0 → 全量（与 get_seal_events 同口径）。
+    """
+    if not referrer_id:
+        return []
+    conn = get_connection()
+    try:
+        if limit is None or limit <= 0:
+            rows = conn.execute(
+                "SELECT * FROM " + REFERRAL_CHAIN_TABLE
+                + " WHERE referrer_id = ? ORDER BY created_at DESC",
+                (referrer_id,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM " + REFERRAL_CHAIN_TABLE
+                + " WHERE referrer_id = ? ORDER BY created_at DESC LIMIT ?",
+                (referrer_id, int(limit)),
+            ).fetchall()
+    finally:
+        conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_referrals_by_referee(referee_id, limit=None):
+    """查某被引荐人被谁引荐 → [dict]，按 created_at 倒序。"""
+    if not referee_id:
+        return []
+    conn = get_connection()
+    try:
+        if limit is None or limit <= 0:
+            rows = conn.execute(
+                "SELECT * FROM " + REFERRAL_CHAIN_TABLE
+                + " WHERE referee_id = ? ORDER BY created_at DESC",
+                (referee_id,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM " + REFERRAL_CHAIN_TABLE
+                + " WHERE referee_id = ? ORDER BY created_at DESC LIMIT ?",
+                (referee_id, int(limit)),
+            ).fetchall()
+    finally:
+        conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_referrals_by_lineage(lineage_id, limit=None):
+    """查某师门内的引荐链 → [dict]，按 created_at 倒序。"""
+    if not lineage_id:
+        return []
+    conn = get_connection()
+    try:
+        if limit is None or limit <= 0:
+            rows = conn.execute(
+                "SELECT * FROM " + REFERRAL_CHAIN_TABLE
+                + " WHERE lineage_id = ? ORDER BY created_at DESC",
+                (lineage_id,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM " + REFERRAL_CHAIN_TABLE
+                + " WHERE lineage_id = ? ORDER BY created_at DESC LIMIT ?",
+                (lineage_id, int(limit)),
+            ).fetchall()
+    finally:
+        conn.close()
+    return [dict(r) for r in rows]
+
+
+def count_referrals_by_referrer_in_year(referrer_id, year):
+    """某引荐人在某自然年内的引荐总数（用于年度额度校验，§3.3）。
+
+    入参 year 为 int（如 2026）；口径 = created_at 前 4 字符匹配年份。
+    """
+    if not referrer_id:
+        return 0
+    year_prefix = "%04d" % int(year)
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT COUNT(*) AS c FROM " + REFERRAL_CHAIN_TABLE
+            + " WHERE referrer_id = ? AND substr(created_at, 1, 4) = ?",
+            (referrer_id, year_prefix),
+        ).fetchone()
+    finally:
+        conn.close()
+    return row["c"] if row else 0
+
+
+def revoke_referral(referral_id, revoke_reason=None):
+    """【软撤回】写 revoked_at + revoke_reason，不删行。
+
+    · 若 referral_id 不存在 → ValueError；
+    · 若已撤回 → ValueError（不可重复撤回）。
+    """
+    if not referral_id:
+        raise ValueError("revoke_referral 必须给 referral_id")
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT revoked_at FROM " + REFERRAL_CHAIN_TABLE + " WHERE referral_id = ?",
+            (referral_id,),
+        ).fetchone()
+        if row is None:
+            raise ValueError("revoke_referral：referral_id 不存在：%r" % (referral_id,))
+        if row["revoked_at"]:
+            raise ValueError("revoke_referral：该引荐已撤回，不可重复撤回：%r" % (referral_id,))
+        conn.execute(
+            "UPDATE " + REFERRAL_CHAIN_TABLE
+            + " SET revoked_at = ?, revoke_reason = ? WHERE referral_id = ?",
+            (datetime.now().isoformat(), revoke_reason, referral_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
