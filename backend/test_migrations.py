@@ -1784,3 +1784,193 @@ def test_0006_design_doc_keeps_frozen_literals():
     assert "权威源" in doc and "投影" in doc
     # §1.2 的「12 项要求」对照表必须存在（本步的验收口径就写在里面）
     assert "12 项要求" in doc
+
+# ===========================================================================
+# 【C 板块 0008】迁移 0008 守护测试：referral_chain 表 + 3 个索引
+# 对齐：docs/phase3-governance-design.md §3.1（数据模型）/ §3.5（上链预留）
+#       docs/phase3-construction-outline.md §1.2（引荐链）
+#       docs/whitepaper-v2.0.md §1.6 + §4.2.1 + §4.4.1（引荐规则）
+# 纪律：全部用例都在 tmp_path 下自建独立 SQLite 文件，
+#       绝不碰 backend/zhiheng.db 与 backend/test.db。
+# ===========================================================================
+
+MIGRATION_0008_PATH = os.path.join(
+    BACKEND_DIR, "alembic", "versions", "0008_add_referral_chain.py"
+)
+PREVIOUS_REVISION_0008 = "0007_add_seal_events"  # 0008 上一版
+REVISION_0008 = "0008_add_referral_chain"        # 0008 自身 revision id（本组唯一升级目标）
+REFERRAL_TABLE = "referral_chain"
+REFERRAL_INDEXES = (
+    "idx_referral_chain_referrer",
+    "idx_referral_chain_referee",
+    "idx_referral_chain_lineage",
+)
+
+# FROZEN_* = 独立书写的契约字面量（来源 = 设计 §3.1），不是从迁移模块复制的。
+# 断言「迁移常量 == 本处字面量」→ 钉死「设计文档 ↔ 迁移 0008」的漂移路径。
+FROZEN_REFERRAL_COLUMNS = (
+    "referral_id",
+    "referrer_id",
+    "referrer_type",
+    "referee_id",
+    "referee_type",
+    "lineage_id",
+    "referral_reason",
+    "created_at",
+    "revoked_at",
+    "revoke_reason",
+    "chain_ready",
+    "chain_hash",
+)
+FROZEN_REFERRAL_INDEXES = (
+    "idx_referral_chain_referrer",
+    "idx_referral_chain_referee",
+    "idx_referral_chain_lineage",
+)
+
+
+def _load_migration_0008():
+    """按文件路径载入迁移 0008（alembic 也是按路径载入的），用于核对常量与 FROZEN 契约。"""
+    assert os.path.exists(MIGRATION_0008_PATH), "迁移 0008 尚未创建：%s" % MIGRATION_0008_PATH
+    spec = importlib.util.spec_from_file_location(
+        "migration_0008_add_referral_chain", MIGRATION_0008_PATH
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _seed_baseline_db_0008(db_path):
+    """造一份「跑到 0007」的库（0008 的升级起点）。
+
+    复用 0005 组的 `_seed_baseline_db()`（造到 0004），再推到 0007；
+    断面 = PREVIOUS_REVISION_0008，与 0008 恰好相接。
+    """
+    _seed_baseline_db(db_path)
+    assert migrations_runner.run_upgrade(PREVIOUS_REVISION_0008, db_file=db_path) is True
+
+
+def test_migration_0008_creates_table_and_indexes(tmp_path):
+    """§3.1：referral_chain 表 12 列 + 3 索引与设计一致；不落 CHECK / 不落外键。"""
+    db = tmp_path / "c08_m1.db"
+    _seed_baseline_db_0008(str(db))
+
+    assert migrations_runner.run_upgrade(REVISION_0008, db_file=str(db)) is True
+
+    ddl = _one(
+        str(db),
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+        (REFERRAL_TABLE,),
+    )["sql"]
+    for column in FROZEN_REFERRAL_COLUMNS:
+        assert column in ddl, "缺少列 %s" % column
+    assert "CHECK" not in ddl.upper()
+    assert "FOREIGN KEY" not in ddl.upper()
+
+    indexes = _names(
+        _read(
+            str(db),
+            "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name=?",
+            (REFERRAL_TABLE,),
+        )
+    )
+    assert set(indexes) >= set(FROZEN_REFERRAL_INDEXES)
+
+    assert _one(str(db), "SELECT version_num FROM alembic_version")["version_num"] == REVISION_0008
+
+
+def test_migration_0008_constants_match_frozen_contract():
+    """把「设计文档 ↔ 迁移 0008」的漂移路径钉死：迁移模块常量 == 本处字面量。"""
+    module = _load_migration_0008()
+    assert module.revision == REVISION_0008
+    assert module.down_revision == PREVIOUS_REVISION_0008
+    assert module.TABLE_NAME == REFERRAL_TABLE
+    assert tuple(module.ALL_COLUMNS) == FROZEN_REFERRAL_COLUMNS
+    assert tuple(module.INDEX_NAMES) == FROZEN_REFERRAL_INDEXES
+
+
+def test_migration_0008_idempotent(tmp_path):
+    """重复 upgrade = no-op（不重复建表、不报错）。"""
+    db = tmp_path / "c08_m2.db"
+    _seed_baseline_db_0008(str(db))
+
+    assert migrations_runner.run_upgrade(REVISION_0008, db_file=str(db)) is True
+    assert migrations_runner.run_upgrade(REVISION_0008, db_file=str(db)) is True
+
+    cols = _columns_of(str(db), REFERRAL_TABLE)
+    assert cols.count("referral_id") == 1
+
+
+def test_migration_0008_downgrade_removes_only_new_table(tmp_path):
+    """downgrade 只回收到 0007：referral_chain 消失，既有表与数据原样保留。"""
+    db = tmp_path / "c08_m3.db"
+    _seed_baseline_db_0008(str(db))
+
+    tables_before = _tables(str(db))
+    assert migrations_runner.run_upgrade(REVISION_0008, db_file=str(db)) is True
+
+    migrations_runner.run_downgrade(PREVIOUS_REVISION_0008, db_file=str(db))
+
+    tables_after = _tables(str(db))
+    assert REFERRAL_TABLE not in tables_after
+    # 既有表全部保留，不因 0008 回退而消失
+    assert tables_before <= tables_after
+    # 索引消失
+    assert (
+        _read(
+            str(db),
+            "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name=?",
+            (REFERRAL_TABLE,),
+        )
+        == []
+    )
+    assert _one(str(db), "SELECT version_num FROM alembic_version")["version_num"] == PREVIOUS_REVISION_0008
+
+
+def test_migration_0008_downgrade_safety_gate_blocks_with_rows(tmp_path):
+    """安全闸：表内有业务行时拒绝降级；清空后可通过。"""
+    db = tmp_path / "c08_m4.db"
+    _seed_baseline_db_0008(str(db))
+    assert migrations_runner.run_upgrade(REVISION_0008, db_file=str(db)) is True
+
+    conn = sqlite3.connect(str(db))
+    try:
+        conn.execute(
+            "INSERT INTO referral_chain "
+            "(referral_id, referrer_id, referrer_type, referee_id, referee_type, "
+            " created_at, chain_ready) "
+            "VALUES ('r1', 'T1', 'TEACHER', 'T2', 'TEACHER', "
+            "        '2026-10-02T00:00:00', 0)"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    with pytest.raises(Exception) as excinfo:
+        migrations_runner.run_downgrade(PREVIOUS_REVISION_0008, db_file=str(db))
+    assert "downgrade 中止" in str(excinfo.value) or "downgrade 已中止" in str(excinfo.value)
+
+    # 表与行仍在
+    assert _one(str(db), "SELECT COUNT(*) AS c FROM referral_chain")["c"] == 1
+
+    # 清空后可通过
+    conn = sqlite3.connect(str(db))
+    try:
+        conn.execute("DELETE FROM referral_chain")
+        conn.commit()
+    finally:
+        conn.close()
+    migrations_runner.run_downgrade(PREVIOUS_REVISION_0008, db_file=str(db))
+    assert REFERRAL_TABLE not in _tables(str(db))
+
+
+def test_migration_0008_does_not_touch_existing_tables(tmp_path):
+    """0008 只新增 referral_chain，不得改动任何既有表的列结构。"""
+    db = tmp_path / "c08_m5.db"
+    _seed_baseline_db_0008(str(db))
+
+    before = _columns_snapshot(str(db), exclude=(REFERRAL_TABLE,))
+    assert migrations_runner.run_upgrade(REVISION_0008, db_file=str(db)) is True
+    after = _columns_snapshot(str(db), exclude=(REFERRAL_TABLE,))
+
+    assert before == after
