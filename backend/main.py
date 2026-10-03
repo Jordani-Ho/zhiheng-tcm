@@ -19,6 +19,7 @@ import uuid
 import crypto_api
 import export_api
 import seal_api
+import witness_router
 
 app = FastAPI(title="zhiheng-tcm-backend")
 
@@ -91,6 +92,7 @@ app.include_router(export_api.router)
 # flag `SEAL_ENABLED` **默認 off** → 404 `seal_disabled`，不影響既有鏈路；
 # 用 `HTTPException` 直出，無自定義異常類 → 不需要 add_exception_handler。
 app.include_router(seal_api.router)
+app.include_router(witness_router.router)
 
 class TranscriptionInput(BaseModel):
     patient_name: str
