@@ -19,6 +19,7 @@ import uuid
 import crypto_api
 import export_api
 import seal_api
+import referral_api
 import witness_router
 
 app = FastAPI(title="zhiheng-tcm-backend")
@@ -55,6 +56,9 @@ except Exception as exc:  # noqa: BLE001 —— 迁移框架不可用（例如�
 # feature flag `TEMPLATE_API_ENABLED` **默认 off**（§5.2 第 5 条）→ 全部 404，前端不渲染入口；
 # 启用：$env:TEMPLATE_API_ENABLED = "on"（PowerShell 示例）。
 app.include_router(template_api.router)
+# 【C 板塊 0008 新增】引薦鏈接口（設計 §9.1）：`/api/referral*`。
+# flag `REFERRAL_ENABLED` **默认 off**（同 seal_api 惯例）。
+app.include_router(referral_api.router)
 app.add_exception_handler(database.TemplateError, template_api.template_error_handler)
 
 # 【Epic 4 新增】師門（lineage）接口與錯誤碼契約（設計 §4.1 / §4.3 / §4.4）：
