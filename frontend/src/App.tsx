@@ -1,6 +1,7 @@
 import { useEffect, useState, useRef } from 'react'
 // 【Epic 1 子任務 4】老師端模板配置卡片（📜 模板傳承（四類））：新檔 components 風格獨立，App.tsx 只做 import + 掛載
 import TemplateStudio from './TemplateStudio'
+import SealPanel from './SealPanel'
 // 【Epic 2 步驟 6a】老師端 🏠 首頁「🧭 智能體階段」卡（階段畫像 + 一致率；flag off / 探測失敗 → 整卡不渲染）
 import AgentStagePanel from './AgentStagePanel'
 
@@ -13,7 +14,7 @@ interface PatientRecord { id: number; patient_name: string; ai_draft: string; fi
 interface PatientProfile { patient_name: string; gender: string; birth_date: string; birth_time: string; birth_place: string; location: string; bazi?: string; wuxing?: string; }
 interface Teacher { name: string; description: string; }
 // 【第62天调整】老师端页签：首页 / 诊室 / 管理（原「学生」+「库存」合并） / 设置
-type TeacherTab = 'home' | 'clinic' | 'manage' | 'settings'
+type TeacherTab = 'home' | 'clinic' | 'manage' | 'settings' | 'seal'
 
 const boxStyle: React.CSSProperties = { background: '#fdfcf0', border: '1px solid #d4c8a8', borderRadius: '12px', padding: '24px', marginBottom: '20px', boxShadow: '0 4px 12px rgba(0,0,0,0.06)' }
 const inputStyle: React.CSSProperties = { width: '100%', padding: '8px', borderRadius: '6px', border: '1px solid #d4c8a8', fontFamily: 'serif', marginBottom: '8px', boxSizing: 'border-box' }
@@ -293,6 +294,24 @@ export default function App() {
 
   // 【第57天新增 / 第62天调整】老师端页签（首页/诊室/管理/设置），切换时不清空 selectedPatient
   const [teacherTab, setTeacherTab] = useState<TeacherTab>('home')
+  const [sealStatus, setSealStatus] = useState<{ sealed: boolean; at: string } | null>(null)
+  useEffect(() => {
+    if (currentRole !== '学生' && currentRole !== '学生智能体') {
+      setSealStatus(null)
+      return
+    }
+    let cancelled = false
+    fetch(`/api/seal/events?subject_type=patient&subject_name=${encodeURIComponent(selectedPatient)}`)
+      .then(res => (res.ok ? res.json() : null))
+      .then((data: { events?: Array<{ action: string; created_at: string }> } | null) => {
+        if (cancelled || !data) return
+        const evs = Array.isArray(data.events) ? data.events : []
+        const latest = evs[0]
+        setSealStatus({ sealed: !!latest && latest.action === 'seal', at: latest ? latest.created_at : '' })
+      })
+      .catch(() => { if (!cancelled) setSealStatus(null) })
+    return () => { cancelled = true }
+  }, [currentRole, selectedPatient])
   // 【第57天新增】诊室：老师搜索学生（前端过滤 teacherPatients）
   const [studentSearch, setStudentSearch] = useState('')
   // 【第71天新增 / 面诊队列整合】🩺 诊室队列：临时加插名单（仅本次会话有效，刷新页面自动清空；不落库、不调后端）
@@ -2343,7 +2362,8 @@ export default function App() {
     { key: 'home', label: '🏠 首页' },
     { key: 'clinic', label: '🩺 诊室' },
     { key: 'manage', label: '🗂️ 管理' },
-    { key: 'settings', label: '⚙️ 设置' }
+    { key: 'settings', label: '⚙️ 设置' },
+    { key: 'seal', label: '🔒 封存' }
   ]
   const teacherTabBtnStyle = (key: TeacherTab): React.CSSProperties => ({
     flex: 1, padding: '10px 4px', borderRadius: '10px', border: '1px solid #8b4513',
@@ -2904,6 +2924,11 @@ export default function App() {
             三个区块：⏳ 待你确认（浅黄底强调） / ✅ 已办汇报（最近 5 条） / 📜 行动日志（最近 10 条）；
             「立即扫描」走统一扫描接口 POST /api/agent/scan（请求体 { teacher_name }），一次扫出三类学生请示：
             沉默关怀 send_care_notice + 欠费预存 send_billing_notice + 复诊提醒 send_recall_notice。 */}
+  {/* 【B4 封存】老师端封存管理页 */}
+  {isTeacherRole && teacherTab === 'seal' && (
+    <SealPanel selectedTeacher={selectedTeacher} selectedPatient={selectedPatient} />
+  )}
+
         {(currentRole === '李老师' || currentRole === '李老师智能体') && teacherTab === 'home' && (
           <div style={boxStyle}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
@@ -3985,6 +4010,14 @@ export default function App() {
             )}
           </div>
         )}
+            {/* 【B4 封存】学生端封存状态 */}
+            {(currentRole === '学生' || currentRole === '学生智能体') && sealStatus && (
+              <div style={{ ...boxStyle, background: sealStatus.sealed ? '#fff5f5' : '#f0fdf4' }}>
+                <div style={{ textAlign: 'center', fontSize: '16px', color: sealStatus.sealed ? '#c0392b' : '#5a7d5a', fontWeight: 'bold' }}>
+                  {sealStatus.sealed ? `🔒 已封存（${sealStatus.at}）` : '✅ 状态正常'}
+                </div>
+              </div>
+            )}
 
         {(currentRole === '李老师' || currentRole === '李老师智能体') && teacherTab === 'clinic' && (
           <div style={{ ...boxStyle, background: '#fff9f0' }}>
