@@ -807,24 +807,24 @@ GET    /api/kangbi/allocation-rule           # 查询分配规则
 
 ### 11.3 与阶段四的衔接
 
-**与 D 板块（治理见证入口）：C 板块治理动作是 D 板块观察对象，需预留只读查询接口，不在 C 板块实现。**
+**与 D 板块（治理见证入口）：C 板块治理动作是 D 板块观察对象。D 通过只读 URI 直读数据库，C 板块不提供 API。**
 
 **与阶段四**：
 
 - 所有新增表预留 `chain_ready` + `chain_hash`。
-- 所有封存/解封动作预留 `evidence_hash`。
+- C 板块的 `evidence_package` 表（§5.3 定义）含 `evidence_hash` 字段，阶段四上链。
 - 阶段四只补上链逻辑，不改数据结构。
 
-**只读查询接口预留**（给 D 板块）：
+**D 板块只读访问的数据**：
 
-```
-GET /api/governance/readonly/referrals      # 引荐链只读
-GET /api/governance/readonly/seals          # 封存记录只读
-GET /api/governance/readonly/levels         # 段位变更只读
-GET /api/governance/readonly/kangbi         # 康币账本只读
-```
+D 板块通过只读 URI 直读数据库，访问以下四类数据：
 
-**这些接口不在 C 板块实现，只在本文档登记需求。**
+- 引荐链（`referral_chain`）
+- 封存记录（`seal_events`，B 板块表）
+- 段位变更（`student_level`）
+- 康币账本（`kangbi_ledger`）
+
+**C 板块不提供 API，只保证表结构稳定。**
 
 ---
 
