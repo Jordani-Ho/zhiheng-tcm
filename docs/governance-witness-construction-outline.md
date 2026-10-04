@@ -93,7 +93,7 @@ M5 接口契约（横切 M1–M6）
 **逐条依赖说明**：
 
 - **A → D**：`canonical_json` / `GENESIS_HASH` / `PAYLOAD_HASH_ALGO` / `CANONICAL_SORT_KEYS`（Epic 3 §2.3）
-- **C → D**：`GET /api/governance/readonly/{referrals,seals,levels,kangbi}`（C v0.5 §11.3）——D 消费，不定义
+- **C → D**：D 通过只读 URI 直读数据库（referrals / seals / levels / kangbi 四类数据）——D 消费，不定义接口
 - **B1 → D**：加密后可进快照的字段清单（D v1.3 §5.4 / §10.3）——待 B1 定稿
 - **D → E**：见证快照 schema（D v1.3 §6.2）+ `EVIDENCE_MODE_OPEN`（§5.5.3）+ 信任根分层（§8.2）
 
@@ -177,7 +177,7 @@ M5 接口契约（横切 M1–M6）
 
 1. C 触发治理动作（除名 / 引荐 / 底线）
 2. C 写入自己的本地治理事件表
-3. D 通过 C v0.5 §11.3 四个只读接口**拉取**
+3. D 通过只读 URI 直读数据库
 4. D 侧见证人（永久席位 / 推举席位联署）自行决定是否开启证据模式
 
 **语义要点**：

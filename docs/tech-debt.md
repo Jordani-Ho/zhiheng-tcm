@@ -483,3 +483,37 @@
 **现状**：UI 层 `enabled !== true → null` 逻辑已审。
 **处置**：内测前补测（或内测中实测）。
 **登记时间**：2026-10-02
+
+---
+
+### TD-B-009 B4 前端时间戳格式化 · 补充
+
+**状态**：归 v1.4 patch
+
+**修正说明**：本条目补充 TD-B-007。**TD-B-007 现有文本 L475 写「已截断 slice(0, 19)」，与代码实测不符**——`SealPanel.tsx:170` 与 `App.tsx:4023` 均直接显示 `created_at` 原样，**未截断**。
+
+**涉及文件**：
+- `frontend/src/SealPanel.tsx`：事件列表 `ev.created_at`（L170）
+- `frontend/src/App.tsx`：学生端状态卡 `sealStatus.at`（L4023）
+
+**改进**：显示时 `.slice(0, 19)`。
+
+**登记时间**：2026-10-04
+
+---
+
+### TD-B-010 B4 异常路径补测 · 具体项
+
+**状态**：内测前补
+
+**内容**：本条目补充 TD-B-008。TD-B-008 仅写「异常路径 A」，本条目给出 4 条具体待测项。
+
+**待测项**：
+- flag off（`SEAL_ENABLED` 未设）→ 老师端 tab 栏应只剩 4 个；学生端无状态卡
+- flag off 时 API 直访 `/api/seal/events` → 应 404 `seal_disabled`
+- 主体名清空点封存 → 应 `alert`「请填写主体名称」
+- 连续点封存 → 第二次应 disabled（`submitting`）
+
+**理由**：UI 层 `enabled !== true → null` 逻辑已审，但未实跑。
+
+**登记时间**：2026-10-04

@@ -54,14 +54,14 @@
 
 **与 D 板块只读预留**：
 
-四个只读接口登记（不在 C 板块实现）：
+D 直读数据库（C 不提供 API）：
 
-```
-GET /api/governance/readonly/referrals      # 引荐链只读
-GET /api/governance/readonly/seals          # 封存记录只读
-GET /api/governance/readonly/levels         # 段位变更只读
-GET /api/governance/readonly/kangbi         # 康币账本只读
-```
+D 板块通过只读 URI 直读数据库（不经过 API）。C 板块需保证以下四类数据的表结构稳定：
+
+- 引荐链（referral_chain）
+- 封存记录（seal_events，B 板块表）
+- 段位变更（student_level）
+- 康币账本（kangbi_ledger）
 
 ---
 
@@ -120,7 +120,7 @@ C 板块调用 B4 时使用上述 API。原「待填」标记撤销。
 **C 板块立场**：C 与 D 之间**无任何直接调用**。是拉模式。
 
 - C 触发治理动作 → 写入本地治理事件表
-- D 通过 C v0.5 §11.3 四个只读接口（referrals / seals / levels / kangbi）**拉取**
+- D 通过只读 URI 直读数据库（referrals / seals / levels / kangbi 四类数据），不经过 API
 - 开启程序由 D 侧见证人自行发起，与 C 无关
 
 **C 板块不做**：
