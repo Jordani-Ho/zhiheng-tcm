@@ -22,3 +22,7 @@ team/acl-reports/
 
 # Obsidian（若启用）
 .obsidian/
+
+# 临时提交消息文件（本仓库用消息文件写中文 commit，勿入库）
+.commit-msg*.tmp
+commit-msg.tmp
