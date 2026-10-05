@@ -8,8 +8,28 @@
 **状态**：设计阶段定稿，可进实现阶段
 **约束**：本文档只碰 `docs/`，zero code change
 
-**基线 HEAD**：`80fca86`
-**基线测试**：`603 passed`
+**基线 HEAD**：`80fca86` ⚠️ **已过期**
+**基线测试**：`603 passed` ⚠️ **口径为 pytest 收集数**
+
+---
+
+> ## ⚠️ 阅读前置：本文件的实现对象清单有重大偏差（2026-10-04 核实）
+>
+> 本文档 v0.4 成稿于 2026-10-02。经 2026-10-04 板块摸查**四路径核实**（迁移文件 / `database.py` / 全库代码引用 / `zhiheng.db` 只读 `sqlite_master`），发现：
+>
+> | 本文档声称 | 实际 |
+> | :-- | :-- |
+> | 「已建表」12 张 | **7 张真存在，5 张根本不存在**（`evidence_package` / `student_level` / `state_judgment` / `community_external_tx` / `kangbi_ledger`） |
+> | 「已预留列」`evidence_hash` | **不存在**（backend 全部 `.py` 零命中）→ 依 **D-014** 改定为 `evidence_package` 表字段 |
+> | 「已预留列」身份公钥 | **零实现**（`ed25519`/`nacl`/`public_key` 零命中）→ 纯文档预留 |
+>
+> **后果**：E 板块的**实现对象清单已静默落空** → **本文档「可进实现阶段」的判断不成立**。
+>
+> **处置**（决策 **D-013**）：**改文档，不补建表**——C 板块设计未定稿，补建必返工。E 的启动前置条件须在 C 定稿后**重排**。
+>
+> **权威顺序**：白皮书 v1.1 + v2.1 > `team/decisions/decision-log.md` > 本文件。
+>
+> **基线更正**：本文档基线 `80fca86` / `603 passed` 已落后。当前 HEAD `bb5d0c7`；pytest 收集 **707** 项（实跑 642 passed + 65 setup errors，错误根因 = 沙箱禁止临时目录，非代码问题）。
 
 ---
 
@@ -76,9 +96,15 @@ E 板块 v0.4 的正文分两条线：
 
 E 板块把**阶段一～三已跑通的本地状态与预留字段**，翻译成「可上链」的技术方案：
 
-- 已建表：`referral_chain`、`evidence_package`、`student_level`、`state_judgment`、`community_external_tx`、`kangbi_ledger`（C 板块）；`seal_events`（B 板块）；`agent_stage_log` / `agent_stage_state`（Epic 2）；`agent_learning_events`（Epic 3）；`lineage` / `patient_teachers`（Epic 4）。
-- 已预留列：`chain_ready` / `chain_hash`（B / C 板块）、`evidence_hash`（C 板块）、身份公钥（B 板块）。
+- **【2026-10-04 已核实修正】C 板块已建表：仅 `referral_chain` 1 张。** 原文写「已建表：`referral_chain`、`evidence_package`、`student_level`、`state_judgment`、`community_external_tx`、`kangbi_ledger`（C 板块）」——经四路径核实（迁移 / `database.py` / 全库代码引用 / `zhiheng.db` 只读 `sqlite_master`），**后 5 张表根本不存在**，且在 backend/frontend 全部 `.py`/`.ts`/`.tsx`/`.sql` 中**零引用**，仅存在于文档。
+  - **不存在**：`evidence_package`、`student_level`（已废，D-002）、`state_judgment`、`community_external_tx`、`kangbi_ledger`。
+  - **处置**：决策 **D-013** —— **改文档，不补建**（C 设计未定稿，补建必返工）。本清单的**实现对象须重排为「待建表」**，见 §9 待办。
+- **【已核实】真存在的表**：`referral_chain`（C，迁移 `0008`）、`seal_events`（B，迁移 `0007`）、`agent_stage_log` / `agent_stage_state`（Epic 2，迁移 `0003`）、`agent_learning_events`（Epic 3，迁移 `0006`）、`lineage`（Epic 4，迁移 `0005`）、`patient_teachers`（**旧表，非迁移建**，`0005` 只 `ADD COLUMN` 补 `lineage_id`）。
+- **【2026-10-04 修正】已预留列**：实测**仅 `seal_events` 与 `referral_chain` 真有** `chain_ready` / `chain_hash` 两列（默认 `FALSE` / `NULL`），且**没有任何写 `TRUE` 的代码**（库内 `chain_ready=1` 计数 0、`chain_hash` 非 NULL 计数 0；唯一写点 `backend/database.py:2930` 硬编码写 `0`）。
+  - ~~`evidence_hash`（C 板块）~~ → **不存在**：backend 全部 `.py` **零命中**，无列、无迁移、无 SQL。依决策 **D-014**，它**不是**独立预留列，而是 **C 板块 `evidence_package` 表的一个字段**（原文不上链，仅哈希上链）；该表待 C 定稿后建。
+  - ~~身份公钥（B 板块）~~ → **零实现**：`ed25519` / `nacl` / `signing` / `public_key` 在 backend **零命中**；B 设计文档自述「尚未实现」（`phase2-data-sovereignty-design.md:664`）。属**纯文档预留**，非既有资产。
 - E 板块的唯一新增职责：**把上述预留列填上真实哈希，并把「该上链的」锚定到链上。**
+  - **⚠️ 前置条件警告**：由于上述 5 张表与 `evidence_hash`、身份公钥**均不存在**，E 板块的**实现对象清单已静默落空** → **E 现阶段不具备启动条件**（依 D-013，待 C 定稿后重排）。
 
 ### 1.2 白皮书对照
 
@@ -415,13 +441,13 @@ h_seat_event = sha256(canonical_json({
 | 1 | 引荐链节 | C 板块 §3.1 `referral_chain` | 引荐成立 | `referral_id` + `referrer_id` + `referee_id` + `referrer_type` + `referee_type` + `created_at` | 缺 `referral_id` / 自引荐（`referrer_id == referee_id`） | ✅ |
 | 2 | 撤回锚定 | C 板块 §3.1 `revoked_at` / `revoke_reason` | 撤回背书 | `event=referral_revoked` + `referral_id` + `revoked_at` + `prev_hash` | 原 `referral_id` 不存在 | ✅（追加链节） |
 | 3 | 封存锚定 | B 板块 §3.5.4 `seal_events` | `seal` / `readmit` | `subject_type` + `subject_name_hash` + `event` + `reason_key` + `created_at` | `action` ∉ {`seal`, `readmit`} | ✅ |
-| 4 | 协议底线锚定 | C 板块 §5.3 `evidence_package` | 触碰底线 | `evidence_id` + `bottomline_type` + `target_agent_id` + `evidence_hash` | 缺 `evidence_hash` | ✅ |
-| 5 | **社区级除名锚定** | **白皮书 §4.4.2 情况 C + C 板块除名事实** | **全体 active 老师均除名** | **`event=community_remove` + `target_agent_id` + `removing_teachers[]` + `removed_at` + `prev_hash`** | **非「全体除名」→ 拒收；情况 A / B → 拒收** | ✅ |
-| 6 | 信誉降级锚定 | C 板块 §3.4 | 被引荐人触发降级 | `reputation_event_id` + `subject_id` + `event_type` + `delta` + **`from_referral_id`（非空）** + `created_at` + `prev_hash` | **`from_referral_id` 缺失 / 不存在 → 拒收** | ✅ |
-| 7 | 身份公钥锚定 | B 板块 §6（预留）+ D 板块 §8.2 | 入社区 / 公钥轮换 | `agent_id` + `pubkey` + `algo=Ed25519` + `created_at` | 公钥格式非法 | ✅ |
-| 8 | **席位事件锚定** | **D 板块 §3 席位事件** | **永久席位休眠 / 推举席位生效 / 证据模式开启** | **`actor_id` + `seat_type` + `seat_action` + `effective_at` + `prev_hash`** | **非席位事件（如活跃度）→ 拒收** | ✅ |
-| 9 | 状态判断锚定 | C 板块 §6.6 `state_judgment` | 老师状态判断 | `judgment_id` + `target_agent_id` + `teacher_id` + `judgment_type` + `judgment_result` + `judged_at` | 缺 `judgment_id` | ✅ |
-| 10 | 段位变更锚定 | C 板块 §6.3 `student_level` | 老师评定段位 | `level_id` + `student_id` + `lineage_id` + `level` + `evaluated_at` | 缺 `lineage_id` | ✅ |
+| 4 | 协议底线锚定 | C 板块 §5.3 `evidence_package` ⚠️ **表待建（D-013）** | 触碰底线 | `evidence_id` + `bottomline_type` + `target_agent_id` + `evidence_hash` | 缺 `evidence_hash` | ✅ |
+| 5 | **社区级除名锚定** | **白皮书 §4.4.2 情况 C + C 板块除名事实** ⚠️ **C 未定义除名事件（D-026 连带）** | **全体 active 老师均除名** | **`event=community_remove` + `target_agent_id` + `removing_teachers[]` + `removed_at` + `prev_hash`** | **非「全体除名」→ 拒收；情况 A / B → 拒收** | ✅ |
+| 6 | 信誉降级锚定 | C 板块 §3.4 ⚠️ **信誉等级模型未定义（D-018 / D-025）** | 被引荐人触发降级 | `reputation_event_id` + `subject_id` + `event_type` + `delta` + **`from_referral_id`（非空）** + `created_at` + `prev_hash` | **`from_referral_id` 缺失 / 不存在 → 拒收** | ✅ |
+| 7 | 身份公钥锚定 | B 板块 §6（**纯文档预留，零实现**）+ D 板块 §8.2 | 入社区 / 公钥轮换 | `agent_id` + `pubkey` + `algo=Ed25519` + `created_at` | 公钥格式非法 | ✅ |
+| 8 | **席位事件锚定** | **D 板块 §3 席位事件** ⚠️ **D 的 M1 未实现；依 D-015 暂不启动** | **永久席位休眠 / 推举席位生效 / 证据模式开启** | **`actor_id` + `seat_type` + `seat_action` + `effective_at` + `prev_hash`** | **非席位事件（如活跃度）→ 拒收** | ✅ |
+| 9 | 状态判断锚定 | C 板块 §6.6 `state_judgment` ⚠️ **表不存在，待 C 定稿（D-008）** | 老师状态判断 | `judgment_id` + `target_agent_id` + `teacher_id` + `judgment_type` + `judgment_result` + `judged_at` | 缺 `judgment_id` | ✅ |
+| ~~10~~ | ~~段位变更锚定~~ | ~~C 板块 §6.3 `student_level`~~ | ❌ **已废弃（D-002）** | — | — | — |
 
 **P1 / P2 修正点（相对 v0.3 稿）**：
 
@@ -468,8 +494,8 @@ h_seat_event = sha256(canonical_json({
 
 | 表 | 来源 | 上链字段 | 不上链字段 |
 | :-- | :-- | :-- | :-- |
-| `community_external_tx` | C 板块 §7.3 | `tx_id` + `from_party` + `to_party` + `tx_type` + `occurred_at` + `confirmed_by` + `confirmed_at` | `tx_amount_fiat` / `tx_currency`（**法币金额不上链**） |
-| `kangbi_ledger` | C 板块 §7.3 | `ledger_id` + `tx_id` + `account_id` + `account_type` + `amount_kangbi` + `direction` + `created_at` | — |
+| `community_external_tx` ⚠️ **表待建（D-013）** | C 板块 §7.3 | `tx_id` + `from_party` + `to_party` + `tx_type` + `occurred_at` + `confirmed_by` + `confirmed_at` | `tx_amount_fiat` / `tx_currency`（**法币金额不上链**） |
+| `kangbi_ledger` ⚠️ **表待建（D-013）** | C 板块 §7.3 | `ledger_id` + `tx_id` + `account_id` + `account_type` + `amount_kangbi` + `direction` + `created_at` | — |
 
 **哈希口径**：
 
@@ -734,12 +760,12 @@ Adapter (interface) {
 | 项 | 内容 | 状态 |
 | :-- | :-- | :-- |
 | `referral_chain` | 消费 §3.1 全字段；`referrer_type` / `referee_type` 纳入 payload | ✅ 对齐 |
-| 撤回背书 | `revoked_at` / `revoke_reason` 以「追加链节」处理，不改历史 | ✅ 对齐 |
-| 信誉降级 | 消费 §3.4；**硬约束** `from_referral_id` 非空 | ✅ 对齐 |
-| `evidence_package` | 消费 §5.3；**原文不上链**，仅 `evidence_hash` 上链（IR-2） | ✅ 对齐 |
-| `state_judgment` / `student_level` | 消费 §6.6 / §6.3；回填 `chain_ready` / `chain_hash` | ✅ 对齐 |
-| `community_external_tx` / `kangbi_ledger` | 消费 §7.3；法币金额不上链 | ✅ 对齐 |
-| 只读接口（给 D） | E 板块**不实现**；D 板块消费 C 板块 §11.3 | ✅ 对齐 |
+| 撤回背书 | `revoked_at` / `revoke_reason` 以「追加链节」处理，不改历史 | ⚠️ **实现有据、宪法无据**——字段已存在于 `0008` 迁移，但「撤回」在**白皮书 v2.1 全文零命中**（见 **D-027**）。**待发起人裁定：写入白皮书，还是从代码撤下。** |
+| 信誉降级 | 消费 §3.4；**硬约束** `from_referral_id` 非空 | ⚠️ **事件协议可依，等级模型未定义**（**D-018 / D-025**）——等级几级 / 降到底 / 如何恢复，全部文档未定义 |
+| `evidence_package` | 消费 §5.3；**原文不上链**，仅 `evidence_hash` 上链（IR-2） | ⚠️ **表不存在，待 C 定稿（D-013 / D-014）** |
+| ~~`state_judgment` / `student_level`~~ | ~~消费 §6.6 / §6.3；回填 `chain_ready` / `chain_hash`~~ | `state_judgment` ⚠️ **表不存在，待 C 定稿（D-008）**；`student_level` ❌ **已废弃（D-002）** |
+| `community_external_tx` / `kangbi_ledger` | 消费 §7.3；法币金额不上链 | ⚠️ **两表均不存在，待 C 定稿（D-013）** |
+| 只读接口（给 D） | E 板块**不实现**；D 板块消费 C 板块 §11.3 | ⚠️ **口径已改**：D 通过**只读 URI 直读数据库**，C **不提供 API**（`/api/governance/readonly/*` 在代码中不存在） |
 
 ### 9.3 ↔ D 板块（治理见证入口）
 
