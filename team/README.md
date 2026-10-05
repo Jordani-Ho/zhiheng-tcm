@@ -133,7 +133,10 @@ team/
 **项目**：知衡中医治未病社区（zhiheng-tcm）
 **路径**：`D:\projects\zhiheng-tcm`
 **HEAD**：`bb5d0c7`（建 C 板块设计角色卡 + worklog）
-**测试基线**：**707 passed / 0 failed / 0 errors**（2026-10-04 取得，全量 `backend`，耗时 809.68s）
+**测试基线**：**709 passed / 0 failed / 0 errors**（2026-10-04，全量 `backend`，耗时 834.04s）
+
+> **基线沿革**：`707`（2026-10-04 首次干净基线）→ **`709`**（同日，D-033 执行 + 0008 离线产物守护各新增 1 条回归用例）。
+> 增量 2 条完全对得上（`test_witness_router.py` 12→13、`test_migrations.py` 38→39），**无回归**。
 
 > **运行说明（2026-10-04 更新）**：本项目曾在 **`workspace-write` 文件策略**下无法跑 pytest——该策略会拦截 pytest 的临时目录（系统 temp 与工作区 `pytest-of-DELL` 均被拒），产生 **65 个 setup 阶段 `PermissionError`** 假错误，并留下不可清理的残留目录。
 > 该限制**随文件策略升为 `danger-full-access` 而消失**（已实测：沙箱内 pytest 14 passed、`git ls-remote` 通）。
