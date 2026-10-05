@@ -135,8 +135,9 @@ team/
 **HEAD**：`bb5d0c7`（建 C 板块设计角色卡 + worklog）
 **测试基线**：**707 passed / 0 failed / 0 errors**（2026-10-04 取得，全量 `backend`，耗时 809.68s）
 
-> ⚠️ **运营纪律：pytest 必须在 DSH 沙箱外运行。**
-> 沙箱会拦截 pytest 的临时目录（系统 temp 与工作区 `pytest-of-DELL` 均被拒），导致 **65 个 setup 阶段 `PermissionError`**，并留下沙箱内不可清理的残留目录。
+> **运行说明（2026-10-04 更新）**：本项目曾在 **`workspace-write` 文件策略**下无法跑 pytest——该策略会拦截 pytest 的临时目录（系统 temp 与工作区 `pytest-of-DELL` 均被拒），产生 **65 个 setup 阶段 `PermissionError`** 假错误，并留下不可清理的残留目录。
+> 该限制**随文件策略升为 `danger-full-access` 而消失**（已实测：沙箱内 pytest 14 passed、`git ls-remote` 通）。
+> **但若会话回落到 `workspace-write`，pytest 与 git push 会重新失败**（后者报 `schannel: SEC_E_NO_CREDENTIALS`）→ 此时须在沙箱外运行。
 > 测试使用独立 `backend/test.db`（`conftest.py:7`），**不触碰生产库 `zhiheng.db`**。
 > 全量输出留档：`team/pytest-baseline.txt`（已 gitignore）。
 

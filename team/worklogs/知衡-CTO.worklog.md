@@ -201,3 +201,105 @@
 - `team/decisions/decision-log.md`（**决策总表 + 未决事项**）
 - `team/README.md` §六（当前基线 + 沙箱纪律）
 - 本 worklog
+
+---
+
+## 2026-10-04 第四轮：入库同步 + 全权授权 + 环境限制澄清
+
+### 发起人授权（本轮新增，效力最高）
+
+> **「之前所有限制都是你前任定的，现在它已经退休。所有限制解除。除了白皮书要跟我商量之外，其它一切都可以推倒重来。本地调通之后，记得要提交入库，与 Github 同步。」**
+
+**因此当前授权边界为**：
+
+| 范围 | 授权 |
+| :-- | :-- |
+| **白皮书 v1.1 / v2.1** | 🚫 **必须先与发起人商量**（唯一保留项） |
+| 代码 / 设计文档 / 主计划 / 团队规范 / 旧决策 | ✅ **全权**，含推倒重来 |
+| commit / push | ✅ **授权**（发起人明确要求同步 GitHub） |
+
+**注意**：前任 C 板块设计角色卡中的「只碰 `docs/phase3-*` 和 `team/`」「不写代码、不跑命令、不 commit」等限制**属前任会话约束，现已解除**。角色卡已同步更新。
+
+### 完成：入库与同步
+
+- 本地与远端起点：`bb5d0c7`，无分叉、无未推送历史。
+- 整理为 **6 个提交**并推送成功：
+
+| commit | 内容 |
+| :-- | :-- |
+| `c3544b3` | chore(infra)：补 .gitignore（pytest 缓存/临时目录、基线输出、acl 报告、.obsidian） |
+| `fb15f48` | docs(team)：建立决策台账 + 角色卡 + 基线摸查 worklog |
+| `24290fb` | docs：修正四份文档对已废概念与不存在交付物的引用 |
+| `2bc6707` | feat(C)!：落盘 C 板块设计 v1.0 骨架；段位残留标注废弃 |
+| `2bef162` | chore(team)：移除误提交的临时文件 commit-msg.tmp |
+| `31d33d4` | chore(infra)：.gitignore 补临时提交消息文件规则 |
+
+- **同步结果**：`git rev-list --left-right --count origin/main...HEAD` = **`0 0`**（完全同步）；工作区干净。
+
+### 完成：推送受阻与排除（含一次环境误判的澄清）
+
+推送首次失败 `fatal: unable to access ... schannel: AcquireCredentialsHandle failed: SEC_E_NO_CREDENTIALS`。排查过程：
+
+1. 一度以为**网络不通**（`Invoke-WebRequest` 对 github.com 与 baidu.com 均失败）。
+2. 用 Python 直连 TLS 复测 → **github.com TLSv1.3 成功** → **出网是通的**，`Invoke-WebRequest` 失败是另一回事。
+3. 结论：**schannel 在低完整性令牌下拿不到凭证**，与临时目录问题同源。
+4. 在沙箱外执行 `git push` → **成功**。
+
+### ⚠️ 本轮最重要的澄清：环境限制**随策略变化**，不是永久结论
+
+当日会话文件策略从 `workspace-write` 升为 **`danger-full-access`**，且审批提示被禁用。实测复核：
+
+| 项 | `workspace-write` 下 | `danger-full-access` 下 |
+| :-- | :-- | :-- |
+| pytest 临时目录 | ❌ 65 个 setup `PermissionError` + 不可清理残留 | ✅ **正常**（14 passed 无错） |
+| `git ls-remote` / `git push` | ❌ `schannel: SEC_E_NO_CREDENTIALS` | ✅ **正常** |
+| 目录列举/删除 | ❌ 权限拒绝 | ✅ 正常 |
+
+→ **已在三处更正表述**（`team/README.md` §六、`team/roles/知衡-CTO.md` 纪律 6/7、`decision-log.md` D-032），把「必须在沙箱外运行」改为「**该限制仅在 `workspace-write` 下成立；策略回落则复发**」。
+
+### 完成：在新策略下重跑全量基线
+
+```
+707 passed, 8 warnings in 797.25s (0:13:17)     退出码 0
+```
+
+- **这是第一次在沙箱内跑出的干净全绿**，且发生在本轮全部提交之后 → 等效于对已推送代码的完整回归验证。
+- 输出留档 `team/pytest-baseline.txt`（已 gitignore）。
+
+### 本轮自纠（第 4 次）
+
+- **临时消息文件被误提交**：写中文 commit 消息用了 `team/commit-msg.tmp`，随后执行 `git add team/`（整目录）→ 该临时文件被一并收进 `fb15f48`。
+  - **处置**：`2bef162` 移除 + `.gitignore` 补规则（`31d33d4`）+ 角色卡纪律第 9 条（**`git add` 必须点名具体路径，不得整目录 add**）。
+- **环境结论下得太早**：第三轮把「pytest 必须在沙箱外跑」写成运营纪律；策略变更后即证伪。→ 已改为带适用条件的表述。
+
+### 经验沉淀（本会话累计 4 次自纠的共同模式）
+
+D-023（依赖判断错）、D-024（端点误报）、D-034 撤回（真库未跟踪）、本轮两条——**都是「先下结论、后验证」**。
+已写入角色卡纪律：**结论要在核实之后下，且必须标注适用条件。**
+
+### 待办（更新）
+
+- [ ] **D-033**：删除废弃 `/levels` 端点 + `_mock_levels()` + 同步改 `test_witness_router.py:58` —— 现已具备条件（基线可信），**待执行**
+- [ ] 修正 `docs/governance-witness-interface-contract.md` 的 `/readonly/levels` 等段位引用
+- [ ] 修正 `docs/phase3-construction-outline.md`（整份旧五子项口径，须整体重写）
+- [ ] 修正 `docs/epic1-template-design-v1.md:54` 的 `student_rank_record` 引用
+- [ ] 登记 B1b-1 架构偏离进 `docs/tech-debt.md`
+- [ ] 修正 `TD-B-010` 与代码不符处（flag off 时老师端 tab 实为恒 5 个）
+- [ ] 补 `docs/migrations/0002_*.sql` 与 `0008_*.sql` 离线产物
+- [ ] 建议发起人：为 MAP-xxx 与项目编号建对照表（D-021 连带）
+
+### 待发起人决策（更新）
+
+- **D-026** 🔴 四条协议底线的判定要件（**C 的 M2 成稿唯一缺口**）
+- **D-025** 信誉「等级」模型是否定义
+- **D-020** 后端鉴权适用时点（第一次落地前 / 真人内测前）
+- **D-027** 「撤回背书」是否入宪
+- **D-030** 白皮书 v2.1 十一条内部矛盾是否出 v2.2 修订清单
+- **板块负责人派任**：A / Epic 1 / Epic 2 / Epic 4 / B / D / E
+
+### 下次启动时读
+
+- `team/decisions/decision-log.md`（**决策总表 + 未决事项**）
+- `team/roles/知衡-CTO.md`（**当前授权边界 + 9 条纪律**）
+- `team/README.md` §六（当前基线）
+- 本 worklog

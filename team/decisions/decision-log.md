@@ -265,7 +265,8 @@
 | **风险** | 原判断「需修 Windows 权限」**已证否**——见下。 |
 | **✅ 解决过程与结论（2026-10-04）** | ① 权限诊断脚本判定 **`VERDICT=NOT_THIS_CLASS`**：三个目录的所有者是当前用户、`WRITE_DAC`/`WRITE_OWNER` 均可用、无外来包条目 → **不是 ACL 问题，是 DSH 沙箱的拦截**。② 在沙箱外（`danger-full-access`）重跑全量：**`707 passed, 8 warnings in 809.68s`，退出码 0**。③ 全量输出留档 `team/pytest-baseline.txt`（已 gitignore）。 |
 | **✅ 取得的第一份干净基线** | **707 passed / 0 failed / 0 errors**（`backend` 全量，2026-10-04）。测试用独立 `backend/test.db`（`conftest.py:7`），**不触碰生产库**。 |
-| **⚠️ 副作用发现** | 工作区根出现 `pytest-of-DELL`（沙箱内不可读、不可删）；已清理。→ **运营纪律：pytest 必须在沙箱外运行**，否则会产生不可清理的残留目录。已写入 `team/roles/知衡-CTO.md` 纪律第 6 条。 |
+| **⚠️ 副作用发现** | 工作区根出现 `pytest-of-DELL`（沙箱内不可读、不可删）；已清理。 |
+| **⚠️ 适用条件更正（2026-10-04 当日）** | 上述限制**仅在 `workspace-write` 文件策略下成立**。该会话随后升为 **`danger-full-access`**，限制**实测消失**：沙箱内 pytest 正常、`git ls-remote` 通。→ **本节结论不是永久纪律**，须随策略变化复核。若策略回落，pytest 与 `git push` 会重新失败（后者报 `schannel: SEC_E_NO_CREDENTIALS`）。 |
 | **重新评估条件** | ✅ 已关闭。后续每次改动均以本基线为回归依据。 |
 
 ### D-015 · D 板块 M1 席位机制暂不启动
