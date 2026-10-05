@@ -1,0 +1,21 @@
+docs(team): 建立决策台账 + 角色卡 + 基线摸查 worklog
+
+发起人 2026-10-04 授权 CTO 技术全权，并指示「先建决策日志再开工」。
+
+新增：
+- team/decisions/decision-log.md —— 项目唯一决策台账（补建）
+  回填 D-001 ~ D-024（含 C 板块 5 项产品判断、T-1/T-2/T-10 裁决、
+  本轮 10 项技术决策、2 项自纠）
+  登记未决 D-025 ~ D-030（四条底线要件、信誉等级模型、撤回背书入宪等）
+  第二轮增 D-031（段位代码残留处置）、D-032（测试基线优先）
+- team/roles/知衡-CTO.md —— CTO 角色卡
+  明确职责/边界/8 条纪律（含沙箱外跑测试、无基线不动被测代码）
+- team/worklogs/知衡-CTO.worklog.md —— 三轮工作记录
+
+更新：
+- team/README.md —— §五 角色清单对齐；§六 基线从 ddb9fd3 更新到 bb5d0c7，
+  补规模数据（130 文件 / 122 端点 / 32 表 / 9 flag）、板块状态表、
+  测试基线 707 passed + 沙箱运行纪律
+- team/worklogs/C板块设计.worklog.md、team/cline-patterns/ —— 前任会话产物，一并入库
+
+决策依据：team/decisions/decision-log.md 的 D-011、D-021、D-032
