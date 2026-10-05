@@ -51,7 +51,8 @@
 
 ### 1.1 表命名与落库位置
 
-- 表名：`templates`（与 `plan_templates`、规划中的 `student_rank_record` 并存；`plan_templates` 保留为兼容镜像，见 §5）。
+- 表名：`templates`（与 `plan_templates` 并存；`plan_templates` 保留为兼容镜像，见 §5）。
+  - **2026-10-04 修正**：原文写「与 `plan_templates`、规划中的 `student_rank_record` 并存」——**`student_rank_record` 已作废**（段位概念整体废弃，决策 **D-002**；Epic 5 废除，**D-017**）。该表**从未创建**，也不应创建。段位已从白皮书 v2.1 删除（附录 B 第 7 条）。
 - 存储：继续 SQLite，列类型全部用 `TEXT` / `INTEGER`，与存量表完全同构（便于 `sqlite3.Row` 直接 `dict()` 返回给前端）。
 - **DDL 唯一真相源 = 迁移脚本**（见 §6）：`database.py::init_db()` 不再重复写一份 `CREATE TABLE templates`，避免两处 DDL 漂移；建表由 `main.py` / `conftest.py` 在 `init_db()` 之后调用迁移运行器补齐。
 

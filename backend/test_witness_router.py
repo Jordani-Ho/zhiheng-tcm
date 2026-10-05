@@ -55,11 +55,24 @@ def test_T6_referrals_ok():
     assert body["count"] > 0
 
 
-def test_T7_seals_levels_kangbi_ok():
-    for path in ("/seals", "/levels", "/kangbi"):
+def test_T7_seals_kangbi_ok():
+    # 【D-033 / 2026-10-04】原为 test_T7_seals_levels_kangbi_ok，循环含 "/levels"。
+    # 段位概念已废弃（D-002），且 Epic 5 已废除（D-017）→ GET /api/v1/witness/levels
+    # 端点连同 _mock_levels() 一并删除，本用例同步收敛为两个端点。
+    for path in ("/seals", "/kangbi"):
         r = client.get(f"/api/v1/witness{path}", headers=_auth_headers())
         assert r.status_code == 200, f"{path} failed"
         assert r.json()["source"] == "mock"
+
+
+def test_T7b_levels_route_removed():
+    """废弃端点不得复活：段位已废（D-002），/levels 必须不存在（404）。
+
+    与 T8/T9 的区别：那两条验「路径存在但写方法未注册（405）」；
+    本条验「路径整体不存在（404）」——是删除动作的回归守护。
+    """
+    r = client.get("/api/v1/witness/levels", headers=_auth_headers())
+    assert r.status_code == 404, "废弃的 /levels 端点被复活了"
 
 
 def test_T8_no_post_route():

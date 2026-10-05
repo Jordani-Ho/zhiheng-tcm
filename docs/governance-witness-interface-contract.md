@@ -156,55 +156,69 @@ D 需要知道：加密后哪些字段可进快照。
 
 ## 4. C 板块（治理机制）接口
 
+> ### ⚠️ 本节已于 2026-10-04 按决策 D-007 / D-013 / D-033 重写
+>
+> **原文写「D 消费 C 的四个只读 GET 接口」——该口径已作废。** 三处修正：
+>
+> | 原文 | 修正后 | 依据 |
+> | :-- | :-- | :-- |
+> | D 调用四个只读 **HTTP 接口** | **D 通过只读 URI 直读数据库**；C **不提供 API** | **D-007**（反向读表 / 拉模式） |
+> | 四类数据含 **段位变更** | **段位整类删除**（段位废弃） | **D-002 / D-017 / D-033**（C 台账 T-9 的处置） |
+> | 路径 `/api/governance/readonly/*` | **该路径在代码中从未存在**，已删除登记 | **D-013**（改文档，不补建） |
+
 ### 4.1 内容
 
-D 消费 C 的四个只读接口，作为观察对象。
+D **不消费 C 的 HTTP 接口**，而是**只读直读数据库**中的 C 侧治理数据，作为观察对象。
 
-### 4.2 接口项
+### 4.2 接口项（已按 D-007 修正为「数据表契约」）
 
-| 方法 | 路径 | 用途 | 来源 |
+| # | C 侧数据 | 底层表 | 状态 |
 | :-- | :-- | :-- | :-- |
-| GET | `/api/governance/readonly/referrals` | 引荐链只读 | C v0.5 §11.3 |
-| GET | `/api/governance/readonly/seals` | 封存记录只读 | 同上 |
-| GET | `/api/governance/readonly/levels` | 段位变更只读 | 同上 |
-| GET | `/api/governance/readonly/kangbi` | 康币账本只读 | 同上 |
+| 1 | 引荐链 | `referral_chain` | ✅ **已实现**（迁移 `0008`） |
+| 2 | 封存记录 | `seal_events`（**B 板块表**） | ✅ **已实现**（迁移 `0007`） |
+| 3 | 康币账本 | `kangbi_ledger` | ⬜ **表不存在**（C 的 X1 未启动，D-013） |
+| ~~4~~ | ~~段位变更~~ | ~~`student_level`~~ | ❌ **已删除**（段位废弃，D-002 / D-017） |
 
-**D 侧对应**（已实现，返回 mock）：
+**C 侧义务**：**保证表结构稳定**（C 不提供 API，只保证表结构）。D 侧按只读 URI 消费。
 
-| D 侧路径 | 对接 C 侧 |
-| :-- | :-- |
-| `/api/v1/witness/referrals` | `/api/governance/readonly/referrals` |
-| `/api/v1/witness/seals` | `/api/governance/readonly/seals` |
-| `/api/v1/witness/levels` | `/api/governance/readonly/levels` |
-| `/api/v1/witness/kangbi` | `/api/governance/readonly/kangbi` |
+**D 侧对应**（已实现）：
+
+| D 侧端点 | 消费的数据 | 数据源现状 |
+| :-- | :-- | :-- |
+| `GET /api/v1/witness/referrals` | `referral_chain` | ⚠️ 当前返回 **mock 假数据** |
+| `GET /api/v1/witness/seals` | `seal_events` | ⚠️ 当前返回 **mock 假数据** |
+| `GET /api/v1/witness/kangbi` | `kangbi_ledger`（表不存在） | ⚠️ 当前返回 **mock 假数据** |
+| ~~`GET /api/v1/witness/levels`~~ | — | ❌ **端点已删除**（D-033，2026-10-04） |
 
 ### 4.3 现状
 
 | 项 | 状态 |
 | :-- | :-- |
-| C 侧定义 | ✅ C v0.5 §11.3 已登记 |
-| C 侧实现 | ⬜ 未实现 |
-| D 侧实现 | ✅ mock 版已完成（M2） |
+| C 侧表结构定义 | 🟡 `referral_chain` 已定稿并实现；`kangbi_ledger` 未定义 |
+| C 侧实现 | 🟡 仅 `referral_chain`（C 的 M1） |
+| D 侧实现 | ✅ mock 版已完成（M2）；**真实接通未做** |
 
 ### 4.4 切换触发
 
-**触发条件**：C 的四个接口全部实现后。
+**触发条件**：C 侧被消费的表全部就绪后。
 
 **切换方式**：
-- `WITNESS_USE_MOCK=0` 时，D 的四个路由改为调 C 的对应接口
-- 响应结构对齐（D 当前返回 `{source, items, count}`，C 返回结构确定后需映射）
+- `WITNESS_USE_MOCK=0` 时，D 的三个路由改为**只读直读数据库**（**不是**调 C 的接口——C 没有接口）
+- 响应结构对齐（D 当前返回 `{source, items, count}`，需从表字段映射）
 
 ### 4.5 拉模式（重要）
 
 D 与 C 之间**无直接调用**，是**拉模式**：
 
-1. C 触发治理动作 → 写本地治理事件表
-2. D 通过 C 的四个只读接口**拉取**
+1. C 触发治理动作 → 写**本地治理事件表**
+2. D **通过只读 URI 直读数据库**获取（**D 不调 C 的 API**）
 3. D 侧见证人自行决定是否开启证据模式
 
-**无直接调用**：C 不调 D，D 不调 C（除 GET 拉取）。
+**无直接调用**：C 不调 D，D 不调 C。**双方各自读对方写的表。**
 
-来源：D 骨架 v0.1 §3.1。
+> **原文此处写「D 通过 C 的四个只读接口拉取」「D 不调 C（除 GET 拉取）」——与同文档的「无直接调用」自相矛盾，且该四接口在代码中不存在。已按 D-007 修正。**
+
+来源：D 骨架 v0.1 §3.1；决策 **D-007**（反向读表）。
 
 ---
 
