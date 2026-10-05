@@ -1974,3 +1974,37 @@ def test_migration_0008_does_not_touch_existing_tables(tmp_path):
     after = _columns_snapshot(str(db), exclude=(REFERRAL_TABLE,))
 
     assert before == after
+
+
+def test_0008_offline_sql_artifact_matches_migration():
+    """离线产物 `docs/migrations/0008_add_referral_chain.sql` 的结构语句与迁移内联常量逐字一致。
+
+    【2026-10-04 补】原缺该产物，也无守护（0005 / 0006 均有）——
+    本用例补齐范式，与 `test_0005_offline_sql_artifact_matches_migration` 同款口径：
+      · 逐条断言 TABLE_DDL / INDEX_DDL 以「语句 + 分号」形式出现在产物中；
+      · 断言 alembic 版本推进语句存在；
+      · 断言产物**不含任何删列语句**（TD-003 / D-003 口径：回退只回收结构、不删业务列）。
+    """
+    module = _load_migration_0008()
+    artifact = os.path.join(
+        os.path.dirname(BACKEND_DIR), "docs", "migrations", "0008_add_referral_chain.sql"
+    )
+    assert os.path.exists(artifact), "离线产物缺失：%s" % artifact
+    text = open(artifact, encoding="utf-8-sig").read().replace("\r\n", "\n")
+
+    # ① 建表语句逐字一致（内联常量不含尾分号，产物含）
+    assert module.TABLE_DDL.strip() + ";" in text, "产物缺 referral_chain 建表语句"
+    # ② 3 个索引逐条一致
+    for ddl in module.INDEX_DDL:
+        assert ddl + ";" in text, "产物缺索引语句：%s" % ddl
+    # ③ 12 列逐列出现在产物中（防列集合漂移）
+    for column in module.ALL_COLUMNS:
+        assert column in text, "产物缺列：%s" % column
+    # ④ alembic 版本推进语句
+    assert "UPDATE alembic_version SET version_num='0008_add_referral_chain'" in text
+    # ⑤ 回退段：3 个 DROP INDEX + DROP TABLE（均以注释形式留存）
+    for ddl in module.DROP_INDEX_DDL:
+        assert "-- " + ddl + ";" in text, "产物回退段缺：%s" % ddl
+    assert "-- " + module.DROP_TABLE_DDL + ";" in text, "产物回退段缺 DROP TABLE"
+    # ⑥ §TD-003 / D-003：产物中不得出现任何删列语句
+    assert "DROP COLUMN" not in text.upper()
