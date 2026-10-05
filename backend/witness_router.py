@@ -55,6 +55,17 @@ def _mock_seals():
 
 
 def _mock_levels():
+    """⚠️ 已废弃（D-002 / D-017）：段位概念整体废弃，本函数与 GET /levels 端点仅为
+    接口契约的既有形态保留，**不得再作为「段位」功能的依据**。
+
+    实测（2026-10-04）：`student_level` / `student_rank_record` 表在两张库中均不存在，
+    backend/frontend 代码零命中段位实现 → 本端点在 `WITNESS_USE_MOCK=0` 时永远 501，
+    不存在任何真实数据源。
+
+    处置：**暂不删除代码**。理由 = 删除须同步改 `test_witness_router.py:58`
+    （`test_T7_seals_levels_kangbi_ok` 循环断言本端点），而测试基线当前不可靠
+    （65 个 setup error 未解决）→ 先改文档、后动代码。删除动作待测试基线恢复后单独立项。
+    """
     return [
         {
             "id": 1,
@@ -108,6 +119,12 @@ async def seals(identity: str = Depends(require_witness)):
 
 @router.get("/levels")
 async def levels(identity: str = Depends(require_witness)):
+    """⚠️ 已废弃端点（D-002 / D-017）。段位概念整体废弃，无任何真实数据源。
+
+    保留仅为不改动 `test_witness_router.py:58` 的既有断言。**前端已不再导航至此**
+    （`WitnessApp.tsx` 的 ENDPOINTS 已移除本项，2026-10-04）。
+    删除动作待测试基线恢复后单独立项。
+    """
     if USE_MOCK:
         return _wrap(_mock_levels())
     raise HTTPException(status_code=501, detail="C 板块 levels 未实现")

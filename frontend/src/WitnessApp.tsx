@@ -3,7 +3,10 @@ import { useEffect, useState } from "react";
 const ENDPOINTS = [
   { path: "/referrals", title: "引荐链" },
   { path: "/seals", title: "封存记录" },
-  { path: "/levels", title: "段位变更" },
+  // 已移除：{ path: "/levels", title: "段位变更" }
+  //   依据 D-002（段位废弃）/ D-017（Epic 5 废除），2026-10-04。
+  //   后端 GET /api/v1/witness/levels 端点仍存在但已标注废弃（见 witness_router.py），
+  //   保留仅为不改动 test_witness_router.py:58 的既有断言；前端不再导航至此。
   { path: "/kangbi", title: "康币账本" },
 ] as const;
 
