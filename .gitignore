@@ -9,3 +9,16 @@ backend/zhiheng.db.bak-*
 backend/backups/
 venv/
 backend/uploads/
+
+# pytest 缓存与临时目录（2026-10-04 补）
+.pytest_cache/
+backend/.pytest_cache/
+# 【注意】不要在这里写 .pytest_cache/v/cache/ —— 那会连带忽略 pytest 的 .gitignore 与 CACHEDIR.TAG
+.pytest_tmp/
+.pytest_tmp*/
+# 测试基线与权限诊断产物（本地留档用，不进版本库）
+team/pytest-baseline.txt
+team/acl-reports/
+
+# Obsidian（若启用）
+.obsidian/
