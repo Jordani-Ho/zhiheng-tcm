@@ -20,6 +20,7 @@ import crypto_api
 import export_api
 import seal_api
 import referral_api
+import teacher_service
 import witness_router
 
 app = FastAPI(title="zhiheng-tcm-backend")
@@ -97,6 +98,11 @@ app.include_router(export_api.router)
 # 用 `HTTPException` 直出，無自定義異常類 → 不需要 add_exception_handler。
 app.include_router(seal_api.router)
 app.include_router(witness_router.router)
+# 【内测场景 1 新增】老师入社区：`POST /api/teachers/onboard`（幂等）。
+# 背景：`teachers` 原先只有 init_db() 的种子数据，无任何「创建老师」入口。
+# 本模块为**纯新增**（teacher_service.py），不改任何既有函数体；师门创建复用
+# lineage_service.create_lineage()，不复制逻辑。无 feature flag（入社区是内测必需动作）。
+app.include_router(teacher_service.router)
 
 class TranscriptionInput(BaseModel):
     patient_name: str
