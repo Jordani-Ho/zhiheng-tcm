@@ -43,6 +43,7 @@ import {
   saveIntakeSession,
   clearIntakeSession,
   formatAgentTime,
+  roleIsTeacher,
   summarizeComplaint,
   LINEAGE_ALL_VIEW,
   loadLineageView,
@@ -71,7 +72,8 @@ export default function App() {
   const [finalPlans, setFinalPlans] = useState<{ [key: number]: string }>({})
   const [points, setPoints] = useState<{ patient_points: number; teacher_points: number } | null>(null)
   const [patients, setPatients] = useState<Patient[]>([])
-  const [selectedPatient, setSelectedPatient] = useState('张三')
+  // 【D-059】初值留空，由「初始化」effect 从后端数据引导填上（原写死 '张三'）
+  const [selectedPatient, setSelectedPatient] = useState('')
   const [showHistory, setShowHistory] = useState(false)
   const [profile, setProfile] = useState<PatientProfile | null>(null)
   const [editingProfile, setEditingProfile] = useState(false)
@@ -79,7 +81,9 @@ export default function App() {
 
   const [teachers, setTeachers] = useState<Teacher[]>([])
   const [patientTeachers, setPatientTeachers] = useState<string[]>([])
-  const [selectedTeacher, setSelectedTeacher] = useState('李老师')
+  // 【D-059】初值留空，由「初始化」effect 从老师列表 / 学生归属引导填上（原写死 '李老师'，
+  // 导致全站只能以「李老师」身份使用）
+  const [selectedTeacher, setSelectedTeacher] = useState('')
   const [showTeacherPicker, setShowTeacherPicker] = useState(false)
   const [teacherPatients, setTeacherPatients] = useState<any[]>([])
 
@@ -412,7 +416,7 @@ export default function App() {
   // ============== 【Epic 4 / step 4.3】師門上下文（flag 探测 → 选择器 → 清场） ==============
   // 老师端判定：本段位置在下方 `isTeacherRole`（老师端页签那一段）之前，故不复用那个常量，
   // 按同一口径本地判定（`const` 有 TDZ，渲染期提前引用会 ReferenceError）。
-  const lineageIsTeacher = currentRole === '李老师' || currentRole === '李老师智能体'
+  const lineageIsTeacher = roleIsTeacher(currentRole)
   // 师门接口可用性（true = flag on）：探测拿到 2xx 才置 true；404 `lineage_disabled` / 其它非 2xx / 连不上 → false（降级旧视图）
   const [lineageEnabled, setLineageEnabled] = useState(false)
   // 学生端归属清单（GET /api/student-lineages）：📇「我的老师」与 🏯「我的師門」两个维度**同一份**数据（§7.1「同源」）
@@ -645,22 +649,63 @@ export default function App() {
   }
 
   // ============== 初始化 ==============
+  // 【D-059 身份引导】原先本 effect 写死 `fetchPatients('张三')`、
+  // `/api/patient-profile?patient_name=张三`，且 `selectedTeacher` 初值写死 `'李老师'`
+  // → 站点只能给「李老师 / 张三」这一组人用（多用户内测不成立）。
+  //
+  // 现改为**数据驱动引导**：老师优先取「学生已归属的老师」，否则取老师列表第一个；
+  // 学生取该老师名下第一个。取不到就保持空串，由后续 effect 兜底。
   useEffect(() => {
     fetch('/api/huangli').then(r => r.json()).then(d => setHuangli(d)).catch(() => setHuangli(null))
-    fetch('/api/teachers').then(r => r.json()).then(d => setTeachers(d)).catch(() => setTeachers([]))
-    fetchPatients('张三')
     const urlParams = new URLSearchParams(window.location.search)
     const inviteCode = urlParams.get('invite')
     if (inviteCode) setPendingInviteCode(inviteCode)
-    fetch('/api/patient-profile?patient_name=张三')
+
+    // 老师：先问「当前学生归属哪些老师」（学生端最准），再退回老师列表
+    fetch(`/api/patient-teachers?patient_name=${selectedPatient}`)
       .then(r => r.json())
-      .then(d => {
-        setGuardianLocation(d.location || '')
-        setGuardianGender(d.gender || '')
-        setGuardianBirthDate(d.birth_date || '')
+      .then((list: string[]) => (Array.isArray(list) && list.length > 0 ? list : Promise.reject(new Error('none'))))
+      .catch(() => fetch('/api/teachers').then(r => r.json()))
+      .then((list: any) => {
+        const names: string[] = Array.isArray(list) ? list.map((x: any) => (typeof x === 'string' ? x : x.name)) : []
+        setTeachers(Array.isArray(list) && list.length && typeof list[0] !== 'string' ? list : [])
+        const tid = selectedTeacher || names[0] || ''
+        if (tid) {
+          setSelectedTeacher(tid)
+          // 学生：取该老师名下第一个；取不到就保持现状
+          fetch(`/api/teacher-patients?teacher_name=${encodeURIComponent(tid)}`)
+            .then(r => (r.ok ? r.json() : []))
+            .then((ps: any[]) => {
+              const first = Array.isArray(ps) && ps.length ? ps[0].name : ''
+              if (first && !selectedPatient) setSelectedPatient(first)
+            })
+            .catch(() => {})
+        }
       })
       .catch(() => {})
+
+    // 监护人档案：跟随实际选中的学生，不再写死「张三」
+    if (selectedPatient) {
+      fetch(`/api/patient-profile?patient_name=${encodeURIComponent(selectedPatient)}`)
+        .then(r => r.json())
+        .then(d => {
+          setGuardianLocation(d.location || '')
+          setGuardianGender(d.gender || '')
+          setGuardianBirthDate(d.birth_date || '')
+        })
+        .catch(() => {})
+    }
+    // 仅在首帧跑一次；后续随 selectedPatient / selectedTeacher 的既有 effect 走
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
+
+  // 【D-059】学生列表跟随**当前学生**（不再写死张三）：guardian 取当前学生自身，
+  // 取不到学生时先不请求，等引导填上再触发。
+  useEffect(() => {
+    if (!selectedPatient) return
+    fetchPatients(selectedPatient)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedPatient])
 
   useEffect(() => {
     fetch(`/api/patient-teachers?patient_name=${selectedPatient}`)
@@ -677,7 +722,7 @@ export default function App() {
   // 与师门无关的 schedule / holidays / herbs 拆到下面一个 effect —— 不把 `lineageReady` 传染给它们，
   // 免得这三条每次就绪位翻转都白跑一遍。
   useEffect(() => {
-    if (currentRole === '李老师' || currentRole === '李老师智能体') {
+    if (roleIsTeacher(currentRole)) {
       if (!lineageReady) return   // 【就緒門】探测未落地 → lineage 相关的一条都不发（400 错误体不再进 state）
       // 【Epic 4 / 批 1 止血】读接口统一「先判 res.ok，再按期望形状取值」：
       // flag on 缺 lineage_id 等 400 的响应体是 `{detail:{error,msg,...}}`，而 `r.json()` **仍会成功**
@@ -696,7 +741,7 @@ export default function App() {
 
   // 老师端「与师门无关」的首屏读取：依赖数组与批 2 之前逐字面一致（**不加** `lineageReady`）→ 请求时机不变。
   useEffect(() => {
-    if (currentRole === '李老师' || currentRole === '李老师智能体') {
+    if (roleIsTeacher(currentRole)) {
       fetchSchedule()
       fetchHolidays()
       fetchHerbs()
@@ -710,7 +755,7 @@ export default function App() {
   // 附录 A1 裁决「不加」，缺口登记 tech-debt.md TD-005 / TD-007），后端对该参数**一律忽略**；
   // 故按 §4.4「URL 逐字面纯净」保持原样 `?teacher_name=`（flag on / off 两种状态下 URL 完全相同）。
   useEffect(() => {
-    if (currentRole !== '李老师' && currentRole !== '李老师智能体') return
+    if (!roleIsTeacher(currentRole)) return
     if (teacherTab !== 'clinic') return
     fetch(`/api/plan_template?teacher_name=${selectedTeacher}`)
       .then(r => r.json())
@@ -720,7 +765,7 @@ export default function App() {
 
   // 【第56天重构】智能体工作台：进入老师端（含切换老师）时一次性拉取三个接口
   useEffect(() => {
-    if (currentRole === '李老师' || currentRole === '李老师智能体') {
+    if (roleIsTeacher(currentRole)) {
       // 【Epic 4 / 批 2 就緒門】三条请求内部都走 `withLineage`（1180 / 1184 / 1188 行）→ 等探测落地才发。
       if (!lineageReady) return
       fetchAgentWorkbench()
@@ -731,7 +776,7 @@ export default function App() {
   // 与上面 plan_template 的依赖写法完全一致（切页签或换老师才重拉，不在诊室里输入时反复请求）。
   // 后端没这个接口时只会把列表置空 + complaintsMissing=true，不影响诊室其它功能。
   useEffect(() => {
-    if (currentRole !== '李老师' && currentRole !== '李老师智能体') return
+    if (!roleIsTeacher(currentRole)) return
     if (teacherTab !== 'clinic') return
     // 【Epic 4 / 批 2 就緒門】`fetchPendingComplaints` 内部走 `withLineage`（1203 行）→ 等探测落地才发。
     if (!lineageReady) return
@@ -835,7 +880,7 @@ export default function App() {
   // ② 老师自己已经写过内容时（finalPlans 非空）绝不覆盖；
   // ③ 自动套用后置 planTemplateApplied[draftId] = true → 第五部分显示小灰字“已套用模板，可修改”。
   useEffect(() => {
-    if (currentRole !== '李老师' && currentRole !== '李老师智能体') return
+    if (!roleIsTeacher(currentRole)) return
     if (teacherTab !== 'clinic') return
     if (!planTemplate.trim()) return
     const target = clinicPatientDrafts[0]
@@ -2050,7 +2095,7 @@ export default function App() {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        name: newFamilyName, guardian_name: '张三', relation: newRelation,
+        name: newFamilyName, guardian_name: selectedPatient, relation: newRelation,
         gender: newGender, birth_date: birthDate, birth_time: newBirthTime,
         birth_place: newBirthPlace, location: newLocation
       })
@@ -2059,16 +2104,16 @@ export default function App() {
       setNewBirthYear(''); setNewBirthMonth(''); setNewBirthDay('')
       setNewBirthTime(''); setNewBirthPlace(''); setNewLocation('')
       setShowAddFamily(false)
-      fetchPatients('张三')
+      fetchPatients(selectedPatient)
     })
   }
 
   const handleDeleteFamily = (name: string) => {
-    if (name === '张三') { alert("本人档案不可删除！"); return }
+    // 【D-059】原先写死 `if (name === '张三')`（按姓名判断「本人」）→ 改按**当前身份**判断
+    if (name === selectedPatient) { alert("本人档案不可删除！"); return }
     if (!confirm(`确定要删除亲友【${name}】吗？`)) return
     fetch(`/api/patients/${name}`, { method: 'DELETE' }).then(() => {
-      if (selectedPatient === name) setSelectedPatient('张三')
-      fetchPatients('张三')
+      fetchPatients(selectedPatient)
     })
   }
 
@@ -2221,7 +2266,7 @@ export default function App() {
   }
 
   // 【第57天新增 / 第62天调整】老师端页签定义：首页 / 诊室 / 管理（原「学生」+「库存」合并为 1 个页签） / 设置
-  const isTeacherRole = currentRole === '李老师' || currentRole === '李老师智能体'
+  const isTeacherRole = roleIsTeacher(currentRole)
   // 【第66天新增】💰 财务管理：账户数据派生值（后端按 username 排序，取第一个 role='student' / 'teacher' 的账户，如 张三 / 李老师）
   const financeStudentAccount = financeAccounts.find(a => a.role === 'student') || null
   const financeTeacherAccount = financeAccounts.find(a => a.role === 'teacher') || null
@@ -2798,7 +2843,7 @@ export default function App() {
     <SealPanel selectedTeacher={selectedTeacher} selectedPatient={selectedPatient} />
   )}
 
-        {(currentRole === '李老师' || currentRole === '李老师智能体') && teacherTab === 'home' && (
+        {(roleIsTeacher(currentRole)) && teacherTab === 'home' && (
           <div style={boxStyle}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
               <div style={{ fontSize: '18px', color: '#8b4513', fontWeight: 'bold' }}>🤖 智能体工作台</div>
@@ -2866,7 +2911,7 @@ export default function App() {
 
         {/* 【Epic 2 步驟 6a】🧭 智能體階段（老師端 🏠 首頁；位置：智能體工作台卡下方、今日備忘錄卡上方）。
             掛載條件與上一張卡**逐字一致**（`isTeacherRole && teacherTab === 'home'`，其中
-            `isTeacherRole = currentRole === '李老师' || currentRole === '李老师智能体'`，見本文件上方定義）。
+            `isTeacherRole = roleIsTeacher(currentRole)`，見本文件上方定義）。
             階段是老師的能力畫像（§5.3）→ **不**傳 lineage_id、也不參與師門就緒門：
             flag on 但老師尚未開山門時本卡照常顯示（與「📜 模板傳承」卡的 no_lineage 分支刻意不同）。
             【Epic 2 步驟 6c】追加 `onEvaluated`：階段卡自己剛寫了階段真值（評估 / 降級成功）→ 重拉本工作台，
@@ -2889,7 +2934,7 @@ export default function App() {
         )}
 
         {/* 【第61天新增】老师端：📋 今日备忘录（动态时间轴 + 未排期事项列；已完成移除、逾期变灰、跨天自动清空） */}
-        {(currentRole === '李老师' || currentRole === '李老师智能体') && teacherTab === 'home' && (
+        {(roleIsTeacher(currentRole)) && teacherTab === 'home' && (
           <div style={{ ...boxStyle, background: '#fffdf5' }}>
             <div style={{ textAlign: 'center', fontSize: '18px', color: '#8b4513', fontWeight: 'bold', marginBottom: '12px' }}>📋 今日备忘录</div>
 
@@ -2928,7 +2973,7 @@ export default function App() {
                     </div>
                   ))
                 )}
-                {currentRole === '李老师' && roleData?.task === '待审核' && roleData?.detail.includes('已打卡') && (
+                {currentRole === selectedTeacher && roleData?.task === '待审核' && roleData?.detail.includes('已打卡') && (
                   <div style={{ textAlign: 'center', marginTop: '10px' }}>
                     <button onClick={handleApprove} style={{ padding: '6px 16px', borderRadius: '20px', border: 'none', background: '#5a7d5a', color: '#fff', fontSize: '13px', cursor: 'pointer', fontFamily: 'serif' }}>签字确认</button>
                   </div>
@@ -3191,7 +3236,7 @@ export default function App() {
         )}
 
         {/* 【第62天调整】管理页签 · 学生（在上）：学生管理 */}
-        {(currentRole === '李老师' || currentRole === '李老师智能体') && teacherTab === 'manage' && (
+        {(roleIsTeacher(currentRole)) && teacherTab === 'manage' && (
           <div style={{ ...boxStyle, background: '#f0f7f0' }}>
             <div style={{ fontSize: '18px', color: '#5a7d5a', fontWeight: 'bold', marginBottom: '10px' }}>👥 学生管理（{teacherPatients.length}人）{renderLineageChip()}</div>
             {/* 【第58天新增】老师端设置学生提醒频率（A 每天 / B 隔天 / C 每周），与学生端 localStorage 共享 */}
@@ -3216,7 +3261,7 @@ export default function App() {
                 fetch('/api/teacher/add-student', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ teacher_name: selectedTeacher, student_name: name }) })
                   // 【Epic 4 / 批 1 止血】按钮回调重拉同名接口：同样「先判 res.ok + Array.isArray」，
                   // 否则 flag on 缺 lineage_id 的 400 错误体会进 teacherPatients（2331/2381/2385 行会抛）
-                  .then(() => { input.value = ''; fetch(withLineage(`/api/teacher-patients?teacher_name=${selectedTeacher}`)).then(r => (r.ok ? r.json() : null)).then((d: any) => setTeacherPatients(Array.isArray(d) ? d : [])).catch(() => setTeacherPatients([])); fetchPatients('张三') })
+                  .then(() => { input.value = ''; fetch(withLineage(`/api/teacher-patients?teacher_name=${selectedTeacher}`)).then(r => (r.ok ? r.json() : null)).then((d: any) => setTeacherPatients(Array.isArray(d) ? d : [])).catch(() => setTeacherPatients([])); fetchPatients(selectedPatient) })
               }} style={{ padding: '8px 16px', borderRadius: '6px', border: 'none', background: '#5a7d5a', color: '#fff', cursor: 'pointer' }}>+ 添加学生</button>
               <button onClick={handleCreateInvite} style={{ padding: '8px 16px', borderRadius: '6px', border: '1px solid #8b4513', background: 'transparent', color: '#8b4513', cursor: 'pointer' }}>🎫 生成邀请码</button>
             </div>
@@ -3253,7 +3298,10 @@ export default function App() {
                     </div>
                     <div style={{ flex: 1, textAlign: 'right' }}>
                       <button style={{ padding: '4px 10px', borderRadius: '12px', border: '1px solid #5a7d5a', background: 'transparent', color: '#5a7d5a', cursor: 'pointer', fontSize: '12px', marginRight: '6px' }} onClick={() => setSelectedPatient(s.name)}>查看</button>
-                      {s.name !== '张三' && s.name !== '李四' && (
+                      {/* 【D-059】原先写死 `s.name !== '张三' && s.name !== '李四'`（保护演示数据）→
+                          改按**身份**判断：不允许把「当前学生本人」从名单里移除。
+                          注意这里在「老师端学生名单」内，`selectedPatient` 即当前身份。 */}
+                      {s.name !== selectedPatient && (
                         <button onClick={() => {
                           if (!confirm(`确定要将学生【${s.name}】从您的名单中移除吗？`)) return
                           fetch(`/api/patient-teachers?patient_name=${s.name}&teacher_name=${selectedTeacher}`, { method: 'DELETE' })
@@ -3737,7 +3785,7 @@ export default function App() {
         )}
 
         {/* 【第51天新增 / 第62天调整】中药材库存（合并进「管理」页签，排在学生卡片下方） */}
-        {(currentRole === '李老师' || currentRole === '李老师智能体') && teacherTab === 'manage' && (
+        {(roleIsTeacher(currentRole)) && teacherTab === 'manage' && (
           <div style={boxStyle}>
             <h3 style={{ color: '#8b4513', textAlign: 'center', marginBottom: '12px' }}>💊 中药材库存</h3>
             <div style={{ marginBottom: '12px' }}>
@@ -3893,7 +3941,7 @@ export default function App() {
               </div>
             )}
 
-        {(currentRole === '李老师' || currentRole === '李老师智能体') && teacherTab === 'clinic' && (
+        {(roleIsTeacher(currentRole)) && teacherTab === 'clinic' && (
           <div style={{ ...boxStyle, background: '#fff9f0' }}>
             <div style={{ textAlign: 'center', fontSize: '18px', color: '#8b4513', fontWeight: 'bold', cursor: 'pointer', display: 'flex', justifyContent: 'center', alignItems: 'center', gap: '5px' }} onClick={() => setShowHistory(!showHistory)}>
               📂 {selectedPatient} 的历史病历 {showHistory ? '▲' : '▼'}
@@ -4209,7 +4257,7 @@ export default function App() {
               第四部分：📝 开方（患者姓名默认当前学生 / 远程诊疗 / 药材 + 克数）
               第五部分：📝 辨证施治方案（+ 预览完整病历）
             所有原有按钮、接口、state 逻辑保持不变，只是重新排列（仅诊室页签显示）。 */}
-        {(currentRole === '李老师' || currentRole === '李老师智能体') && teacherTab === 'clinic' && (
+        {(roleIsTeacher(currentRole)) && teacherTab === 'clinic' && (
           <div style={{ ...boxStyle, background: '#fcfdfa', border: '1px solid #d4c8a8', width: '100%' }}>
             <div style={{ textAlign: 'center', fontSize: '20px', color: '#8b4513', fontWeight: 'bold', marginBottom: '6px', paddingBottom: '12px', borderBottom: '2px solid #e6dcc2' }}>🩺 诊室工作台{renderLineageChip()}</div>
             <div style={{ textAlign: 'center', fontSize: '12px', color: '#999', marginBottom: '16px' }}>
@@ -4613,7 +4661,13 @@ export default function App() {
         <div style={boxStyle}>
           <div style={{ textAlign: 'center', marginBottom: '15px', color: '#8b4513', fontWeight: 'bold' }}>🧑‍⚕️ 角色切换</div>
           <div style={{ display: 'flex', flexWrap: 'wrap', justifyContent: 'center' }}>
-            {['李老师', '李老师智能体', '学生', '学生智能体'].map((role) => (
+            {/* 【D-059】角色选项**按实际选中的老师**构造，不再写死「李老师」——
+                原写死导致切换身份只能切到「李老师」，多老师内测不成立。
+                老师未选出时退化为学生端两条，避免出现「·智能体」这种空名角色。 */}
+            {(selectedTeacher
+              ? [`${selectedTeacher}`, `${selectedTeacher}智能体`, '学生', '学生智能体']
+              : ['学生', '学生智能体']
+            ).map((role) => (
               <button key={role} style={roleBtnStyle(role)} onClick={() => setCurrentRole(role)}>{role}</button>
             ))}
           </div>

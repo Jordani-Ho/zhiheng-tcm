@@ -17,6 +17,33 @@ export interface Teacher { name: string; description: string; }
 // 【第62天调整】老师端页签：首页 / 诊室 / 管理（原「学生」+「库存」合并） / 设置
 export type TeacherTab = 'home' | 'clinic' | 'manage' | 'settings' | 'seal'
 
+// ============================================================================
+// 【D-059】身份判定：与老师**姓名**解耦
+// ============================================================================
+// 背景：原先全仓 16 处把「是否老师端」写成 `currentRole === '李老师' || currentRole === '李老师智能体'`
+// —— **老师姓名硬编码进了角色判定**，导致站点只能给「李老师」一个人用（张三/李四同理）。
+//
+// 角色字符串的语义分类（UI 的四条固定选项）：
+//   · 老师端       ：「<某位老师>」「<某位老师>智能体」   ← 姓名嵌在角色名里
+//   · 学生端       ：「学生」「学生智能体」
+//
+// 判据必须**只依赖角色类型，不依赖姓名**：
+//   · 学生端两种角色的字面量是固定的 → 可直接比字面量；
+//   · 老师端角色名含任意姓名 → 用「不是学生端」来判定（等价且与姓名无关）。
+//
+// 用 `function` 声明（会被提升）而非 `const`：App.tsx 的 `lineageIsTeacher`
+// （渲染期、`isTeacherRole` 之前）也要用它，const 会触发 TDZ ReferenceError。
+export function roleIsStudent(role: string): boolean {
+  return role === '学生' || role === '学生智能体'
+}
+
+export function roleIsTeacher(role: string): boolean {
+  return !roleIsStudent(role)
+}
+
+/** UI 的四条角色选项，按「老师 / 学生 × 真人 / 智能体」分组。 */
+export const ROLE_OPTIONS = ['李老师', '李老师智能体', '学生', '学生智能体'] as const
+
 export const boxStyle: React.CSSProperties = { background: '#fdfcf0', border: '1px solid #d4c8a8', borderRadius: '12px', padding: '24px', marginBottom: '20px', boxShadow: '0 4px 12px rgba(0,0,0,0.06)' }
 export const inputStyle: React.CSSProperties = { width: '100%', padding: '8px', borderRadius: '6px', border: '1px solid #d4c8a8', fontFamily: 'serif', marginBottom: '8px', boxSizing: 'border-box' }
 export const dateSelectStyle: React.CSSProperties = { padding: '8px', borderRadius: '6px', border: '1px solid #d4c8a8', fontFamily: 'serif', marginRight: '6px', marginBottom: '8px' }
