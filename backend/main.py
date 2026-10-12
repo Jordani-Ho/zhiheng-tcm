@@ -109,6 +109,12 @@ class TranscriptionInput(BaseModel):
     teacher_name: str
     content: str
     data_type: str
+    # 【内测核心闭环修复，D-054】师门隔离开启时，本模型原先**不带** `lineage_id`，
+    # 而端点内部调 `get_transcriptions()` / `get_patient_records()` 时也只传两个参数
+    # → `lineage_read_scope()` 抛 400 `lineage_required`（§5.2「漏改必 4xx」按设计生效）。
+    # 结果：**内测核心闭环的第一个动作（录音→转写）直接 400**。
+    # 现按设计口径补齐：调用方显式透传；缺省 None 时行为与 flag off 完全一致。
+    lineage_id: str = None
 
 class DraftUpdate(BaseModel):
     content: str
@@ -693,14 +699,14 @@ def _generate_and_store_llm_draft(transcript_id, patient_name, teacher_name, con
 def transcribe(input_data: TranscriptionInput):
     database.insert_transcription(input_data.patient_name, input_data.teacher_name, input_data.content, input_data.data_type)
 
-    transcripts = database.get_transcriptions(input_data.patient_name, input_data.teacher_name)
+    transcripts = database.get_transcriptions(input_data.patient_name, input_data.teacher_name, input_data.lineage_id)
     if not transcripts:
         return {"message": "转述失败"}
     latest = transcripts[0]
 
     patient_name = latest['patient_name']
     teacher_name = latest['teacher_name']
-    past_records = database.get_patient_records(patient_name, teacher_name)
+    past_records = database.get_patient_records(patient_name, teacher_name, input_data.lineage_id)
     past_content = "\n".join([f"- {r['final_plan']}" for r in past_records]) if past_records else "暂无过往病历"
 
     # 【第41天修复】学生端已做过结构化，后端不再调 structurize，直接交给老师智能体
@@ -712,7 +718,8 @@ def transcribe(input_data: TranscriptionInput):
     return {"message": "转述成功，病历草案已自动生成"}
 
 @app.post("/api/upload")
-async def upload_image(patient_name: str = "张三", teacher_name: str = "李老师", file: UploadFile = File(...)):
+async def upload_image(patient_name: str = "张三", teacher_name: str = "李老师",
+                       lineage_id: str = None, file: UploadFile = File(...)):
     ext = os.path.splitext(file.filename)[1] if file.filename else ".jpg"
     unique_name = f"{uuid.uuid4().hex}{ext}"
     file_path = os.path.join(UPLOAD_DIR, unique_name)
@@ -721,10 +728,10 @@ async def upload_image(patient_name: str = "张三", teacher_name: str = "李老
     file_url = f"/uploads/{unique_name}"
     database.insert_transcription(patient_name, teacher_name, file_url, "image")
 
-    transcripts = database.get_transcriptions(patient_name, teacher_name)
+    transcripts = database.get_transcriptions(patient_name, teacher_name, lineage_id)
     if transcripts:
         latest = transcripts[0]
-        past_records = database.get_patient_records(patient_name, teacher_name)
+        past_records = database.get_patient_records(patient_name, teacher_name, lineage_id)
         past_content = "\n".join([f"- {r['final_plan']}" for r in past_records]) if past_records else "暂无过往病历"
         content_desc = "[学生上传了图片：" + file_url + "]"
         # 【Epic 1 §12.2】与上传音路径同一套生成接入（段落骨架 + template_id/version）
@@ -757,14 +764,14 @@ def get_transcriptions(patient_name: str = None, teacher_name: str = None, linea
     return database.get_transcriptions(patient_name, teacher_name, lineage_id)
 
 @app.post("/api/generate-draft")
-def generate_draft(transcript_id: int):
-    transcripts = database.get_transcriptions()
+def generate_draft(transcript_id: int, lineage_id: str = None):
+    transcripts = database.get_transcriptions(patient_name=None, teacher_name=None, lineage_id=lineage_id)
     transcript = next((t for t in transcripts if t["id"] == transcript_id), None)
     if not transcript:
         return {"error": "找不到该转述"}
     patient_name = transcript['patient_name']
     teacher_name = transcript['teacher_name']
-    past_records = database.get_patient_records(patient_name, teacher_name)
+    past_records = database.get_patient_records(patient_name, teacher_name, lineage_id)
     past_content = "\n".join([f"- {r['final_plan']}" for r in past_records]) if past_records else "暂无过往病历"
     if transcript['data_type'] == 'image':
         content_desc = "[学生上传了图片：" + str(transcript['content']) + "]"
@@ -934,12 +941,17 @@ class AppointmentInput(BaseModel):
     scheduled_date: str
     scheduled_time: str
     reason: str
+    # 【内测场景 3/4，D-053】True=远程问诊 / False=当面诊疗（默认当面）。
+    # 与 `PrescriptionInput.is_remote: bool = False` 同款语义；落库为 appointments.is_remote 0/1。
+    # 此前本模型**没有这个字段** → 远程诊断无法通过接口创建（场景 4 阻塞）。
+    is_remote: bool = False
 
 @app.post("/api/appointments")
 def create_appointment(input_data: AppointmentInput):
     return database.create_appointment(
         input_data.patient_name, input_data.teacher_name, input_data.initiator,
-        input_data.scheduled_date, input_data.scheduled_time, input_data.reason
+        input_data.scheduled_date, input_data.scheduled_time, input_data.reason,
+        input_data.is_remote
     )
 
 @app.get("/api/appointments")

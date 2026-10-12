@@ -1005,7 +1005,7 @@ def _sign_draft_baseline(draft_id):
          ("张三", TEACHER, "AI 原稿", "完整病历", TEACHER, "<NOW>")),
         ("INSERT INTO homework (patient_name, teacher_name, task, detail, status, created_at) "
          "VALUES (?, ?, ?, ?, ?, ?)",
-         ("张三", TEACHER, "今日医嘱：最终方案", "请严格遵医嘱执行", "pending", "2026-09-19")),
+         ("张三", TEACHER, "今日医嘱：最终方案", "请严格遵医嘱执行", "pending", "<NOW>")),
         ("DELETE FROM transcriptions WHERE id = ?", (_TRANSCRIPT_ID,)),
         ("DELETE FROM drafts WHERE id = ?", (draft_id,)),
     ]

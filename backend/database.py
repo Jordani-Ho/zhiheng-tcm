@@ -647,10 +647,61 @@ def update_homework_status(patient_name, teacher_name, status):
     conn.close()
 
 # ---------- 转述相关操作 ----------
+def _derived_lineage_id(teacher_name):
+    """由老师名推导其（一师一门）师门 id —— 写路径共用。
+
+    【内测修复，D-052/D-054】Epic 4 给读路径加了 `lineage_id = ?` 过滤（flag on 时），
+    但**多条写入路径漏写该列**，导致「刚写入的行立刻查不到」：
+      · `accept_invite()` 建师生关系（D-052）
+      · `insert_transcription()` 落转述（D-054，本函数抽出后共用）
+    抽成一处，避免第三处再漏（项目纪律：同一个判断只许一份实现）。
+
+    口径：走 `lineage_service.default_lineage_id()`（既有推导规则，可复现）；
+    师门模块不可用时**退回空串**，不抛异常、不阻断写入（韧性优先于隔离强度）。
+    """
+    try:
+        import lineage_service
+        return lineage_service.default_lineage_id(teacher_name)
+    except Exception:  # noqa: BLE001 —— 师门未启用 / 模块不可用
+        return ""
+
+
+def _backfill_lineage_id(conn, table, teacher_name, where_sql, where_params):
+    """写路径补 `lineage_id` 的**统一入口**（flag on 时才执行）。
+
+    【内测核心闭环修复，D-052/D-054】Epic 4 给**读路径**加了 `lineage_id = ?` 过滤（flag on 时），
+    但**多条写入路径漏写该列** → 「刚写入的行立刻查不到」。已发现的漏点：
+
+    | 写路径 | 表 | 症状 |
+    | :-- | :-- | :-- |
+    | `accept_invite()` | `patient_teachers` | 邀请入社区的学生在老师端列表查不到（D-052）|
+    | `insert_transcription()` | `transcriptions` | 转写刚落库就查不到（D-054）|
+    | `insert_draft()` | `drafts` | `/api/transcribe` 说「草案已生成」但列表为空（D-054）|
+    | `sign_draft()` | `patient_records` + `homework` | 签字说「已归档」，但病历与随访都查不到（D-054）|
+
+    **为什么不改各处的 INSERT 语句**：多条 INSERT 被「flag off 语句序列逐字节一致」的守护钉死
+    （`test_agent_stage.py` 的 `_BASELINE_FLAG_OFF_*`）。故统一改为**定向 UPDATE**，且用
+    `lineage_enabled()` 门控 → **flag off 时一条语句都不多**，逐字节守护不受影响
+    （与既有 `_agent_stage_snapshot_enabled()` 的兼容手法同款）。
+
+    失败一律静默：补不上列只是「按师门查不到该行」，绝不回滚已完成的业务写入。
+    """
+    try:
+        import lineage_service
+        if not lineage_service.lineage_enabled():
+            return
+        conn.execute(
+            "UPDATE %s SET lineage_id = ? WHERE %s" % (table, where_sql),
+            tuple([_derived_lineage_id(teacher_name)] + list(where_params)),
+        )
+    except Exception:  # noqa: BLE001 —— 师门不可用 / 语句不适用时不补列
+        pass
+
+
 def insert_transcription(patient_name, teacher_name, content, data_type):
     conn = get_connection()
-    conn.execute("INSERT INTO transcriptions (patient_name, teacher_name, content, data_type, processed) VALUES (?, ?, ?, ?, 0)",
-                 (patient_name, teacher_name, content, data_type))
+    conn.execute("INSERT INTO transcriptions (patient_name, teacher_name, content, data_type, processed, lineage_id) VALUES (?, ?, ?, ?, 0, ?)",
+                 (patient_name, teacher_name, content, data_type, _derived_lineage_id(teacher_name)))
     # 【第35天新增】更新学生的最近活跃时间
     conn.execute("UPDATE patients SET last_active_at = ? WHERE name = ?", ("2026-09-17", patient_name))
     conn.commit()
@@ -842,6 +893,23 @@ def insert_draft(transcript_id, patient_name, teacher_name, content, template_id
         cursor = conn.execute("INSERT INTO drafts (transcript_id, patient_name, teacher_name, content, signed) VALUES (?, ?, ?, ?, ?)",
                               (transcript_id, patient_name, teacher_name, content, 0))
     conn.execute("UPDATE transcriptions SET processed = 1 WHERE id = ?", (transcript_id,))
+    # 【内测核心闭环修复，D-054】补写 `drafts.lineage_id` —— 只在师门隔离**开启**时执行。
+    #
+    # 背景：`insert_draft()` 没有 `lineage_id` 入参，而 `get_drafts()` 在 flag on 时于**子查询内部**
+    # 用 `lineage_id = ?` 过滤（见 :904）→ 草案刚落库就**查不出来**（`/api/transcribe` 返回
+    # 「病历草案已自动生成」，但老师端草案列表为空）。
+    #
+    # 为什么不改上面三条 INSERT：那三条分支被「flag off 语句序列逐字节一致」的守护钉死
+    # （`test_agent_stage.py` 的 `_BASELINE_FLAG_OFF_*`，断言 `_all_calls(sql_log) == 基线`）。
+    # 故改为**独立定向 UPDATE**，且用同一个 flag 门控 → flag off 时**一条语句都不多**，
+    # 与既有 `_agent_stage_snapshot_enabled()` 的兼容手法同款。
+    try:
+        import lineage_service as _ls
+        if _ls.lineage_enabled():
+            conn.execute("UPDATE drafts SET lineage_id = ? WHERE id = ?",
+                         (_derived_lineage_id(teacher_name), cursor.lastrowid))
+    except Exception:  # noqa: BLE001 —— 师门不可用时不补列，落库结果不受影响
+        pass
     conn.commit()
     draft_id = cursor.lastrowid
     conn.close()
@@ -988,8 +1056,18 @@ def sign_draft(draft_id, final_plan, final_content=None):
         )
     conn.execute(
         "INSERT INTO homework (patient_name, teacher_name, task, detail, status, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-        (draft["patient_name"], draft["teacher_name"], f"今日医嘱：{final_plan}", "请严格遵医嘱执行", "pending", "2026-09-19")
+        (draft["patient_name"], draft["teacher_name"], f"今日医嘱：{final_plan}", "请严格遵医嘱执行", "pending",
+         datetime.now().isoformat())
     )
+    # 【内测核心闭环修复，D-054】flag on 时补两表的 `lineage_id` —— 否则签字后
+    # `get_patient_records()` / `get_homework()` 按师门过滤，**刚签的字立刻查不到**
+    # （接口返回「签字成功，已归档」，但病历与随访列表皆空）。flag off 时零语句。
+    _backfill_lineage_id(conn, "patient_records", draft["teacher_name"],
+                         "patient_name = ? AND teacher_name = ?",
+                         (draft["patient_name"], draft["teacher_name"]))
+    _backfill_lineage_id(conn, "homework", draft["teacher_name"],
+                         "patient_name = ? AND teacher_name = ?",
+                         (draft["patient_name"], draft["teacher_name"]))
     conn.execute("DELETE FROM transcriptions WHERE id = ?", (draft["transcript_id"],))
     conn.execute("DELETE FROM drafts WHERE id = ?", (draft_id,))
 
@@ -1076,16 +1154,10 @@ def accept_invite(code, student_name):
     #   `get_teacher_patients()` 在 `LINEAGE_ENABLED=on` 时强制 `pt.lineage_id = ?`（见 :470-471），
     #   而原先此处**不写该列** → `lineage_id` 为 NULL/空串 → 邀请入社区的学生在老师端学生列表里
     #   **查不出来**（HTTP 200 但返回 []），下游按师门过滤的读点（病历 / 预约 / 作业）一并看不到。
-    #   师门 id 走既有推导规则 `lineage_service.default_lineage_id()`（一师一门，可复现），
-    #   与迁移 0005 的回填口径一致（实测种子行即为 `lin-<slug>`）。
-    try:
-        import lineage_service as _lineage_service
-        _lineage_id = _lineage_service.default_lineage_id(invite["teacher_name"])
-    except Exception:  # noqa: BLE001 —— 师门未启用 / 模块不可用时退回空串，不阻断入社区
-        _lineage_id = ""
+    #   师门 id 走共用推导 `_derived_lineage_id()`（与转述写入同一份实现，见 D-054）。
     try:
         conn.execute("INSERT INTO patient_teachers (patient_name, teacher_name, status, created_at, lineage_id) VALUES (?, ?, 'active', ?, ?)",
-                     (student_name, invite["teacher_name"], datetime.now().strftime('%Y-%m-%d'), _lineage_id))
+                     (student_name, invite["teacher_name"], datetime.now().strftime('%Y-%m-%d'), _derived_lineage_id(invite["teacher_name"])))
     except sqlite3.IntegrityError:
         pass
     # 初始积分
@@ -1250,23 +1322,36 @@ def check_slot_available(teacher_name, scheduled_date, scheduled_time, exclude_a
     return row["count"] == 0
 
 
-def create_appointment(patient_name, teacher_name, initiator, scheduled_date, scheduled_time, reason):
+def create_appointment(patient_name, teacher_name, initiator, scheduled_date, scheduled_time, reason,
+                       is_remote=False):
+    """提交预约（`status='pending'`）。
+
+    【内测场景 3/4 修复，D-053】
+    · `is_remote`：`False`=当面诊疗 / `True`=远程问诊（`appointments.is_remote` 0/1）。
+      该列自「第73天」就存在，但**此前没有任何写入路径**（`AppointmentInput` 也没这个字段）
+      → 所有预约恒为 `0=面诊`，**内测场景 4「远程诊断」用接口造不出来**
+      （旧代码靠 `reason` 文本里有没有「远程」二字在前端归列，属临时办法）。
+      本参数与 `create_prescription(..., is_remote=0)` 同款语义与同款 0/1 落库口径。
+    · `created_at`：原先**硬编码 "2026-09-21"**（同批系统性硬编码时间戳之一）→ 现写真实时间。
+    """
     # 【第49天新增】先检查冲突
     if not check_slot_available(teacher_name, scheduled_date, scheduled_time):
         return {"error": "该时段已被预约，请选择其他时间"}
     conn = get_connection()
     conn.execute(
-        "INSERT INTO appointments (patient_name, teacher_name, initiator, scheduled_date, scheduled_time, reason, status, created_at) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)",
-        (patient_name, teacher_name, initiator, scheduled_date, scheduled_time, reason, "2026-09-21")
+        "INSERT INTO appointments (patient_name, teacher_name, initiator, scheduled_date, scheduled_time, reason, status, created_at, is_remote) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
+        (patient_name, teacher_name, initiator, scheduled_date, scheduled_time, reason,
+         datetime.now().isoformat(), 1 if is_remote else 0)
     )
     conn.commit()
     conn.close()
     return {"message": "预约已提交"}
 
 def update_appointment_status(appt_id, status):
+    """更新预约状态；`confirmed_at` 原**硬编码 "2026-09-20"** → 现写真实时间（D-053）。"""
     conn = get_connection()
     conn.execute("UPDATE appointments SET status = ?, confirmed_at = ? WHERE id = ?",
-                 (status, "2026-09-20", appt_id))
+                 (status, datetime.now().isoformat(), appt_id))
     conn.commit()
     conn.close()
     return {"message": "预约状态已更新"}
