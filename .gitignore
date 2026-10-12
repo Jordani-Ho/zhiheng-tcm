@@ -22,6 +22,9 @@ pytest-of-*
 # 测试基线与权限诊断产物（本地留档用，不进版本库）
 team/pytest-baseline.txt
 team/acl-reports/
+# 本地运行日志（uvicorn / vite 实启验证时产生）
+team/*.log
+*.log
 
 # Obsidian（若启用）
 .obsidian/
