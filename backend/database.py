@@ -1072,9 +1072,20 @@ def accept_invite(code, student_name):
     conn.execute("INSERT OR IGNORE INTO patients (name, guardian_name, relation, created_at) VALUES (?, 'self', '本人', ?)",
                  (student_name, datetime.now().strftime('%Y-%m-%d')))
     # 建立师生关系
+    # 【内测场景 2 修复，D-052】必须同时写 `lineage_id`：
+    #   `get_teacher_patients()` 在 `LINEAGE_ENABLED=on` 时强制 `pt.lineage_id = ?`（见 :470-471），
+    #   而原先此处**不写该列** → `lineage_id` 为 NULL/空串 → 邀请入社区的学生在老师端学生列表里
+    #   **查不出来**（HTTP 200 但返回 []），下游按师门过滤的读点（病历 / 预约 / 作业）一并看不到。
+    #   师门 id 走既有推导规则 `lineage_service.default_lineage_id()`（一师一门，可复现），
+    #   与迁移 0005 的回填口径一致（实测种子行即为 `lin-<slug>`）。
     try:
-        conn.execute("INSERT INTO patient_teachers (patient_name, teacher_name, status, created_at) VALUES (?, ?, 'active', ?)",
-                     (student_name, invite["teacher_name"], datetime.now().strftime('%Y-%m-%d')))
+        import lineage_service as _lineage_service
+        _lineage_id = _lineage_service.default_lineage_id(invite["teacher_name"])
+    except Exception:  # noqa: BLE001 —— 师门未启用 / 模块不可用时退回空串，不阻断入社区
+        _lineage_id = ""
+    try:
+        conn.execute("INSERT INTO patient_teachers (patient_name, teacher_name, status, created_at, lineage_id) VALUES (?, ?, 'active', ?, ?)",
+                     (student_name, invite["teacher_name"], datetime.now().strftime('%Y-%m-%d'), _lineage_id))
     except sqlite3.IntegrityError:
         pass
     # 初始积分
