@@ -684,20 +684,27 @@ export default function App() {
       })
       .catch(() => {})
 
-    // 监护人档案：跟随实际选中的学生，不再写死「张三」
-    if (selectedPatient) {
-      fetch(`/api/patient-profile?patient_name=${encodeURIComponent(selectedPatient)}`)
-        .then(r => r.json())
-        .then(d => {
-          setGuardianLocation(d.location || '')
-          setGuardianGender(d.gender || '')
-          setGuardianBirthDate(d.birth_date || '')
-        })
-        .catch(() => {})
-    }
+    // 监护人档案**不在此处拉取**：本 effect 只在 mount 跑一次，而 `selectedPatient`
+    // 由上面那段异步引导填上（mount 时还是空串）→ 放这里会导致档案永不拉取。
+    // 已改为下方依赖 `selectedPatient` 的独立 effect。
     // 仅在首帧跑一次；后续随 selectedPatient / selectedTeacher 的既有 effect 走
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
+
+  // 【D-059】监护人档案跟随**当前学生**（原写死 `/api/patient-profile?patient_name=张三`）。
+  // 依赖 selectedPatient：身份引导填上后自动触发。
+  useEffect(() => {
+    if (!selectedPatient) return
+    fetch(`/api/patient-profile?patient_name=${encodeURIComponent(selectedPatient)}`)
+      .then(r => r.json())
+      .then(d => {
+        setGuardianLocation(d.location || '')
+        setGuardianGender(d.gender || '')
+        setGuardianBirthDate(d.birth_date || '')
+      })
+      .catch(() => {})
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedPatient])
 
   // 【D-059】学生列表跟随**当前学生**（不再写死张三）：guardian 取当前学生自身，
   // 取不到学生时先不请求，等引导填上再触发。
