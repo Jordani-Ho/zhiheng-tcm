@@ -15,14 +15,45 @@ import database
 
 load_dotenv()
 
-# ============ LLM 初始化 ============
-llm = ChatOpenAI(
-    model="deepseek-chat",
-    api_key=os.getenv("DEEPSEEK_API_KEY"),
-    base_url="https://api.deepseek.com",
-    temperature=0.1,
-    timeout=30
-)
+# ============ LLM 初始化（惰性） ============
+# 【2026-10-04 修复】原先此处是模块级 `llm = ChatOpenAI(...)`，会在 `import agent` 时
+# 立即构造客户端；缺 `DEEPSEEK_API_KEY` 时抛 `OpenAIError: Missing credentials`
+# → **整个后端起不来**（`import main` 直接崩），而非优雅降级。
+#
+# 现改为惰性：只有真正调用 `invoke()` 时才构造客户端。
+#   · 保持 `agent.llm` 这个名字不变 —— `test_agent_stage.py:6246` 与
+#     `test_templates.py:755` 通过 `monkeypatch.setattr(agent, "llm", 替身)` 注入假模型，
+#     该替换点必须继续有效。
+#   · 缺 key 时 `invoke()` 抛 RuntimeError，由各调用点既有的 try/except 降级
+#     （如 `patient_structurize` 的「调用失败时原样返回」）。
+class _LazyLLM:
+    """惰性 LLM 客户端：首次 `invoke()` 时才构造，缺 key 不阻塞模块导入。"""
+
+    def __init__(self):
+        self._client = None
+
+    def _ensure(self):
+        if self._client is None:
+            api_key = os.getenv("DEEPSEEK_API_KEY")
+            if not api_key:
+                raise RuntimeError(
+                    "未配置 DEEPSEEK_API_KEY：后端已可启动，但 AI 能力不可用。"
+                    "请在 backend/.env 中设置后重试。"
+                )
+            self._client = ChatOpenAI(
+                model="deepseek-chat",
+                api_key=api_key,
+                base_url="https://api.deepseek.com",
+                temperature=0.1,
+                timeout=30,
+            )
+        return self._client
+
+    def invoke(self, *args, **kwargs):
+        return self._ensure().invoke(*args, **kwargs)
+
+
+llm = _LazyLLM()
 
 # ============ 患者智能体 ============
 class PatientState(TypedDict):
@@ -641,20 +672,11 @@ def check_billing_alerts(teacher_name, low_balance=BILLING_LOW_BALANCE, lineage_
 def _parse_visit_at(value):
     """【第77天新增】把 patient_records.visit_at 解析成 datetime；为空 / 解析不了 → None。
 
-    主格式是 database.sign_draft 落的 datetime.now().isoformat()（如 2026-09-23T15:30:00），
-    顺带兼容纯日期「2026-09-23」与空格分隔的「2026-09-23 15:30:00」（手工造数据 / 早期写法）。
-    带时区的值去掉时区后按本地时间参与比较，保证能和 datetime.now()（naive）相减。
+    【P-301 抽取】本函数的实现已上移为 `database.parse_interaction_at()`（同一个判断只许有
+    一份实现，INSTR-2026-10-04-03 §2.2 要求 4）。本函数**保留为薄委托**，签名与返回语义一字不改，
+    既有的模块级调用点（`check_recall_alerts`）与外部引用零改动。
     """
-    text = (value or "").strip()
-    if not text:
-        return None
-    for fmt in (None, "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
-        try:
-            parsed = datetime.fromisoformat(text) if fmt is None else datetime.strptime(text, fmt)
-        except ValueError:
-            continue
-        return parsed.replace(tzinfo=None)  # 统一成 naive，方便和 now 相减
-    return None
+    return database.parse_interaction_at(value)
 
 
 def check_recall_alerts(teacher_name, recall_days=RECALL_DAYS, lineage_id=None):
@@ -667,26 +689,19 @@ def check_recall_alerts(teacher_name, recall_days=RECALL_DAYS, lineage_id=None):
       + patient_name + status='pending' 已存在 → 跳过，不重复建单。
     返回：本次新建的请示条数。
 
-    【Epic 4 §3.2 P1】本函数**自己发一条 SQL**（patient_records 聚合），故按 flag on/off 拼 `owner_where`：
-      · flag on：`lineage_id = ? AND teacher_name = ?`（学生集合与去重查询由被调函数各自带过滤）；
-      · flag off：字面量/参数与改动前逐字节相同。
+    【P-301 抽取，2026-10-04】原先内联在这里的 `MAX(visit_at)` 聚合已上移为
+    `database.get_last_interactions_by_teacher()`（**静默基线的唯一实现**）。
+    该函数与内联版本**同一口径**（同 flag 拼法、同 visit_at 非空过滤、同 GROUP BY），
+    故本函数**行为零变化**；抽取目的是让「最后一次互动时间」在门规 C1 / 复诊提醒之间只有一份实现。
     """
-    filter_on, lineage_id = database.lineage_read_scope(teacher_name, lineage_id)
-    recall_where = "lineage_id = ? AND teacher_name = ?" if filter_on else "teacher_name = ?"
-    recall_params = (lineage_id, teacher_name) if filter_on else (teacher_name,)
+    database.lineage_read_scope(teacher_name, lineage_id)   # 先校验（fail-loud 不佔連接）
     conn = database.get_connection()
     cur = conn.cursor()
     now = datetime.now()
     created = 0
 
     # 每个学生的最近一次就诊时间（只取该老师的病历；visit_at 为空的旧记录直接排除）
-    latest_rows = cur.execute("""
-        SELECT patient_name, MAX(visit_at) AS last_visit_at
-        FROM patient_records
-        WHERE """ + recall_where + """ AND visit_at IS NOT NULL AND visit_at != ''
-        GROUP BY patient_name
-    """, recall_params).fetchall()
-    last_visit_map = {row["patient_name"]: row["last_visit_at"] for row in latest_rows}
+    last_visit_map = database.get_last_interactions_by_teacher(teacher_name, lineage_id)
 
     for name in _teacher_student_names(cur, teacher_name, lineage_id):
         last_visit = _parse_visit_at(last_visit_map.get(name))
