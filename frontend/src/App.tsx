@@ -5,6 +5,8 @@ import { ReferralStudio } from './ReferralStudio'
 import SealPanel from './SealPanel'
 // 【Epic 2 步驟 6a】老師端 🏠 首頁「🧭 智能體階段」卡（階段畫像 + 一致率；flag off / 探測失敗 → 整卡不渲染）
 import AgentStagePanel from './AgentStagePanel'
+// 【D-062 / 内测场景 1】老师入社区面板：独立文件，避免继续膨胀本文件
+import TeacherOnboarding from './TeacherOnboarding'
 // 【D-058 前端拆分第一步】共享常量 / 类型 / 纯函数已外移到 `appShared.ts`。
 // 这里用 `import` 引入（**不是**再导出）—— 已核实全仓无人从 App.tsx 导入符号，
 // 故 App.tsx 只需「能用到这些名字」即可。本次**只做外移，不改任何引用点**，
@@ -257,6 +259,10 @@ export default function App() {
   const [apptDate, setApptDate] = useState('')
   const [apptTime, setApptTime] = useState('')
   const [apptReason, setApptReason] = useState('')
+  // 【D-053 / 内测场景 4】预约形式：false=当面诊疗 / true=远程问诊。
+  // 后端 `appointments.is_remote` 早已存在（0/1），但前端此前**不传该字段**
+  // → 所有预约恒为「面诊」，**场景 4「远程诊断」在界面上造不出来**。
+  const [apptIsRemote, setApptIsRemote] = useState(false)
 
   // 老师工作时间（新）
   const [schedule, setSchedule] = useState<{ [day: string]: string[] } | null>(null)
@@ -2187,13 +2193,13 @@ export default function App() {
 
   // ============== 预约 ==============
   const fetchAppointments = () => {
-    let url = currentRole.includes('老师')
+    let url = roleIsTeacher(currentRole)
       ? `/api/appointments?teacher_name=${selectedTeacher}`
       : `/api/appointments?patient_name=${selectedPatient}`
     // 【Epic 4 §3.2 P0-④】flag on 时学生端也要补 teacher_name：后端 `lineage_read_scope()` 要求
     // 「老师身份 + 师门」双因子（缺 teacher_name → 400 lineage_required，绝不退化为全量）；
     // flag off → 不补任何参数，URL 与 Epic 4 之前逐字面一致。
-    if (lineageEnabled && !currentRole.includes('老师')) url = `${url}&teacher_name=${encodeURIComponent(selectedTeacher)}`
+    if (lineageEnabled && !roleIsTeacher(currentRole)) url = `${url}&teacher_name=${encodeURIComponent(selectedTeacher)}`
     // 【Epic 4 / 批 1 止血】同 fetchDrafts：400（缺 lineage_id / teacher_name）的错误体不是数组，
     // 直接 setState 会让渲染期的 `appointments.filter(...)`（2271 / 2318 / 2333 / 3601… ）抛异常。
     fetch(withLineage(url))
@@ -2210,7 +2216,7 @@ export default function App() {
       alert("请填写完整的预约信息（日期、时间、原因）")
       return
     }
-    const initiator = currentRole.includes('老师') ? 'teacher' : 'student'
+    const initiator = roleIsTeacher(currentRole) ? 'teacher' : 'student'
     fetch('/api/appointments', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -2220,11 +2226,13 @@ export default function App() {
         initiator,
         scheduled_date: apptDate,
         scheduled_time: apptTime,
-        reason: apptReason.trim()
+        reason: apptReason.trim(),
+        // 【D-053 / 场景 4】落库 appointments.is_remote（0/1）；此前不传 → 恒为面诊
+        is_remote: apptIsRemote
       })
     }).then(() => {
       setShowApptForm(false)
-      setApptDate(''); setApptTime(''); setApptReason('')
+      setApptDate(''); setApptTime(''); setApptReason(''); setApptIsRemote(false)
       fetchAppointments()
     })
   }
@@ -3485,6 +3493,19 @@ export default function App() {
               </div>
             )}
 
+            {/* ============ 分区 ⓪ 🧑‍⚕️ 老师入社区（老师端设置页签） ============
+                【D-062 / 内测场景 1】后端 `POST /api/teachers/onboard` 已实现，此前**前端零入口**。
+                放在设置页最前：入社区是「成为某位老师之前」的系统级动作。 */}
+            {isTeacherRole && (
+              <TeacherOnboarding
+                selectedTeacher={selectedTeacher}
+                onOnboarded={() => {
+                  fetch('/api/teachers').then(r => r.json()).then(d => setTeachers(Array.isArray(d) ? d : [])).catch(() => {})
+                }}
+                onPickTeacher={(t) => setSelectedTeacher(t)}
+              />
+            )}
+
             {/* ============ 分区 ① 💊 药材入库（老师端设置页签） ============ */}
             {isTeacherRole && (
               <>
@@ -3505,7 +3526,7 @@ export default function App() {
             {isTeacherRole ? (
               <div style={sectionCardStyle}>
             {/* 老师工作时间设置 */}
-            {currentRole.includes('老师') && schedule && (
+            {roleIsTeacher(currentRole) && schedule && (
               <div style={{ marginBottom: '12px', padding: '10px', background: '#f0f7f0', borderRadius: '8px', border: '1px dashed #5a7d5a' }}>
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '6px' }}>
                   <div style={{ fontSize: '13px', color: '#5a7d5a', fontWeight: 'bold' }}>⚙️ 我的工作时间</div>
@@ -3551,7 +3572,7 @@ export default function App() {
             )}
 
             {/* 节假日管理 */}
-            {currentRole.includes('老师') && (
+            {roleIsTeacher(currentRole) && (
               <div style={{ marginBottom: '12px', padding: '10px', background: '#fff5f5', borderRadius: '8px', border: '1px dashed #c0392b' }}>
                 <div style={{ fontSize: '13px', color: '#c0392b', fontWeight: 'bold', marginBottom: '8px' }}>🎌 节假日设置</div>
                 <div style={{ display: 'flex', gap: '6px', marginBottom: '8px' }}>
@@ -3645,7 +3666,7 @@ export default function App() {
                     <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: '6px' }}>
                       {[...day.slots].sort().map((slot: string) => {
                         const booked = day.booked[slot]
-                        const isTeacher = currentRole.includes('老师')
+                        const isTeacher = roleIsTeacher(currentRole)
                         return (
                           <button
                             key={slot}
@@ -3677,7 +3698,7 @@ export default function App() {
                 })()}
 
                 {/* 老师端待处理 */}
-                {currentRole.includes('老师') && (
+                {roleIsTeacher(currentRole) && (
                   <div style={{ marginTop: '15px' }}>
                     <div style={{ fontSize: '13px', color: '#5a7d5a', fontWeight: 'bold', marginBottom: '8px' }}>📋 待处理预约</div>
                     {appointments.filter((a: any) => a.status === 'pending').length === 0 ? (
@@ -3698,7 +3719,7 @@ export default function App() {
                 )}
 
                 {/* 学生端预约记录 */}
-                {!currentRole.includes('老师') && appointments.length > 0 && (
+                {!roleIsTeacher(currentRole) && appointments.length > 0 && (
                   <div style={{ marginTop: '15px' }}>
                     <div style={{ fontSize: '13px', color: '#5a7d5a', fontWeight: 'bold', marginBottom: '8px' }}>📋 我的预约记录</div>
                     {appointments.map((a: any) => (
@@ -3726,8 +3747,25 @@ export default function App() {
                   onChange={e => setApptReason(e.target.value)}
                   style={{ width: '100%', height: '60px', padding: '8px', borderRadius: '6px', border: '1px solid #d4c8a8', fontFamily: 'serif', fontSize: '13px', marginBottom: '8px', boxSizing: 'border-box' }}
                 />
+                {/* 【D-053 / 内测场景 3、4】就诊形式：当面诊疗 / 远程问诊。
+                    落库 appointments.is_remote（0/1）；此前前端不传该字段 → 恒为面诊。 */}
+                <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '10px' }}>
+                  <span style={{ fontSize: '13px', color: '#8b4513', fontWeight: 'bold' }}>就诊形式：</span>
+                  {([{ v: false, label: '🏥 当面诊疗' }, { v: true, label: '💻 远程问诊' }] as const).map(opt => (
+                    <button
+                      key={String(opt.v)}
+                      onClick={() => setApptIsRemote(opt.v)}
+                      style={{
+                        padding: '5px 14px', borderRadius: '16px', cursor: 'pointer', fontSize: '12px', fontFamily: 'serif',
+                        border: `1px solid ${apptIsRemote === opt.v ? '#8b4513' : '#d4c8a8'}`,
+                        background: apptIsRemote === opt.v ? '#8b4513' : '#fffaf0',
+                        color: apptIsRemote === opt.v ? '#fff' : '#8b4513'
+                      }}
+                    >{opt.label}</button>
+                  ))}
+                </div>
                 <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '8px' }}>
-                  <button onClick={() => { setShowApptForm(false); setApptDate(''); setApptTime(''); setApptReason('') }} style={{ padding: '6px 16px', borderRadius: '20px', border: '1px solid #999', background: 'transparent', color: '#666', cursor: 'pointer', fontSize: '12px' }}>取消</button>
+                  <button onClick={() => { setShowApptForm(false); setApptDate(''); setApptTime(''); setApptReason(''); setApptIsRemote(false) }} style={{ padding: '6px 16px', borderRadius: '20px', border: '1px solid #999', background: 'transparent', color: '#666', cursor: 'pointer', fontSize: '12px' }}>取消</button>
                   <button onClick={handleCreateAppointment} style={{ padding: '6px 20px', borderRadius: '20px', border: 'none', background: '#8b4513', color: '#fff', cursor: 'pointer', fontSize: '12px' }}>提交预约</button>
                 </div>
               </div>
