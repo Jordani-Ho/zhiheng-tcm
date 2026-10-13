@@ -1455,11 +1455,28 @@ export default function App() {
       ? '\n\n【学生上传的录音】\n' + pendingAudios.map((url, i) => `录音${i+1}：${url}`).join('\n') : ''
     const fullContent = structuredPreview + imagePart + audioPart
 
-    await fetch('/api/transcribe', {
+    // 【D-076 修复 · **核心闭环入口**】原实现**不带 lineage_id** 且**不检查响应**：
+    //   flag on 时后端 400 `lineage_required`，而界面照样清空输入、装作发送成功
+    //   → 学生以为发出去了，老师端什么也没有 -> 核心闭环断在第一步。
+    // 现改为：请求体走 `buildTranscribeBody`（强制带 lineage_id）+ 显式判定响应；
+    //   **失败时不清空输入**（学生的十问问答不能因为一次网络/契约问题被抹掉）。
+    const resp = await fetch('/api/transcribe', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ patient_name: selectedPatient, teacher_name: selectedTeacher, content: fullContent, data_type: 'text' })
+      body: JSON.stringify({
+        patient_name: selectedPatient,
+        teacher_name: selectedTeacher,
+        content: fullContent,
+        data_type: 'text',
+        lineage_id: currentLineageId || '',
+      })
     })
+    const body = await resp.json().catch(() => ({}))
+    const verdict = evaluateTranscribeResult(resp.status, body)
+    if (!verdict.ok) {
+      alert(`发送失败（${verdict.errorCode}）${verdict.message ? '：' + verdict.message : ''}\n你的回答已保留，可稍后重试。`)
+      return
+    }
 
     setInputText(''); setPendingImages([]); setPendingAudios([]); setStructuredPreview(null)
     fetchDrafts()

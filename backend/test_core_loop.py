@@ -204,6 +204,43 @@ def test_walk_in_visit_needs_no_appointment(client, lineage_on):
     assert n == 0, "非预约路径不得凭空产生预约记录"
 
 
+def test_student_send_reaches_teacher(client, lineage_on):
+    """**核心闭环入口守护（D-076）**：学生「确认发送」→ 老师端能看到草案。
+
+    这是内测目标的第一个环节（录音/AI整理 → 病历草案 → 老师签字）。
+    前端 `handleConfirmSend` 原先**不带 lineage_id** 且**不检查响应**
+    → flag on 时 400，而界面照样清空输入、装作发送成功 → 老师端什么都没有。
+
+    本用例从**学生侧解析 lineage** 出发（复现前端 `deriveCurrentLineageId` 的学生端规则：
+    在 `/api/student-lineages` 里找 `teacher_name == 当前老师 && status == 'active' && lineage_id` 非空），
+    再走转写，最后断言**老师端**能查到该草案。
+    """
+    lin = lineage_on
+    _setup_teacher_and_student(client)
+
+    # 学生侧：解析出「当前咨询老师」对应的活跃师门（前端 deriveCurrentLineageId 的学生端分支）
+    sl = client.get("/api/student-lineages", params={"student_name": STUDENT})
+    assert sl.status_code == 200, sl.text
+    rows = sl.json().get("student_lineages")
+    assert isinstance(rows, list), "形状应为 {student_lineages: [...]}（前端按此消费）"
+    mine = [r for r in rows
+            if r.get("teacher_name") == TEACHER and r.get("status") == "active" and r.get("lineage_id")]
+    assert mine, "学生刚加入的师门应可解析出 lineage_id"
+    student_lineage = mine[0]["lineage_id"]
+
+    # 学生发送
+    r = client.post("/api/transcribe", json={
+        "patient_name": STUDENT, "teacher_name": TEACHER,
+        "content": "学生自述：头痛三天", "data_type": "text",
+        "lineage_id": student_lineage})
+    assert r.status_code == 200, r.text
+
+    # 老师端能看到草案（这才是「送达」的定义）
+    drafts = database.get_drafts(teacher_name=TEACHER, lineage_id=lin)
+    assert len(drafts) == 1, "老师端应能看到学生刚发送的内容生成的草案"
+    assert drafts[0]["patient_name"] == STUDENT
+
+
 def test_walk_in_onsite_entry_requires_lineage_id(client, lineage_on):
     """**D-076 契约钉**：老师现场录入（非预约面诊兜底）的 `/api/transcribe` **必须带 lineage_id**。
 
