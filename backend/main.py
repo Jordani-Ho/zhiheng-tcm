@@ -478,7 +478,10 @@ def get_role_data(role: str, patient_name: str = "张三", teacher_name: str = "
     # flag off 时第三个参数被忽略，SQL 与响应逐字节不变。
     hw = database.get_homework(patient_name, teacher_name, lineage_id)
 
-    if role == "李老师":
+    # 【D-074 修复】原为 `if role == "李老师"`：角色名一旦换成别的老师（如「王医生」），
+    # 判定就落到下面的学生分支 -> **老师被当学生**。改为「非学生端即老师端」——
+    # 与前端 `appShared.roleIsTeacher()` 同一口径（学生端四个字面量是固定的）。
+    if role not in ("学生", "学生智能体", "患者", "患者智能体"):
         if not hw:
             return {"role_type": "teacher", "name": teacher_name, "task": "待审核", "detail": f"{patient_name}尚未打卡。"}
         if hw["status"] == "pending":
@@ -809,7 +812,8 @@ def sign_draft_endpoint(draft_id: int, input_data: SignInput):
     # 【第45天修改】签字前，先提取音频URL并删除物理文件（音频转文字已确认，即销毁）
     import re
     conn = database.get_connection()
-    draft = conn.execute("SELECT content FROM drafts WHERE id = ?", (draft_id,)).fetchone()
+    # 【D-074】多查一列 `teacher_name`：签字后要按**草案所属老师**扣分（原写死「李老师」）。
+    draft = conn.execute("SELECT content, teacher_name FROM drafts WHERE id = ?", (draft_id,)).fetchone()
     conn.close()
     if not draft:
         return {"error": "找不到该草案"}
@@ -828,7 +832,12 @@ def sign_draft_endpoint(draft_id: int, input_data: SignInput):
     patient_name = database.sign_draft(draft_id, input_data.final_plan, input_data.final_content)
     if not patient_name:
         return {"error": "找不到该病历"}
-    database.transfer_points(patient_name, "李老师", 50)
+    # 【D-074 修复】扣分对象必须是**草案所属的那位老师**，不得写死演示老师「李老师」。
+    # 实测（修复前）：新老师签字 -> 他自己的账户纹丝不动，而从未参与签字的「李老师」被扣 50。
+    # 这正是「去单例锁」在积分上的体现：谁签字扣谁。
+    # 注：`transfer_points` 用 UPDATE，账户不存在时静默不生效 —— 该「账户不存在」问题
+    # 由 D-075 单独处理（需发起人裁决新账户的初始分政策），本处只修「扣错人」。
+    database.transfer_points(patient_name, draft["teacher_name"], 50)
     return {"message": "签字成功，完整病历已归档，音频已销毁，积分已支付"}
 
 # ---------- 【第46天新增】病历标签 ----------
@@ -1024,10 +1033,12 @@ def cancel_appointment(appt_id: int):
     return database.update_appointment_status(appt_id, "cancelled")
 
 @app.get("/api/points")
-def get_points(patient_name: str = "张三"):
+def get_points(patient_name: str = "张三", teacher_name: str = "李老师"):
+    # 【D-074 修复】原 `get_points("李老师")` 写死：无论问哪位老师，teacher_points 恒返回
+    # 演示老师的分数。现按请求传入的老师名返回（默认值保持向后兼容）。
     return {
         "patient_points": database.get_points(patient_name),
-        "teacher_points": database.get_points("李老师")
+        "teacher_points": database.get_points(teacher_name)
     }
 # ============ Pydantic 模型：中药材库存 ============
 

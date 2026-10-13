@@ -959,7 +959,9 @@ export default function App() {
       }).catch(() => setPatientRecords([]))
   }
   const fetchPoints = () => {
-    fetch(`/api/points?patient_name=${selectedPatient}`).then(r => r.json()).then(d => setPoints(d)).catch(() => setPoints(null))
+    // 【D-074】必须带 teacher_name：后端原写死返回「李老师」的积分，修复后按传入老师返回；
+    // 若前端不传，则永远看不到当前老师的真实分数。
+    fetch(`/api/points?patient_name=${selectedPatient}&teacher_name=${encodeURIComponent(selectedTeacher)}`).then(r => r.json()).then(d => setPoints(d)).catch(() => setPoints(null))
   }
   // 【第66天新增】💰 财务管理：账户列表（顶部两个数字 + 充值/赠送/扣费表单的“学生姓名”下拉框都取自这里）
   const fetchFinanceAccounts = () => {
