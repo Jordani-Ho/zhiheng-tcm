@@ -101,9 +101,10 @@ npm run dev        # 开发；或 npm run build 出 dist
 
 | 项 | 值 |
 | :-- | :-- |
-| 后端全量 | **737 passed / 1 failed**（738 收集） |
+| 后端全量 | **757 passed / 1 failed**（758 收集；截至 D-081） |
 | 唯一失败 | `test_agent_stage.py::test_scan_response_has_no_stage_field_flag_off` —— **属 C 板块 P-301 在途工作**，已发回，与本仓当前 HEAD 的功能改动无关 |
-| **前端** | **`npm test` → 84 passed**（6 文件；D-065/D-067/D-069/D-071/D-072） |
+| **前端** | **`npm test` → 99 passed**（7 文件；D-065/D-067/D-069/D-071/D-072/D-076） |
+| **验收旅程（自动化）** | **`pytest backend/test_internal_test_journey.py` → 2 passed**（D-081：把本文件 §3.1 的验收表编码成自动化测试，覆盖四场景 + 核心闭环 + 两师隔离 + 缺 lineage_id 的 4xx 契约） |
 | 前端类型/构建 | `tsc -b` 退出码 0；`vite build` 成功 |
 
 **跑基线须在 DSH 沙箱外**（沙箱会拦截 pytest 临时目录 → 65 个假错误）。
