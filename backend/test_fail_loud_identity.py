@@ -141,3 +141,39 @@ def test_approve_with_real_identity_still_works(client, seeded):
     r = client.post("/api/approve", params={"patient_name": STUDENT, "teacher_name": TEACHER})
     assert r.status_code == 200, r.text
     assert _homework_status() == "approved"
+
+
+# ---------------------------------------------------------------------------
+# /api/upload（图片入库）：空身份会把记录挂到无关的人名下
+# ---------------------------------------------------------------------------
+def _upload(client, patient, teacher, lineage_id=None):
+    params = {"patient_name": patient, "teacher_name": teacher}
+    if lineage_id is not None:
+        params["lineage_id"] = lineage_id
+    return client.post(
+        "/api/upload",
+        params=params,
+        files={"file": ("t.jpg", b"\xff\xd8\xff\xe0fake-jpeg", "image/jpeg")},
+    )
+
+
+def test_upload_with_empty_identity_fails_loud(client, seeded):
+    """空身份上传图片 -> 4xx（否则这条图片记录会挂到无关的人名下）。"""
+    r = _upload(client, "", "")
+    assert r.status_code >= 400, "空身份不得把图片记录挂到默认演示数据上"
+
+
+def test_upload_with_empty_patient_only_fails_loud(client, seeded):
+    r = _upload(client, "", TEACHER)
+    assert r.status_code >= 400
+
+
+def test_upload_with_real_identity_succeeds(client, seeded):
+    """正路：真实身份 + 合法 lineage_id 上传应成功（保住既有能力）。
+
+    注：`/api/upload` 内部走 `get_transcriptions(..., lineage_id)`，flag on 时同样
+    要求非空合法 `lineage_id`（与 `/api/transcribe` 同一契约）。本用例一并钉住。
+    """
+    lin = database._derived_lineage_id(TEACHER)
+    r = _upload(client, STUDENT, TEACHER, lineage_id=lin)
+    assert r.status_code == 200, r.text

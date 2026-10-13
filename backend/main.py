@@ -745,6 +745,11 @@ def transcribe(input_data: TranscriptionInput):
 @app.post("/api/upload")
 async def upload_image(patient_name: str = "张三", teacher_name: str = "李老师",
                        lineage_id: str = None, file: UploadFile = File(...)):
+    # 【D-079 扩展】本端点是**图片入库**：空身份会让 `insert_transcription` 把这条
+    # 图片记录挂到无关的人名下（`UPDATE`/`INSERT` 都不会报错）。故同样 fail-loud。
+    # 注：签名里的演示默认值「张三 / 李老师」保留（本端点当前前端未调用，见下），
+    #     但**空串**必须拦 —— 那正是身份未解析时前端会传的形态。
+    _require_identity(patient_name, teacher_name)
     ext = os.path.splitext(file.filename)[1] if file.filename else ".jpg"
     unique_name = f"{uuid.uuid4().hex}{ext}"
     file_path = os.path.join(UPLOAD_DIR, unique_name)
