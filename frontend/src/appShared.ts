@@ -13,7 +13,9 @@ export interface Draft { id: number; transcript_id: number; patient_name: string
 export interface Patient { name: string; teacher_name: string; guardian_name: string; relation: string; }
 export interface PatientRecord { id: number; patient_name: string; ai_draft: string; final_plan: string; doctor: string; }
 export interface PatientProfile { patient_name: string; gender: string; birth_date: string; birth_time: string; birth_place: string; location: string; bazi?: string; wuxing?: string; }
-export interface Teacher { name: string; description: string; }
+// 【D-069 修正】`description` 改为可选：后端 `GET /api/teachers` 在未填简介时**不返回该字段**
+// （实测返回 `{"name":"李医生"}`），原定义 `description: string` 比真实契约更严 → 类型不实。
+export interface Teacher { name: string; description?: string; }
 // 【第62天调整】老师端页签：首页 / 诊室 / 管理（原「学生」+「库存」合并） / 设置
 export type TeacherTab = 'home' | 'clinic' | 'manage' | 'settings' | 'seal'
 

@@ -9,6 +9,8 @@ import AgentStagePanel from './AgentStagePanel'
 import TeacherOnboarding from './TeacherOnboarding'
 // 【D-067 / 内测补缺入口】学习闭环卡：A 板块后端已闭环但前端零消费
 import LearningPanel from './LearningPanel'
+// 【D-069】身份引导：决定「当前是谁」的运行时逻辑，抽成可测模块（11 条 vitest 覆盖）
+import { bootstrapIdentity } from './identityBootstrap'
 // 【D-058 前端拆分第一步】共享常量 / 类型 / 纯函数已外移到 `appShared.ts`。
 // 这里用 `import` 引入（**不是**再导出）—— 已核实全仓无人从 App.tsx 导入符号，
 // 故 App.tsx 只需「能用到这些名字」即可。本次**只做外移，不改任何引用点**，
@@ -658,45 +660,32 @@ export default function App() {
   }
 
   // ============== 初始化 ==============
-  // 【D-059 身份引导】原先本 effect 写死 `fetchPatients('张三')`、
-  // `/api/patient-profile?patient_name=张三`，且 `selectedTeacher` 初值写死 `'李老师'`
-  // → 站点只能给「李老师 / 张三」这一组人用（多用户内测不成立）。
+  // 【D-059 身份引导 / D-069 抽成可测模块】
+  // 原先本 effect 写死 `fetchPatients('张三')`、`/api/patient-profile?patient_name=张三`，
+  // 且 `selectedTeacher` 初值写死 `'李老师'` → 站点只能给「李老师 / 张三」这一组人用。
   //
-  // 现改为**数据驱动引导**：老师优先取「学生已归属的老师」，否则取老师列表第一个；
-  // 学生取该老师名下第一个。取不到就保持空串，由后续 effect 兜底。
+  // 身份解析（老师来源优先学生归属、退回老师列表；学生取该老师名下第一个）已抽到
+  // `identityBootstrap.ts` —— 它是「决定我是谁」的运行时逻辑，**此前零测试覆盖**；
+  // 抽成纯函数后可用 vitest 覆盖（11 条），并顺带减小 App() 体积。
   useEffect(() => {
     fetch('/api/huangli').then(r => r.json()).then(d => setHuangli(d)).catch(() => setHuangli(null))
     const urlParams = new URLSearchParams(window.location.search)
     const inviteCode = urlParams.get('invite')
     if (inviteCode) setPendingInviteCode(inviteCode)
 
-    // 老师：先问「当前学生归属哪些老师」（学生端最准），再退回老师列表
-    fetch(`/api/patient-teachers?patient_name=${selectedPatient}`)
-      .then(r => r.json())
-      .then((list: string[]) => (Array.isArray(list) && list.length > 0 ? list : Promise.reject(new Error('none'))))
-      .catch(() => fetch('/api/teachers').then(r => r.json()))
-      .then((list: any) => {
-        const names: string[] = Array.isArray(list) ? list.map((x: any) => (typeof x === 'string' ? x : x.name)) : []
-        setTeachers(Array.isArray(list) && list.length && typeof list[0] !== 'string' ? list : [])
-        const tid = selectedTeacher || names[0] || ''
-        if (tid) {
-          setSelectedTeacher(tid)
-          // 学生：取该老师名下第一个；取不到就保持现状
-          fetch(`/api/teacher-patients?teacher_name=${encodeURIComponent(tid)}`)
-            .then(r => (r.ok ? r.json() : []))
-            .then((ps: any[]) => {
-              const first = Array.isArray(ps) && ps.length ? ps[0].name : ''
-              if (first && !selectedPatient) setSelectedPatient(first)
-            })
-            .catch(() => {})
-        }
+    let alive = true
+    bootstrapIdentity(selectedTeacher, selectedPatient)
+      .then(r => {
+        if (!alive) return
+        if (r.teachers.length > 0) setTeachers(r.teachers)
+        if (r.teacherName && r.teacherName !== selectedTeacher) setSelectedTeacher(r.teacherName)
+        if (r.patientName && r.patientName !== selectedPatient) setSelectedPatient(r.patientName)
       })
-      .catch(() => {})
+      .catch(() => { /* bootstrapIdentity 自身已保证不抛；这里只是双保险 */ })
 
-    // 监护人档案**不在此处拉取**：本 effect 只在 mount 跑一次，而 `selectedPatient`
-    // 由上面那段异步引导填上（mount 时还是空串）→ 放这里会导致档案永不拉取。
-    // 已改为下方依赖 `selectedPatient` 的独立 effect。
-    // 仅在首帧跑一次；后续随 selectedPatient / selectedTeacher 的既有 effect 走
+    return () => { alive = false }
+    // 监护人档案不在此处拉取（本 effect 只跑一次，而 selectedPatient 是异步填上的）
+    // 已由下方依赖 selectedPatient 的独立 effect 负责。
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
