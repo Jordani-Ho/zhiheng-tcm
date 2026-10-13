@@ -46,6 +46,7 @@ import {
   clearIntakeSession,
   formatAgentTime,
   roleIsTeacher,
+  buildRoleOptions,
   summarizeComplaint,
   LINEAGE_ALL_VIEW,
   loadLineageView,
@@ -4708,11 +4709,8 @@ export default function App() {
           <div style={{ display: 'flex', flexWrap: 'wrap', justifyContent: 'center' }}>
             {/* 【D-059】角色选项**按实际选中的老师**构造，不再写死「李老师」——
                 原写死导致切换身份只能切到「李老师」，多老师内测不成立。
-                老师未选出时退化为学生端两条，避免出现「·智能体」这种空名角色。 */}
-            {(selectedTeacher
-              ? [`${selectedTeacher}`, `${selectedTeacher}智能体`, '学生', '学生智能体']
-              : ['学生', '学生智能体']
-            ).map((role) => (
+                规则抽到 appShared.buildRoleOptions（可单测；未选老师时不产出空名角色）。 */}
+            {buildRoleOptions(selectedTeacher).map((role) => (
               <button key={role} style={roleBtnStyle(role)} onClick={() => setCurrentRole(role)}>{role}</button>
             ))}
           </div>

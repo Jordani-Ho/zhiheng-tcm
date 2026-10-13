@@ -44,6 +44,20 @@ export function roleIsTeacher(role: string): boolean {
 /** UI 的四条角色选项，按「老师 / 学生 × 真人 / 智能体」分组。 */
 export const ROLE_OPTIONS = ['李老师', '李老师智能体', '学生', '学生智能体'] as const
 
+/**
+ * 【D-059 / D-062 回归守护】构造角色切换按钮的选项列表。
+ *
+ * 旧写法把四条角色**写死**为 `['李老师', '李老师智能体', '学生', '学生智能体']`
+ * → 换个老师进来，切换器只能切到「李老师」，多老师内测不成立。
+ *
+ * 规则：有选中老师 → 老师两条（用**该老师的名字**）+ 学生两条；
+ *       未选老师 → 只给学生两条，**不产出「·智能体」这种空名角色**。
+ */
+export function buildRoleOptions(teacherName: string): string[] {
+  const t = (teacherName || '').trim()
+  return t ? [t, `${t}智能体`, '学生', '学生智能体'] : ['学生', '学生智能体']
+}
+
 export const boxStyle: React.CSSProperties = { background: '#fdfcf0', border: '1px solid #d4c8a8', borderRadius: '12px', padding: '24px', marginBottom: '20px', boxShadow: '0 4px 12px rgba(0,0,0,0.06)' }
 export const inputStyle: React.CSSProperties = { width: '100%', padding: '8px', borderRadius: '6px', border: '1px solid #d4c8a8', fontFamily: 'serif', marginBottom: '8px', boxSizing: 'border-box' }
 export const dateSelectStyle: React.CSSProperties = { padding: '8px', borderRadius: '6px', border: '1px solid #d4c8a8', fontFamily: 'serif', marginRight: '6px', marginBottom: '8px' }

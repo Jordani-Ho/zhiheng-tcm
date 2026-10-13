@@ -3,6 +3,7 @@ import {
   roleIsStudent,
   roleIsTeacher,
   ROLE_OPTIONS,
+  buildRoleOptions,
   formatAgentTime,
   summarizeComplaint,
   COMPLAINT_SUMMARY_LIMIT,
@@ -51,6 +52,30 @@ describe('角色判定（D-059 核心判据）', () => {
     const roles = [...ROLE_OPTIONS, '王医生', '王医生智能体', '某某', '某某智能体']
     for (const r of roles) {
       expect(roleIsStudent(r) !== roleIsTeacher(r)).toBe(true)
+    }
+  })
+})
+
+describe('buildRoleOptions（角色切换按钮选项）', () => {
+  it('有选中老师 -> 老师两条（**用该老师的名字**）+ 学生两条', () => {
+    expect(buildRoleOptions('王医生')).toEqual(['王医生', '王医生智能体', '学生', '学生智能体'])
+  })
+
+  it('姓名自动 trim', () => {
+    expect(buildRoleOptions('  王医生 ') [0]).toBe('王医生')
+  })
+
+  it('未选老师 -> 只给学生两条，**不产出「·智能体」空名角色**', () => {
+    expect(buildRoleOptions('')).toEqual(['学生', '学生智能体'])
+    expect(buildRoleOptions('   ')).toEqual(['学生', '学生智能体'])
+    expect(buildRoleOptions(null as unknown as string)).toEqual(['学生', '学生智能体'])
+  })
+
+  it('**回归守护**：不再写死「李老师」——任意老师名都进选项', () => {
+    for (const name of ['王医生', '张老师', 'Dr.Li']) {
+      const opts = buildRoleOptions(name)
+      expect(opts[0]).toBe(name)
+      expect(opts).not.toContain('李老师')
     }
   })
 })
