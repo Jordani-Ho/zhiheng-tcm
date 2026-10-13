@@ -83,6 +83,7 @@ npm run dev        # 开发；或 npm run build 出 dist
 | 4 | **预约远程** | 同上但选「💻 远程问诊」 | 落库 `is_remote=1` |
 | 5 | **非预约面诊** | 直接转写（不经预约）→ 生成草案 → 签字 | 病历 + 随访生成；**不得凭空产生预约记录** |
 | 6 | **核心闭环** | 学生录音/上传 → 老师改草案 → 签字 | 学生端见病历与随访 |
+| 7 | **切换老师不串台**（D-070） | 以老师 A 打开诊室/管理（让列表有数据）→ 点老师选择器切到老师 B | **B 的页面不得短暂显示 A 的草案/病历/预约/待办**；应立刻清空再加载 B 的数据 |
 
 ### 3.2 已知限制（内测期接受）
 
@@ -102,7 +103,7 @@ npm run dev        # 开发；或 npm run build 出 dist
 | :-- | :-- |
 | 后端全量 | **737 passed / 1 failed**（738 收集） |
 | 唯一失败 | `test_agent_stage.py::test_scan_response_has_no_stage_field_flag_off` —— **属 C 板块 P-301 在途工作**，已发回，与本仓当前 HEAD 的功能改动无关 |
-| **前端** | **`npm test` → 40 passed**（3 文件；D-065/D-067） |
+| **前端** | **`npm test` → 51 passed**（4 文件；D-065/D-067/D-069） |
 | 前端类型/构建 | `tsc -b` 退出码 0；`vite build` 成功 |
 
 **跑基线须在 DSH 沙箱外**（沙箱会拦截 pytest 临时目录 → 65 个假错误）。
@@ -120,6 +121,7 @@ npm run test:watch # 开发时监听
 | `src/appShared.test.ts` | 23 | 角色判定（含「任意姓名」回归）/ 角色选项构造 / 时间格式化 / 摘要折叠 / 问答会话三条拒绝规则 + 过期边界 / localStorage 隔离 |
 | `src/TeacherOnboarding.test.tsx` | 9 | 真实挂载到 jsdom：按实际数据渲染（反向断言无硬编码「李老师」）/ 空列表与失败不炸 / 入社区请求体契约 / 空姓名不发请求 / 回调与当前身份标记 / console.error 零调用 |
 | `src/LearningPanel.test.tsx` | 8 | flag off 整卡不渲染 / 空 teacherName 不发请求 / 链节与链状态渲染 / 双因子 URL 编码 / 空链文案 / **链断 409 是数据事实**不当故障 / 500 不白屏 / console.error 零调用 |
+| `src/identityBootstrap.test.ts` | 11 | 身份解析全部分支：学生归属优先 / 兜底老师列表 / 沿用已选老师与学生 / 空列表 / 请求失败 / JSON 坏 / fetch 抛异常 —— **一律不抛错**（首屏不白屏）；URL 编码；兼容两种返回形态 |
 
 **纪律（D-066）**：全部用例用 **fetch 桩、不联网**；组件测试用 `react-dom/client` + `act`（未引 `@testing-library/react`）；`IS_REACT_ACT_ENVIRONMENT` 必须为 true（React 19 要求，已在 `src/test-setup.ts` 设置）。
 
