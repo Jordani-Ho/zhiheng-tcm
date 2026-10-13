@@ -3094,10 +3094,15 @@ def get_seal_events(subject_type, subject_name, limit=None):
     return [dict(r) for r in rows]
 
 # ---------- referral_chain（C 板块 0008） ----------
+# 【P-102 / C1 清理 / D-089】白名单已收窄：
+#   · 原 `REFERRAL_REFERRER_TYPES = ("TEACHER", "STUDENT")`   -> 只留 "TEACHER"
+#   · 原 `REFERRAL_REFEREE_TYPES = ("TEACHER", "STUDENT", "DEPENDENT")` -> 只留 "TEACHER"
+#   · 原 `REFERRAL_ANNUAL_QUOTA = 3` -> **已删**（年度额度与宪法 §4.1.1
+#     「引荐不是『审核资格』，是『我愿意为他背书』」冲突：额度是一种审核）
+# 学生引荐亲友（§3.3）已整体删除，故 STUDENT / DEPENDENT 不再合法。
 REFERRAL_CHAIN_TABLE = "referral_chain"
-REFERRAL_REFERRER_TYPES = ("TEACHER", "STUDENT")
-REFERRAL_REFEREE_TYPES = ("TEACHER", "STUDENT", "DEPENDENT")
-REFERRAL_ANNUAL_QUOTA = 3
+REFERRAL_REFERRER_TYPES = ("TEACHER",)
+REFERRAL_REFEREE_TYPES = ("TEACHER",)
 
 
 def insert_referral_chain(referrer_id, referrer_type, referee_id, referee_type,
@@ -3107,9 +3112,9 @@ def insert_referral_chain(referrer_id, referrer_type, referee_id, referee_type,
     形制照 insert_seal_event：入参先过白名单 / 非空校验（不合法 → ValueError），
     再 try/finally 关连接。
 
-    【C 板块 0008 硬口径】（docs/phase3-governance-design.md §3.1 / §3.2 / §3.3）
-      · referrer_type ∈ {'TEACHER', 'STUDENT'}；
-      · referee_type ∈ {'TEACHER', 'STUDENT', 'DEPENDENT'}；
+    【C 板块 0008 硬口径】（**P-102 后已收窄，见下**）
+      · referrer_type ∈ {'TEACHER'}；            ← 原为 {'TEACHER','STUDENT'}
+      · referee_type ∈ {'TEACHER'}；             ← 原为 {'TEACHER','STUDENT','DEPENDENT'}
       · referrer_id / referee_id 非空；
       · referrer_id != referee_id（不得自引荐，§3.2）；
       · referrer_type='TEACHER' 时 referral_reason 必填（§3.2）；
@@ -3117,15 +3122,19 @@ def insert_referral_chain(referrer_id, referrer_type, referee_id, referee_type,
       · chain_ready / chain_hash 本步不写（建表默认 FALSE / NULL），填充归阶段四；
       · 本区段永不提供 update / delete —— 「只增」由代码层强制
         （撤回走 revoke_referral，不删行）。
+
+    【P-102 / D-089 变更】学生引荐亲友（§3.3）已整体删除，故 STUDENT / DEPENDENT
+    不再合法。删除理由：白皮书 v2.1 §4.1.1「引荐不是『审核资格』，是『我愿意为他背书』」
+    —— 而原学生引荐带「年度额度 3 位」配额闸，**额度即审核**，与宪法冲突。
     """
     if referrer_type not in REFERRAL_REFERRER_TYPES:
         raise ValueError(
-            "insert_referral_chain 的 referrer_type 必须是 TEACHER 或 STUDENT，实得：%r"
+            "insert_referral_chain 的 referrer_type 必须是 TEACHER（P-102 后仅老师可引荐），实得：%r"
             % (referrer_type,)
         )
     if referee_type not in REFERRAL_REFEREE_TYPES:
         raise ValueError(
-            "insert_referral_chain 的 referee_type 必须是 TEACHER / STUDENT / DEPENDENT，实得：%r"
+            "insert_referral_chain 的 referee_type 必须是 TEACHER（P-102 后仅老师可被引荐），实得：%r"
             % (referee_type,)
         )
     if not referrer_id:
@@ -3246,24 +3255,10 @@ def get_referrals_by_lineage(lineage_id, limit=None):
     return [dict(r) for r in rows]
 
 
-def count_referrals_by_referrer_in_year(referrer_id, year):
-    """某引荐人在某自然年内的引荐总数（用于年度额度校验，§3.3）。
-
-    入参 year 为 int（如 2026）；口径 = created_at 前 4 字符匹配年份。
-    """
-    if not referrer_id:
-        return 0
-    year_prefix = "%04d" % int(year)
-    conn = get_connection()
-    try:
-        row = conn.execute(
-            "SELECT COUNT(*) AS c FROM " + REFERRAL_CHAIN_TABLE
-            + " WHERE referrer_id = ? AND substr(created_at, 1, 4) = ?",
-            (referrer_id, year_prefix),
-        ).fetchone()
-    finally:
-        conn.close()
-    return row["c"] if row else 0
+# 【P-102 / D-089】`count_referrals_by_referrer_in_year` **已删**。
+# 它唯一用途是「学生引荐亲友」的年度额度校验（§3.3）；该路径整体删除后成为死代码。
+# 核实依据：全仓检索该符号，**除定义处外零引用**（调用方仅 referral_service 的
+# create_student_referral 与 get_annual_referral_count，两者均已删除，且后者本身也零调用方）。
 
 
 def revoke_referral(referral_id, revoke_reason=None):

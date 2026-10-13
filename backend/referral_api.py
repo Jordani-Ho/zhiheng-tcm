@@ -1,11 +1,12 @@
-"""C 板塊「引薦鏈」API：老師引薦 / 學生引薦 / 查詢 / 撤回（前綴 `/api/referral`）。
+"""C 板塊「引薦鏈」API：老師引薦 / 查詢 / 撤回（前綴 `/api/referral`）。
 
 對齊：docs/phase3-governance-design.md §9.1
   · POST /api/referral/teacher            老師引薦老師
-  · POST /api/referral/student            學生引薦親友
   · GET  /api/referral/chain/{agent_id}   雙向引薦鏈查詢
   · GET  /api/referral/{referral_id}      單條查詢
   · POST /api/referral/{referral_id}/revoke  撤回背書
+
+【P-102 / D-089】原「POST /api/referral/student 學生引薦親友」**已刪除**（越權面 + 憲法衝突）。
 
 落地分工（照 seal_api 同款）：
   · 本文件只做四件事 —— 門衛 → 入參校驗 → 調用 referral_service → 統一錯誤體；
@@ -43,7 +44,8 @@ _REFERRAL_ERROR_STATUS = {
 
 _ENABLED_VALUES = ("on", "1", "true", "yes")
 
-_REFEREE_TYPES = ("STUDENT", "DEPENDENT")
+# 【P-102 / D-089】原 `_REFEREE_TYPES = ("STUDENT", "DEPENDENT")` 已删
+# —— 它只服务已删除的学生引荐端点，删除后成为死代码。
 
 
 def _fail(status_code, code, msg):
@@ -75,12 +77,7 @@ class TeacherReferralInput(BaseModel):
     lineage_id: str = ""
 
 
-class StudentReferralInput(BaseModel):
-    """`POST /student`：學生引薦親友（referee_type 默認 STUDENT）。"""
-    referrer_id: str = ""
-    referee_id: str = ""
-    referee_type: str = "STUDENT"
-    lineage_id: str = ""
+# 【P-102 / D-089】原 `StudentReferralInput` 已删 —— 它只服务已删除的学生引荐端点。
 
 
 class RevokeInput(BaseModel):
@@ -113,30 +110,15 @@ def create_teacher_referral(data: TeacherReferralInput):
     return {"referral_id": referral_id}
 
 
-@router.post("/student")
-def create_student_referral(data: StudentReferralInput):
-    """學生引薦親友 → 返回新 referral_id。"""
-    import referral_service
-    _guard()
-    if not data.referrer_id:
-        _fail_code("referrer_required", "referrer_id required")
-    if not data.referee_id:
-        _fail_code("referee_required", "referee_id required")
-    if data.referee_type not in _REFEREE_TYPES:
-        _fail_code("referee_type_invalid", "referee_type must be STUDENT or DEPENDENT")
-    try:
-        referral_id = referral_service.create_student_referral(
-            referrer_id=data.referrer_id,
-            referee_id=data.referee_id,
-            referee_type=data.referee_type,
-            lineage_id=data.lineage_id or None,
-        )
-    except ValueError as exc:
-        msg = str(exc)
-        if "額度" in msg or "额度" in msg or "quota" in msg.lower():
-            _fail_code("quota_exceeded", msg)
-        _fail_code("referral_invalid", msg)
-    return {"referral_id": referral_id}
+# 【P-102 / C1 清理 / D-089】`POST /api/referral/student`（學生引薦親友）**已整體刪除**。
+# 理由：
+#   ① 白皮書 v2.1 §4.1.1（L990）逐字「引薦**不是**『審核資格』，是『我願意為他背書』」
+#      —— 該端點帶「年度額度 3 位」配額閘，**額度即審核**，與憲法衝突；
+#   ② §4.3.1 L1053 只說「單向、一次性」，是逐次語義，**不是年度配額**；
+#   ③ 越權面：學生可調用它憑空建立引薦記錄。
+# 一併刪除：`StudentReferralInput` 模型 與 `_REFEREE_TYPES` 常量。
+# 遷移 `0009` 負責清理歷史數據。**本端點不得重新引入。**
+# 遷移 `0009` 負責清理歷史數據。**本端點不得重新引入。**
 
 
 @router.get("/chain/{agent_id}")

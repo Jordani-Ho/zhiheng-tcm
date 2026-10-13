@@ -89,43 +89,22 @@ def test_teacher_referral_missing_reason_fails(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# 学生引荐亲友
 # ---------------------------------------------------------------------------
-def test_student_referral_success(tmp_path, monkeypatch):
-    client = _setup_client(tmp_path, monkeypatch, enabled=True)
-    resp = client.post("/api/referral/student", json={
-        "referrer_id": "S-001", "referee_id": "S-002", "referee_type": "STUDENT"})
-    assert resp.status_code == 200
-    assert resp.json()["referral_id"].startswith("ref-")
-
-
-def test_student_referral_dependent_ok(tmp_path, monkeypatch):
-    client = _setup_client(tmp_path, monkeypatch, enabled=True)
-    resp = client.post("/api/referral/student", json={
-        "referrer_id": "S-001", "referee_id": "C-001", "referee_type": "DEPENDENT"})
-    assert resp.status_code == 200
-
-
-def test_student_referral_invalid_type_fails(tmp_path, monkeypatch):
-    client = _setup_client(tmp_path, monkeypatch, enabled=True)
-    resp = client.post("/api/referral/student", json={
-        "referrer_id": "S-001", "referee_id": "X-001", "referee_type": "TEACHER"})
-    assert resp.status_code == 400
-    assert resp.json()["detail"]["error"] == "referee_type_invalid"
-
-
-def test_student_referral_quota_exceeded(tmp_path, monkeypatch):
-    """一年内第 4 次引荐 → 额度超限。"""
-    client = _setup_client(tmp_path, monkeypatch, enabled=True)
-    for i in range(3):
-        resp = client.post("/api/referral/student", json={
-            "referrer_id": "S-001", "referee_id": "S-%03d" % (i + 2),
-            "referee_type": "STUDENT"})
-        assert resp.status_code == 200
-    resp = client.post("/api/referral/student", json={
-        "referrer_id": "S-001", "referee_id": "S-099", "referee_type": "STUDENT"})
-    assert resp.status_code == 400
-    assert resp.json()["detail"]["error"] == "quota_exceeded"
+# 【P-102 / D-089】学生引荐亲友：**原 4 条测试已删**
+# ---------------------------------------------------------------------------
+# 删除的 4 条：test_student_referral_success / _dependent_ok / _invalid_type_fails /
+#              _quota_exceeded。
+#
+# 为什么删而不是改：它们验的是「学生引荐能用」——与清理方向**相反**。
+# 端点已下线（学生引荐与宪法 §4.1.1「引荐不是审核资格」冲突，且是越权面）。
+#
+# **但没有留下空洞**：`backend/test_referral_c1_cleanup.py` 新增了 10 条**反向守护**
+#   —— 钉住「端点必须不存在」「白名单不得含 STUDENT/DEPENDENT」「额度常量与函数已删」，
+#      并确认**老师引荐老师照常工作**。否则将来有人把这段代码加回来，没有任何用例会响。
+#
+# 另注：其中 `test_student_referral_quota_exceeded` 依赖的 `quota_exceeded` 错误码
+# 也随之失效；`referral_api._REFERRAL_ERROR_STATUS` 里若仍留有该码，属可容忍的
+# 存量（不产生活动路径），本次不动它以免扩大改动面。
 
 
 # ---------------------------------------------------------------------------

@@ -3,9 +3,10 @@
 对齐：docs/phase3-governance-design.md §3（引荐链）
   §3.1  数据模型（12 列，0008 迁移落盘）
   §3.2  老师引荐老师：referral_reason 必填，不得自引荐
-  §3.3  学生引荐亲友：额度 3 位/年，可自理 / 不能自理两分支
+  §3.3  学生引荐亲友：**已整体删除**（P-102 / C1 清理，见下方删除说明）
   §3.4  引荐人信誉降级：不连坐，只降级
   §3.5  上链预留：chain_ready / chain_hash（本步不写）
+  【现仅存】§3.2 老师引荐老师 —— 引荐人只可能是老师、被引荐人也只可能是老师。
 
 CTO 2026-10-02 施工裁决（本文件的依据）：
   · 本步 = 服务层骨架：create_teacher_referral / create_student_referral /
@@ -26,10 +27,11 @@ from datetime import datetime
 def _db():
     """延迟取 database 模块：SQL / 连接 / row_factory 全在 database.py 单点持有。
 
-    本模块只允许碰 database 的 7 个 referral 原语（C 板块 0008 落盘）：
+    本模块只允许碰 database 的 referral 原语（C 板块 0008 落盘；**P-102 后为 6 个**）：
       insert_referral_chain / get_referral / get_referrals_by_referrer /
-      get_referrals_by_referee / get_referrals_by_lineage /
-      count_referrals_by_referrer_in_year / revoke_referral。
+      get_referrals_by_referee / get_referrals_by_lineage / revoke_referral。
+      （原有第 7 个 `count_referrals_by_referrer_in_year` 随「年度额度」一起删除了——
+        额度与宪法 §4.1.1「引荐不是审核资格」冲突，见本文件 §学生引荐亲友 的删除说明。）
     """
     import database
     return database
@@ -61,49 +63,17 @@ def create_teacher_referral(referrer_id, referee_id, referral_reason,
 
 
 # ---------------------------------------------------------------------------
-# 学生引荐亲友（§3.3）
+# 【P-102 / C1 清理 / D-089】学生引荐亲友（§3.3）**已整体删除**
 # ---------------------------------------------------------------------------
-def create_student_referral(referrer_id, referee_id, referee_type="STUDENT",
-                            lineage_id=None, created_at=None, year=None):
-    """学生引荐亲友 → 新 referral_id。
-
-    业务规则（本函数负责）：
-      · referee_type ∈ {STUDENT, DEPENDENT}（学生不能引荐老师）；
-      · 额度：同一年内，同一 referrer_id 最多 3 条；
-      · 可自理者 → referee_type="STUDENT"；
-        不能自理者/未成年人 → referee_type="DEPENDENT"。
-
-    year：年份参数（默认当年）；用于测试注入。
-    """
-    if referee_type not in ("STUDENT", "DEPENDENT"):
-        raise ValueError(
-            "create_student_referral 的 referee_type 必须是 STUDENT 或 DEPENDENT，实得：%r"
-            % (referee_type,)
-        )
-    if not referrer_id:
-        raise ValueError("create_student_referral 必须给 referrer_id")
-    if not referee_id:
-        raise ValueError("create_student_referral 必须给 referee_id")
-
-    db = _db()
-    quota = db.REFERRAL_ANNUAL_QUOTA
-    target_year = int(year) if year is not None else datetime.now().year
-    used = db.count_referrals_by_referrer_in_year(referrer_id, target_year)
-    if used >= quota:
-        raise ValueError(
-            "create_student_referral：引荐人 %r 在 %d 年的引荐额度已满（%d/%d）"
-            % (referrer_id, target_year, used, quota)
-        )
-
-    return db.insert_referral_chain(
-        referrer_id=referrer_id,
-        referrer_type="STUDENT",
-        referee_id=referee_id,
-        referee_type=referee_type,
-        lineage_id=lineage_id,
-        referral_reason=None,
-        created_at=created_at,
-    )
+# 删除理由（三重）：
+#   ① **宪法冲突**：白皮书 v2.1 §4.1.1（L990）逐字「引荐**不是**『审核资格』，是
+#      『我愿意为他背书』」——而本条带「年度额度 3 位」的配额闸，**额度就是一种审核**。
+#   ② **白皮书未定义额度**：§4.3.1 L1053 只说「单向、一次性」，是逐次语义，不是年度配额。
+#   ③ **越权面**：`POST /api/referral/student` 可被学生调用凭空建引荐记录。
+# 一并删除：`create_student_referral` / `REFERRAL_ANNUAL_QUOTA` /
+#           `count_referrals_by_referrer_in_year` / `get_annual_referral_count`
+#           （后两者只服务额度校验，实测**全仓零调用方**）。
+# 迁移 `0009` 负责清理白名单与历史数据。**本区段不得重新引入。**
 
 
 # ---------------------------------------------------------------------------
@@ -143,7 +113,7 @@ def list_referrals_by_lineage(lineage_id, limit=None):
     return _db().get_referrals_by_lineage(lineage_id, limit)
 
 
-def get_annual_referral_count(referrer_id, year=None):
-    """某引荐人在某年的引荐总数（默认当年）。用于额度查看。"""
-    target_year = int(year) if year is not None else datetime.now().year
-    return _db().count_referrals_by_referrer_in_year(referrer_id, target_year)
+# 【P-102 / D-089】`get_annual_referral_count`（原 L146-149）**已删**：
+# 它只封装 `database.count_referrals_by_referrer_in_year`（额度计数），
+# 而额度校验随学生引荐一起删除 → 该函数成为死代码。
+# 核实依据：全仓检索该符号，**除定义处外零引用**（无调用方、无测试）。
