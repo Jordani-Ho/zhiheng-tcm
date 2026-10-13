@@ -11,6 +11,13 @@ import TeacherOnboarding from './TeacherOnboarding'
 import LearningPanel from './LearningPanel'
 // 【D-069】身份引导：决定「当前是谁」的运行时逻辑，抽成可测模块（11 条 vitest 覆盖）
 import { bootstrapIdentity } from './identityBootstrap'
+// 【D-071】面诊前准备（十问歌）纯逻辑：问答串契约 / 轮数上限兜底 / 会话持久化条件 / 起始计划
+import {
+  mergeIntakeQA,
+  decideIntakeRoundOutcome,
+  buildIntakeSessionPersist,
+  planIntakeStart,
+} from './intakeFlow'
 // 【D-058 前端拆分第一步】共享常量 / 类型 / 纯函数已外移到 `appShared.ts`。
 // 这里用 `import` 引入（**不是**再导出）—— 已核实全仓无人从 App.tsx 导入符号，
 // 故 App.tsx 只需「能用到这些名字」即可。本次**只做外移，不改任何引用点**，
@@ -43,8 +50,6 @@ import {
   IMAGE_ORIGIN,
   MEMO_DONE_STORE_KEY,
   REMOTE_APPT_KEYWORDS,
-  INTAKE_QA_SEP,
-  MAX_INTAKE_ROUNDS,
   loadIntakeSession,
   saveIntakeSession,
   clearIntakeSession,
@@ -1493,13 +1498,16 @@ export default function App() {
         if (!d || d.done || !next) {
           setIntakeQuestion(''); setIntakeDone(true)
           // 【第83天新增】已问全：会话仍保留（currentQuestion 为空）→ 下次进来自动回到「发送确认」，可以补发
-          if (answers.trim()) saveIntakeSession(selectedPatient, teacherName, { currentQuestion: '', answers, questionIndex: answeredRounds, updatedAt: new Date().toISOString() })
+          // 【D-071】持久化条件抽到 `buildIntakeSessionPersist`（已答内容为空则不写）
+          const s = buildIntakeSessionPersist(answers, '', answeredRounds)
+          if (s) saveIntakeSession(selectedPatient, teacherName, s)
           return
         }
         setIntakeQuestion(next)
         setIntakeDone(false)
         // 【第83天新增】拿到下一问 → 立刻持久化「当前问题 + 累积回答 + 已答轮数」，这就是会话恢复的依据
-        if (answers.trim()) saveIntakeSession(selectedPatient, teacherName, { currentQuestion: next, answers, questionIndex: answeredRounds, updatedAt: new Date().toISOString() })
+        const s = buildIntakeSessionPersist(answers, next, answeredRounds)
+        if (s) saveIntakeSession(selectedPatient, teacherName, s)
       })
       .catch(() => { setIntakeLoading(false); alert('智能体追问失败，请稍后再试。') })
   }
@@ -1508,24 +1516,30 @@ export default function App() {
     const teacherName = intakeTeacherName
     // 【第83天新增】打开「面诊前准备」先查 localStorage：有进行中会话就恢复，没有就从第一问开始
     // （过期 > 24 小时 / 一条答案都没有的会话会被 loadIntakeSession 当成无效并清掉）
-    const session = loadIntakeSession(selectedPatient, teacherName)
+    // 【D-071】「从哪开始」的三分支抽到 `intakeFlow.planIntakeStart`（纯函数、已单测）
+    const plan = planIntakeStart(loadIntakeSession(selectedPatient, teacherName))
     setShowIntake(true)
     setIntakeAnswer('')
     setIntakeSent(false)
-    if (session) {
-      setIntakeAnswers(session.answers)      // 恢复已答内容
-      setIntakeRounds(session.questionIndex) // 恢复已答轮数（UI 里的「已答 N 问」）
-      setIntakeResumed(true)                 // 标记“这是接着上次问”，渲染那行小灰字
-      if (session.currentQuestion) {
-        setIntakeQuestion(session.currentQuestion)   // 恢复上次停在的那一问，接着问
-        setIntakeDone(false)
-      } else {
-        // 上次已经问全（currentQuestion 为空）→ 带着完整回答再问一次拿后端的 done，直接回到「发送确认」
-        setIntakeQuestion(''); setIntakeDone(false)
-        intakeAskNext(session.answers, session.questionIndex)
-      }
+
+    if (plan.mode === 'resume') {
+      setIntakeAnswers(plan.answers)      // 恢复已答内容
+      setIntakeRounds(plan.rounds)        // 恢复已答轮数（UI 里的「已答 N 问」）
+      setIntakeResumed(true)              // 标记“这是接着上次问”，渲染那行小灰字
+      setIntakeQuestion(plan.question)    // 恢复上次停在的那一问，接着问
+      setIntakeDone(false)
       return
     }
+    if (plan.mode === 'finalize') {
+      // 上次已经问全（currentQuestion 为空）→ 带着完整回答再问一次拿后端的 done，直接回到「发送确认」
+      setIntakeAnswers(plan.answers)
+      setIntakeRounds(plan.rounds)
+      setIntakeResumed(true)
+      setIntakeQuestion(''); setIntakeDone(false)
+      intakeAskNext(plan.answers, plan.rounds)
+      return
+    }
+    // fresh：从第一问开始
     setIntakeQuestion(''); setIntakeAnswers('')
     setIntakeRounds(0); setIntakeDone(false); setIntakeResumed(false)
     intakeAskNext('', 0)   // 第一次调用：current_answers 为空字符串（后端从十问歌第 1 项开始）
@@ -1534,19 +1548,20 @@ export default function App() {
   const handleNextIntakeQuestion = () => {
     const answer = intakeAnswer.trim()
     if (!answer) { alert('先写一句回答（或点 🎙️ 语音输入）再点“下一个问题”。'); return }
-    const merged = (intakeAnswers ? intakeAnswers + INTAKE_QA_SEP : '')
-      + '问：' + intakeQuestion + INTAKE_QA_SEP + '答：' + answer
+    // 【D-071】拼接格式抽到 `intakeFlow.mergeIntakeQA` —— 该格式是**前后端契约**
+    // （后端 `agent.py:470` 用 `count("答：")` 数轮次），已有专门用例钉住。
+    const merged = mergeIntakeQA(intakeAnswers, intakeQuestion, answer)
     setIntakeAnswers(merged)
     setIntakeAnswer('')
-    const rounds = intakeRounds + 1
-    setIntakeRounds(rounds)
-    if (rounds >= MAX_INTAKE_ROUNDS) {   // 兜底：拉满上限就直接进入「发送确认」，不让学生被卡住
+    const { nextRounds, capped } = decideIntakeRoundOutcome(intakeRounds)
+    setIntakeRounds(nextRounds)
+    if (capped) {   // 兜底：拉满上限就直接进入「发送确认」，不让学生被卡住
       setIntakeQuestion(''); setIntakeDone(true)
-      // 【第83天新增】兜底收尾也存会话（currentQuestion 为空 → 下次进来直接回到「发送确认」）
-      saveIntakeSession(selectedPatient, intakeTeacherName, { currentQuestion: '', answers: merged, questionIndex: rounds, updatedAt: new Date().toISOString() })
+      const s = buildIntakeSessionPersist(merged, '', nextRounds)
+      if (s) saveIntakeSession(selectedPatient, intakeTeacherName, s)
       return
     }
-    intakeAskNext(merged, rounds)        // 带着累积的回答去拉下一问（成功后由 intakeAskNext 写入 localStorage）
+    intakeAskNext(merged, nextRounds)   // 带着累积的回答去拉下一问（成功后由 intakeAskNext 写入 localStorage）
   }
 
   // 【第83天新增 / 十问歌会话持久化】「放弃本次」：清空该学生对该老师的进行中会话（已答内容不再保留）
