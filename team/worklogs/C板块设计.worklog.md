@@ -1116,3 +1116,85 @@
 - `team/instructions/INSTR-2026-10-04-04-C板块.md`
 - `docs/phase3-governance-design-v1.md` **§1.3 / §4.3.0 / §4.3.5 / §12.5**
 - `docs/phase3-construction-outline.md` **P-304（已冻结）**
+
+---
+
+## 2026-10-12 第十三轮：跨周回归 —— 收口 P-301（HEAD 半提交破损 + 录制语义回归）
+
+**背景**：距上一轮（2026-10-04）**间隔约 8 天**。期间项目新增 **36 个提交**，重心转向**前端拆分 + 内测核心闭环**（D-053 ～ D-082）。C 板块文档自 `968dccf` 起**无新活动**。
+
+### 一、🔴 复核发现：HEAD 处于「半提交破损态」
+
+| 文件 | HEAD | 工作树 | 判定 |
+| :-- | :-- | :-- | :-- |
+| `backend/agent.py` | ✅ **已含** P-301 抽取（`_parse_visit_at` 薄委托 + 调 `get_last_interactions_by_teacher`） | 同 HEAD | 已提交 |
+| `backend/database.py` | ❌ **缺**那三个函数 | ✅ 我的新增在（未提交） | **未提交** |
+
+→ **后果**：`agent.check_recall_alerts` 调用 `database.get_last_interactions_by_teacher()`，而该函数**在 HEAD 的 `database.py` 里不存在** → **一经调用即 `AttributeError`**（`/api/agent/scan` 的复诊提醒扫描全程不可用）。
+→ 我那份未提交的 `database.py` 正是**唯一补齐件**。
+
+### 二、🔴 发现并修掉一处「录制语义」回归（由全量回归暴露）
+
+**失败用例**：`test_agent_stage.py::test_scan_response_has_no_stage_field_flag_off`
+
+**断言**：`AGENT_STAGE_ENABLED=off` 时，`/api/agent/scan` **零 SQL**（连一次 SELECT 都不许发）。
+
+**根因（逐行定位，非猜测）**：
+
+`test_agent_stage.py` 的 `_RecordingConnection`（`record_cursor=False`，L520–533）**只录 `conn.execute()`**，**不录 `cursor().execute()`**。
+
+| 版本 | 那条 `MAX(visit_at)` 聚合的走法 | 是否进录制 |
+| :-- | :-- | :-- |
+| **原内联版**（`agent.check_recall_alerts`） | `cur.execute(...)` | ❌ **不进** → 守护通过 |
+| **我的抽取版** | `conn.execute(...)` | ✅ **进** → 守护**被打破** |
+
+→ **我无意中改变了函数的可观测行为**（不是业务行为，是「被录制与否」）。这类回归**最难自察**：`test_silent_baseline.py` 12 条全过、业务正确，只有那条**既有守护**能抓到。
+
+**修法**：`get_last_interaction_at` 与 `get_last_interactions_by_teacher` **两处均改走 `cursor()`**，并在代码里写明「这是刻意的口径对齐，不是风格差异」，防后人再改回。
+
+**验证**：守护用例 + `test_silent_baseline.py` → **13 passed** ✅
+
+### 三、本项目其它复核结论
+
+| # | 结论 |
+| :-- | :-- |
+| 1 | **核心病害仍在**：`database.py:645` / `706` 仍写死 `"2026-09-17"` → **P-301 的存在理由依然成立** |
+| 2 | **P-302 / P-303 全程零开工**（全仓检索 `homework_spec` / `check_in_records` / `teacher_rules` / `suggest_archive` **零命中**，唯一命中是本项自己的注释） |
+| 3 | **基线口径已变**：后端 **709 → 757**（新增旅程测试等）→ 判据必须用新基线，**不得沿用 709** |
+| 4 | **项目重心转移**：D-037「第一次落地按**单人演示**走」；D-057/D-061/D-065「前端拆分与身份层优先」。→ **P-304（师门归档）在单人演示下不阻塞核心闭环**，冻结无代价的判断依然成立 |
+
+### 四、⚠️ 一次操作失误（已恢复，须记）
+
+为判定「守护用例在 HEAD 上是否本就失败」，我用 PowerShell 重定向 `git show HEAD:backend/database.py > backend\database.py` **覆盖了源文件** —— 重定向写出 **UTF-16**，导致 `SyntaxError: source code string cannot contain null bytes`。
+
+**恢复**：事前已 `Copy-Item` 备份 → **完整还原**，校验 `null 字节数: 0`、`get_last_interaction_at` 在位、`git diff` 仍为 `106 行新增`，与失误前一致。
+
+**教训（新增纪律）**：
+> **不得用 shell 重定向写源码文件**（PowerShell 默认 UTF-16）。
+> 需要「临时切到某版本验证」时，用 `git stash` / `git worktree` / 临时副本，**不要覆盖工作树源文件**。
+
+### 五、提交
+
+- `backend/database.py`（P-301 三函数 + `cursor()` 口径对齐）
+- `backend/test_silent_baseline.py`（12 条新用例）
+- `docs/phase3-construction-outline.md`（P-301 完工记录 + **2026-10-12 复核发现**五条）
+- `team/worklogs/C板块设计.worklog.md`（本轮）
+
+### 待办（★ = 本轮新增/升级）
+
+- [ ] ★ **`database.py` 必须尽快提交** —— 否则 HEAD 对 `check_recall_alerts` 是**破损**的
+- [ ] ★ **回归判据改用 757**（后端），前端另有 99 条
+- [ ] ★ **纪律新增**：不得用 shell 重定向写源码文件
+- [ ] 等 **D-047 / D-048 / D-049**（发起人裁；D-050 归 B 板块）
+- [ ] 等 **D-040**（P-102 执行人）
+- [ ] **C-6 / P-307 + C-7 / P-308**：与 B 板块会商
+- [ ] 与发起人讨论 **T-3b / T-3c**
+- [ ] 补 §3.2 四条底线判定要件（**D-026**）
+- [ ] 补 §9.2 其余表结构 / 前端影响节 / 附录 A·B·D
+
+### 下次启动时读
+
+- `backend/test_silent_baseline.py`（P-301 守护，12 条）
+- `backend/database.py` §「P-301 静默基线」段（含 `cursor()` 口径说明）
+- `docs/phase3-construction-outline.md` **P-301**（含 2026-10-12 复核五条）
+- `team/decisions/decision-log.md`（**D-037 / D-045 ~ D-050**）

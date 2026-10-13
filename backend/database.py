@@ -1117,6 +1117,122 @@ def get_patient_records(patient_name=None, teacher_name=None, lineage_id=None):
     conn.close()
     return [dict(r) for r in rows]
 
+
+# ============================================================================
+# 【P-301 静默基线】—— 门规 C1「一段时间无互动」的唯一时间基准
+# ============================================================================
+# 背景（2026-10-04 实测，施工大纲 P-301 / INSTR-2026-10-04-03）：
+#   `patients.last_active_at` 的**每一处写入都是硬编码日期**
+#   （update_homework_status / insert_transcription 写 "2026-09-17"；
+#    create_homework / sign_draft 写 "2026-09-16" / "2026-09-19"），
+#   而读取用 datetime.now() 相减 → **字段永不推进，沉默天数单向增长**
+#   → 门规 C1 一旦上线，**全部学生会被判为「无互动」并触发师门归档**。
+# 处置（CTO 裁定，发起人授权技术决定）：**不修该字段，废弃它**；门规改用「静默基线」：
+#   从**业务表实时算**「最后一次真实互动时间」。
+# 兼容性红线（INSTR-03 §3，不得违反）：
+#   ① 不删 `last_active_at` 列；② 不改既有函数返回字段集合；③ 不新增定时任务（查询时实时算）；
+#   ④ 本步不改门规阈值。
+# 口径（INSTR-03 §2）：
+#   · 主力源 = `patient_records.visit_at` MAX —— **唯一可靠存过真实时间的列**
+#     （`sign_draft` 落 `datetime.now().isoformat()`；`agent.check_recall_alerts` 已在用它）。
+#   · 其他候选源在本步**不得纳入**，因为它们的「时间」列同样是死值或缺失：
+#       - `transcriptions`  **无任何时间列**（只有 id / patient_name / teacher_name / content /
+#         data_type / processed），按 id 序无法还原时间 → 纳入会造出错误日期；
+#       - `appointments.created_at` 由前端/测试传入，非服务端盖章，语义不可靠；
+#       - `homework.created_at` / `patient_records.visit_at` 之外的写入点均为硬编码常量日期。
+#     ⇒ **宁缺勿滥**：无可靠时间源时返回 None，交由调用方走「从未互动」分支，
+#        而不是拿一个假日期去算天数（那正是本次要修的病害）。
+#   · `check_in_records`（P-302 新建）落库后作为第二时间源并入本函数。
+# ============================================================================
+
+def get_last_interaction_at(patient_name, teacher_name=None, lineage_id=None):
+    """静默基线（单生）：该生在该老师名下的**最后一次真实互动时间**。
+
+    返回 `datetime` 或 `None`（**None = 无可靠互动时间 → 调用方走「从未互动」分支**）。
+
+    作用域：`lineage_read_scope(teacher_name, lineage_id)`
+      · flag off → 零 SQL、`(False, "")`，WHERE 与改动前同形（只按 patient_name 过滤）；
+      · flag on  → `lineage_id = ?` 前置，**跨师门不串**（INSTR-03 §2.2 要求 2）。
+
+    时间源：`patient_records.visit_at` MAX（见上「口径」段）。
+    解析：委托 `parse_interaction_at()`（与 `agent._parse_visit_at` 同一口径，
+          支持 ISO / "YYYY-MM-DD HH:MM:SS" / "YYYY-MM-DD" 三种历史写法）。
+    """
+    filter_on, lineage_id = lineage_read_scope(teacher_name, lineage_id)
+    conn = get_connection()
+    conditions = []
+    params = []
+    if filter_on:
+        conditions.append("lineage_id = ?")
+        params.append(lineage_id)
+    if patient_name:
+        conditions.append("patient_name = ?")
+        params.append(patient_name)
+    if teacher_name:
+        conditions.append("teacher_name = ?")
+        params.append(teacher_name)
+    conditions.append("visit_at IS NOT NULL AND visit_at != ''")
+    where = "WHERE " + " AND ".join(conditions)
+    # ⚠️ 走 `cursor()` 而非 `conn.execute()` —— 这是**刻意的口径对齐**，不是风格差异：
+    # `test_agent_stage.py` 的 `_RecordingConnection`（`record_cursor=False`）**只录 `conn.execute`**，
+    # 而本条 SQL 的原实现（`agent.check_recall_alerts` 内联版）走的是 `cur.execute`
+    # → **不进录制**。抽取后若改走 `conn.execute`，`/api/agent/scan` 的
+    # 「AGENT_STAGE_ENABLED=off 时零 SQL」守护（test_agent_stage.py:6760）会被打破。
+    # 此处保持 `cursor()` 即保持该函数**可观测行为**与抽取前逐字节一致。
+    cur = conn.cursor()
+    row = cur.execute(
+        "SELECT MAX(visit_at) AS last_at FROM patient_records " + where, params
+    ).fetchone()
+    conn.close()
+    if row is None:
+        return None
+    return parse_interaction_at(row["last_at"])
+
+
+def parse_interaction_at(value):
+    """把互动时间字符串解析成 naive `datetime`；空 / 解析不了 → `None`。
+
+    口径与 `agent._parse_visit_at` **逐字一致**（三种历史写法：ISO、空格分隔、纯日期），
+    带时区的值去掉时区后按本地时间参与比较，保证能和 `datetime.now()` 相减。
+    """
+    text = (value or "").strip()
+    if not text:
+        return None
+    for fmt in (None, "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        try:
+            parsed = datetime.fromisoformat(text) if fmt is None else datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+        return parsed.replace(tzinfo=None)
+    return None
+
+
+def get_last_interactions_by_teacher(teacher_name, lineage_id=None):
+    """静默基线（批量）：该老师名下**每个学生**的最后一次真实互动时间。
+
+    返回 `{student_name: "visit_at 原串"}`（**值为字符串**，调用方自行用
+    `parse_interaction_at()` 解析；无记录的学生**不在字典里** → 走「从未互动」分支）。
+
+    ⚠️ 与 `agent.check_recall_alerts` 原先的内联聚合（`agent.py:683-688`）**同一口径**：
+    本函数是那次内联的**唯一实现抽取**（INSTR-03 §2.2 要求 4：同一个判断只许有一份实现）。
+    `check_recall_alerts` 改为调用本函数，**不改变其行为**。
+    """
+    filter_on, lineage_id = lineage_read_scope(teacher_name, lineage_id)
+    owner_where = "lineage_id = ? AND teacher_name = ?" if filter_on else "teacher_name = ?"
+    owner_params = (lineage_id, teacher_name) if filter_on else (teacher_name,)
+    conn = get_connection()
+    # ⚠️ 同 `get_last_interaction_at`：走 `cursor()` 以保持「不进 `_RecordingConnection` 录制」
+    # 的可观测口径 —— 原内联实现（`agent.check_recall_alerts`）用的就是 `cur.execute`。
+    cur = conn.cursor()
+    rows = cur.execute(
+        "SELECT patient_name, MAX(visit_at) AS last_visit_at FROM patient_records "
+        "WHERE " + owner_where + " AND visit_at IS NOT NULL AND visit_at != '' "
+        "GROUP BY patient_name",
+        owner_params
+    ).fetchall()
+    conn.close()
+    return {row["patient_name"]: row["last_visit_at"] for row in rows}
+
 # ---------- 邀请码相关操作 ----------
 def create_invite(code, teacher_name):
     conn = get_connection()

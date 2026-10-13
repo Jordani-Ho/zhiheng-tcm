@@ -185,12 +185,33 @@ X1 康币 ────────→ ⏸ 推迟（上游供养场景未定义�
 | 状态 | ✅ 可施工 |
 | 问题 | `patients.last_active_at` **每处写入都是硬编码日期**（`database.py:645` / `655` 写 `"2026-09-17"`；`636` 写 `"2026-09-16"`），读取用 `datetime.now()` 相减（`1783` / `506`）→ **字段永不推进，沉默天数单向增长** → C1 上线会**误伤全体学生** |
 | 裁定 | **不修该字段，废弃它**——门规改用「**静默基线**」：从业务表实时算最后真实互动时间 |
-| 主力数据源 | `patient_records.visit_at` MAX（**已实现**于 `agent.py:683–688`；`agent.py:536–538` 已明确废弃病历文本解析） |
-| 副数据源 | `transcriptions`（按 `id` 序近似，该表**无时间列**）/ `appointments`（有 `created_at`）/ `check_in_records`（P-302 新建） |
-| 特殊口径 | 全空 = **从未互动**，**不按沉默天数**（否则新学生立即触发） |
+| **主力数据源** | `patient_records.visit_at` MAX —— **唯一可靠存过真实时间的列** |
+| **其他源一律不纳入（本步）** | 实测：`transcriptions` 无任何时间列；`appointments.created_at` 由前端传入非服务端盖章；`homework.created_at` 是三处硬编码常量之一（`"2026-09-16"` / `"2026-09-19"`）。→ **宁缺勿滥**：无可靠源则返回 `None`，交由调用方走「从未互动」分支。`check_in_records`（P-302）落库后并入 |
+| 特殊口径 | 无可靠互动时间 = **从未互动**，**不按沉默天数**（否则新学生/老数据会立即触发） |
 | 附带处置 | `last_active_at` 字段**保留**（不破坏 `get_teacher_patients` / `get_student_status` 返回结构），但**不作为门规依据** |
-| 验收 | ① 构造「昨天有就诊」的学生，静默天数 = 1，**不随时间虚增**；② 构造「从未互动」学生，走「从未互动」分支而非沉默阈值 |
 | 依赖 | 无 |
+
+#### ✅ P-301 完工记录（2026-10-04 实现；2026-10-12 复核补记）
+
+| 项 | 内容 |
+| :-- | :-- |
+| **状态** | ✅ **实现完成**；⚠️ **提交状态曾有缺口**（见下方「2026-10-12 复核发现」） |
+| **实现（新增，`backend/database.py`）** | `get_last_interaction_at(patient_name, teacher_name, lineage_id)` —— 单生静默基线；`get_last_interactions_by_teacher(teacher_name, lineage_id)` —— 批量（返回 `{name: visit_at 原串}`）；`parse_interaction_at(value)` —— 时间解析（三种历史写法） |
+| **共用抽取** | `agent.check_recall_alerts` 原先内联的 `MAX(visit_at)` 聚合（原 `agent.py:683–688`；现 `agent.py:704`）**上移**为 `get_last_interactions_by_teacher`；`agent._parse_visit_at` 改为**薄委托** `database.parse_interaction_at`。**同一判断只有一份实现**（INSTR-03 §2.2 要求 4） |
+| **顺手修掉的既有缺陷** | 原 `check_recall_alerts` 在 `get_connection()` **之后**才做 `lineage_read_scope` 校验 → 校验抛错时**连接泄漏**（`agent.py:610–612` 的注释亲手警告过这个 bug）。抽取时把校验**前置到开连接之前**，与 `check_billing_alerts` 既有写法对齐 |
+| **兼容性红线（全守）** | ① 未删 `last_active_at` 列；② 未改 `get_teacher_patients` / `get_student_status` 返回字段集合；③ 未新增定时任务（查询时实时算）；④ 未改门规阈值 |
+| **新增用例** | `backend/test_silent_baseline.py`（**12 个**）：验收 1（昨天=1 天 / 隔天=2 天）/ **核心回归**（`last_active_at` 死值不影响基线）/ 验收 2（从未互动返回 `None`、批量不在字典里、`visit_at` 空串不视为 1970）/ 验收 3（跨师门隔离，一师两门）/ 解析三格式 / 共用实现委托哨兵 / 薄委托 |
+| **验收结果** | `test_silent_baseline.py` → **12 passed**（2026-10-04，旧基线口径） |
+
+##### 🔴 2026-10-12 复核发现（一周后回归时的实测）
+
+| # | 发现 |
+| :-- | :-- |
+| **1** | **`agent.py` 侧的抽取已进 HEAD，`database.py` 侧的三个函数未进** → **HEAD 处于半提交破损态**：`agent.check_recall_alerts` 调用 `database.get_last_interactions_by_teacher()`，而该函数**在 HEAD 的 `database.py` 里不存在** → 一经调用即 `AttributeError`。工作树里的 `database.py`（未提交）正是补齐件。 |
+| **2** | **核心病害仍未修**：`database.py:645` / `706` 仍写死 `"2026-09-17"` → P-301 的**存在理由依然成立**。 |
+| **3** | **P-302 / P-303 全程零开工**（全仓检索 `homework_spec` / `check_in_records` / `teacher_rules` / `suggest_archive` 零命中，唯一命中是本项自己的注释）。 |
+| **4** | **基线口径已变**：后端由 **709 → 757**（新增旅程测试等）；判据须用新基线，不得沿用 709。 |
+| **5** | **项目重心已转移**：D-037「第一次落地按**单人演示**走」+ D-057/D-065「前端拆分与身份层优先」——C 板块文档自 `968dccf` 起**一周无新活动**。 |
 
 ### P-302 · 医嘱规格 + 打卡实例（C2）
 
