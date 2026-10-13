@@ -506,14 +506,36 @@ def create_homework(input_data: HomeworkInput):
     database.create_homework(input_data.patient_name, input_data.teacher_name, input_data.task, input_data.detail)
     return {"message": "作业已布置"}
 
+def _require_identity(patient_name: str, teacher_name: str):
+    """【D-079】写端点的身份校验：空 / 全空白一律 400，**不得静默假成功**。
+
+    为什么必须 fail-loud：
+      · 这两个端点底层是 `UPDATE ... WHERE role_name = ?` 形态 —— 名字对不上就**静默不生效**；
+      · 原先默认值是演示数据「张三 / 李老师」，不传参数会**把打卡打到无关的人身上**；
+      · 前端 `selectedPatient` / `selectedTeacher` 初值是空串（D-059 数据驱动引导），
+        身份未解析出来就点按钮 -> 会看到「打卡成功」而实际什么都没发生。
+    """
+    if not (patient_name or "").strip() or not (teacher_name or "").strip():
+        raise HTTPException(status_code=400, detail={
+            "error": "identity_required",
+            "msg": "缺少身份：patient_name 与 teacher_name 都必须非空（否则打卡/审核会静默打到无关记录上）",
+            "errors": [], "warnings": [],
+        })
+
+
 @app.post("/api/check-in")
-def check_in(patient_name: str = "张三", teacher_name: str = "李老师"):
+def check_in(patient_name: str = "", teacher_name: str = ""):
+    # 【D-079】原来签名是 `patient_name: str = "张三", teacher_name: str = "李老师"`：
+    # 不传参数就会把打卡写到演示数据上。现改为必填 + fail-loud。
+    _require_identity(patient_name, teacher_name)
     database.update_homework_status(patient_name, teacher_name, "checked_in")
     database.add_points(patient_name, 10)
     return {"message": "打卡成功"}
 
 @app.post("/api/approve")
-def approve(patient_name: str = "张三", teacher_name: str = "李老师"):
+def approve(patient_name: str = "", teacher_name: str = ""):
+    # 【D-079】同 `/api/check-in`。
+    _require_identity(patient_name, teacher_name)
     database.update_homework_status(patient_name, teacher_name, "approved")
     return {"message": "审核通过"}
 

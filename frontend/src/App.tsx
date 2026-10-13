@@ -1354,13 +1354,28 @@ export default function App() {
   }
 
   // ============== 学生端行为 ==============
+  // 【D-079】身份未解析出来时不发请求：后端已改为 fail-loud（空身份 400），
+  // 但前端更该在源头拦住 —— 否则会把 400 当成"打卡失败"弹给还没选身份的用户。
+  const hasIdentity = !!selectedPatient && !!selectedTeacher
   const handleCheckIn = () => {
-    fetch(`/api/check-in?patient_name=${selectedPatient}&teacher_name=${selectedTeacher}`, { method: 'POST' })
-      .then(() => { fetchRoleData(); fetchPoints() })
+    if (!hasIdentity) { alert('请先选择学生与老师（身份未就绪）'); return }
+    fetch(`/api/check-in?patient_name=${encodeURIComponent(selectedPatient)}&teacher_name=${encodeURIComponent(selectedTeacher)}`, { method: 'POST' })
+      .then(r => (r.ok ? r.json() : r.json().catch(() => ({})).then(b => {
+        alert(`打卡失败（${(b && b.detail && b.detail.error) || r.status}）`)
+        return null
+      })))
+      .then(d => { if (d) { fetchRoleData(); fetchPoints() } })
+      .catch(() => alert('打卡失败，请稍后重试'))
   }
   const handleApprove = () => {
-    fetch(`/api/approve?patient_name=${selectedPatient}&teacher_name=${selectedTeacher}`, { method: 'POST' })
-      .then(() => fetchRoleData())
+    if (!hasIdentity) { alert('请先选择学生与老师（身份未就绪）'); return }
+    fetch(`/api/approve?patient_name=${encodeURIComponent(selectedPatient)}&teacher_name=${encodeURIComponent(selectedTeacher)}`, { method: 'POST' })
+      .then(r => (r.ok ? r.json() : r.json().catch(() => ({})).then(b => {
+        alert(`签字确认失败（${(b && b.detail && b.detail.error) || r.status})`)
+        return null
+      })))
+      .then(d => { if (d) fetchRoleData() })
+      .catch(() => alert('签字确认失败，请稍后重试'))
   }
 
   const startStudentRecording = async () => {
