@@ -7,6 +7,8 @@ import SealPanel from './SealPanel'
 import AgentStagePanel from './AgentStagePanel'
 // 【D-062 / 内测场景 1】老师入社区面板：独立文件，避免继续膨胀本文件
 import TeacherOnboarding from './TeacherOnboarding'
+// 【D-067 / 内测补缺入口】学习闭环卡：A 板块后端已闭环但前端零消费
+import LearningPanel from './LearningPanel'
 // 【D-058 前端拆分第一步】共享常量 / 类型 / 纯函数已外移到 `appShared.ts`。
 // 这里用 `import` 引入（**不是**再导出）—— 已核实全仓无人从 App.tsx 导入符号，
 // 故 App.tsx 只需「能用到这些名字」即可。本次**只做外移，不改任何引用点**，
@@ -2947,6 +2949,12 @@ export default function App() {
             draftId={clinicPatientDrafts[0]?.id}
             onEvaluated={() => { fetchAgentWorkbench() }}
           />
+        )}
+
+        {/* 【D-067 / 内测补缺入口】学习闭环卡：A 板块后端已闭环但**前端零消费**。
+            flag off（LEARNING_ENABLED 未开）→ 组件 404 探测失败 → 整卡不渲染。 */}
+        {isTeacherRole && teacherTab === 'home' && (
+          <LearningPanel teacherName={selectedTeacher} />
         )}
 
         {/* 【第61天新增】老师端：📋 今日备忘录（动态时间轴 + 未排期事项列；已完成移除、逾期变灰、跨天自动清空） */}
