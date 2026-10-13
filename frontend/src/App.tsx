@@ -484,6 +484,24 @@ export default function App() {
     setShowHistory(false)
   }
 
+  // 【D-070 数据隔离缺陷修复】切换老师的**唯一入口**。
+  //
+  // 原缺陷：`clearLineageScopedPanels()`（「先清场再重拉」的**先清场**那半）此前只在
+  // `handleSwitchLineageView` 里被调用；而**用户主动切老师的两个入口漏了它**：
+  //   · 老师选择器按钮（`setSelectedTeacher(t)`）
+  //   · 入社区面板的「切为当前」（`onPickTeacher`）
+  // → 切老师后，**上一位老师的草案 / 病历 / 预约 / 待办仍会短暂显示**，
+  //   直到依赖 `[currentRole, selectedPatient, selectedTeacher]` 的 effect 重拉完才被替换。
+  //   在慢网 / 后端异常时窗口更长 —— 属 §7.3「防陈旧数据串门」明文要防的情况。
+  //
+  // 修法：把「切老师」收敛成一个入口，清场与赋值**绑在一起**，避免未来新增入口再漏。
+  // 若切到同一位老师（`t === selectedTeacher`）则直接返回 —— 不清场、不产生无谓空态。
+  const switchTeacher = (t: string) => {
+    if (!t || t === selectedTeacher) return
+    clearLineageScopedPanels()
+    setSelectedTeacher(t)
+  }
+
   // 【Epic 4 §7.2】卡片标题旁的師門只讀徽章（诊室队列 / 诊室工作台 / 學生管理 三处共用同一个 render，
   // 避免三份重複標記）：flag off 或還沒探到師門 → 返回 null（零 UI）；`archived` → 追加「已封存 · 只讀」。
   const renderLineageChip = () => (lineageEnabled && teacherLineage ? (
@@ -595,6 +613,8 @@ export default function App() {
     if (lineageEnabled) saveLineageView(selectedPatient, view)   // flag on 才写（flag off 不写任何 key）
     if (view !== LINEAGE_ALL_VIEW) {
       const target = studentLineages.find(r => r.lineage_id === view)
+      // 【D-070】此处**已在上方 `clearLineageScopedPanels()` 清过场**，故直接赋值、不走 switchTeacher
+      // （否则重复清场，多一次无谓空态）。
       if (target && target.teacher_name && target.teacher_name !== selectedTeacher) setSelectedTeacher(target.teacher_name)
     }
   }
@@ -717,6 +737,8 @@ export default function App() {
       .then(r => r.json())
       .then((list: string[]) => {
         setPatientTeachers(list)
+        // 【D-070】派生赋值（学生变了 -> 跟着改成该学生归属的老师），非用户主动「切老师」：
+        // 依赖 `[currentRole, selectedPatient, selectedTeacher]` 的 effect 会全量重拉，故不在此清场。
         if (list.length > 0) setSelectedTeacher(list[0])
       })
       .catch(() => setPatientTeachers([]))
@@ -3153,7 +3175,7 @@ export default function App() {
             <div style={{ display: 'flex', flexWrap: 'wrap' }}>
               {patientTeachers.map(t => (
                 <div key={t} style={{ display: 'flex', alignItems: 'center', margin: '4px' }}>
-                  <button style={teacherBtnStyle(t)} onClick={() => setSelectedTeacher(t)}>👨‍⚕️ {t}</button>
+                  <button style={teacherBtnStyle(t)} onClick={() => switchTeacher(t)}>👨‍⚕️ {t}</button>
                   {patientTeachers.length > 1 && (
                     <button onClick={() => handleRemoveTeacher(t)} style={{ marginLeft: '4px', padding: '2px 8px', borderRadius: '12px', border: '1px solid #c0392b', background: 'transparent', color: '#c0392b', cursor: 'pointer', fontSize: '11px' }}>✕</button>
                   )}
@@ -3500,7 +3522,7 @@ export default function App() {
                 onOnboarded={() => {
                   fetch('/api/teachers').then(r => r.json()).then(d => setTeachers(Array.isArray(d) ? d : [])).catch(() => {})
                 }}
-                onPickTeacher={(t) => setSelectedTeacher(t)}
+                onPickTeacher={(t) => switchTeacher(t)}
               />
             )}
 
