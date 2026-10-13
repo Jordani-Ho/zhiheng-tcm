@@ -466,3 +466,55 @@ D-023（依赖判断错）、D-024（端点误报）、D-034 撤回（真库未�
 - `team/decisions/decision-log.md`（决策总表 + 未决）
 - `team/roles/知衡-CTO.md`（授权边界 + 9 条纪律）
 - 本 worklog
+
+
+---
+
+## 【2026-10-12】C 板块并入知衡（D-086）+ P-301 核心病害收口
+
+### 1. 接管 C 板块（发起人指令）
+
+> 发起人：「你把 C 板块的任务也接管了吧，我就不再两头剪贴了」
+
+**背景（实测）**：C 板块与本会话**无直接通道** —— INSTR-01 ~ INSTR-05 与 C 的 REPLY
+全部靠发起人**物理转贴**。转贴是纯开销，且是 **E-001 / E-002 两条错题的共同结构成因**
+（一份约束在两个地方被标为"当前有效"）。
+
+**处置**：
+- `team/roles/C板块设计.md` 顶部加「已并入」说明；该卡**不再是执行依据**（历史内容原样保留）
+- `team/README.md` 角色清单与板块归属表更新：C 社区规则 → 知衡
+- **不再新增「致 C 板块」指令**（`team/instructions/` 下 INSTR-01~05 保留为历史）
+- C 的施工记录统一写入**本 worklog**（不再分头维护）
+
+**保留的事实源**：C 的设计文档、施工大纲、`C板块设计.worklog.md`（919 行）、
+以 `fix(C)`/`docs(C)` 为前缀的提交 —— 全部不动。
+
+**代价（须发记）**：C 曾两次**独立抓出我的错**（D-042 引述不存在的额度；康币额度改判被驳回）。
+并入后**失去这层独立复核**，改由「测试 + git 史 + 台账」补足。
+凡「只有我自己在断言」的结论，须显式标注证据来源。
+
+### 2. P-301 核心病害收口（C 只做了检测基线，没修本体）
+
+**我先核了 C 刚提交的 `188aa8c`**：它加了 `get_last_interaction_at` /
+`parse_interaction_at` / `get_last_interactions_by_teacher` + `test_silent_baseline.py`（223 行）
+—— 是**检测基线**。而**核心病害仍在**（与提交信息「收口」不符）：
+
+| 位置 | 原写法 |
+| :-- | :-- |
+| `database.py` `teacher_add_student` | `patients.created_at` / `patient_teachers.created_at` 硬编码 `"2026-09-17"` |
+| `database.py` `update_homework_status` | `patients.last_active_at` 硬编码 `"2026-09-17"` |
+| `database.py` `insert_transcription` | 同上 |
+
+**已修**：四处全部改为 `datetime.now().isoformat()`。
+
+**为何不破坏 C 的基线**：C 的静默基线用 **`visit_at`** 计算，并**显式把 `last_active_at`
+排除在算式外**（`test_dead_last_active_at_does_not_affect_baseline`）。故改这一列不动基线判定。
+
+**验证**：改动前 `test_silent_baseline.py` 12 passed（基线）；
+`database.py` 无残留 `"2026-09-17"` 字面量（仅注释中说明原写法）；AST 检查通过。
+
+### 3. 下一批（按序）
+
+1. **P-102 C1 引荐链清理**（施工面已核实，见 INSTR-05 §1；`0009` 迁移号由我占用）
+2. 内测人工浏览器验收的收尾（唯一我做不了的一步）
+3. 台账 D-047/048/049（发起人命题）到达后转达
