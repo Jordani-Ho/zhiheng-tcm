@@ -18,6 +18,8 @@ import {
   buildIntakeSessionPersist,
   planIntakeStart,
 } from './intakeFlow'
+// 【D-072】师门上下文派生：withLineage 是全站唯一的 lineage_id 拼参出口，规则抽成纯函数
+import { deriveCurrentLineageId, withLineageParam } from './lineageContext'
 // 【D-058 前端拆分第一步】共享常量 / 类型 / 纯函数已外移到 `appShared.ts`。
 // 这里用 `import` 引入（**不是**再导出）—— 已核实全仓无人从 App.tsx 导入符号，
 // 故 App.tsx 只需「能用到这些名字」即可。本次**只做外移，不改任何引用点**，
@@ -460,18 +462,16 @@ export default function App() {
 
   // **当前师门上下文**：老师端 = 自己的唯一师门；学生端 = 当前咨询老师（selectedTeacher）对应的师门，
   // 取不到时回落显式选中的视图。flag off → 恒为空串（于是所有请求 URL 与 Epic 4 之前逐字面一致）。
-  const currentLineageId = (() => {
-    if (!lineageEnabled) return ''
-    if (lineageIsTeacher) return teacherLineage ? teacherLineage.id : ''
-    const row = studentLineages.find(r => r.teacher_name === selectedTeacher && r.status === 'active' && !!r.lineage_id)
-    if (row) return row.lineage_id
-    return lineageView && lineageView !== LINEAGE_ALL_VIEW ? lineageView : ''
-  })()
+  // 【D-072】派生规则抽到 `lineageContext.deriveCurrentLineageId`（纯函数、17 条用例）
+  const currentLineageId = deriveCurrentLineageId({
+    lineageEnabled, lineageIsTeacher, teacherLineage,
+    studentLineages, selectedTeacher, lineageView, allView: LINEAGE_ALL_VIEW,
+  })
 
   // §7.2「集中在一处拼参」：**唯一**的 lineage 拼参出口。
   // 空上下文（flag off / 未歸屬 / 还没开山门）→ 原样返回 URL（不产生 `?lineage_id=`，也不改变参数顺序）。
-  const withLineage = (url: string) =>
-    currentLineageId ? `${url}${url.includes('?') ? '&' : '?'}lineage_id=${encodeURIComponent(currentLineageId)}` : url
+  // 【D-072】拼参规则抽到 `lineageContext.withLineageParam`（纯函数、已覆盖 `?`/`&` 与编码）
+  const withLineage = (url: string) => withLineageParam(url, currentLineageId)
 
   // §7.3「先清场再重拉」：切师门时把「上一个师门拉回来的列表」同步清空，
   // 再靠既有的 `[currentRole, selectedPatient, selectedTeacher]` effect 全量重拉 —— 防陈旧数据串门。
