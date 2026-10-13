@@ -531,14 +531,18 @@ def add_patient_teacher(patient_name, teacher_name):
     
 # 【第34天新增】老师拉学生：创建学生账户并建立师生关系
 def teacher_add_student(teacher_name, student_name):
+    # 【P-301 施工 / 知衡接管后收口】原为硬编码 "2026-09-17"（两处）—— 属「静默基线」要治的
+    # 假数据：学生建档日与师生关系建立日会永远显示为 2026-09-17，与实际无关。
+    # 改为真实时刻（与 `insert_draft` / `update_appointment_status` 同一口径）。
+    _now = datetime.now().isoformat()
     conn = get_connection()
     # 1. 创建学生账户（如果不存在）
     conn.execute("INSERT OR IGNORE INTO patients (name, guardian_name, relation, created_at) VALUES (?, 'self', '本人', ?)",
-                 (student_name, "2026-09-17"))
+                 (student_name, _now))
     # 2. 建立师生关系
     try:
         conn.execute("INSERT INTO patient_teachers (patient_name, teacher_name, status, created_at) VALUES (?, ?, 'active', ?)",
-                     (student_name, teacher_name, "2026-09-17"))
+                     (student_name, teacher_name, _now))
     except sqlite3.IntegrityError:
         pass  # 关系已存在
     # 3. 给新学生一个初始积分（如果账户不存在）
@@ -642,7 +646,11 @@ def update_homework_status(patient_name, teacher_name, status):
     conn.execute("UPDATE homework SET status = ? WHERE id = (SELECT MAX(id) FROM homework WHERE patient_name = ? AND teacher_name = ?)",
                  (status, patient_name, teacher_name))
     # 【第35天新增】更新学生的最近活跃时间
-    conn.execute("UPDATE patients SET last_active_at = ? WHERE name = ?", ("2026-09-17", patient_name))
+    # 【P-301 施工 / 知衡接管后收口】原硬编码 "2026-09-17"（假数据：无论何时操作，
+    # 学生"最近活跃时间"永远显示成 2026-09-17）→ 改为真实时刻。
+    # 注：静默基线（`get_last_interaction_at`）**不用**这一列（C 的
+    # `test_dead_last_active_at_does_not_affect_baseline` 已钉），故本次改动不影响基线判定。
+    conn.execute("UPDATE patients SET last_active_at = ? WHERE name = ?", (datetime.now().isoformat(), patient_name))
     conn.commit()
     conn.close()
 
@@ -703,7 +711,8 @@ def insert_transcription(patient_name, teacher_name, content, data_type):
     conn.execute("INSERT INTO transcriptions (patient_name, teacher_name, content, data_type, processed, lineage_id) VALUES (?, ?, ?, ?, 0, ?)",
                  (patient_name, teacher_name, content, data_type, _derived_lineage_id(teacher_name)))
     # 【第35天新增】更新学生的最近活跃时间
-    conn.execute("UPDATE patients SET last_active_at = ? WHERE name = ?", ("2026-09-17", patient_name))
+    # 【P-301 施工 / 知衡接管后收口】原硬编码 "2026-09-17" → 真实时刻（同 `update_homework_status`）。
+    conn.execute("UPDATE patients SET last_active_at = ? WHERE name = ?", (datetime.now().isoformat(), patient_name))
     conn.commit()
     conn.close()
 
