@@ -46,9 +46,9 @@
 
 | 模块 | 施工项数 | 状态 | 阻塞源 |
 | :-- | :-- | :-- | :-- |
-| **M1 引荐链** | 3（含 1 清理） | 🟡 | 无（P-102 等 D-040 执行人） |
+| **M1 引荐链** | 3（含 1 清理） | ✅ | **P-102 已完成**（2026-10-12，知衡执行，D-089/`0009`）；无阻塞 |
 | **M2 守护机制** | 3 | 🔴 | **D 板块 M1 席位机制未启动**（D-015） |
-| **M3 门规** | 4（P-304 已冻结） | 🟡 | P-304 冻结（D-046）；P-301/302/303 可开工 |
+| **M3 门规** | 4（P-304 已冻结） | 🟡 | P-304 冻结（D-046）；**P-301 已完成**（D-087）；P-302/303 按 D-085 **暂缓至内测后** |
 | **M4 入社区机制** | 4 | 🟡 | 无硬依赖（T-3b / T-3c 待与发起人讨论） |
 | **X1 康币** | 0 | ⏸ | **推迟**（T-8 裁决） |
 | **X2 除名事件** | 2 | 🟡 | 依赖 M3 除名动作定型 |
@@ -99,27 +99,44 @@ X1 康币 ────────→ ⏸ 推迟（上游供养场景未定义�
 | 验收 | 5 端点路径与设计一致，或回改设计 |
 | 依赖 | 无 |
 
-### P-102 · **C1 引荐链清理**（🔴 最高优先）
+### P-102 · **C1 引荐链清理** —— ✅ **已完成（2026-10-12，知衡执行，D-089）**
 
 | 项 | 内容 |
 | :-- | :-- |
-| 状态 | 🔴 **确认未做**（附录 F.8.1 实测） |
+| 状态 | ✅ **完工**（提交 `24478cb`；全量回归 770 passed / 0 failed） |
 | 依据 | 设计史实录 L978–1007（C1 清单）+ L1078（「立刻做，否则 C2/C3 在脏地基上」） |
-| 前置决策 | ⬜ **W-9**：白皮书 §2.8.3 节点 1 是否同步删除（待项目总管） |
+| 前置决策 | ✅ W-9 已解除（CTO 前置裁决：白皮书修订与代码清理解耦，见下方 2026-10-04 裁决） |
+| 执行人 | ✅ **知衡**（D-040 已收口于 2026-10-12；C 板块并入后由知衡直执行） |
 
-**清理清单（8 删 + 1 迁移）**：
+**完工记录（2026-10-12）**：8 删 + 1 迁移**逐项完成**；另**自行核出两处大纲未覆盖的耦合**：
 
-| # | 位置 | 动作 | 实测现状 |
+| # | 大纲外发现 | 处置 |
+| :-- | :-- | :-- |
+| A | `count_referrals_by_referrer_in_year` 还被 `referral_service.get_annual_referral_count` 调用 | 该包装函数**全仓零调用方** → 一并删除（否则"额度全部成为死代码"不成立） |
+| B | 真库 `referral_chain` 实测 = 1 行 `(TEACHER,TEACHER)`、**学生引荐 0 行** | 迁移对真库是**无操作**；安全闸不会触发 |
+
+**迁移 `0009` 的两条纪律**：① 安全闸——表内确有学生引荐行时**中止迁移**，
+须显式 `P102_PURGE_LEGACY_STUDENT_REFERRALS=on` 放行（防"一声不响毁数据"）；
+② downgrade **不做数据恢复**（显式声明：删的是宪法冲突的越权数据，单向决策）。
+
+**测试净 +12（删 4 增 16）**：删除的 4 条验的是「学生引荐能用」（方向相反）；
+新增 `test_referral_c1_cleanup.py`（10）+ `test_migration_0009.py`（5），
+钉住「端点不可用」「白名单收窄」「额度码已清」「**老师引荐老师照常**」
+「**安全闸中止且数据未被半删**」「**正当引荐不被误删**」。
+
+**原清理清单（存档，均为当日实测现状）**：
+
+| # | 位置 | 动作 | 完工 |
 | :-- | :-- | :-- | :-- |
-| 1 | `backend/referral_service.py` | 删 `create_student_referral` | ❌ 仍在 L66 |
-| 2 | `backend/database.py` | 删 `REFERRAL_ANNUAL_QUOTA` | ❌ 仍在 L2879（`= 3`） |
-| 3 | `backend/database.py` | 删 `count_referrals_by_referrer_in_year` | ❌ 仍在 L3028 |
-| 4 | `backend/database.py` | `REFERRAL_REFERRER_TYPES` 去 `'STUDENT'` | ❌ L2877 = `("TEACHER","STUDENT")` |
-| 5 | `backend/database.py` | `REFERRAL_REFEREE_TYPES` 去 `'STUDENT'`/`'DEPENDENT'` | ❌ L2878 = 三值 |
-| 6 | `backend/referral_api.py` | 删 `POST /api/referral/student` + `_REFEREE_TYPES`（L46） | ❌ 仍在 L117 |
-| 7 | `backend/test_referral_api.py` | 删 4 个学生引荐测试 | ❌ L94 / L102 / L109 / L117 |
-| 8 | `frontend/src/ReferralStudio.tsx` | 删学生引荐 UI（若有） | ✅ **CTO 已核实：检索「学生」零命中 → 前端无学生引荐 UI，本项无需施工** |
-| 9 | 新迁移 `0009` | 清理白名单 + 删函数（**不加字段、不改表结构**） | ❌ 不存在（**CTO 已核实号段 `0009` 空闲，未被占用**） |
+| 1 | `backend/referral_service.py` | 删 `create_student_referral` | ✅ |
+| 2 | `backend/database.py` | 删 `REFERRAL_ANNUAL_QUOTA` | ✅ |
+| 3 | `backend/database.py` | 删 `count_referrals_by_referrer_in_year` | ✅ |
+| 4 | `backend/database.py` | `REFERRAL_REFERRER_TYPES` 去 `'STUDENT'` | ✅ 现为 `("TEACHER",)` |
+| 5 | `backend/database.py` | `REFERRAL_REFEREE_TYPES` 去 `'STUDENT'`/`'DEPENDENT'` | ✅ 现为 `("TEACHER",)` |
+| 6 | `backend/referral_api.py` | 删 `POST /api/referral/student` + `_REFEREE_TYPES` | ✅（顺带删 `StudentReferralInput`） |
+| 7 | `backend/test_referral_api.py` | 删 4 个学生引荐测试 | ✅ |
+| 8 | `frontend/src/ReferralStudio.tsx` | 删学生引荐 UI（若有） | ✅ 无需施工（前端无该 UI） |
+| 9 | 新迁移 `0009` | 清理白名单 + 删函数 | ✅ `0009_p102_referral_student_cleanup` |
 
 > ### 🔴 CTO 前置裁决（2026-10-04）—— **P-102 的 W-9 前置已解除**
 >
