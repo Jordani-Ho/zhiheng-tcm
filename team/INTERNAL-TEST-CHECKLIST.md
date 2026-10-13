@@ -102,9 +102,29 @@ npm run dev        # 开发；或 npm run build 出 dist
 | :-- | :-- |
 | 后端全量 | **737 passed / 1 failed**（738 收集） |
 | 唯一失败 | `test_agent_stage.py::test_scan_response_has_no_stage_field_flag_off` —— **属 C 板块 P-301 在途工作**，已发回，与本仓当前 HEAD 的功能改动无关 |
-| 前端 | `tsc --noEmit` 退出码 0；`vite build` 成功 |
+| **前端** | **`npm test` → 32 passed**（2 文件；D-065 新建） |
+| 前端类型/构建 | `tsc -b` 退出码 0；`vite build` 成功 |
 
 **跑基线须在 DSH 沙箱外**（沙箱会拦截 pytest 临时目录 → 65 个假错误）。
+
+### 4.1 前端测试（D-065 新建）
+
+```bash
+cd frontend
+npm test           # 一次性跑完（vitest run）
+npm run test:watch # 开发时监听
+```
+
+| 文件 | 条数 | 覆盖 |
+| :-- | :-- | :-- |
+| `src/appShared.test.ts` | 23 | 角色判定（含「任意姓名」回归）/ 角色选项构造 / 时间格式化 / 摘要折叠 / 问答会话三条拒绝规则 + 过期边界 / localStorage 隔离 |
+| `src/TeacherOnboarding.test.tsx` | 9 | 真实挂载到 jsdom：按实际数据渲染（反向断言无硬编码「李老师」）/ 空列表与失败不炸 / 入社区请求体契约 / 空姓名不发请求 / 回调与当前身份标记 / console.error 零调用 |
+
+**纪律（D-066）**：全部用例用 **fetch 桩、不联网**；组件测试用 `react-dom/client` + `act`（未引 `@testing-library/react`）；`IS_REACT_ACT_ENVIRONMENT` 必须为 true（React 19 要求，已在 `src/test-setup.ts` 设置）。
+
+---
+
+## 5. 已知限制（内测期接受）
 
 ---
 
