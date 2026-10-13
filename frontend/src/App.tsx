@@ -20,6 +20,12 @@ import {
 } from './intakeFlow'
 // 【D-072】师门上下文派生：withLineage 是全站唯一的 lineage_id 拼参出口，规则抽成纯函数
 import { deriveCurrentLineageId, withLineageParam } from './lineageContext'
+// 【D-076】病历草案落库兜底：请求体构造（强制带 lineage_id）+ 响应显式判定
+import {
+  buildTranscribeBody,
+  evaluateTranscribeResult,
+  decideDraftFallback,
+} from './draftFlow'
 // 【D-058 前端拆分第一步】共享常量 / 类型 / 纯函数已外移到 `appShared.ts`。
 // 这里用 `import` 引入（**不是**再导出）—— 已核实全仓无人从 App.tsx 导入符号，
 // 故 App.tsx 只需「能用到这些名字」即可。本次**只做外移，不改任何引用点**，
@@ -1759,14 +1765,27 @@ export default function App() {
       .catch(() => null)
 
   const createDraftViaTranscribe = (patientName: string): Promise<number | null> => {
-    const now = new Date()
-    const placeholder = `【老师现场录入】\n学生姓名：${patientName}\n就诊时间：${now.getFullYear()}年${now.getMonth() + 1}月${now.getDate()}日\n（本次由老师在诊室直接录入病历，学生未提交线上陈述）`
+    // 【D-076 修复】原实现有两个缺陷，导致「非预约面诊 · 老师现场录入」在 flag on 时不可用：
+    //   ① 请求体**不带 `lineage_id`** → 后端 400 `lineage_required`
+    //      （契约见 lineage_service.lineage_read_scope：空/缺一律 4xx，不许退化为全量）
+    //   ② `.then(() => findDraftIdByPatient(...))` **完全不看响应** → 400 也当成功
+    //      → 最终返回 null，老师只看到「落库失败：没能生成病历草案，无法签字」，说不清原因
+    // 现改为：请求体走 `buildTranscribeBody`（强制带 lineage_id）+ 显式 `evaluateTranscribeResult` 判失败。
     return fetch('/api/transcribe', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ patient_name: patientName, teacher_name: selectedTeacher, content: placeholder, data_type: 'text' })
+      body: JSON.stringify(buildTranscribeBody(patientName, selectedTeacher, currentLineageId))
     })
-      .then(() => findDraftIdByPatient(patientName))
+      .then(r => r.json().catch(() => ({})).then(body => ({ status: r.status, body })))
+      .then(({ status, body }) => {
+        const verdict = evaluateTranscribeResult(status, body)
+        if (!verdict.ok) {
+          // 把后端错误码带出来（原实现只报「落库失败」，无法定位是契约问题还是后端故障）
+          alert(`现场录入失败（${verdict.errorCode}）${verdict.message ? '：' + verdict.message : ''}\n请检查该老师是否已开师门，或稍后重试。`)
+          return null
+        }
+        return findDraftIdByPatient(patientName)
+      })
       .catch(() => null)
   }
 
@@ -1780,14 +1799,21 @@ export default function App() {
     setLocalDrafts(prev => prev.map(d => d.id === localId ? { ...d, content: newContent } : d))
     return fetch(withLineage(`/api/transcriptions?patient_name=${encodeURIComponent(patientName)}&teacher_name=${encodeURIComponent(selectedTeacher)}`))
       .then(r => r.json())
-      .then((list: any[]) => {
-        const latest = Array.isArray(list) && list.length > 0 ? list[0] : null
-        if (!latest) return createDraftViaTranscribe(patientName)   // 没有待处理陈述 → 兜底：造临时陈述 + 让后端自动生成草案
-        return fetch(`/api/generate-draft?transcript_id=${latest.id}`, { method: 'POST' })
+      // 【D-076】分支决策抽到 `draftFlow.decideDraftFallback`（可单测），此处逐字保留原语义：
+      //   ① 没有待处理陈述 -> 走「老师现场录入」兜底
+      //   ② 有陈述但 generate-draft 没给出 id（已被处理过）-> 同样走兜底
+      //   ③ 有陈述且成功 -> 直接用该陈述
+      .then((list: any[]): Promise<number | null> => {
+        const latestId = Array.isArray(list) && list.length > 0 ? Number(list[0].id) : null
+        if (latestId == null) return createDraftViaTranscribe(patientName)
+        return fetch(`/api/generate-draft?transcript_id=${latestId}`, { method: 'POST' })
           .then(r => r.json())
-          .then((res: any) => (res && res.draft_id)
-            ? Number(res.draft_id)
-            : createDraftViaTranscribe(patientName))   // 陈述已被处理过（processed = 1）→ 同样走兜底
+          .then((res: any) => {
+            const gotId = !!(res && res.draft_id)
+            const plan = decideDraftFallback(latestId, gotId)
+            if (plan.step === 'create-via-transcribe') return createDraftViaTranscribe(patientName)
+            return Number(res.draft_id)
+          })
       })
       .catch(() => createDraftViaTranscribe(patientName))
       .then(draftId => {

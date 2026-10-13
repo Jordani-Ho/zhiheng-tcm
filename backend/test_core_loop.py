@@ -204,6 +204,45 @@ def test_walk_in_visit_needs_no_appointment(client, lineage_on):
     assert n == 0, "非预约路径不得凭空产生预约记录"
 
 
+def test_walk_in_onsite_entry_requires_lineage_id(client, lineage_on):
+    """**D-076 契约钉**：老师现场录入（非预约面诊兜底）的 `/api/transcribe` **必须带 lineage_id**。
+
+    背景：前端兜底 `createDraftViaTranscribe` 原先不带该字段 → flag on 时 400，
+    而它**不检查响应** → 老师看到「落库失败：没能生成病历草案，无法签字」，
+    内测场景 3「非预约面诊」在老师现场录入这条路上直接不可用。
+
+    本用例把两端契约各自钉住（前端侧另有 vitest `draftFlow.test.ts`）：
+      · 缺 lineage_id / 空串 → 400 `lineage_required`（**不许退化为全量**）
+      · 带合法 lineage_id → 200，且草案随即生成
+    """
+    lin = lineage_on
+    _setup_teacher_and_student(client)
+    onsite = "【老师现场录入】\n学生姓名：%s\n就诊时间：2026年10月4日" % STUDENT
+
+    # ① 缺字段 -> 400，且错误码明确
+    r = client.post("/api/transcribe", json={
+        "patient_name": STUDENT, "teacher_name": TEACHER,
+        "content": onsite, "data_type": "text"})
+    assert r.status_code == 400, "缺 lineage_id 必须 fail-loud（§5.2 漏改必 4xx）"
+    assert r.json()["detail"]["error"] == "lineage_required"
+
+    # ② 空串同样 400（空不得被当成"未启用"）
+    r = client.post("/api/transcribe", json={
+        "patient_name": STUDENT, "teacher_name": TEACHER,
+        "content": onsite, "data_type": "text", "lineage_id": ""})
+    assert r.status_code == 400
+
+    # ③ 带上合法 id -> 成功，且草案已生成（这才是前端兜底该走的形态）
+    r = client.post("/api/transcribe", json={
+        "patient_name": STUDENT, "teacher_name": TEACHER,
+        "content": onsite, "data_type": "text", "lineage_id": lin})
+    assert r.status_code == 200, r.text
+    assert "转述失败" not in str(r.json())
+
+    drafts = database.get_drafts(teacher_name=TEACHER, lineage_id=lin)
+    assert len(drafts) == 1, "现场录入后应生成草案，老师才能继续签字"
+
+
 def test_appointment_timestamps_are_real(client, lineage_on):
     """时间戳必须是真实时间（原 `created_at` 硬编码 2026-09-21、`confirmed_at` 硬编码 2026-09-20）。
 
