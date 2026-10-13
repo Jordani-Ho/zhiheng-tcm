@@ -103,7 +103,7 @@ npm run dev        # 开发；或 npm run build 出 dist
 | :-- | :-- |
 | 后端全量 | **737 passed / 1 failed**（738 收集） |
 | 唯一失败 | `test_agent_stage.py::test_scan_response_has_no_stage_field_flag_off` —— **属 C 板块 P-301 在途工作**，已发回，与本仓当前 HEAD 的功能改动无关 |
-| **前端** | **`npm test` → 51 passed**（4 文件；D-065/D-067/D-069） |
+| **前端** | **`npm test` → 84 passed**（6 文件；D-065/D-067/D-069/D-071/D-072） |
 | 前端类型/构建 | `tsc -b` 退出码 0；`vite build` 成功 |
 
 **跑基线须在 DSH 沙箱外**（沙箱会拦截 pytest 临时目录 → 65 个假错误）。
@@ -122,6 +122,8 @@ npm run test:watch # 开发时监听
 | `src/TeacherOnboarding.test.tsx` | 9 | 真实挂载到 jsdom：按实际数据渲染（反向断言无硬编码「李老师」）/ 空列表与失败不炸 / 入社区请求体契约 / 空姓名不发请求 / 回调与当前身份标记 / console.error 零调用 |
 | `src/LearningPanel.test.tsx` | 8 | flag off 整卡不渲染 / 空 teacherName 不发请求 / 链节与链状态渲染 / 双因子 URL 编码 / 空链文案 / **链断 409 是数据事实**不当故障 / 500 不白屏 / console.error 零调用 |
 | `src/identityBootstrap.test.ts` | 11 | 身份解析全部分支：学生归属优先 / 兜底老师列表 / 沿用已选老师与学生 / 空列表 / 请求失败 / JSON 坏 / fetch 抛异常 —— **一律不抛错**（首屏不白屏）；URL 编码；兼容两种返回形态 |
+| `src/intakeFlow.test.ts` | 16 | 十问歌：问答串格式**对齐后端 `count("答：")` 口径** / 轮数上限 `>=` 封顶 / 持久化"已答为空则不写" / 起始三分支（fresh·resume·finalize） |
+| `src/lineageContext.test.ts` | 17 | 师门上下文：flag off 恒空串（URL 逐字节一致）/ 学生端只认 active 且有 id 的归属 / 「全部师门汇总」不得当上下文 / 拼参 `?`与`&`、保留原参数顺序、encode / 幂等风险 |
 
 **纪律（D-066）**：全部用例用 **fetch 桩、不联网**；组件测试用 `react-dom/client` + `act`（未引 `@testing-library/react`）；`IS_REACT_ACT_ENVIRONMENT` 必须为 true（React 19 要求，已在 `src/test-setup.ts` 设置）。
 
